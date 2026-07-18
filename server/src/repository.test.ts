@@ -4,7 +4,14 @@ import { basename, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { classifyGitFailure, createOrReuseRequirementWorktree, getLocalBranches, getWorktreeSnapshot, isProtectedBranch } from "./repository.js";
+import {
+  classifyGitFailure,
+  cleanupFailedManagedWorktreeCreation,
+  createOrReuseRequirementWorktree,
+  getLocalBranches,
+  getWorktreeSnapshot,
+  isProtectedBranch
+} from "./repository.js";
 
 const exec = promisify(execFile); const dirs: string[] = [];
 afterEach(async()=>{for(const dir of dirs.splice(0))await rm(dir,{recursive:true,force:true})});
@@ -230,5 +237,46 @@ describe("requirement worktree lifecycle", () => {
     expect(classifyGitFailure({ code: 128, signal: null })).toBe("command_failed");
     expect(classifyGitFailure({ code: "ENOENT", signal: null })).toBe("unavailable");
     expect(classifyGitFailure({ code: 1, signal: "SIGTERM" })).toBe("unavailable");
+  });
+
+  it("does not clean an external winner when worktree add was attempted without target ownership", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const branch = "ai/REQ-9011";
+    const target = resolve(
+      await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "requirements", "REQ-9011"
+    );
+    await mkdir(resolve(target, ".."), { recursive: true });
+    await git(repoPath, "branch", branch, "feature/2.2.1");
+    await git(repoPath, "worktree", "add", target, branch);
+    const head = await git(repoPath, "rev-parse", branch);
+
+    await cleanupFailedManagedWorktreeCreation({
+      repoPath: await realpath(repoPath), worktreePath: target, branch,
+      targetReserved: false, worktreeAddAttempted: true, worktreeAdded: false
+    });
+
+    expect(await git(repoPath, "rev-parse", branch)).toBe(head);
+    expect(await git(target, "branch", "--show-current")).toBe(branch);
+    expect(await registeredPaths(repoPath, branch)).toEqual([target]);
+  });
+
+  it("does not clean an unregistered foreign repository at a reserved target", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const branch = "ai/REQ-9012";
+    const target = resolve(
+      await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "requirements", "REQ-9012"
+    );
+    await mkdir(resolve(target, ".."), { recursive: true });
+    await exec("git", ["init", "-b", branch, target]);
+    await git(target, "config", "user.email", "foreign@example.com"); await git(target, "config", "user.name", "Foreign");
+    await writeFile(join(target, "FOREIGN.md"), "foreign\n"); await git(target, "add", "--all"); await git(target, "commit", "-m", "foreign");
+
+    await cleanupFailedManagedWorktreeCreation({
+      repoPath: await realpath(repoPath), worktreePath: target, branch,
+      targetReserved: true, worktreeAddAttempted: true, worktreeAdded: false
+    });
+
+    expect(await git(target, "branch", "--show-current")).toBe(branch);
+    expect(await git(target, "show", "HEAD:FOREIGN.md")).toBe("foreign");
   });
 });

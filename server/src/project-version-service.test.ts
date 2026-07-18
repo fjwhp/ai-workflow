@@ -272,6 +272,32 @@ describe("project version worktree lifecycle", () => {
     expect(await mainState(repoPath)).toEqual(before);
   });
 
+  it("preserves one winner when different branches concurrently claim the same version target", async () => {
+    const { repoPath } = await setupRepository();
+    await git(repoPath, "branch", "feature/a");
+    await git(repoPath, "branch", "feature/b");
+    const before = await mainState(repoPath);
+    const target = resolve(
+      await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "versions", "same-target"
+    );
+
+    const results = await Promise.allSettled(["feature/a", "feature/b"].map((branch) => createProjectVersionWorktree({
+      repoPath, versionId: "same-target", branch, baseBranch: "prod", mode: "attach_branch"
+    })));
+
+    expect(results.filter((item) => item.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.find((item): item is PromiseRejectedResult => item.status === "rejected");
+    expect(rejected?.reason).toMatchObject({ message: "PROJECT_VERSION_PATH_IN_USE" });
+    expect(await pathExists(target)).toBe(true);
+    const registrations = [
+      ...await registeredPaths(repoPath, "feature/a"),
+      ...await registeredPaths(repoPath, "feature/b")
+    ].filter((path) => path === target);
+    expect(registrations).toEqual([target]);
+    expect(["feature/a", "feature/b"]).toContain(await git(target, "branch", "--show-current"));
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
   it("rolls back a created version branch and target after checkout failure", async () => {
     const { repoPath } = await setupRepository();
     await configureFailingSmudge(repoPath);

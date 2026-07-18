@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, readFile, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, realpath, rm } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -47,20 +47,20 @@ async function canonicalGitCommonDir(repoOrWorktreePath: string) {
   return realpath(resolve(repoOrWorktreePath, stdout.trim()));
 }
 
-const branchLocks = new Map<string, Promise<void>>();
+const worktreeMutationLocks = new Map<string, Promise<void>>();
 
-export async function withRepoBranchLock<T>(repoPath: string, branch: string, operation: () => Promise<T>): Promise<T> {
-  const key = `${await canonicalGitCommonDir(repoPath)}\0${branch}`;
-  const predecessor = branchLocks.get(key) ?? Promise.resolve();
+export async function withRepoWorktreeMutationLock<T>(repoPath: string, operation: () => Promise<T>): Promise<T> {
+  const key = await canonicalGitCommonDir(repoPath);
+  const predecessor = worktreeMutationLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
   const tail = predecessor.then(() => gate);
-  branchLocks.set(key, tail);
+  worktreeMutationLocks.set(key, tail);
   await predecessor;
   try { return await operation(); }
   finally {
     release();
-    if (branchLocks.get(key) === tail) branchLocks.delete(key);
+    if (worktreeMutationLocks.get(key) === tail) worktreeMutationLocks.delete(key);
   }
 }
 
@@ -206,15 +206,52 @@ async function findRegisteredWorktree(repoPath: string, branch: string, managedR
   return { ...matches[0]!, path: deterministicPath, baseCommit: identity.headCommit };
 }
 
-async function cleanupFailedRequirementCreation(repoPath: string, worktreePath: string, branch: string, ownedHead?: string) {
-  await execFileAsync("git", ["-C", repoPath, "worktree", "remove", "--force", worktreePath]).catch(() => undefined);
-  await rm(worktreePath, { recursive: true, force: true }).catch(() => undefined);
-  if (!ownedHead) return;
+export async function cleanupFailedManagedWorktreeCreation(input: {
+  repoPath: string;
+  worktreePath: string;
+  branch: string;
+  ownedHead?: string;
+  targetReserved: boolean;
+  worktreeAddAttempted: boolean;
+  worktreeAdded: boolean;
+}) {
+  const mayOwnTarget = input.targetReserved && (input.worktreeAddAttempted || input.worktreeAdded);
+  if (mayOwnTarget) {
+    let targetRegistration: RegisteredWorktree | undefined;
+    try {
+      const { stdout } = await execFileAsync("git", ["-C", input.repoPath, "worktree", "list", "--porcelain", "-z"]);
+      for (const item of parseRegisteredWorktrees(stdout)) {
+        let registeredPath = resolve(item.path);
+        try { registeredPath = await realpath(item.path); } catch { /* keep registered lexical path */ }
+        if (registeredPath === input.worktreePath) { targetRegistration = item; break; }
+      }
+    } catch { /* do not touch an unverified target */ }
+
+    if (targetRegistration?.branch === `refs/heads/${input.branch}`) {
+      const identity = await inspectActualWorktreeIdentity(input.repoPath, input.worktreePath, input.branch);
+      if (identity.valid && identity.path === input.worktreePath) {
+        await execFileAsync("git", ["-C", input.repoPath, "worktree", "remove", "--force", input.worktreePath]).catch(() => undefined);
+        await rm(input.worktreePath, { recursive: true, force: true }).catch(() => undefined);
+      }
+    } else if (!targetRegistration) {
+      let safeToRemove = false;
+      try {
+        safeToRemove = (await readdir(input.worktreePath)).length === 0;
+        if (!safeToRemove) {
+          const identity = await inspectActualWorktreeIdentity(input.repoPath, input.worktreePath, input.branch);
+          safeToRemove = identity.valid && identity.path === input.worktreePath;
+        }
+      } catch { /* missing or unverifiable targets need no cleanup */ }
+      if (safeToRemove) await rm(input.worktreePath, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  if (!input.ownedHead) return;
   try {
-    const { stdout } = await execFileAsync("git", ["-C", repoPath, "worktree", "list", "--porcelain", "-z"]);
-    const stillInUse = parseRegisteredWorktrees(stdout).some((item) => item.branch === `refs/heads/${branch}`);
+    const { stdout } = await execFileAsync("git", ["-C", input.repoPath, "worktree", "list", "--porcelain", "-z"]);
+    const stillInUse = parseRegisteredWorktrees(stdout).some((item) => item.branch === `refs/heads/${input.branch}`);
     if (!stillInUse) {
-      await execFileAsync("git", ["-C", repoPath, "update-ref", "-d", `refs/heads/${branch}`, ownedHead]);
+      await execFileAsync("git", ["-C", input.repoPath, "update-ref", "-d", `refs/heads/${input.branch}`, input.ownedHead]);
     }
   } catch { /* best-effort rollback without touching pre-existing refs */ }
 }
@@ -223,7 +260,7 @@ export async function createOrReuseRequirementWorktree(repoPath: string, baseBra
   if (!/^REQ-[0-9]{4,}$/.test(requirementCode)) throw new Error("REQUIREMENT_CODE_INVALID");
   repoPath = await requirementRepoPath(repoPath);
   const branch = `ai/${requirementCode}`;
-  return withRepoBranchLock(repoPath, branch, async () => {
+  return withRepoWorktreeMutationLock(repoPath, async () => {
     await validateLocalBranch(repoPath, baseBranch, "REQUIREMENT_BASE_BRANCH_INVALID", "REQUIREMENT_BASE_BRANCH_NOT_FOUND");
     const root = resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "requirements");
     const worktreePath = resolve(root, requirementCode);
@@ -244,18 +281,28 @@ export async function createOrReuseRequirementWorktree(repoPath: string, baseBra
 
     const branchExists = await localBranchExists(repoPath, branch);
     let ownedHead: string | undefined;
+    let targetReserved = false;
+    let worktreeAddAttempted = false;
+    let worktreeAdded = false;
     try {
       if (!branchExists) {
         const { stdout } = await execFileAsync("git", ["-C", repoPath, "rev-parse", baseBranch]);
-        ownedHead = stdout.trim();
-        await execFileAsync("git", ["-C", repoPath, "update-ref", `refs/heads/${branch}`, ownedHead, ""]);
+        const baseHead = stdout.trim();
+        await execFileAsync("git", ["-C", repoPath, "update-ref", `refs/heads/${branch}`, baseHead, ""]);
+        ownedHead = baseHead;
       }
+      await mkdir(worktreePath);
+      targetReserved = true;
+      worktreeAddAttempted = true;
       await execFileAsync("git", ["-C", repoPath, "worktree", "add", worktreePath, branch]);
+      worktreeAdded = true;
       const created = await findRegisteredWorktree(repoPath, branch, root);
       if (!created || created.path !== worktreePath) throw new Error("REQUIREMENT_WORKTREE_POSTCONDITION_FAILED");
       return { branch, worktreePath, baseCommit: created.baseCommit, reused: false };
     } catch (cause) {
-      await cleanupFailedRequirementCreation(repoPath, worktreePath, branch, ownedHead);
+      await cleanupFailedManagedWorktreeCreation({
+        repoPath, worktreePath, branch, ownedHead, targetReserved, worktreeAddAttempted, worktreeAdded
+      });
       throw new Error("REQUIREMENT_WORKTREE_CREATE_FAILED", { cause });
     }
   });
