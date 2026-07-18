@@ -265,6 +265,13 @@ export class WorkflowStore {
       .map(mapRequirementProject);
   }
 
+  listArchivedRequirementProjectHistory(requirementId: string): RequirementProject[] {
+    return (this.db.prepare(`SELECT rp.*, p.name AS project_name, p.status AS project_status
+      FROM requirement_projects rp JOIN projects p ON p.id = rp.project_id
+      WHERE rp.requirement_id = ? AND rp.status = 'archived' AND p.status = 'archived'
+      ORDER BY rp.position, rp.created_at`).all(requirementId) as any[]).map(mapRequirementProject);
+  }
+
   replaceRequirementProjects(requirementId: string, inputs: RequirementProjectInput[]): RequirementProject[] {
     if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
     const projectIds = [...new Set(inputs.map((item) => item.projectId))];

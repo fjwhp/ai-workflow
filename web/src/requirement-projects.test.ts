@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ApiError } from "./api.js";
 import {
   associationSummary, associationApiErrors, associationReducer, availableProjectChoices,
+  activeAssociations, historyAssociations, moveAssociation, requirementProjectsPayload,
   hasMaterialAssociationEdit, initialAssociationState, phaseOneDeliveryGate,
   setPrimary, setUsage, validateAssociations, type Association
 } from "./requirement-projects.js";
@@ -21,6 +22,19 @@ describe("requirement project helpers", () => {
     expect(availableProjectChoices([{ id: "web", name: "Web", status: "active" }, archived], [primary])).toEqual([]);
     expect(associationSummary([{ ...primary, projectId: "old", status: "archived", projectStatus: "archived" }]).archivedCount).toBe(1);
   });
+  it("classifies archived projects as history and excludes them from gate and payload", () => {
+    const archived = { ...delivery, projectId: "old", projectStatus: "archived" as const };
+    expect(activeAssociations([primary, archived])).toEqual([primary]);
+    expect(historyAssociations([primary, archived])).toEqual([archived]);
+    expect(phaseOneDeliveryGate([primary, archived]).kind).toBe("missing");
+    expect(requirementProjectsPayload([primary, archived])).toEqual([{ projectId: "web", role: "primary", usage: "context", deliveryRequired: false, moduleMode: "auto", moduleIds: [], position: 0 }]);
+  });
+  it("summarizes total and required delivery projects", () => expect(associationSummary([primary, delivery, { ...delivery, projectId: "mobile", deliveryRequired: false }])).toMatchObject({ deliveryCount: 2, requiredDeliveryCount: 1 }));
+  it("offers every eligible active unassociated project", () => expect(availableProjectChoices([{ id: "api", name: "API", status: "active" }, { id: "mobile", name: "Mobile", status: "active" }, { id: "old", name: "Old", status: "archived" }], [primary])).toEqual([{ id: "api", name: "API", status: "active" }, { id: "mobile", name: "Mobile", status: "active" }]));
+  it("reorders active rows deterministically without moving history", () => {
+    const archived = { ...delivery, projectId: "old", projectStatus: "archived" as const };
+    expect(moveAssociation([primary, archived, delivery], "api", -1).map(item => [item.projectId, item.position])).toEqual([["api", 0], ["web", 1], ["old", 1]]);
+  });
   it("enforces one primary and clears required delivery for context", () => {
     expect(setPrimary([primary, delivery], "api").map(item => item.role)).toEqual(["collaborator", "primary"]);
     expect(setUsage([delivery], "api", "context")[0]).toMatchObject({ usage: "context", deliveryRequired: false });
@@ -30,6 +44,12 @@ describe("requirement project helpers", () => {
     expect(validateAssociations([{ ...primary, moduleMode: "selected", moduleIds: ["gone"] }], { web: { status: "ready", modules: ["src"] } }).rows[0]?.moduleIds).toContain("不可用");
     expect(validateAssociations([primary], {}).valid).toBe(true);
     expect(validateAssociations([{ ...primary, moduleMode: "all" }], {}).valid).toBe(true);
+    expect(validateAssociations([{ ...primary, moduleMode: "selected", moduleIds: ["src"] }], { web: { status: "error", modules: [], error: "offline" } }).rows[0]?.moduleIds).toContain("不可用");
+  });
+  it("reports duplicate projects and zero or two primaries", () => {
+    expect(validateAssociations([primary, { ...delivery, projectId: "web" }], {}).rows[1]?.projectId).toContain("重复");
+    expect(validateAssociations([{ ...primary, role: "collaborator" }], {}).rows[0]?.role).toBeTruthy();
+    expect(validateAssociations([primary, { ...delivery, role: "primary" }], {}).rows[1]?.role).toBeTruthy();
   });
   it("warns on material edits at or after a frozen technical design", () => {
     expect(hasMaterialAssociationEdit([primary], [{ ...primary, moduleMode: "all" }], "technical_design", { version: 1 })).toBe(true);

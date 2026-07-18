@@ -80,7 +80,7 @@ export async function buildApp(store: WorkflowStore) {
   });
   app.get("/api/requirements/:id/projects",async(req:any,reply)=>{
     if(!store.getRequirement(req.params.id))return reply.code(404).send({error:"NOT_FOUND"});
-    return {projects:store.listRequirementProjects(req.params.id),snapshot:store.getRequirementProjectSnapshot(req.params.id),snapshots:store.listRequirementProjectSnapshots(req.params.id)};
+    return {projects:[...store.listRequirementProjects(req.params.id),...store.listArchivedRequirementProjectHistory(req.params.id)],snapshot:store.getRequirementProjectSnapshot(req.params.id),snapshots:store.listRequirementProjectSnapshots(req.params.id)};
   });
   app.put("/api/requirements/:id/projects",async(req:any,reply)=>{
     if(!store.getRequirement(req.params.id))return reply.code(404).send({error:"NOT_FOUND"});
