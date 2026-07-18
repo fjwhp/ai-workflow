@@ -3,6 +3,7 @@ import {
   productArtifactSchema,
   projectInputSchema,
   projectUpdateSchema,
+  requirementInputSchema,
   requirementProjectsInputSchema
 } from "./schemas.js";
 import { selectDeliveryProjects, selectPrimaryProject, type RequirementProject } from "./project-association.js";
@@ -66,9 +67,11 @@ describe("requirementProjectsInputSchema", () => {
   });
 
   it("rejects duplicate projects", () => {
-    expect(requirementProjectsInputSchema.safeParse([
+    const result = requirementProjectsInputSchema.safeParse([
       association(), association({ role: "collaborator", usage: "delivery", deliveryRequired: true, position: 1 })
-    ]).success).toBe(false);
+    ]);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.issues[0]?.path).toEqual([1, "projectId"]);
   });
 
   it("rejects selected mode without modules", () => {
@@ -77,10 +80,26 @@ describe("requirementProjectsInputSchema", () => {
     ]).success).toBe(false);
   });
 
+  it("rejects duplicate selected module IDs after trimming", () => {
+    expect(requirementProjectsInputSchema.safeParse([
+      association({ moduleMode: "selected", moduleIds: ["api", " api "] })
+    ]).success).toBe(false);
+  });
+
+  it.each(["auto", "all"])("rejects modules provided in %s mode", (moduleMode) => {
+    expect(requirementProjectsInputSchema.safeParse([
+      association({ moduleMode, moduleIds: ["api"] })
+    ]).success).toBe(false);
+  });
+
   it("rejects zero primary associations", () => {
     expect(requirementProjectsInputSchema.safeParse([
       association({ role: "collaborator" })
     ]).success).toBe(false);
+  });
+
+  it("rejects an empty association collection", () => {
+    expect(requirementProjectsInputSchema.safeParse([]).success).toBe(false);
   });
 
   it("rejects two primary associations", () => {
@@ -106,5 +125,24 @@ describe("project schemas", () => {
 
   it("rejects an empty project update", () => {
     expect(projectUpdateSchema.safeParse({}).success).toBe(false);
+  });
+
+  it("accepts null category to clear it", () => {
+    expect(projectUpdateSchema.parse({ category: null })).toEqual({ category: null });
+  });
+});
+
+describe("requirementInputSchema", () => {
+  const input = {
+    title: "Requirement", businessProblem: "A concrete business problem",
+    expectedOutcome: "Useful outcome", priority: "medium" as const
+  };
+
+  it("requires a primary project ID", () => {
+    expect(requirementInputSchema.safeParse(input).success).toBe(false);
+  });
+
+  it("trims the primary project ID", () => {
+    expect(requirementInputSchema.parse({ ...input, primaryProjectId: " project-1 " }).primaryProjectId).toBe("project-1");
   });
 });

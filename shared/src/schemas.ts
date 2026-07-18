@@ -1,9 +1,11 @@
 import { z } from "zod";
 import { workflowStages, workflowStatuses } from "./domain.js";
+import { moduleModes, projectRoles, projectUsages } from "./project-association.js";
 
 export const prioritySchema = z.enum(["low", "medium", "high", "urgent"]);
 
 const nonEmptyIdSchema = z.string().trim().min(1);
+export const projectCategorySchema = z.string().trim().min(1);
 const allowedCommandSchema = z.object({
   command: z.string().trim().min(1),
   argsPrefix: z.array(z.string()).optional()
@@ -15,20 +17,22 @@ export const projectInputSchema = z.object({
   defaultBranch: z.string().trim().min(1),
   allowedCommands: z.array(allowedCommandSchema),
   sensitivePatterns: z.array(z.string()),
-  category: z.string().trim().min(1).optional()
+  category: projectCategorySchema.optional()
 });
 
-export const projectUpdateSchema = projectInputSchema.partial().refine(
+export const projectUpdateSchema = projectInputSchema.partial().extend({
+  category: projectCategorySchema.nullable().optional()
+}).refine(
   (value) => Object.values(value).some((field) => field !== undefined),
   { message: "Project update must include at least one field" }
 );
 
 export const requirementProjectInputSchema = z.object({
   projectId: nonEmptyIdSchema,
-  role: z.enum(["primary", "collaborator"]),
-  usage: z.enum(["context", "delivery"]),
+  role: z.enum(projectRoles),
+  usage: z.enum(projectUsages),
   deliveryRequired: z.boolean(),
-  moduleMode: z.enum(["auto", "all", "selected"]),
+  moduleMode: z.enum(moduleModes),
   moduleIds: z.array(nonEmptyIdSchema),
   position: z.number().int().nonnegative()
 }).superRefine((value, ctx) => {
@@ -47,12 +51,19 @@ export const requirementProjectInputSchema = z.object({
 });
 
 export const requirementProjectsInputSchema = z.array(requirementProjectInputSchema).superRefine((items, ctx) => {
-  if (items.filter((item) => item.role === "primary").length !== 1) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Exactly one primary project is required" });
+  const primaryIndexes = items.flatMap((item, index) => item.role === "primary" ? [index] : []);
+  if (primaryIndexes.length !== 1) {
+    const issueIndexes = primaryIndexes.length > 1 ? primaryIndexes : (items.length ? items.map((_, index) => index) : [0]);
+    for (const index of issueIndexes) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: [index, "role"], message: "Exactly one primary project is required" });
+    }
   }
-  const projectIds = items.map((item) => item.projectId);
-  if (new Set(projectIds).size !== projectIds.length) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Project IDs must be unique" });
+  const seenProjectIds = new Set<string>();
+  for (const [index, item] of items.entries()) {
+    if (seenProjectIds.has(item.projectId)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: [index, "projectId"], message: "Project IDs must be unique" });
+    }
+    seenProjectIds.add(item.projectId);
   }
 });
 

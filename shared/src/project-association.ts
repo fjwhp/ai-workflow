@@ -1,6 +1,12 @@
-export type ProjectRole = "primary" | "collaborator";
-export type ProjectUsage = "context" | "delivery";
-export type ModuleMode = "auto" | "all" | "selected";
+export const projectRoles = ["primary", "collaborator"] as const;
+export const projectUsages = ["context", "delivery"] as const;
+export const moduleModes = ["auto", "all", "selected"] as const;
+export const requirementProjectStatuses = ["active", "archived"] as const;
+
+export type ProjectRole = typeof projectRoles[number];
+export type ProjectUsage = typeof projectUsages[number];
+export type ModuleMode = typeof moduleModes[number];
+export type RequirementProjectStatus = typeof requirementProjectStatuses[number];
 
 export interface RequirementProject {
   id: string;
@@ -13,7 +19,7 @@ export interface RequirementProject {
   moduleMode: ModuleMode;
   moduleIds: string[];
   position: number;
-  status: "active" | "archived";
+  status: RequirementProjectStatus;
   createdAt: string;
   updatedAt: string;
 }
