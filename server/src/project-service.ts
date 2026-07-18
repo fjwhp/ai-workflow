@@ -70,7 +70,10 @@ async function confinedModulePath(repoPath: string, path: string, warnings: stri
   try {
     const canonical = await realpath(candidate);
     if (!isContained(repoPath, canonical)) { warnings.push(`Ignored module path outside repository: ${path}`); return null; }
-  } catch { /* nonexistent knowledge hints remain safe after lexical containment */ }
+  } catch {
+    warnings.push(`Ignored module path that does not resolve inside repository: ${path}`);
+    return null;
+  }
   return normalized;
 }
 

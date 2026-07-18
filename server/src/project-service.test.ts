@@ -69,7 +69,7 @@ describe("inspectProjectRepository", () => {
   });
 
   it("uses knowledge module entries when supplied", async () => {
-    const repo = await createRepo({ "package.json": JSON.stringify({ workspaces: ["apps/*"] }), "apps/web/package.json": "{}" });
+    const repo = await createRepo({ "package.json": JSON.stringify({ workspaces: ["apps/*"] }), "apps/web/package.json": "{}", "services/api/package.json": "{}" });
     const result = await inspectProjectRepository(repo, "main", [
       { path: "services/api", kind: "module", title: "API service" },
       { path: "README.md", kind: "overview", title: "Overview" }
@@ -113,10 +113,14 @@ describe("inspectProjectRepository", () => {
       "safe/web/package.json": "{}"
     });
     await symlink(outside, join(repo, "linked"));
+    await symlink(join(outside, "does-not-exist"), join(repo, "dangling"));
     const result = await inspectProjectRepository(repo, "main", [
       { path: join(outside, "secret-module"), kind: "module", title: "Absolute secret" },
       { path: "../outside/secret-module", kind: "module", title: "Traversal secret" },
       { path: "linked/secret-module", kind: "module", title: "Symlink secret" },
+      { path: "linked/missing-leaf", kind: "module", title: "Missing outside leaf" },
+      { path: "dangling/missing-leaf", kind: "module", title: "Dangling leaf" },
+      { path: "ordinary/missing-leaf", kind: "module", title: "Nonexistent leaf" },
       { path: "safe/web", kind: "module", title: "Web" }
     ]);
     expect(result.modules).toEqual([
