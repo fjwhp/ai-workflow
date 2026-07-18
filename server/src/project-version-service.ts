@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { lstat, mkdir, realpath, rm } from "node:fs/promises";
 import { basename, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { ProjectVersionValidation } from "@ai-workflow/shared";
-import { inspectActualWorktreeIdentity } from "./repository.js";
+import { classifyGitFailure, inspectActualWorktreeIdentity, withRepoBranchLock } from "./repository.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -62,15 +62,21 @@ async function validateRepo(repoPath: string) {
 
 async function validateBranch(repoPath: string, branch: string, code: string) {
   if (!branch || branch.includes("\0")) fail(code);
-  try { await git(repoPath, ["check-ref-format", "--branch", branch]); }
-  catch { fail(code); }
+  try { await execFileAsync("git", ["check-ref-format", "--branch", branch]); }
+  catch (error) {
+    if (classifyGitFailure(error) === "unavailable") throw new Error("PROJECT_VERSION_GIT_UNAVAILABLE", { cause: error });
+    fail(code);
+  }
 }
 
 async function localBranchExists(repoPath: string, branch: string) {
   try {
     await git(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
     return true;
-  } catch { return false; }
+  } catch (error) {
+    if (classifyGitFailure(error) === "not_found") return false;
+    throw new Error("PROJECT_VERSION_GIT_UNAVAILABLE", { cause: error });
+  }
 }
 
 async function canonicalWorktree(worktree: RegisteredWorktree) {
@@ -164,6 +170,28 @@ async function prepareManagedTarget(repoPath: string, versionId: string, worktre
   return worktreePath;
 }
 
+async function inspectCreatedVersionWorktree(repoPath: string, branch: string, expectedPath: string) {
+  const matches = (await registeredWorktrees(repoPath)).filter((item) => item.branch === `refs/heads/${branch}`);
+  if (matches.length !== 1) throw new Error("PROJECT_VERSION_WORKTREE_POSTCONDITION_FAILED");
+  let registeredPath: string;
+  try { registeredPath = await realpath(matches[0]!.path); }
+  catch { throw new Error("PROJECT_VERSION_WORKTREE_POSTCONDITION_FAILED"); }
+  if (registeredPath !== expectedPath) throw new Error("PROJECT_VERSION_WORKTREE_POSTCONDITION_FAILED");
+  const identity = await inspectActualWorktreeIdentity(repoPath, expectedPath, branch);
+  if (!identity.valid) throw new Error("PROJECT_VERSION_WORKTREE_POSTCONDITION_FAILED");
+  return identity;
+}
+
+async function cleanupFailedVersionCreation(repoPath: string, worktreePath: string, branch: string, ownedHead?: string) {
+  await git(repoPath, ["worktree", "remove", "--force", worktreePath]).catch(() => undefined);
+  await rm(worktreePath, { recursive: true, force: true }).catch(() => undefined);
+  if (!ownedHead) return;
+  try {
+    const stillInUse = (await registeredWorktrees(repoPath)).some((item) => item.branch === `refs/heads/${branch}`);
+    if (!stillInUse) await git(repoPath, ["update-ref", "-d", `refs/heads/${branch}`, ownedHead]);
+  } catch { /* best-effort rollback without touching pre-existing refs */ }
+}
+
 export async function createProjectVersionWorktree(input: {
   repoPath: string; versionId: string; branch: string; baseBranch: string;
   mode: "create_branch" | "attach_branch" | "reuse_worktree";
@@ -171,34 +199,46 @@ export async function createProjectVersionWorktree(input: {
 }): Promise<{ worktreePath: string; headCommit: string; createdBranch: boolean; createdWorktree: boolean }> {
   const repoPath = await validateRepo(input.repoPath);
   if (!validVersionId(input.versionId)) fail("PROJECT_VERSION_ID_INVALID");
-  const inspected = await inspectCanonical(repoPath, input.branch, input.baseBranch);
-  if (inspected.mode !== input.mode) fail("PROJECT_VERSION_MODE_MISMATCH");
+  return withRepoBranchLock(repoPath, input.branch, async () => {
+    const inspected = await inspectCanonical(repoPath, input.branch, input.baseBranch);
+    if (inspected.mode !== input.mode) fail("PROJECT_VERSION_MODE_MISMATCH");
 
-  if (input.mode === "reuse_worktree") {
-    if (!input.reuseExistingWorktree) fail("PROJECT_VERSION_REUSE_NOT_CONFIRMED");
-    if (!input.existingWorktreePath || !inspected.existingWorktreePath) fail("PROJECT_VERSION_WORKTREE_MISMATCH");
-    let requested: string;
-    try { requested = await realpath(input.existingWorktreePath); }
-    catch { fail("PROJECT_VERSION_WORKTREE_MISMATCH"); }
-    if (requested !== inspected.existingWorktreePath) fail("PROJECT_VERSION_WORKTREE_MISMATCH");
-    const identity = await inspectActualWorktreeIdentity(repoPath, requested, input.branch);
-    if (!identity.valid) fail("PROJECT_VERSION_WORKTREE_IDENTITY_MISMATCH");
-    return { worktreePath: requested, headCommit: identity.headCommit, createdBranch: false, createdWorktree: false };
-  }
+    if (input.mode === "reuse_worktree") {
+      if (!input.reuseExistingWorktree) fail("PROJECT_VERSION_REUSE_NOT_CONFIRMED");
+      if (!input.existingWorktreePath || !inspected.existingWorktreePath) fail("PROJECT_VERSION_WORKTREE_MISMATCH");
+      let requested: string;
+      try { requested = await realpath(input.existingWorktreePath); }
+      catch { fail("PROJECT_VERSION_WORKTREE_MISMATCH"); }
+      if (requested !== inspected.existingWorktreePath) fail("PROJECT_VERSION_WORKTREE_MISMATCH");
+      const identity = await inspectActualWorktreeIdentity(repoPath, requested, input.branch);
+      if (!identity.valid) fail("PROJECT_VERSION_WORKTREE_IDENTITY_MISMATCH");
+      const live = await inspectCreatedVersionWorktree(repoPath, input.branch, requested)
+        .catch(() => fail("PROJECT_VERSION_WORKTREE_IDENTITY_MISMATCH"));
+      return { worktreePath: requested, headCommit: live.headCommit, createdBranch: false, createdWorktree: false };
+    }
 
-  const worktreePath = await prepareManagedTarget(repoPath, input.versionId, await registeredWorktrees(repoPath));
-  if (input.mode === "create_branch") {
-    await git(repoPath, ["worktree", "add", "-b", input.branch, worktreePath, input.baseBranch]);
-  } else {
-    await git(repoPath, ["worktree", "add", worktreePath, input.branch]);
-  }
-  const { stdout } = await git(worktreePath, ["rev-parse", "HEAD"]);
-  return {
-    worktreePath,
-    headCommit: stdout.trim(),
-    createdBranch: input.mode === "create_branch",
-    createdWorktree: true
-  };
+    const worktreePath = await prepareManagedTarget(repoPath, input.versionId, await registeredWorktrees(repoPath));
+    let ownedHead: string | undefined;
+    try {
+      if (input.mode === "create_branch") {
+        const { stdout } = await git(repoPath, ["rev-parse", input.baseBranch]);
+        const baseHead = stdout.trim();
+        await git(repoPath, ["update-ref", `refs/heads/${input.branch}`, baseHead, ""]);
+        ownedHead = baseHead;
+      }
+      await git(repoPath, ["worktree", "add", worktreePath, input.branch]);
+      const identity = await inspectCreatedVersionWorktree(repoPath, input.branch, worktreePath);
+      return {
+        worktreePath,
+        headCommit: identity.headCommit,
+        createdBranch: input.mode === "create_branch",
+        createdWorktree: true
+      };
+    } catch (cause) {
+      await cleanupFailedVersionCreation(repoPath, worktreePath, input.branch, ownedHead);
+      throw new Error("PROJECT_VERSION_WORKTREE_CREATE_FAILED", { cause });
+    }
+  });
 }
 
 export async function inspectVersionWorktree(input: {

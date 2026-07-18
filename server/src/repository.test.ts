@@ -1,10 +1,10 @@
-import { mkdtemp, mkdir, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { createOrReuseRequirementWorktree, getLocalBranches, getWorktreeSnapshot, isProtectedBranch } from "./repository.js";
+import { classifyGitFailure, createOrReuseRequirementWorktree, getLocalBranches, getWorktreeSnapshot, isProtectedBranch } from "./repository.js";
 
 const exec = promisify(execFile); const dirs: string[] = [];
 afterEach(async()=>{for(const dir of dirs.splice(0))await rm(dir,{recursive:true,force:true})});
@@ -45,6 +45,33 @@ async function replaceWithForeignRepository(path: string, branch: string) {
   await exec("git", ["init", "-b", branch, path]);
   await git(path, "config", "user.email", "foreign@example.com"); await git(path, "config", "user.name", "Foreign");
   await writeFile(join(path, "FOREIGN.md"), "foreign\n"); await git(path, "add", "--all"); await git(path, "commit", "-m", "foreign");
+}
+
+async function registeredPaths(repoPath: string, branch: string) {
+  const output = (await exec("git", ["-C", repoPath, "worktree", "list", "--porcelain"])).stdout;
+  return output.trim().split("\n\n").map((record) => ({
+    path: record.split("\n").find((line) => line.startsWith("worktree "))?.slice("worktree ".length),
+    branch: record.split("\n").find((line) => line.startsWith("branch "))?.slice("branch ".length)
+  })).filter((item) => item.branch === `refs/heads/${branch}`).map((item) => item.path);
+}
+
+async function pathExists(path: string) {
+  try { await lstat(path); return true; } catch { return false; }
+}
+
+async function localBranchExistsForTest(repoPath: string, branch: string) {
+  try { await git(repoPath, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`); return true; }
+  catch { return false; }
+}
+
+async function configureFailingSmudge(repoPath: string) {
+  await writeFile(join(repoPath, ".gitattributes"), "failure.txt filter=required-fail\n");
+  await writeFile(join(repoPath, "failure.txt"), "checkout must fail\n");
+  await git(repoPath, "add", "--all"); await git(repoPath, "commit", "-m", "add required filter file");
+  await git(repoPath, "branch", "-f", "feature/2.2.1", "prod");
+  await git(repoPath, "config", "filter.required-fail.clean", "cat");
+  await git(repoPath, "config", "filter.required-fail.smudge", "false");
+  await git(repoPath, "config", "filter.required-fail.required", "true");
 }
 
 async function setupVersionRepository() {
@@ -156,5 +183,52 @@ describe("requirement worktree lifecycle", () => {
     ));
     expect((await readdir(aliasParent)).sort()).toEqual(["alias"]);
     expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("serializes concurrent create-or-reuse calls for the same requirement", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const before = await mainState(repoPath);
+    const results = await Promise.all([
+      createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0008"),
+      createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0008")
+    ]);
+    expect(results.map((item) => item.reused).sort()).toEqual([false, true]);
+    expect(new Set(results.map((item) => item.worktreePath)).size).toBe(1);
+    expect(await registeredPaths(repoPath, "ai/REQ-0008")).toHaveLength(1);
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("rejects a requirement branch mounted at a non-deterministic managed path", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const root = resolve(await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "requirements");
+    const wrongPath = resolve(root, "not-the-deterministic-code");
+    await mkdir(root, { recursive: true });
+    await git(repoPath, "branch", "ai/REQ-9000", "feature/2.2.1");
+    await git(repoPath, "worktree", "add", wrongPath, "ai/REQ-9000");
+    await expect(createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-9000"))
+      .rejects.toThrow("REQUIREMENT_WORKTREE_PATH_MISMATCH");
+  });
+
+  it("rolls back a created requirement branch and target after checkout failure", async () => {
+    const { repoPath } = await setupVersionRepository();
+    await configureFailingSmudge(repoPath);
+    const before = await mainState(repoPath);
+    const target = resolve(await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "requirements", "REQ-9001");
+    let failure: unknown;
+    try { await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-9001"); }
+    catch (error) { failure = error; }
+
+    expect(failure).toMatchObject({ message: "REQUIREMENT_WORKTREE_CREATE_FAILED" });
+    expect(await localBranchExistsForTest(repoPath, "ai/REQ-9001")).toBe(false);
+    expect(await pathExists(target)).toBe(false);
+    expect(await registeredPaths(repoPath, "ai/REQ-9001")).toEqual([]);
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("classifies only exit code 1 without a signal as a missing Git ref", () => {
+    expect(classifyGitFailure({ code: 1, signal: null })).toBe("not_found");
+    expect(classifyGitFailure({ code: 128, signal: null })).toBe("command_failed");
+    expect(classifyGitFailure({ code: "ENOENT", signal: null })).toBe("unavailable");
+    expect(classifyGitFailure({ code: 1, signal: "SIGTERM" })).toBe("unavailable");
   });
 });

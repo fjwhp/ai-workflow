@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -50,6 +50,33 @@ async function replaceWithForeignRepository(path: string, branch: string) {
   await writeFile(join(path, "FOREIGN.md"), "foreign\n");
   await git(path, "add", "--all");
   await git(path, "commit", "-m", "foreign");
+}
+
+async function registeredPaths(repoPath: string, branch: string) {
+  const output = (await exec("git", ["-C", repoPath, "worktree", "list", "--porcelain"])).stdout;
+  return output.trim().split("\n\n").map((record) => ({
+    path: record.split("\n").find((line) => line.startsWith("worktree "))?.slice("worktree ".length),
+    branch: record.split("\n").find((line) => line.startsWith("branch "))?.slice("branch ".length)
+  })).filter((item) => item.branch === `refs/heads/${branch}`).map((item) => item.path);
+}
+
+async function pathExists(path: string) {
+  try { await lstat(path); return true; } catch { return false; }
+}
+
+async function localBranchExists(repoPath: string, branch: string) {
+  try { await git(repoPath, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`); return true; }
+  catch { return false; }
+}
+
+async function configureFailingSmudge(repoPath: string) {
+  await writeFile(join(repoPath, ".gitattributes"), "failure.txt filter=required-fail\n");
+  await writeFile(join(repoPath, "failure.txt"), "checkout must fail\n");
+  await git(repoPath, "add", "--all");
+  await git(repoPath, "commit", "-m", "add required filter file");
+  await git(repoPath, "config", "filter.required-fail.clean", "cat");
+  await git(repoPath, "config", "filter.required-fail.smudge", "false");
+  await git(repoPath, "config", "filter.required-fail.required", "true");
 }
 
 afterEach(async () => {
@@ -220,6 +247,47 @@ describe("project version worktree lifecycle", () => {
       await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "versions", "alias-version"
     ));
     expect((await readdir(aliasParent)).sort()).toEqual(["alias"]);
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("serializes concurrent creation attempts for the same version branch", async () => {
+    const { repoPath } = await setupRepository();
+    await git(repoPath, "branch", "feature/race");
+    const before = await mainState(repoPath);
+    const canonicalRepo = await realpath(repoPath);
+    const paths = ["race-a", "race-b"].map((versionId) => resolve(
+      canonicalRepo, "..", ".ai-workflow-worktrees", basename(canonicalRepo), "versions", versionId
+    ));
+
+    const results = await Promise.allSettled(["race-a", "race-b"].map((versionId) => createProjectVersionWorktree({
+      repoPath, versionId, branch: "feature/race", baseBranch: "prod", mode: "attach_branch"
+    })));
+
+    expect(results.filter((item) => item.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.find((item): item is PromiseRejectedResult => item.status === "rejected");
+    expect(rejected?.reason).toMatchObject({ message: "PROJECT_VERSION_MODE_MISMATCH" });
+    const registered = (await registeredPaths(repoPath, "feature/race")).filter(Boolean);
+    expect(registered).toHaveLength(1);
+    expect(await Promise.all(paths.filter((path) => !registered.includes(path)).map(pathExists))).toEqual([false]);
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("rolls back a created version branch and target after checkout failure", async () => {
+    const { repoPath } = await setupRepository();
+    await configureFailingSmudge(repoPath);
+    const before = await mainState(repoPath);
+    const target = resolve(await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "versions", "failure");
+    let failure: unknown;
+    try {
+      await createProjectVersionWorktree({
+        repoPath, versionId: "failure", branch: "feature/failure", baseBranch: "prod", mode: "create_branch"
+      });
+    } catch (error) { failure = error; }
+
+    expect(failure).toMatchObject({ message: "PROJECT_VERSION_WORKTREE_CREATE_FAILED" });
+    expect(await localBranchExists(repoPath, "feature/failure")).toBe(false);
+    expect(await pathExists(target)).toBe(false);
+    expect(await registeredPaths(repoPath, "feature/failure")).toEqual([]);
     expect(await mainState(repoPath)).toEqual(before);
   });
 });
