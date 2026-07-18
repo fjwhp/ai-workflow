@@ -1070,6 +1070,9 @@ export class WorkflowStore {
       FROM requirements r JOIN requirement_projects rp ON rp.requirement_id = r.id
       WHERE rp.project_version_id = ? AND rp.project_id = ?
         AND rp.usage = 'delivery' AND rp.status = 'active'
+        AND (SELECT COUNT(*) FROM requirement_projects active_delivery
+          WHERE active_delivery.requirement_id = r.id
+            AND active_delivery.usage = 'delivery' AND active_delivery.status = 'active') = 1
         AND r.stage = 'integration' AND r.status = 'awaiting_merge'
         AND r.id != COALESCE(?, '')
       ORDER BY r.updated_at, r.code`).all(versionId, version.projectId, version.pendingRequirementId ?? null) as any[];

@@ -677,11 +677,25 @@ describe("project version application leases", () => {
     const project = createProject(store, "Application queue", join(path, "..", "application-queue"));
     const version = createVersion(store, project.id, "1.0.0", join(path, "..", "application-queue-v1"));
     const otherVersion = createVersion(store, project.id, "2.0.0", join(path, "..", "application-queue-v2"));
+    const collaboratorProject = createProject(store, "Queue collaborator", join(path, "..", "application-queue-collaborator"));
+    const collaboratorVersion = createVersion(store, collaboratorProject.id, "1.0.0", join(path, "..", "application-queue-collaborator-v1"));
     const firstWaiter = store.createRequirement(requirementInput(project.id, version.id, "First waiter"));
     const secondWaiter = store.createRequirement(requirementInput(project.id, version.id, "Second waiter"));
     const owner = store.createRequirement(requirementInput(project.id, version.id, "Owner"));
     const wrongVersion = store.createRequirement(requirementInput(project.id, otherVersion.id, "Wrong version"));
-    for (const requirement of [firstWaiter, secondWaiter, owner, wrongVersion]) {
+    const multipleDeliveries = store.createRequirement(requirementInput(project.id, version.id, "Multiple deliveries"));
+    store.replaceRequirementProjects(multipleDeliveries.id, [
+      {
+        projectId: project.id, projectVersionId: version.id, role: "primary", usage: "delivery",
+        deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0
+      },
+      {
+        projectId: collaboratorProject.id, projectVersionId: collaboratorVersion.id,
+        role: "collaborator", usage: "delivery", deliveryRequired: true,
+        moduleMode: "auto", moduleIds: [], position: 1
+      }
+    ]);
+    for (const requirement of [firstWaiter, secondWaiter, owner, wrongVersion, multipleDeliveries]) {
       store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
     }
     database.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?")
@@ -713,6 +727,9 @@ describe("project version application leases", () => {
       { requirementId: firstWaiter.id, owner: false, position: 3 }
     ]);
     expect(new Set(queue.map(({ requirementId }) => requirementId)).size).toBe(3);
+    expect(queue.some(({ requirementId }) => requirementId === multipleDeliveries.id)).toBe(false);
+    expect(store.listVersionApplicationQueue(collaboratorVersion.id)
+      .some(({ requirementId }) => requirementId === multipleDeliveries.id)).toBe(false);
   });
 });
 
