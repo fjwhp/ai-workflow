@@ -201,6 +201,8 @@ export class WorkflowStore {
     this.ensureColumn("executions", "codex_thread_id", "TEXT");
     this.ensureColumn("executions", "events_json", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("executions", "diagnostics_text", "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn("executions", "project_version_id", "TEXT");
+    this.ensureColumn("executions", "base_commit", "TEXT");
     this.ensureColumn("approvals", "actor_type", "TEXT NOT NULL DEFAULT 'human'");
     this.ensureColumn("approvals", "artifact_id", "TEXT");
     this.ensureColumn("approvals", "reasons_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -856,9 +858,9 @@ export class WorkflowStore {
   addExecution(input: any) {
     const item = { id: randomUUID(), createdAt: new Date().toISOString(), ...input };
     this.db.prepare(`INSERT INTO executions
-      (id, requirement_id, stage, project_id, branch, worktree_path, status, commands_json, diff_text, error, created_at, completed_at, codex_thread_id, events_json, diagnostics_text)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
-      item.id, item.requirementId, item.stage, item.projectId, item.branch, item.worktreePath,
+      (id, requirement_id, stage, project_id, project_version_id, branch, worktree_path, base_commit, status, commands_json, diff_text, error, created_at, completed_at, codex_thread_id, events_json, diagnostics_text)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
+      item.id, item.requirementId, item.stage, item.projectId, item.projectVersionId ?? null, item.branch, item.worktreePath, item.baseCommit ?? null,
       item.status, JSON.stringify(item.commands ?? []), item.diff ?? "", item.error ?? null,
       item.createdAt, item.completedAt ?? null, item.codexThreadId ?? null,
       JSON.stringify(item.events ?? []), item.diagnostics ?? ""
@@ -869,7 +871,8 @@ export class WorkflowStore {
   listExecutions(requirementId: string) {
     return this.db.prepare("SELECT * FROM executions WHERE requirement_id = ? ORDER BY created_at DESC").all(requirementId).map((row: any) => ({
       id: row.id, requirementId: row.requirement_id, stage: row.stage, projectId: row.project_id,
-      branch: row.branch, worktreePath: row.worktree_path, status: row.status,
+      projectVersionId: row.project_version_id ?? undefined, branch: row.branch, worktreePath: row.worktree_path,
+      baseCommit: row.base_commit ?? undefined, status: row.status,
       commands: JSON.parse(row.commands_json), diff: row.diff_text, error: row.error,
       codexThreadId: row.codex_thread_id, events: JSON.parse(row.events_json || "[]"), diagnostics: row.diagnostics_text,
       createdAt: row.created_at, completedAt: row.completed_at

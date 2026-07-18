@@ -95,9 +95,10 @@ export async function buildApp(store: WorkflowStore) {
     const item = store.getRequirement(req.params.id);
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
     const executionStage=["coding","code_review","testing","acceptance","integration"].includes(item.stage);
-    let deliveryProject:any;
+    let deliveryProject:any,deliveryVersion:any;
     if(executionStage){try{deliveryProject=resolveSoleDeliveryProject(item.projects);}catch(error){return sendDomainError(reply,error);}}
     if(deliveryProject?.projectStatus==="archived")return reply.code(409).send({error:"PROJECT_ARCHIVED",message:"归档项目不能启动新执行"});
+    if(executionStage){try{deliveryVersion=resolveDeliveryVersion(store,deliveryProject);}catch(error){return sendDomainError(reply,error);}}
     if(item.stage==="integration")return reply.code(409).send({error:"INTEGRATION_REQUIRES_MANUAL_ACTION",message:"代码应用节点不会启动 AI，请执行应用预检"});
     const existing = store.listStageRuns(item.id, item.stage).find((run: any) => run.status === "running");
     if (existing) return reply.code(409).send({ error: "RUN_ALREADY_ACTIVE", message: "当前阶段已有 AI 正在执行" });
@@ -121,10 +122,10 @@ export async function buildApp(store: WorkflowStore) {
     const run = store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: context });
     for(const block of context.projectContext?.projects??[])store.appendStageRunEvent(run.id,"knowledge.retrieved",{projectId:block.projectId,version:block.version,sourceHead:block.sourceHead,paths:block.entries.map((entry:any)=>entry.path),totalAvailable:block.totalAvailable,budgetMaxChars:context.projectContext.budgetMaxChars,totalChars:block.totalChars,contextTotalChars:context.projectContext.totalChars,truncated:block.truncated});
     store.updateRequirementState(item.id, item.stage, "ai_running");
-    void executeRun(run.id, item, context, project, sensitivePatterns);
+    void executeRun(run.id, item, context, project, deliveryVersion, sensitivePatterns);
     return reply.code(202).send(run);
 
-    async function executeRun(runId: string, runItem: any, runContext: any, runProject: any, patterns:string[]) {
+    async function executeRun(runId: string, runItem: any, runContext: any, runProject: any, runVersion:any, patterns:string[]) {
       const emit = (type: string, payload: unknown) => store.appendStageRunEvent(runId, type, redactSensitive(payload, patterns));
     try {
       if (runItem.stage === "coding") {
@@ -132,9 +133,9 @@ export async function buildApp(store: WorkflowStore) {
         if (!runProject) throw new Error("关联项目不存在");
         const projectContext = runContext.projectContext?.projects?.[0];
         if (!projectContext) throw new Error("编码阶段缺少交付项目上下文");
-        const coding = await runCodexCoding({ requirement: runContext.requirement, artifacts: runContext.priorArtifacts, project: runProject, projectContext, reworkContext: runContext.reworkContext, onEvent: emit });
+        const coding = await runCodexCoding({ requirement: runContext.requirement, artifacts: runContext.priorArtifacts, project: runProject, version: runVersion, projectContext, reworkContext: runContext.reworkContext, onEvent: emit });
         const conclusion = coding.diff ? "pass" : "return";
-        const execution = store.addExecution({ requirementId: runItem.id, stage: runItem.stage, projectId: runProject.id, branch: coding.branch, worktreePath: coding.worktreePath, status: conclusion === "pass" ? "completed" : "needs_review", commands: [], diff: coding.diff, codexThreadId: coding.codexThreadId, events: coding.events, diagnostics: coding.diagnostics.join("\n"), completedAt: new Date().toISOString() });
+        const execution = store.addExecution({ requirementId: runItem.id, stage: runItem.stage, projectId: runProject.id, projectVersionId: runVersion.id, branch: coding.branch, worktreePath: coding.worktreePath, baseCommit: coding.baseCommit, status: conclusion === "pass" ? "completed" : "needs_review", commands: [], diff: coding.diff, codexThreadId: coding.codexThreadId, events: coding.events, diagnostics: coding.diagnostics.join("\n"), completedAt: new Date().toISOString() });
         const snapshot = buildCodingEvidence({ diff: coding.diff, files: coding.files, additions: coding.additions, deletions: coding.deletions });
         const evidence = store.addCodingEvidence({ ...snapshot, executionId: execution.id, requirementId: runItem.id, projectId: runProject.id,
           branch: coding.branch, worktreePath: coding.worktreePath, diagnostics: coding.diagnostics.join("\n") });
@@ -365,7 +366,15 @@ function applyRequirementProjects(store:WorkflowStore,requirementId:string,input
   const technicalDesignInvalidated=materialChange&&store.invalidateTechnicalDesignForProjectChange(requirementId);
   return {requirement:store.getRequirement(requirementId),projects,snapshot:store.getRequirementProjectSnapshot(requirementId),materialChange,technicalDesignInvalidated:Boolean(technicalDesignInvalidated)};
 }
-function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
+function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});if(["REQUIREMENT_VERSION_REQUIRED","REQUIREMENT_VERSION_PROJECT_MISMATCH","PROJECT_VERSION_NOT_ACTIVE"].includes(message))return reply.code(409).send({error:message,message});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
+
+export function resolveDeliveryVersion(store:WorkflowStore,deliveryProject:any){
+  if(!deliveryProject?.projectVersionId)throw new Error("REQUIREMENT_VERSION_REQUIRED");
+  const version=store.getProjectVersion(deliveryProject.projectVersionId);
+  if(!version||version.projectId!==deliveryProject.projectId)throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
+  if(version.status!=="active")throw new Error("PROJECT_VERSION_NOT_ACTIVE");
+  return version;
+}
 function sendProjectContextError(reply:any,error:unknown){
   if(!(error instanceof ProjectContextError))return reply.code(409).send({error:"PROJECT_KNOWLEDGE_UNAVAILABLE",message:error instanceof Error?error.message:"项目知识库不可用"});
   const messages:Record<string,string>={PROJECT_REQUIRED:"当前阶段必须关联一个交付项目",PROJECT_ARCHIVED:"归档项目不能启动新执行",MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED:"多项目交付执行将在第二阶段提供",PROJECT_KNOWLEDGE_BUILDING:"项目知识库正在生成，请稍后重试",PROJECT_KNOWLEDGE_UNAVAILABLE:"项目知识库不可用",PROJECT_CONTEXT_BUDGET_TOO_SMALL:"项目上下文预算不足，请提高配置或减少关联项目"};

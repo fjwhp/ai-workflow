@@ -47,6 +47,26 @@ describe("WorkflowStore", () => {
     expect(store.listProjects()).toEqual([]);
   });
 
+  it("migrates existing executions with project version provenance columns", () => {
+    const directory = mkdtempSync(join(tmpdir(), "workflow-execution-migration-")); directories.push(directory);
+    const path = join(directory, "workflow.db");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`CREATE TABLE executions (
+      id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL, project_id TEXT NOT NULL,
+      branch TEXT NOT NULL, worktree_path TEXT NOT NULL, status TEXT NOT NULL, commands_json TEXT NOT NULL,
+      diff_text TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, completed_at TEXT
+    )`);
+    legacy.close();
+
+    const store = new WorkflowStore(path); stores.push(store);
+    const inspection = new DatabaseSync(path);
+    const columns = (inspection.prepare("PRAGMA table_info(executions)").all() as Array<{name:string}>).map((item) => item.name);
+    inspection.close();
+
+    expect(columns).toContain("project_version_id");
+    expect(columns).toContain("base_commit");
+  });
+
   it("creates and lists project metadata", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = store.createProject({
@@ -448,8 +468,10 @@ describe("WorkflowStore", () => {
   it("stores one immutable coding evidence snapshot per execution", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = store.createProject({ name: "Repo", repoPath: "/tmp/repo", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const version = ensureProjectVersion(store, project.id)!;
     const req = createRequirement(store, { title: "接口", businessProblem: "缺少", expectedOutcome: "新增", priority: "medium", primaryProjectId: project.id });
-    const execution = store.addExecution({ requirementId: req.id, stage: "coding", projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", status: "completed", diff: "diff", events: [] });
+    const execution = store.addExecution({ requirementId: req.id, stage: "coding", projectId: project.id, projectVersionId: version.id, branch: "ai/one", worktreePath: "/tmp/wt", baseCommit: "version-head", status: "completed", diff: "diff", events: [] });
+    expect(store.listExecutions(req.id)[0]).toMatchObject({ projectVersionId: version.id, baseCommit: "version-head" });
     const evidence = store.addCodingEvidence({ executionId: execution.id, requirementId: req.id, projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", diffHash: "abc", diff: "diff", originalChars: 4, truncated: false, files: ["a.ts"], additions: 1, deletions: 0, diagnostics: "" });
     expect(store.getLatestCodingEvidence(req.id)?.id).toBe(evidence.id);
     expect(() => store.addCodingEvidence({ ...evidence, id: undefined })).toThrow();

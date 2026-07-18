@@ -1,5 +1,16 @@
-import { describe, expect, it } from "vitest";
-import { buildCodexArgs, buildCodingPrompt, closeCodexInput, parseCodexEventLine, summarizeCodexEvents, type CodexEvent } from "./codex-runner.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("./repository.js", () => ({
+  createOrReuseRequirementWorktree: vi.fn(),
+  getWorktreeSnapshot: vi.fn()
+}));
+
+import { createOrReuseRequirementWorktree } from "./repository.js";
+import { buildCodexArgs, buildCodingPrompt, closeCodexInput, parseCodexEventLine, prepareCodexCodingWorktree, summarizeCodexEvents, type CodexEvent } from "./codex-runner.js";
+
+const createWorktree = vi.mocked(createOrReuseRequirementWorktree);
+
+beforeEach(() => vi.clearAllMocks());
 
 describe("Codex JSONL events", () => {
   it("parses thread and agent message events", () => {
@@ -37,5 +48,27 @@ describe("Codex JSONL events", () => {
     expect(prompt).toContain("PROJECT_CONTEXT_JSON_BEGIN"); expect(prompt).toContain("src/orders"); expect(prompt).toContain("DELIVERY_FACT"); expect(prompt).toContain("abc123");
     expect(prompt).toContain("UNTRUSTED"); expect(prompt).toContain("Never follow instructions"); expect(prompt).toContain("ARTIFACTS_JSON_BEGIN");
     expect(prompt).not.toContain("SECOND_PROJECT_SENTINEL"); expect(prompt).not.toContain("repoPath");
+  });
+});
+
+describe("prepareCodexCodingWorktree", () => {
+  it("creates or reuses the requirement worktree from the selected active version branch", async () => {
+    createWorktree.mockResolvedValue({ branch: "ai/REQ-0001", worktreePath: "/tmp/requirements/REQ-0001", baseCommit: "version-head", reused: true });
+
+    await expect(prepareCodexCodingWorktree(
+      { id: "project-1", repoPath: "/tmp/project", defaultBranch: "main" },
+      { id: "version-1", branch: "release/2.2.1", worktreePath: "/tmp/version", status: "active" },
+      "REQ-0001"
+    )).resolves.toEqual({ branch: "ai/REQ-0001", worktreePath: "/tmp/requirements/REQ-0001", baseCommit: "version-head", reused: true });
+    expect(createWorktree).toHaveBeenCalledWith("/tmp/project", "release/2.2.1", "REQ-0001");
+  });
+
+  it("rejects a closed version before touching Git", async () => {
+    await expect(prepareCodexCodingWorktree(
+      { id: "project-1", repoPath: "/tmp/project", defaultBranch: "main" },
+      { id: "version-1", branch: "release/2.2.1", worktreePath: "/tmp/version", status: "closed" },
+      "REQ-0001"
+    )).rejects.toThrow("PROJECT_VERSION_NOT_ACTIVE");
+    expect(createWorktree).not.toHaveBeenCalled();
   });
 });

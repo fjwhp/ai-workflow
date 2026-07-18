@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { isAllowedCommand, runCommand } from "./command-policy.js";
-import { createIsolatedWorktree, getWorktreeDiff } from "./repository.js";
+import { createOrReuseRequirementWorktree, getWorktreeDiff } from "./repository.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -17,12 +17,18 @@ export function resolveWorktreePath(worktree: string, requested: string) {
 }
 
 type CodingProject = { id: string; repoPath: string; defaultBranch: string; allowedCommands: { command: string; argsPrefix?: string[] }[] };
+export type CodingVersion = { id: string; branch: string; worktreePath: string; status: "active" | "closed" };
 
-export async function runCodingAgent(input: { requirement: any; artifacts: any[]; project: CodingProject }) {
+export async function prepareCodingWorktree(project: CodingProject, version: CodingVersion, requirementCode: string) {
+  if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
+  return createOrReuseRequirementWorktree(project.repoPath, version.branch, requirementCode);
+}
+
+export async function runCodingAgent(input: { requirement: any; artifacts: any[]; project: CodingProject; version: CodingVersion }) {
   if (!process.env.OPENAI_API_KEY) throw new Error("未配置 OPENAI_API_KEY");
   if (process.env.OPENAI_API_MODE !== "chat") throw new Error("编码代理当前要求 OPENAI_API_MODE=chat");
   const runId = crypto.randomUUID();
-  const worktree = await createIsolatedWorktree(input.project.repoPath, input.project.defaultBranch, input.requirement.code, runId);
+  const worktree = await prepareCodingWorktree(input.project, input.version, input.requirement.code);
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.OPENAI_BASE_URL || undefined });
   const commands: any[] = [];
   const tools: any[] = [
