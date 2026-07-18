@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { open, opendir, realpath, stat } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { basename, isAbsolute, posix, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -49,7 +49,32 @@ function moduleFromPath(path: string, name?: string): ProjectModule {
   return normalized === "." ? { id: "root", name: "root", path: "." } : { id: normalized, name: name || basename(normalized), path: normalized };
 }
 
-async function detectWorkspaceModules(repoPath: string, packageJson: any): Promise<ProjectModule[]> {
+function isContained(repoPath: string, candidate: string) {
+  const pathFromRoot = relative(repoPath, candidate);
+  return pathFromRoot === "" || (pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot));
+}
+
+function normalizeModulePath(path: string) {
+  const input = path.trim().replaceAll("\\", "/");
+  if (!input || input.includes("\0") || input.startsWith("/") || /^[A-Za-z]:\//.test(input)) return null;
+  const normalized = posix.normalize(input).replace(/^\.\//, "").replace(/\/$/, "");
+  if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) return null;
+  return normalized;
+}
+
+async function confinedModulePath(repoPath: string, path: string, warnings: string[]) {
+  const normalized = normalizeModulePath(path);
+  if (!normalized) { warnings.push(`Ignored module path outside repository: ${path}`); return null; }
+  const candidate = resolve(repoPath, normalized);
+  if (!isContained(repoPath, candidate)) { warnings.push(`Ignored module path outside repository: ${path}`); return null; }
+  try {
+    const canonical = await realpath(candidate);
+    if (!isContained(repoPath, canonical)) { warnings.push(`Ignored module path outside repository: ${path}`); return null; }
+  } catch { /* nonexistent knowledge hints remain safe after lexical containment */ }
+  return normalized;
+}
+
+async function detectWorkspaceModules(repoPath: string, packageJson: any, warnings: string[]): Promise<ProjectModule[]> {
   const patterns = Array.isArray(packageJson?.workspaces) ? packageJson.workspaces : packageJson?.workspaces?.packages;
   if (!Array.isArray(patterns)) return [];
   const modules: ProjectModule[] = [];
@@ -59,16 +84,21 @@ async function detectWorkspaceModules(repoPath: string, packageJson: any): Promi
     if (modules.length >= MAX_WORKSPACE_ENTRIES - 1 || scannedEntries >= MAX_SCANNED_ENTRIES) break;
     if (typeof pattern !== "string") continue;
     if (!pattern.includes("*")) {
-      const module = moduleFromPath(pattern);
+      const path = await confinedModulePath(repoPath, pattern, warnings);
+      if (!path) continue;
+      const module = moduleFromPath(path);
       if (!seen.has(module.id)) { seen.add(module.id); modules.push(module); }
       continue;
     }
     if (!pattern.endsWith("/*") || pattern.slice(0, -2).includes("*")) continue;
-    const parent = pattern.slice(0, -2);
+    const parent = await confinedModulePath(repoPath, pattern.slice(0, -2), warnings);
+    if (!parent) continue;
     const entries: string[] = [];
     let directory: Awaited<ReturnType<typeof opendir>> | undefined;
     try {
-      directory = await opendir(resolve(repoPath, parent));
+      const canonicalParent = await realpath(resolve(repoPath, parent));
+      if (!isContained(repoPath, canonicalParent)) { warnings.push(`Ignored workspace outside repository: ${pattern}`); continue; }
+      directory = await opendir(canonicalParent);
       for await (const entry of directory) {
         scannedEntries++;
         if (entry.isDirectory()) entries.push(entry.name);
@@ -117,8 +147,12 @@ export async function inspectProjectRepository(repoPath: string, defaultBranch: 
   const category = frontend && !backend ? "frontend" : backend && !frontend ? "backend" : "other";
   const declaredManager = typeof packageJson?.packageManager === "string" ? packageJson.packageManager.split("@")[0] : null;
   const packageManager = hasPnpmLock ? "pnpm" : hasYarnLock ? "yarn" : hasNpmLock ? "npm" : hasPom ? "maven" : (hasGradle || hasGradleKts) ? "gradle" : (["npm", "pnpm", "yarn"].includes(declaredManager) ? declaredManager : null);
-  const knowledgeModules = knowledgeEntries.filter((entry) => entry.kind === "module").slice(0, MAX_WORKSPACE_ENTRIES - 1).map((entry) => moduleFromPath(entry.path, entry.title));
-  const detectedModules = knowledgeModules.length ? knowledgeModules : await detectWorkspaceModules(normalizedPath, packageJson);
+  const knowledgeModules: ProjectModule[] = [];
+  for (const entry of knowledgeEntries.filter((item) => item.kind === "module").slice(0, MAX_WORKSPACE_ENTRIES - 1)) {
+    const path = await confinedModulePath(normalizedPath, entry.path, warnings);
+    if (path) knowledgeModules.push(moduleFromPath(path, entry.title));
+  }
+  const detectedModules = knowledgeModules.length ? knowledgeModules : await detectWorkspaceModules(normalizedPath, packageJson, warnings);
   const modules = [...new Map([{ id: "root", name: "root", path: "." }, ...detectedModules].map((item) => [item.id, item])).values()].slice(0, MAX_WORKSPACE_ENTRIES);
   return { valid: true, repoPath: normalizedPath, defaultBranch, category, technology: [...new Set(technology)], packageManager: packageManager as ProjectInspection["packageManager"], modules, warnings };
 }

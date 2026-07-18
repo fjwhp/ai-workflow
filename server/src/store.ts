@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type RequirementInput, type WorkflowStage } from "@ai-workflow/shared";
 import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./human-override.js";
@@ -461,7 +462,7 @@ export class WorkflowStore {
   }
 
   createProject(input: any) {
-    const repoPath = resolve(input.repoPath);
+    const repoPath = canonicalRepoPath(input.repoPath);
     if (this.findProjectByRepoPath(repoPath)) throw new Error("PROJECT_REPO_PATH_EXISTS");
     const now = new Date().toISOString();
     const item = { id: randomUUID(), ...input, repoPath, category: input.category ?? null, technology: input.technology ?? [], status: "active", createdAt: now, updatedAt: now };
@@ -474,7 +475,7 @@ export class WorkflowStore {
   updateProject(id: string, input: any) {
     const current = this.getProject(id);
     if (!current) return null;
-    const repoPath = input.repoPath === undefined ? current.repoPath : resolve(input.repoPath);
+    const repoPath = input.repoPath === undefined ? current.repoPath : canonicalRepoPath(input.repoPath);
     const duplicate = this.findProjectByRepoPath(repoPath);
     if (duplicate && duplicate.id !== id) throw new Error("PROJECT_REPO_PATH_EXISTS");
     const item = { ...current, ...input, repoPath, category: input.category === undefined ? current.category : input.category, updatedAt: new Date().toISOString() };
@@ -548,7 +549,7 @@ export class WorkflowStore {
   }
 
   findProjectByRepoPath(repoPath: string) {
-    const row = this.db.prepare("SELECT * FROM projects WHERE repo_path = ?").get(resolve(repoPath));
+    const row = this.db.prepare("SELECT * FROM projects WHERE repo_path = ?").get(canonicalRepoPath(repoPath));
     return row ? mapProject(row as any) : null;
   }
 
@@ -620,6 +621,12 @@ function mapProject(row: any) {
     allowedCommands: JSON.parse(row.allowed_commands || "[]"), sensitivePatterns: JSON.parse(row.sensitive_patterns || "[]"),
     category: row.category ?? null, technology: JSON.parse(row.technology_json || "[]"), status: row.status || "active",
     createdAt: row.created_at, updatedAt: row.updated_at || row.created_at };
+}
+
+function canonicalRepoPath(repoPath: string) {
+  const resolved = resolve(repoPath);
+  try { return realpathSync(resolved); }
+  catch { return resolved; }
 }
 
 function mapStageRun(row: any, events: any[]) {

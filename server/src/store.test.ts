@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -49,6 +49,24 @@ describe("WorkflowStore", () => {
     expect(() => store.createProject({ name: "Replacement", repoPath: "/tmp/identity/repo", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] })).toThrow("PROJECT_REPO_PATH_EXISTS");
     const other = store.createProject({ name: "Other", repoPath: "/tmp/identity/other", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
     expect(() => store.updateProject(other.id, { repoPath: "/tmp/identity/repo" })).toThrow("PROJECT_REPO_PATH_EXISTS");
+  });
+
+  it("uses canonical repository identity for existing paths and symlink aliases", () => {
+    const directory = mkdtempSync(join(tmpdir(), "project-identity-")); directories.push(directory);
+    const firstRepo = join(directory, "first");
+    const secondRepo = join(directory, "second");
+    mkdirSync(firstRepo); mkdirSync(secondRepo);
+    const firstAlias = join(directory, "first-alias");
+    const secondAlias = join(directory, "second-alias");
+    symlinkSync(firstRepo, firstAlias); symlinkSync(secondRepo, secondAlias);
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const first = store.createProject({ name: "First", repoPath: firstAlias, defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    expect(first.repoPath).toBe(realpathSync(firstRepo));
+    expect(store.findProjectByRepoPath(firstAlias)?.id).toBe(first.id);
+    expect(() => store.createProject({ name: "Duplicate", repoPath: firstRepo, defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] })).toThrow("PROJECT_REPO_PATH_EXISTS");
+    const second = store.createProject({ name: "Second", repoPath: secondRepo, defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    expect(() => store.updateProject(second.id, { repoPath: firstAlias })).toThrow("PROJECT_REPO_PATH_EXISTS");
+    expect(store.findProjectByRepoPath(secondAlias)?.id).toBe(second.id);
   });
 
   it("archives idempotently, keeps projects readable, and blocks new primary associations", () => {

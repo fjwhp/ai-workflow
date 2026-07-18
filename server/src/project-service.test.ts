@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -101,6 +101,36 @@ describe("inspectProjectRepository", () => {
     const repo = await createRepo(files);
     const result = await inspectProjectRepository(repo, "main");
     expect(result.modules).toEqual([{ id: "root", name: "root", path: "." }]);
+  });
+
+  it("confines workspace patterns and knowledge modules to the canonical repository", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "outside-project-"));
+    directories.push(outside);
+    await mkdir(join(outside, "secret-module"));
+    await writeFile(join(outside, "secret-module", "package.json"), "{}");
+    const repo = await createRepo({
+      "package.json": JSON.stringify({ workspaces: [join(outside, "*"), "../outside/*", "linked/*", "safe/*"] }),
+      "safe/web/package.json": "{}"
+    });
+    await symlink(outside, join(repo, "linked"));
+    const result = await inspectProjectRepository(repo, "main", [
+      { path: join(outside, "secret-module"), kind: "module", title: "Absolute secret" },
+      { path: "../outside/secret-module", kind: "module", title: "Traversal secret" },
+      { path: "linked/secret-module", kind: "module", title: "Symlink secret" },
+      { path: "safe/web", kind: "module", title: "Web" }
+    ]);
+    expect(result.modules).toEqual([
+      { id: "root", name: "root", path: "." },
+      { id: "safe/web", name: "Web", path: "safe/web" }
+    ]);
+    expect(result.warnings.some((warning) => warning.includes("outside"))).toBe(true);
+    expect(result.modules.some((module) => module.name.includes("secret"))).toBe(false);
+    const workspaceResult = await inspectProjectRepository(repo, "main");
+    expect(workspaceResult.modules).toEqual([
+      { id: "root", name: "root", path: "." },
+      { id: "safe/web", name: "web", path: "safe/web" }
+    ]);
+    expect(workspaceResult.warnings.some((warning) => warning.includes("outside"))).toBe(true);
   });
 
   it("returns structured invalid results for missing, nested, and branchless paths", async () => {
