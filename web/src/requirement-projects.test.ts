@@ -3,6 +3,7 @@ import { ApiError } from "./api.js";
 import {
   associationSummary, associationApiErrors, associationReducer, availableProjectChoices,
   activeAssociations, historyAssociations, moveAssociation, requirementProjectsPayload,
+  saveAssociationThenRefresh, selectedModuleProjectIds, shouldRequestModules,
   hasMaterialAssociationEdit, initialAssociationState, phaseOneDeliveryGate,
   setPrimary, setUsage, validateAssociations, type Association
 } from "./requirement-projects.js";
@@ -11,6 +12,19 @@ const primary: Association = { projectId: "web", projectName: "Web", role: "prim
 const delivery: Association = { projectId: "api", projectName: "API", role: "collaborator", usage: "delivery", deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 1, status: "active", projectStatus: "active" };
 
 describe("requirement project helpers", () => {
+  it("requests modules only for selected active rows and deduplicates loaded or in-flight projects", () => {
+    expect(selectedModuleProjectIds([primary, { ...delivery, moduleMode: "selected", moduleIds: ["src"] }])).toEqual(["api"]);
+    expect(selectedModuleProjectIds([primary])).toEqual([]);
+    expect(shouldRequestModules({}, "api")).toBe(true);
+    expect(shouldRequestModules({ api: { status: "loading", modules: [] } }, "api")).toBe(false);
+    expect(shouldRequestModules({ api: { status: "ready", modules: ["src"] } }, "api")).toBe(false);
+    expect(shouldRequestModules({ api: { status: "error", modules: [], error: "offline" } }, "api")).toBe(true);
+  });
+  it("closes after PUT success even when refresh fails", async () => {
+    const events: string[] = [];
+    await saveAssociationThenRefresh(async () => { events.push("put"); }, () => events.push("close"), async () => { events.push("refresh"); throw new Error("offline"); }, () => events.push("refresh-error"));
+    expect(events).toEqual(["put", "close", "refresh", "refresh-error"]);
+  });
   it("summarizes a context primary and delivery count", () => expect(associationSummary([primary, delivery])).toMatchObject({ primaryName: "Web", primaryUsage: "context", deliveryCount: 1 }));
   it("gates zero, one, and multiple delivery projects", () => {
     expect(phaseOneDeliveryGate([]).kind).toBe("missing");

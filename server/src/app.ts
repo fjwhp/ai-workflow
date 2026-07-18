@@ -304,6 +304,11 @@ export async function buildApp(store: WorkflowStore) {
     if(status.status==="ready"){try{const head=await getRepositoryHead(project.repoPath);return {...status,currentHead:head,status:head===status.sourceHead?"ready":"stale"};}catch{return status;}}
     return status;
   });
+  app.get("/api/projects/:id/modules",async(req:any,reply)=>{
+    const project=store.getProject(req.params.id);if(!project)return reply.code(404).send({error:"NOT_FOUND"});
+    const knowledge:any=store.getProjectKnowledgeStatus(project.id);if(knowledge.status!=="ready")return reply.code(409).send({error:"PROJECT_MODULES_UNAVAILABLE",message:knowledge.status==="building"?"项目知识库正在生成":"项目模块索引不可用"});
+    const seen=new Set<string>(),modules=[] as Array<{id:string;name:string;path:string}>;for(const entry of knowledge.entries??[]){if(entry.kind!=="module")continue;const id=String(entry.moduleId||entry.id||entry.path||"").trim(),path=String(entry.path||id).trim();if(!id||seen.has(id))continue;seen.add(id);modules.push({id,name:String(entry.name||entry.title||id),path});if(modules.length>=256)break;}return {modules};
+  });
   app.get("/api/projects/:id/memory",async(req:any,reply)=>{const project=store.getProject(req.params.id);if(!project)return reply.code(404).send({error:"NOT_FOUND"});return store.listProjectMemory(project.id);});
   app.get("/api/requirements/:id/knowledge-changes",async(req:any,reply)=>{if(!store.getRequirement(req.params.id))return reply.code(404).send({error:"NOT_FOUND"});return store.getKnowledgeChangeSet(req.params.id);});
   app.post("/api/projects/:id/knowledge/rebuild",async(req:any,reply)=>{

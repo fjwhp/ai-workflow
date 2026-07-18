@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { AlertTriangle, Bot, Check, ChevronRight, CircleDot, ClipboardCheck, Code2, FileText, FolderGit2, LayoutDashboard, ListTodo, PanelLeftClose, PanelLeftOpen, Play, Plus, RefreshCw, Settings, ShieldCheck, TestTube2, X } from "lucide-react";
 import { returnStage, stageLabels, statusLabels, workflowStages, type GateConfig, type Requirement, type WorkflowStage, type WorkflowStatus } from "@ai-workflow/shared";
@@ -18,6 +18,7 @@ import { productArtifactView } from "./product-artifact-view.js";
 import { filterRequirements, navigationTarget, type QueueFilter } from "./navigation-view.js";
 import { ProjectManagement } from "./project-management.js";
 import { PlannedDelivery, RequirementProjectSummary, RequirementProjectsDialog, phaseOneDeliveryGate, type Association } from "./requirement-projects.js";
+import { DetailRequestTracker } from "./detail-requests.js";
 
 type Detail = Requirement & { projectId?: string; projectName?: string; primaryProjectId?: string; primaryProjectName?: string; projects?: Association[]; projectSnapshot?: any; version?: number; clarifications?: string; artifacts: any[]; approvals: any[]; executions?: any[]; revisions?: any[]; runs?: StageRun[]; codingEvidence?: any; reworkContext?: any; humanOverride?: any; integrationRun?: any;knowledgeChanges?:any };
 type Page = "dashboard" | "requirements" | "projects" | "settings";
@@ -32,13 +33,14 @@ function App() {
   const [runView, setRunView] = useState<StageRun | null>(null);
   const [queueFilter,setQueueFilter]=useState<QueueFilter|null>(null);
   const [sidebarCollapsed,setSidebarCollapsed]=useState(()=>localStorage.getItem("flowgate.sidebarCollapsed")==="1");
+  const detailRequests=useRef(new DetailRequestTracker()),desiredRequirementId=useRef<string|null>(null);
   const queues = useMemo(() => groupRequirements(items), [items]);
   const visibleItems=useMemo(()=>filterRequirements(items,queueFilter),[items,queueFilter]);
   const loadDetail = async (id: string) => { const [detail, associations] = await Promise.all([api<Detail>(`/requirements/${id}`), api<any>(`/requirements/${id}/projects`)]); return { ...detail, projects: associations.projects, projectSnapshot: associations.snapshot }; };
-  const refresh = async () => { const data = await api<Requirement[]>("/requirements"); setItems(data); if (selected) setSelected(await loadDetail(selected.id)); };
+  const refresh = async () => { const data = await api<Requirement[]>("/requirements"); setItems(data); const id=desiredRequirementId.current;if(id){const token=detailRequests.current.begin(id),detail=await loadDetail(id);if(detailRequests.current.accept(token,desiredRequirementId.current))setSelected(detail);} };
   useEffect(() => { refresh().catch((e) => setError(e.message)); }, []);
-  const open = async (item: Requirement) => { setSelected(await loadDetail(item.id)); setPage("requirements"); };
-  const navigate=(next:Page,filter:QueueFilter|null=null)=>{const target=navigationTarget(next,filter);setPage(target.page);setSelected(null);setQueueFilter(target.queueFilter)};
+  const open = async (item: Requirement) => { desiredRequirementId.current=item.id;const token=detailRequests.current.begin(item.id);setPage("requirements");const detail=await loadDetail(item.id);if(detailRequests.current.accept(token,desiredRequirementId.current))setSelected(detail); };
+  const navigate=(next:Page,filter:QueueFilter|null=null)=>{const target=navigationTarget(next,filter);desiredRequirementId.current=null;detailRequests.current.clear();setPage(target.page);setSelected(null);setQueueFilter(target.queueFilter)};
   const selectQueue=(filter:QueueFilter)=>navigate("requirements",filter);
   const toggleSidebar=()=>setSidebarCollapsed(value=>{const next=!value;localStorage.setItem("flowgate.sidebarCollapsed",next?"1":"0");return next});
 
@@ -68,7 +70,7 @@ function App() {
     {modal === "approve" && selected && <ApprovalModal item={selected} onClose={() => setModal(null)} onSubmit={async (body: Record<string, unknown>) => { await post(`/requirements/${selected.id}/approve`, body); setModal(null); await refresh(); }}/>}
     {modal === "human_override" && selected && <HumanOverrideModal item={selected} onClose={() => setModal(null)} onSubmit={async (comment:string) => { await post(`/requirements/${selected.id}/human-override`, {comment}); setModal(null); await refresh(); }}/>}
     {modal === "integrate" && selected && <IntegrationConfirm item={selected} busy={busy} onClose={()=>setModal(null)} onSubmit={async(protectedBranchConfirmation:string)=>{setBusy(true);try{await post(`/requirements/${selected.id}/integrate`,{protectedBranchConfirmation});setModal(null);await refresh()}catch(e:any){setError(e.message);setModal(null)}finally{setBusy(false)}}}/>}
-    {modal === "associations" && selected && <RequirementProjectsDialog requirementId={selected.id} stage={selected.stage} onClose={() => setModal(null)} onSaved={async () => { await refresh(); }}/>}
+    {modal === "associations" && selected && <RequirementProjectsDialog requirementId={selected.id} stage={selected.stage} onClose={() => setModal(null)} onSaved={refresh} onRefreshError={() => setError("数据已保存，但刷新失败，请重新打开需求")}/>}
     {runView && <RunDetailsModal initialRun={runView} onClose={() => setRunView(null)} onTerminal={refresh}/>}
   </div>;
 }
