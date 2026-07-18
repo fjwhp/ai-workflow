@@ -1,0 +1,58 @@
+import { describe, expect, it } from "vitest";
+import {
+  filterProjects,
+  initialSubmissionState,
+  normalizeAllowedCommands,
+  parseAllowedCommands,
+  projectActions,
+  projectHealth,
+  projectValidationLabel,
+  submissionReducer,
+  validationAfterChange,
+} from "./project-management.js";
+
+describe("project management helpers", () => {
+  it("exposes maintenance actions only for active projects", () => {
+    expect(projectActions("active")).toEqual(["edit", "validate", "rebuild", "archive"]);
+    expect(projectActions("archived")).toEqual(["view"]);
+  });
+
+  it("summarizes a valid Node pnpm repository inspection", () => {
+    expect(projectValidationLabel({ valid: true, technology: ["node", "fastify"], packageManager: "pnpm" })).toBe("验证通过 · Node.js / Fastify · pnpm");
+  });
+
+  it("parses line-based allowed commands without shell interpretation", () => {
+    expect(parseAllowedCommands("pnpm test\nnpm run lint\n")).toEqual({
+      commands: [{ command: "pnpm", argsPrefix: ["test"] }, { command: "npm", argsPrefix: ["run", "lint"] }],
+      error: "",
+    });
+    expect(parseAllowedCommands("pnpm test && rm -rf / ").error).toContain("不支持");
+    expect(normalizeAllowedCommands([{ command: "pnpm", argsPrefix: ["test"] }])).toBe("pnpm test");
+  });
+
+  it("filters active and archived projects and retains both counts", () => {
+    const projects = [{ id: "a", status: "active" }, { id: "b", status: "archived" }, { id: "c", status: "active" }] as const;
+    expect(filterProjects(projects, "active")).toEqual({ list: [projects[0], projects[2]], active: 2, archived: 1, total: 3 });
+    expect(filterProjects(projects, "archived").list).toEqual([projects[1]]);
+  });
+
+  it("invalidates validation only when repository identity changes", () => {
+    const validation = { repoPath: "/repo", defaultBranch: "main", result: { valid: true } };
+    expect(validationAfterChange(validation, "name", "Renamed")).toBe(validation);
+    expect(validationAfterChange(validation, "category", "backend")).toBe(validation);
+    expect(validationAfterChange(validation, "repoPath", "/other")).toBeNull();
+    expect(validationAfterChange(validation, "defaultBranch", "dev")).toBeNull();
+  });
+
+  it("labels archived and unhealthy projects", () => {
+    expect(projectHealth({ status: "archived" })).toEqual({ label: "已归档", tone: "archived" });
+    expect(projectHealth({ status: "active" }, { status: "failed" })).toEqual({ label: "知识构建失败", tone: "failed" });
+    expect(projectHealth({ status: "active" }, { status: "ready" })).toEqual({ label: "运行正常", tone: "ready" });
+  });
+
+  it("preserves form values after an API submission failure", () => {
+    const form = { name: "Orders", repoPath: "/repo" };
+    const busy = submissionReducer(initialSubmissionState(form), { type: "submit" });
+    expect(submissionReducer(busy, { type: "failure", error: "重复仓库" })).toEqual({ form, submitting: false, error: "重复仓库" });
+  });
+});
