@@ -47,6 +47,7 @@ export interface StageRunInput {
   projectId?: string;
   projectVersionId?: string;
   expectedRequirementUpdatedAt?: string;
+  expectedProjectUpdatedAt?: string;
 }
 
 const executionStages = new Set<WorkflowStage>(["coding", "code_review", "testing", "acceptance", "integration"]);
@@ -549,12 +550,14 @@ export class WorkflowStore {
       }
       if (executionStages.has(input.stage)) {
         if (!input.projectId || !input.projectVersionId || !input.expectedRequirementUpdatedAt) throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
+        if (!input.expectedProjectUpdatedAt) throw new Error("PROJECT_CHANGED_DURING_RUN_PREPARATION");
         const delivery = this.db.prepare(`SELECT project_id, project_version_id FROM requirement_projects
           WHERE requirement_id = ? AND status = 'active' AND usage = 'delivery' ORDER BY position`).all(input.requirementId) as Array<{ project_id: string; project_version_id: string | null }>;
         if (delivery.length !== 1 || delivery[0]!.project_id !== input.projectId || delivery[0]!.project_version_id !== input.projectVersionId) {
           throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
         }
-        const project = this.db.prepare("SELECT status FROM projects WHERE id = ?").get(input.projectId) as { status: string } | undefined;
+        const project = this.db.prepare("SELECT status, updated_at FROM projects WHERE id = ?").get(input.projectId) as { status: string; updated_at: string } | undefined;
+        if(project&&project.updated_at!==input.expectedProjectUpdatedAt)throw new Error("PROJECT_CHANGED_DURING_RUN_PREPARATION");
         if (!project || project.status !== "active") throw new Error("PROJECT_ARCHIVED");
         const version = this.db.prepare("SELECT project_id, status FROM project_versions WHERE id = ?").get(input.projectVersionId) as { project_id: string; status: string } | undefined;
         if (!version || version.project_id !== input.projectId) throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
@@ -833,15 +836,26 @@ export class WorkflowStore {
   }
 
   updateProject(id: string, input: any) {
-    const current = this.getProject(id);
-    if (!current) return null;
-    const repoPath = input.repoPath === undefined ? current.repoPath : canonicalRepoPath(input.repoPath);
-    const duplicate = this.findProjectByRepoPath(repoPath);
-    if (duplicate && duplicate.id !== id) throw new Error("PROJECT_REPO_PATH_EXISTS");
-    const item = { ...current, ...input, repoPath, category: input.category === undefined ? current.category : input.category, updatedAt: new Date().toISOString() };
-    this.db.prepare(`UPDATE projects SET name=?,repo_path=?,default_branch=?,allowed_commands=?,sensitive_patterns=?,category=?,technology_json=?,updated_at=? WHERE id=?`)
-      .run(item.name, item.repoPath, item.defaultBranch, JSON.stringify(item.allowedCommands), JSON.stringify(item.sensitivePatterns), item.category, JSON.stringify(item.technology), item.updatedAt, id);
-    return this.getProject(id);
+    const changesExecutionIdentity=["repoPath","defaultBranch","allowedCommands","sensitivePatterns","technology"].some((field)=>Object.prototype.hasOwnProperty.call(input,field));
+    this.db.exec("BEGIN IMMEDIATE");
+    try{
+      const current = this.getProject(id);
+      if (!current){this.db.exec("COMMIT");return null;}
+      if(changesExecutionIdentity&&this.db.prepare(`SELECT sr.id FROM stage_runs sr
+        JOIN requirement_projects rp ON rp.requirement_id = sr.requirement_id
+        WHERE sr.status = 'running' AND rp.status = 'active' AND rp.usage = 'delivery' AND rp.project_id = ? LIMIT 1`).get(id)){
+        throw new Error("PROJECT_IN_ACTIVE_EXECUTION");
+      }
+      const repoPath = input.repoPath === undefined ? current.repoPath : canonicalRepoPath(input.repoPath);
+      const duplicate = this.findProjectByRepoPath(repoPath);
+      if (duplicate && duplicate.id !== id) throw new Error("PROJECT_REPO_PATH_EXISTS");
+      const timestamp=new Date().toISOString(),updatedAt=timestamp===current.updatedAt?new Date(Date.parse(timestamp)+1).toISOString():timestamp;
+      const item = { ...current, ...input, repoPath, category: input.category === undefined ? current.category : input.category, updatedAt };
+      this.db.prepare(`UPDATE projects SET name=?,repo_path=?,default_branch=?,allowed_commands=?,sensitive_patterns=?,category=?,technology_json=?,updated_at=? WHERE id=?`)
+        .run(item.name, item.repoPath, item.defaultBranch, JSON.stringify(item.allowedCommands), JSON.stringify(item.sensitivePatterns), item.category, JSON.stringify(item.technology), item.updatedAt, id);
+      this.db.exec("COMMIT");
+      return this.getProject(id);
+    }catch(error){this.db.exec("ROLLBACK");throw error;}
   }
 
   archiveProject(id: string) {

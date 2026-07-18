@@ -270,12 +270,22 @@ describe("project and requirement association APIs",()=>{
     expect(response.statusCode).toBe(409);expect(response.json().error).toBe("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");expect(store.listStageRuns(req.id)).toHaveLength(0);expect(version.id).not.toBe(next.id);await app.close();
   });
 
+  it("maps a project identity change during context preparation to 409 without creating a run",async()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const repo=await projectRepo();const project=store.createProject(projectPayload(repo));ensureProjectVersion(store,project.id);const req=createRequirement(store,{title:"项目准备竞态",businessProblem:"上下文准备期间项目身份可能变化",expectedOutcome:"拒绝过期项目",priority:"medium",primaryProjectId:project.id});const knowledge=store.beginProjectKnowledge(project.id,(await execFileAsync("git",["-C",repo,"rev-parse","HEAD"])).stdout.trim(),"test");store.completeProjectKnowledge(knowledge.id,{summary:"ready",entries:[]});store.updateRequirementState(req.id,"coding","ai_ready");const reserve=store.createStageRun.bind(store);store.createStageRun=((input:any)=>{store.updateProject(project.id,{allowedCommands:[{command:"npm",argsPrefix:["test"]}]});return reserve(input);}) as any;const app=await buildApp(store);
+
+    const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});
+
+    expect(response.statusCode).toBe(409);expect(response.json().error).toBe("PROJECT_CHANGED_DURING_RUN_PREPARATION");expect(store.listStageRuns(req.id)).toHaveLength(0);await app.close();
+  });
+
   it("atomically allows only one of two concurrent coding run requests",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const repo=await projectRepo();const project=store.createProject(projectPayload(repo));ensureProjectVersion(store,project.id);const req=createRequirement(store,{title:"并发运行",businessProblem:"两个请求可能同时完成上下文准备",expectedOutcome:"只创建一个运行",priority:"medium",primaryProjectId:project.id});const knowledge=store.beginProjectKnowledge(project.id,(await execFileAsync("git",["-C",repo,"rev-parse","HEAD"])).stdout.trim(),"test");store.completeProjectKnowledge(knowledge.id,{summary:"ready",entries:[]});store.updateRequirementState(req.id,"coding","ai_ready");let release!:(value:any)=>void;const pending=new Promise(resolve=>{release=resolve});vi.mocked(runCodexCoding).mockImplementation(()=>pending as any);const app=await buildApp(store);
 
     const responses=await Promise.all([app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}}),app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}})]);
 
-    release(codingResult);expect(responses.map((response)=>response.statusCode).sort()).toEqual([202,409]);expect(responses.find((response)=>response.statusCode===409)?.json().error).toBe("RUN_ALREADY_ACTIVE");expect(store.listStageRuns(req.id)).toHaveLength(1);for(let attempt=0;attempt<50&&store.getStageRun(store.listStageRuns(req.id)[0]!.id)?.status==="running";attempt++)await new Promise(resolve=>setTimeout(resolve,10));await app.close();
+    expect(responses.map((response)=>response.statusCode).sort()).toEqual([202,409]);expect(responses.find((response)=>response.statusCode===409)?.json().error).toBe("RUN_ALREADY_ACTIVE");expect(store.listStageRuns(req.id)).toHaveLength(1);
+    const blocked=await app.inject({method:"PATCH",url:`/api/projects/${project.id}`,payload:{allowedCommands:[{command:"npm",argsPrefix:["test"]}]}});release(codingResult);expect(blocked.statusCode).toBe(409);expect(blocked.json().error).toBe("PROJECT_IN_ACTIVE_EXECUTION");expect(runCodexCoding).toHaveBeenCalledWith(expect.objectContaining({project:expect.objectContaining({id:project.id,allowedCommands:[]})}));
+    for(let attempt=0;attempt<50&&store.getStageRun(store.listStageRuns(req.id)[0]!.id)?.status==="running";attempt++)await new Promise(resolve=>setTimeout(resolve,10));const updated=await app.inject({method:"PATCH",url:`/api/projects/${project.id}`,payload:{allowedCommands:[{command:"npm",argsPrefix:["test"]}]}});expect(updated.statusCode).toBe(200);expect(updated.json().allowedCommands).toEqual([{command:"npm",argsPrefix:["test"]}]);await app.close();
   });
 
   it("rejects phase-one execution when multiple delivery projects are associated",async()=>{
