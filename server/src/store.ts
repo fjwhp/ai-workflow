@@ -1068,7 +1068,10 @@ export class WorkflowStore {
     if (!version) return [];
     const rows = this.db.prepare(`SELECT DISTINCT r.id, r.code, r.title, r.status, r.updated_at
       FROM requirements r JOIN requirement_projects rp ON rp.requirement_id = r.id
+      JOIN project_versions pv ON pv.id = rp.project_version_id AND pv.project_id = rp.project_id
+      JOIN projects p ON p.id = pv.project_id
       WHERE rp.project_version_id = ? AND rp.project_id = ?
+        AND pv.status = 'active' AND p.status = 'active'
         AND rp.usage = 'delivery' AND rp.status = 'active'
         AND (SELECT COUNT(*) FROM requirement_projects active_delivery
           WHERE active_delivery.requirement_id = r.id

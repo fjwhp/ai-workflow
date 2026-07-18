@@ -730,6 +730,14 @@ describe("project version application leases", () => {
     expect(queue.some(({ requirementId }) => requirementId === multipleDeliveries.id)).toBe(false);
     expect(store.listVersionApplicationQueue(collaboratorVersion.id)
       .some(({ requirementId }) => requirementId === multipleDeliveries.id)).toBe(false);
+
+    database.prepare("UPDATE project_versions SET status = 'closed' WHERE id = ?").run(otherVersion.id);
+    expect(store.listVersionApplicationQueue(otherVersion.id)).toEqual([]);
+
+    store.archiveProject(project.id);
+    expect(store.listVersionApplicationQueue(version.id).map(({ requirementId, owner, position }) => ({
+      requirementId, owner, position
+    }))).toEqual([{ requirementId: owner.id, owner: true, position: 1 }]);
   });
 });
 
