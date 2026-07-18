@@ -93,8 +93,9 @@ function capBlock(input: ProjectContextBlock, cap: number): ProjectContextBlock 
   let changed = input.truncated;
   const text = (value: unknown, limit: number) => {
     const original = typeof value === "string" ? value : String(value ?? "");
-    if (original.length > limit) changed = true;
-    return original.slice(0, limit);
+    const truncated = truncateCodePoints(original, limit);
+    if (truncated !== original) changed = true;
+    return truncated;
   };
   const list = (values: unknown, count: number, length: number) => {
     const source = Array.isArray(values) ? values : [];
@@ -114,19 +115,19 @@ function capBlock(input: ProjectContextBlock, cap: number): ProjectContextBlock 
   if (input.entries.length > candidates.length) changed = true;
   block.truncated = changed;
   while (JSON.stringify(block).length > contentCap && block.moduleIds.length) { block.moduleIds.pop(); block.truncated = true; }
-  while (JSON.stringify(block).length > contentCap && block.summary.length) { block.summary = block.summary.slice(0, Math.floor(block.summary.length / 2)); block.truncated = true; }
-  while (JSON.stringify(block).length > contentCap && block.name.length > 1) { block.name = block.name.slice(0, Math.floor(block.name.length / 2)); block.truncated = true; }
+  while (JSON.stringify(block).length > contentCap && block.summary.length) { block.summary = truncateCodePoints(block.summary, Math.floor(codePointLength(block.summary) / 2)); block.truncated = true; }
+  while (JSON.stringify(block).length > contentCap && codePointLength(block.name) > 1) { block.name = truncateCodePoints(block.name, Math.floor(codePointLength(block.name) / 2)); block.truncated = true; }
   for (const candidate of candidates) {
     block.entries.push(candidate);
     if (JSON.stringify(block).length > contentCap) {
-      const originalContent = candidate.content;
-      let low = 0, high = candidate.content.length;
+      const originalContent = Array.from(candidate.content);
+      let low = 0, high = originalContent.length;
       while (low < high) {
         const middle = Math.ceil((low + high) / 2);
-        candidate.content = originalContent.slice(0, middle);
+        candidate.content = originalContent.slice(0, middle).join("");
         if (JSON.stringify(block).length <= contentCap) low = middle; else high = middle - 1;
       }
-      candidate.content = originalContent.slice(0, low);
+      candidate.content = originalContent.slice(0, low).join("");
       if (!candidate.content || JSON.stringify(block).length > contentCap) block.entries.pop();
       block.truncated = true;
       break;
@@ -135,4 +136,12 @@ function capBlock(input: ProjectContextBlock, cap: number): ProjectContextBlock 
   if (input.totalAvailable > block.entries.length || input.entries.length > block.entries.length) block.truncated = true;
   do { block.totalChars = JSON.stringify(block).length; } while (block.totalChars !== JSON.stringify(block).length);
   return block;
+}
+
+function codePointLength(value: string) { let length = 0; for (const _ of value) length += 1; return length; }
+function truncateCodePoints(value: string, limit: number) {
+  if (limit <= 0) return "";
+  let count = 0, end = 0;
+  for (const character of value) { if (count >= limit) break; count += 1; end += character.length; }
+  return end === value.length ? value : value.slice(0, end);
 }

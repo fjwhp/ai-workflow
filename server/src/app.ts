@@ -92,11 +92,15 @@ export async function buildApp(store: WorkflowStore) {
   app.post("/api/requirements/:id/run", async (req: any, reply) => {
     const item = store.getRequirement(req.params.id);
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
-    let deliveryProject:any;try{deliveryProject=resolveSoleDeliveryProject(item.projects);}catch(error){return sendDomainError(reply,error);}
+    const executionStage=["coding","code_review","testing","acceptance","integration"].includes(item.stage);
+    let deliveryProject:any;
+    if(executionStage){try{deliveryProject=resolveSoleDeliveryProject(item.projects);}catch(error){return sendDomainError(reply,error);}}
     if(deliveryProject?.projectStatus==="archived")return reply.code(409).send({error:"PROJECT_ARCHIVED",message:"归档项目不能启动新执行"});
     if(item.stage==="integration")return reply.code(409).send({error:"INTEGRATION_REQUIRES_MANUAL_ACTION",message:"代码应用节点不会启动 AI，请执行应用预检"});
     const existing = store.listStageRuns(item.id, item.stage).find((run: any) => run.status === "running");
     if (existing) return reply.code(409).send({ error: "RUN_ALREADY_ACTIVE", message: "当前阶段已有 AI 正在执行" });
+    const associatedProjects=(item.projects??[]).map((association:any)=>store.getProject(association.projectId)).filter(Boolean);
+    const sensitivePatterns=[...new Set(associatedProjects.flatMap((associated:any)=>associated.sensitivePatterns??[]))] as string[];
     const project = deliveryProject ? store.getProject(deliveryProject.projectId) : null;
     const reworkContext=item.status==="returned"?store.getLatestReworkContext(item.id):null;
     let projectContext:any=undefined;
@@ -105,23 +109,28 @@ export async function buildApp(store: WorkflowStore) {
       try{projectContext=await buildRequirementProjectContext(store,item.id,item.stage,projectContextBudget);}
       catch(error){return sendProjectContextError(reply,error);}
     }
-    const context = { requirement: item, priorArtifacts: store.listArtifacts(item.id), approvalHistory: store.listApprovals(item.id), projectContext, reworkRequired:Boolean(reworkContext), reworkContext, userContext: req.body?.context };
+    const context = redactSensitive({ requirement: item, priorArtifacts: store.listArtifacts(item.id), approvalHistory: store.listApprovals(item.id), projectContext, reworkRequired:Boolean(reworkContext), reworkContext, userContext: req.body?.context },sensitivePatterns);
+    if(context.projectContext){
+      for(const block of context.projectContext.projects){do{block.totalChars=JSON.stringify(block).length;}while(block.totalChars!==JSON.stringify(block).length);}
+      context.projectContext.totalChars=JSON.stringify(context.projectContext.projects).length;
+      if(context.projectContext.totalChars>context.projectContext.budgetMaxChars)return sendProjectContextError(reply,new ProjectContextError("PROJECT_CONTEXT_BUDGET_TOO_SMALL",[],{maxChars:context.projectContext.budgetMaxChars,minimumRequiredChars:context.projectContext.totalChars,projectCount:context.projectContext.projects.length}));
+    }
     const model = item.stage === "coding" ? (process.env.OPENAI_CODING_MODEL || process.env.OPENAI_MODEL || "gpt-5.5") : (process.env.OPENAI_MODEL || "gpt-5.5");
-    const run = store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: redactSensitive(context, project?.sensitivePatterns || []) });
-    for(const block of projectContext?.projects??[])store.appendStageRunEvent(run.id,"knowledge.retrieved",{projectId:block.projectId,version:block.version,sourceHead:block.sourceHead,paths:block.entries.map((entry:any)=>entry.path),totalAvailable:block.totalAvailable,budgetMaxChars:projectContext.budgetMaxChars,totalChars:block.totalChars,contextTotalChars:projectContext.totalChars,truncated:block.truncated});
+    const run = store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: context });
+    for(const block of context.projectContext?.projects??[])store.appendStageRunEvent(run.id,"knowledge.retrieved",{projectId:block.projectId,version:block.version,sourceHead:block.sourceHead,paths:block.entries.map((entry:any)=>entry.path),totalAvailable:block.totalAvailable,budgetMaxChars:context.projectContext.budgetMaxChars,totalChars:block.totalChars,contextTotalChars:context.projectContext.totalChars,truncated:block.truncated});
     store.updateRequirementState(item.id, item.stage, "ai_running");
-    void executeRun(run.id, item, context, project);
+    void executeRun(run.id, item, context, project, sensitivePatterns);
     return reply.code(202).send(run);
 
-    async function executeRun(runId: string, runItem: any, runContext: any, runProject: any) {
-      const emit = (type: string, payload: unknown) => store.appendStageRunEvent(runId, type, redactSensitive(payload, runProject?.sensitivePatterns || []));
+    async function executeRun(runId: string, runItem: any, runContext: any, runProject: any, patterns:string[]) {
+      const emit = (type: string, payload: unknown) => store.appendStageRunEvent(runId, type, redactSensitive(payload, patterns));
     try {
       if (runItem.stage === "coding") {
         if (!runItem.projectId) throw new Error("编码阶段必须先关联本地项目");
         if (!runProject) throw new Error("关联项目不存在");
         const projectContext = runContext.projectContext?.projects?.[0];
         if (!projectContext) throw new Error("编码阶段缺少交付项目上下文");
-        const coding = await runCodexCoding({ requirement: runItem, artifacts: store.listArtifacts(runItem.id), project: runProject, projectContext, reworkContext: runContext.reworkContext, onEvent: emit });
+        const coding = await runCodexCoding({ requirement: runContext.requirement, artifacts: runContext.priorArtifacts, project: runProject, projectContext, reworkContext: runContext.reworkContext, onEvent: emit });
         const conclusion = coding.diff ? "pass" : "return";
         const execution = store.addExecution({ requirementId: runItem.id, stage: runItem.stage, projectId: runProject.id, branch: coding.branch, worktreePath: coding.worktreePath, status: conclusion === "pass" ? "completed" : "needs_review", commands: [], diff: coding.diff, codexThreadId: coding.codexThreadId, events: coding.events, diagnostics: coding.diagnostics.join("\n"), completedAt: new Date().toISOString() });
         const snapshot = buildCodingEvidence({ diff: coding.diff, files: coding.files, additions: coding.additions, deletions: coding.deletions });
@@ -138,7 +147,7 @@ export async function buildApp(store: WorkflowStore) {
         emit("gate.decided", gate);
         store.applyGateDecision({ requirementId: runItem.id, stage: runItem.stage, artifactId: artifact.id, ...gate });
         refreshRequirementKnowledge(store,runItem.id);
-        store.completeStageRun(runId, redactSensitive(content));
+        store.completeStageRun(runId, redactSensitive(content,patterns));
         return;
       }
       let evidence: any = null;
@@ -154,7 +163,7 @@ export async function buildApp(store: WorkflowStore) {
       }
       const result = needsEvidence && !["valid", "truncated"].includes(evidenceStatus)
         ? { conclusion: "conditional", confidence: 0, summary: `编码证据状态为 ${evidenceStatus}，无法自动执行${stageLabel(runItem.stage)}。`, facts: [], assumptions: [], openQuestions: ["请重新执行编码自测生成有效证据"], risks: ["缺少可验证的真实代码证据"], findings: [] }
-        : await runAgent(runItem.stage, { ...runContext, codingEvidence: evidence ? { ...evidence, status: evidenceStatus } : undefined }, emit);
+        : await runAgent(runItem.stage, redactSensitive({ ...runContext, codingEvidence: evidence ? { ...evidence, status: evidenceStatus } : undefined },patterns), emit);
       const content = evidence ? { ...result, evidenceId: evidence.id, evidenceExecutionId: evidence.executionId, evidenceDiffHash: evidence.diffHash, evidenceStatus } : result;
       const artifact = store.addArtifact(runItem.id, runItem.stage, `${stageLabel(runItem.stage)} AI 成果`, content);
       let gate = evaluateGate(runItem.stage, content, store.getGateConfig());
@@ -163,10 +172,10 @@ export async function buildApp(store: WorkflowStore) {
       const applied=store.applyGateDecision({ requirementId: runItem.id, stage: runItem.stage, artifactId: artifact.id, ...gate });
       refreshRequirementKnowledge(store,runItem.id);
       if(gate.decision==="auto_return"&&applied.approval){store.addReworkContext(runItem.id,buildReworkContext({approval:applied.approval,artifact}));}
-      store.completeStageRun(runId, redactSensitive(content));
+      store.completeStageRun(runId, redactSensitive(content,patterns));
     } catch (error) {
       const message = error instanceof Error ? error.message : "AI 执行失败";
-      store.failStageRun(runId, redactSensitive(message));
+      store.failStageRun(runId, redactSensitive(message,patterns));
       store.updateRequirementState(runItem.id, runItem.stage, "ai_ready");
     }
     }

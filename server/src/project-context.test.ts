@@ -158,4 +158,20 @@ describe("buildRequirementProjectContext", () => {
     const context = await buildRequirementProjectContext(store, requirement.id, "technical_design", { maxChars: minimumRequiredChars });
     expect(context.totalChars).toBe(minimumRequiredChars);
   });
+
+  it("truncates non-BMP metadata without producing lone surrogates", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const emoji = "\u{1F680}";
+    const project = store.createProject({ name: emoji.repeat(800), repoPath: process.cwd(), defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const requirement = store.createRequirement({ title: "Unicode", businessProblem: "Keep emoji valid", expectedOutcome: "Safe JSON", priority: "medium", primaryProjectId: project.id });
+    const moduleIds = [emoji.repeat(700)];
+    ready(store, project.id, emoji.repeat(2_000), [{ path: moduleIds[0], kind: "module", title: emoji.repeat(700), content: emoji.repeat(5_000), tags: [emoji.repeat(300)] }]);
+    store.replaceRequirementProjects(requirement.id, [{ projectId: project.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "selected", moduleIds, position: 0 }]);
+
+    const context = await buildRequirementProjectContext(store, requirement.id, "coding", { maxChars: 4_000 });
+    const serialized = JSON.stringify(context.projects);
+    const hasLoneSurrogate = (value: string) => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value);
+    expect(serialized.length).toBeLessThanOrEqual(4_000);
+    expect(hasLoneSurrogate(serialized)).toBe(false);
+  });
 });
