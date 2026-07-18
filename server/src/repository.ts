@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, realpath } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -19,8 +19,15 @@ export async function getLocalBranches(repoPath:string){
 }
 
 export async function validateRepository(repoPath: string) {
-  const { stdout } = await execFileAsync("git", ["-C", repoPath, "rev-parse", "--show-toplevel"]);
-  return stdout.trim() === resolve(repoPath);
+  try {
+    const [actualPath, { stdout }] = await Promise.all([
+      realpath(resolve(repoPath)),
+      execFileAsync("git", ["-C", repoPath, "rev-parse", "--show-toplevel"])
+    ]);
+    return await realpath(stdout.trim()) === actualPath;
+  } catch {
+    return false;
+  }
 }
 
 export async function createIsolatedWorktree(repoPath: string, defaultBranch: string, requirementCode: string, runId: string) {

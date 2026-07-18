@@ -19,6 +19,52 @@ describe("WorkflowStore", () => {
     expect(store.listProjects()).toEqual([]);
   });
 
+  it("creates and lists project metadata", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject({
+      name: "Storefront", repoPath: "/tmp/storefront", defaultBranch: "main",
+      category: "frontend", technology: ["node", "react"], allowedCommands: [], sensitivePatterns: []
+    });
+    expect(project).toMatchObject({ category: "frontend", technology: ["node", "react"], status: "active" });
+    expect(project.updatedAt).toBe(project.createdAt);
+    expect(store.listProjects({ activeOnly: true })).toEqual([project]);
+    expect(store.findProjectByRepoPath("/tmp/storefront/../storefront")?.id).toBe(project.id);
+  });
+
+  it("updates only specified project fields and supports category clearing", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject({ name: "Old", repoPath: "/tmp/update-project", defaultBranch: "main", category: "other", technology: ["node"], allowedCommands: [], sensitivePatterns: [] });
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    const updated = store.updateProject(project.id, { name: "New", category: "backend", defaultBranch: "prod" });
+    expect(updated).toMatchObject({ name: "New", category: "backend", defaultBranch: "prod", technology: ["node"] });
+    expect(updated!.updatedAt > project.updatedAt).toBe(true);
+    expect(store.updateProject(project.id, { category: null })?.category).toBeNull();
+  });
+
+  it("rejects normalized duplicate repository paths, including archived projects", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const original = store.createProject({ name: "One", repoPath: "/tmp/identity/repo", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    expect(() => store.createProject({ name: "Two", repoPath: "/tmp/identity/child/../repo", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] })).toThrow("PROJECT_REPO_PATH_EXISTS");
+    store.archiveProject(original.id);
+    expect(() => store.createProject({ name: "Replacement", repoPath: "/tmp/identity/repo", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] })).toThrow("PROJECT_REPO_PATH_EXISTS");
+    const other = store.createProject({ name: "Other", repoPath: "/tmp/identity/other", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    expect(() => store.updateProject(other.id, { repoPath: "/tmp/identity/repo" })).toThrow("PROJECT_REPO_PATH_EXISTS");
+  });
+
+  it("archives idempotently, keeps projects readable, and blocks new primary associations", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject({ name: "Old", repoPath: "/tmp/archived", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const requirement = store.createRequirement({ title: "Existing", businessProblem: "Existing business issue", expectedOutcome: "Resolved", priority: "medium" });
+    expect(store.archiveProject(project.id)?.status).toBe("archived");
+    expect(store.archiveProject(project.id)?.status).toBe("archived");
+    expect(store.listProjects({ activeOnly: true })).toEqual([]);
+    expect(store.listProjects()).toHaveLength(1);
+    expect(store.getProject(project.id)?.status).toBe("archived");
+    expect(store.setRequirementProject(requirement.id, project.id)).toBeNull();
+    expect(() => store.createRequirement({ title: "New association", businessProblem: "Archived project cannot be selected", expectedOutcome: "Selection rejected", priority: "medium", primaryProjectId: project.id })).toThrow("PROJECT_NOT_ACTIVE");
+    expect(store.archiveProject("missing")).toBeNull();
+  });
+
   it("creates the multi-project tables without legacy requirement columns", () => {
     const directory = mkdtempSync(join(tmpdir(), "workflow-store-")); directories.push(directory);
     const path = join(directory, "workflow.db");
@@ -39,9 +85,9 @@ describe("WorkflowStore", () => {
     const store = new WorkflowStore(path); store.close();
     const db = new DatabaseSync(path);
     const now = new Date().toISOString();
-    const insertProject = db.prepare("INSERT INTO projects (id,name,repo_path,default_branch,created_at) VALUES (?,?,?,?,?)");
-    insertProject.run("p1", "One", "/tmp/one", "main", now);
-    insertProject.run("p2", "Two", "/tmp/two", "main", now);
+    const insertProject = db.prepare("INSERT INTO projects (id,name,repo_path,default_branch,created_at,updated_at) VALUES (?,?,?,?,?,?)");
+    insertProject.run("p1", "One", "/tmp/one", "main", now, now);
+    insertProject.run("p2", "Two", "/tmp/two", "main", now, now);
     db.prepare("INSERT INTO requirements (id,code,title,business_problem,expected_outcome,priority,stage,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
       .run("r1", "REQ-0001", "Title", "Business problem", "Outcome", "medium", "prd", "ai_ready", now, now);
     const insertAssociation = db.prepare("INSERT INTO requirement_projects (id,requirement_id,project_id,role,usage,delivery_required,module_mode,module_ids_json,position,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");

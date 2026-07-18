@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type RequirementInput, type WorkflowStage } from "@ai-workflow/shared";
 import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./human-override.js";
 
@@ -17,7 +18,9 @@ export class WorkflowStore {
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, repo_path TEXT NOT NULL UNIQUE,
         default_branch TEXT NOT NULL, allowed_commands TEXT NOT NULL DEFAULT '[]',
-        sensitive_patterns TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL
+        sensitive_patterns TEXT NOT NULL DEFAULT '[]', category TEXT, technology_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'archived')),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS requirements (
         id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
@@ -147,6 +150,10 @@ export class WorkflowStore {
       );
     `);
     this.ensureColumn("requirements", "version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("projects", "category", "TEXT");
+    this.ensureColumn("projects", "technology_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("projects", "status", "TEXT NOT NULL DEFAULT 'active'");
+    this.ensureColumn("projects", "updated_at", "TEXT");
     this.ensureColumn("requirements", "clarifications", "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn("executions", "codex_thread_id", "TEXT");
     this.ensureColumn("executions", "events_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -207,7 +214,7 @@ export class WorkflowStore {
 
   setRequirementProject(id: string, projectId: string | null): any {
     if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(id)) return null;
-    if (projectId && !this.db.prepare("SELECT id FROM projects WHERE id = ?").get(projectId)) return null;
+    if (projectId && !this.db.prepare("SELECT id FROM projects WHERE id = ? AND status = 'active'").get(projectId)) return null;
     const now = new Date().toISOString();
     this.db.exec("BEGIN");
     try {
@@ -228,6 +235,7 @@ export class WorkflowStore {
   }
 
   private insertInterimPrimaryAssociation(requirementId: string, projectId: string, now: string) {
+    if (!this.db.prepare("SELECT id FROM projects WHERE id = ? AND status = 'active'").get(projectId)) throw new Error("PROJECT_NOT_ACTIVE");
     this.db.prepare(`INSERT INTO requirement_projects
       (id, requirement_id, project_id, role, usage, delivery_required, module_mode, module_ids_json, position, status, created_at, updated_at)
       VALUES (?, ?, ?, 'primary', 'delivery', 1, 'auto', '[]', 0, 'active', ?, ?)`)
@@ -453,12 +461,32 @@ export class WorkflowStore {
   }
 
   createProject(input: any) {
-    const item = { id: randomUUID(), ...input, createdAt: new Date().toISOString() };
-    this.db.prepare("INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?)").run(
-      item.id, item.name, item.repoPath, item.defaultBranch,
-      JSON.stringify(item.allowedCommands ?? []), JSON.stringify(item.sensitivePatterns ?? []), item.createdAt
-    );
+    const repoPath = resolve(input.repoPath);
+    if (this.findProjectByRepoPath(repoPath)) throw new Error("PROJECT_REPO_PATH_EXISTS");
+    const now = new Date().toISOString();
+    const item = { id: randomUUID(), ...input, repoPath, category: input.category ?? null, technology: input.technology ?? [], status: "active", createdAt: now, updatedAt: now };
+    this.db.prepare(`INSERT INTO projects (id,name,repo_path,default_branch,allowed_commands,sensitive_patterns,category,technology_json,status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(item.id, item.name, item.repoPath, item.defaultBranch,
+      JSON.stringify(item.allowedCommands ?? []), JSON.stringify(item.sensitivePatterns ?? []), item.category, JSON.stringify(item.technology), item.status, item.createdAt, item.updatedAt);
     return item;
+  }
+
+  updateProject(id: string, input: any) {
+    const current = this.getProject(id);
+    if (!current) return null;
+    const repoPath = input.repoPath === undefined ? current.repoPath : resolve(input.repoPath);
+    const duplicate = this.findProjectByRepoPath(repoPath);
+    if (duplicate && duplicate.id !== id) throw new Error("PROJECT_REPO_PATH_EXISTS");
+    const item = { ...current, ...input, repoPath, category: input.category === undefined ? current.category : input.category, updatedAt: new Date().toISOString() };
+    this.db.prepare(`UPDATE projects SET name=?,repo_path=?,default_branch=?,allowed_commands=?,sensitive_patterns=?,category=?,technology_json=?,updated_at=? WHERE id=?`)
+      .run(item.name, item.repoPath, item.defaultBranch, JSON.stringify(item.allowedCommands), JSON.stringify(item.sensitivePatterns), item.category, JSON.stringify(item.technology), item.updatedAt, id);
+    return this.getProject(id);
+  }
+
+  archiveProject(id: string) {
+    if (!this.getProject(id)) return null;
+    this.db.prepare("UPDATE projects SET status='archived',updated_at=? WHERE id=? AND status!='archived'").run(new Date().toISOString(), id);
+    return this.getProject(id);
   }
 
   beginProjectKnowledge(projectId:string,sourceHead:string,refreshReason:string){
@@ -509,15 +537,19 @@ export class WorkflowStore {
 
   listProjectMemory(projectId:string){const rows=this.db.prepare(`SELECT r.*,v.title,v.content,v.modules_json,v.tags_json,v.evidence_json,v.source_requirement_id,v.source_stage,v.confidence,v.risk_level,v.created_at AS version_created_at FROM knowledge_records r JOIN knowledge_record_versions v ON v.record_id=r.id AND v.version=r.current_version WHERE r.project_id=? ORDER BY r.updated_at DESC`).all(projectId) as any[];const records=rows.map(row=>({id:row.id,projectId:row.project_id,subjectKey:row.subject_key,layer:row.layer,type:row.type,status:row.status,version:row.current_version,title:row.title,content:row.content,modules:JSON.parse(row.modules_json),tags:JSON.parse(row.tags_json),evidence:JSON.parse(row.evidence_json),sourceRequirementId:row.source_requirement_id,sourceStage:row.source_stage,confidence:row.confidence,riskLevel:row.risk_level,createdAt:row.version_created_at}));return {records,total:records.length,layers:Object.fromEntries(["source_fact","project_rule","decision","requirement_experience"].map(layer=>[layer,records.filter(item=>item.layer===layer).length]))};}
 
-  listProjects() {
-    return this.db.prepare("SELECT * FROM projects ORDER BY created_at DESC").all().map((r: any) => ({
-      id: r.id, name: r.name, repoPath: r.repo_path, defaultBranch: r.default_branch,
-      allowedCommands: JSON.parse(r.allowed_commands), sensitivePatterns: JSON.parse(r.sensitive_patterns), createdAt: r.created_at
-    }));
+  listProjects(options: { activeOnly?: boolean } = {}) {
+    const sql = `SELECT * FROM projects${options.activeOnly ? " WHERE status = 'active'" : ""} ORDER BY created_at DESC`;
+    return this.db.prepare(sql).all().map(mapProject);
   }
 
   getProject(id: string) {
-    return this.listProjects().find((project: any) => project.id === id) ?? null;
+    const row = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(id);
+    return row ? mapProject(row as any) : null;
+  }
+
+  findProjectByRepoPath(repoPath: string) {
+    const row = this.db.prepare("SELECT * FROM projects WHERE repo_path = ?").get(resolve(repoPath));
+    return row ? mapProject(row as any) : null;
   }
 
   addExecution(input: any) {
@@ -581,6 +613,13 @@ function mapRequirement(row: any) {
     projectName: row.project_name ?? undefined, version: row.version ?? 1, clarifications: row.clarifications ?? "", integrationTargetBranch:row.integration_target_branch??undefined,
     stage: row.stage, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at
   };
+}
+
+function mapProject(row: any) {
+  return { id: row.id, name: row.name, repoPath: row.repo_path, defaultBranch: row.default_branch,
+    allowedCommands: JSON.parse(row.allowed_commands || "[]"), sensitivePatterns: JSON.parse(row.sensitive_patterns || "[]"),
+    category: row.category ?? null, technology: JSON.parse(row.technology_json || "[]"), status: row.status || "active",
+    createdAt: row.created_at, updatedAt: row.updated_at || row.created_at };
 }
 
 function mapStageRun(row: any, events: any[]) {
