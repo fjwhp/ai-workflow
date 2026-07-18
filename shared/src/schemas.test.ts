@@ -143,6 +143,36 @@ describe("requirementProjectsInputSchema", () => {
       }));
     }
   });
+
+  it("preserves optional project version display fields", () => {
+    const input = requirementProjectsInputSchema.parse([
+      association({
+        usage: "delivery",
+        deliveryRequired: true,
+        projectVersionId: "version-delivery",
+        projectVersionName: "Release 1",
+        projectVersionBranch: "feature/release-1",
+        projectVersionStatus: "active"
+      })
+    ]);
+
+    expect(input[0]).toMatchObject({
+      projectVersionName: "Release 1",
+      projectVersionBranch: "feature/release-1",
+      projectVersionStatus: "active"
+    });
+  });
+
+  it("rejects an unknown project version display status", () => {
+    expect(requirementProjectsInputSchema.safeParse([
+      association({
+        usage: "delivery",
+        deliveryRequired: true,
+        projectVersionId: "version-delivery",
+        projectVersionStatus: "planned"
+      })
+    ]).success).toBe(false);
+  });
 });
 
 describe("project schemas", () => {
@@ -165,8 +195,12 @@ describe("project schemas", () => {
 describe("projectVersionInputSchema", () => {
   it("trims project version input strings", () => {
     expect(projectVersionInputSchema.parse({
-      name: " Release 1 ", branch: " feature/release-1 ", baseBranch: " main "
-    })).toEqual({ name: "Release 1", branch: "feature/release-1", baseBranch: "main" });
+      name: " Release 1 ", branch: " feature/release-1 ", baseBranch: " main ",
+      reuseExistingWorktree: true
+    })).toEqual({
+      name: "Release 1", branch: "feature/release-1", baseBranch: "main",
+      reuseExistingWorktree: true
+    });
   });
 
   it.each(["name", "branch", "baseBranch"])("rejects an empty %s", (field) => {

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { workflowStages, workflowStatuses } from "./domain.js";
 import { moduleModes, projectRoles, projectUsages } from "./project-association.js";
+import { projectVersionStatuses } from "./project-version.js";
 
 export const prioritySchema = z.enum(["low", "medium", "high", "urgent"]);
 
@@ -37,6 +38,9 @@ export const projectUpdateSchema = projectInputSchema.partial().extend({
 export const requirementProjectInputSchema = z.object({
   projectId: nonEmptyIdSchema,
   projectVersionId: nonEmptyIdSchema.optional(),
+  projectVersionName: z.string().optional(),
+  projectVersionBranch: z.string().optional(),
+  projectVersionStatus: z.enum(projectVersionStatuses).optional(),
   role: z.enum(projectRoles),
   usage: z.enum(projectUsages),
   deliveryRequired: z.boolean(),

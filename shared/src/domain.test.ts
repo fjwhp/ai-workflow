@@ -22,8 +22,10 @@ describe("workflow transitions", () => {
     expect(canTransition("awaiting_local_resolution", "completed")).toBe(true);
     expect(canTransition("awaiting_local_resolution", "awaiting_merge")).toBe(true);
     expect(canTransition("awaiting_local_resolution", "manual_resolution_required")).toBe(true);
+    expect(canTransition("awaiting_local_resolution", "cancelled")).toBe(true);
     expect(canTransition("manual_resolution_required", "completed")).toBe(true);
     expect(canTransition("manual_resolution_required", "awaiting_merge")).toBe(true);
+    expect(canTransition("manual_resolution_required", "cancelled")).toBe(true);
   });
 
   it("places local code integration after acceptance", () => {
