@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -21,21 +20,22 @@ describe("real server startup acceptance", () => {
     const oldBytes = Buffer.from("synthetic incompatible workflow database\n");
     await writeFile(databasePath, oldBytes);
     await writeFile(`${databasePath}.schema-version`, "single-project-v1");
-    const port = await reservePort();
-    const logs = boundedLogs();
+    const stdout = boundedLogs();
+    const allLogs = boundedLogs();
     const child = spawn(process.execPath, [resolve("node_modules/tsx/dist/cli.mjs"), resolve("server/src/index.ts")], {
       cwd: resolve("."),
-      env: { ...process.env, DATA_DIR: dataDir, PORT: String(port), OPENAI_API_KEY: "" },
+      env: { ...process.env, DATA_DIR: dataDir, PORT: "0", OPENAI_API_KEY: "" },
       stdio: ["ignore", "pipe", "pipe"]
     });
     runningChildren.add(child);
-    child.stdout?.on("data", logs.append);
-    child.stderr?.on("data", logs.append);
+    child.stdout?.on("data", (chunk) => { stdout.append(chunk); allLogs.append(chunk); });
+    child.stderr?.on("data", allLogs.append);
 
     try {
-      await waitForHealth(port, child, logs.read);
-      await expect(getJson(port, "/api/projects")).resolves.toEqual([]);
-      await expect(getJson(port, "/api/requirements")).resolves.toEqual([]);
+      const baseUrl = await waitForListeningEvent(child, stdout.read, allLogs.read);
+      await waitForHealth(baseUrl, child, allLogs.read);
+      await expect(getJson(baseUrl, "/api/projects")).resolves.toEqual([]);
+      await expect(getJson(baseUrl, "/api/requirements")).resolves.toEqual([]);
       const backupNames = (await readdir(dataDir)).filter((name) => /^workflow\.db\.backup-\d{4}-\d{2}-\d{2}T/.test(name) && !name.endsWith("-wal") && !name.endsWith("-shm"));
       expect(backupNames).toHaveLength(1);
       await expect(readFile(join(dataDir, backupNames[0]!))).resolves.toEqual(oldBytes);
@@ -46,36 +46,47 @@ describe("real server startup acceptance", () => {
   });
 });
 
-async function reservePort() {
-  const server = createServer();
-  await new Promise<void>((resolveReady, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolveReady());
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("Could not reserve an ephemeral port");
-  await new Promise<void>((resolveClosed, reject) => server.close((error) => error ? reject(error) : resolveClosed()));
-  return address.port;
-}
-
-async function waitForHealth(port: number, child: ChildProcess, logs: () => string) {
+async function waitForListeningEvent(child: ChildProcess, stdout: () => string, logs: () => string) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Server exited (${child.exitCode ?? child.signalCode}) before health check passed.\n${logs()}`);
+    assertChildRunning(child, logs, "listening event");
+    const match = stdout().match(/(?:^|\n)FLOWGATE_LISTENING (\{[^\n]+\})(?:\n|$)/);
+    if (match) {
+      const event = JSON.parse(match[1]!) as { url?: unknown };
+      if (typeof event.url !== "string") throw new Error(`Invalid FLOWGATE_LISTENING event.\n${logs()}`);
+      const url = new URL(event.url);
+      if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") throw new Error(`Unsafe FLOWGATE_LISTENING URL: ${event.url}`);
+      return url.origin;
+    }
+    await delay(25);
+  }
+  throw new Error(`Server listening event timed out.\n${logs()}`);
+}
+
+async function waitForHealth(baseUrl: string, child: ChildProcess, logs: () => string) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    assertChildRunning(child, logs, "health check");
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/health`);
+      const response = await fetch(`${baseUrl}/api/health`);
       if (response.ok) return;
     } catch {}
-    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    await delay(50);
   }
   throw new Error(`Server health check timed out.\n${logs()}`);
 }
 
-async function getJson(port: number, path: string) {
-  const response = await fetch(`http://127.0.0.1:${port}${path}`);
+async function getJson(baseUrl: string, path: string) {
+  const response = await fetch(`${baseUrl}${path}`);
   if (!response.ok) throw new Error(`${path} returned ${response.status}`);
   return response.json();
 }
+
+function assertChildRunning(child: ChildProcess, logs: () => string, milestone: string) {
+  if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Server exited (${child.exitCode ?? child.signalCode}) before ${milestone}.\n${logs()}`);
+}
+
+const delay = (milliseconds: number) => new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
 
 async function stopChild(child: ChildProcess) {
   runningChildren.delete(child);

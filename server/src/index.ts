@@ -18,4 +18,5 @@ store.interruptActiveIntegrationRuns();
 store.interruptActiveProjectKnowledge();
 store.recoverInterruptedRequirements();
 const app = await buildApp(store);
-await app.listen({ host: "127.0.0.1", port: Number(process.env.PORT || 3210) });
+const listeningUrl = await app.listen({ host: "127.0.0.1", port: Number(process.env.PORT || 3210) });
+process.stdout.write(`FLOWGATE_LISTENING ${JSON.stringify({ url: listeningUrl })}\n`);

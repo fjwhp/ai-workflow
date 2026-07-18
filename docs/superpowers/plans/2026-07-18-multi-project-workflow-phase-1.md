@@ -617,7 +617,7 @@ Expected: all commands exit 0 and Vitest reports no failed files or tests.
 
 - [x] **Step 3: Verify clean reset through the real server entrypoint**
 
-Create a synthetic incompatible database in a temporary `DATA_DIR`, launch `server/src/index.ts` as a child process on an ephemeral localhost port, and verify:
+Create a synthetic incompatible database in a temporary `DATA_DIR`, launch `server/src/index.ts` as a child process with `PORT=0`, discover its OS-assigned localhost URL from the `FLOWGATE_LISTENING` stdout event, and verify:
 
 - a timestamped backup exists;
 - `GET /api/projects` returns `[]`;
