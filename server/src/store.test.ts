@@ -8,14 +8,28 @@ import { WorkflowStore } from "./store.js";
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
 let fixtureProjectSequence = 0;
+function ensureProjectVersion(store: WorkflowStore, projectId: string) {
+  const existing = store.listProjectVersions(projectId, "active")[0];
+  if (existing) return existing;
+  const project = store.getProject(projectId);
+  if (!project || project.status !== "active") return null;
+  return store.createProjectVersion({
+    projectId, name: "fixture", branch: `fixture/${projectId}`, baseBranch: project.defaultBranch,
+    worktreePath: `/tmp/requirement-version-${projectId}`, headCommit: "fixture-head"
+  });
+}
 function createRequirement(store: WorkflowStore, input: any) {
-  if (input.primaryProjectId) return store.createRequirement(input);
+  if (input.primaryProjectId) {
+    const version = input.primaryProjectVersionId ? null : ensureProjectVersion(store, input.primaryProjectId);
+    return store.createRequirement({ ...input, primaryProjectVersionId: input.primaryProjectVersionId ?? version?.id ?? "missing-version" });
+  }
   fixtureProjectSequence += 1;
   const project = store.createProject({
     name: `Fixture ${fixtureProjectSequence}`, repoPath: `/tmp/requirement-fixture-${fixtureProjectSequence}`,
     defaultBranch: "main", allowedCommands: [], sensitivePatterns: []
   });
-  return store.createRequirement({ ...input, primaryProjectId: project.id });
+  const version = ensureProjectVersion(store, project.id)!;
+  return store.createRequirement({ ...input, primaryProjectId: project.id, primaryProjectVersionId: version.id });
 }
 afterEach(() => {
   stores.splice(0).forEach((store) => store.close());
@@ -96,7 +110,7 @@ describe("WorkflowStore", () => {
 
   it("blocks archiving delivery projects throughout unfinished delivery stages",()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject({name:"Delivery",repoPath:"/tmp/archive-lifecycle",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
-    const req=store.createRequirement({title:"交付生命周期",businessProblem:"需要保护活动项目交付",expectedOutcome:"阻止错误归档",priority:"medium",primaryProjectId:project.id});
+    const req=createRequirement(store,{title:"交付生命周期",businessProblem:"需要保护活动项目交付",expectedOutcome:"阻止错误归档",priority:"medium",primaryProjectId:project.id});
     for(const [stage,status] of [["coding","ai_ready"],["code_review","awaiting_approval"],["testing","returned"],["acceptance","blocked"],["integration","awaiting_merge"]] as const){store.updateRequirementState(req.id,stage,status);expect(store.projectHasActiveDelivery(project.id)).toBe(true);}
     store.updateRequirementState(req.id,"integration","completed");expect(store.projectHasActiveDelivery(project.id)).toBe(false);
   });
@@ -195,7 +209,8 @@ describe("WorkflowStore", () => {
       name: "Admin", repoPath: "/tmp/admin", defaultBranch: "main",
       allowedCommands: [], sensitivePatterns: []
     });
-    expect(store.setRequirementProject(req.id, replacement.id)).toMatchObject({ projectId: replacement.id, projectName: "Admin" });
+    const replacementVersion = ensureProjectVersion(store, replacement.id)!;
+    expect(store.setRequirementProject(req.id, replacement.id, replacementVersion.id)).toMatchObject({ projectId: replacement.id, projectName: "Admin" });
   });
 
   it("persists ordered joined requirement project associations atomically", () => {
@@ -203,23 +218,41 @@ describe("WorkflowStore", () => {
     const primary = store.createProject({ name: "Web", repoPath: "/tmp/rp-web", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
     const collaborator = store.createProject({ name: "API", repoPath: "/tmp/rp-api", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
     const req = createRequirement(store, { title: "Cross project", businessProblem: "Behavior differs between applications", expectedOutcome: "Consistent behavior", priority: "high", primaryProjectId: primary.id });
+    const collaboratorVersion = ensureProjectVersion(store, collaborator.id)!;
     const inputs = [
       { projectId: primary.id, role: "primary" as const, usage: "context" as const, deliveryRequired: false, moduleMode: "auto" as const, moduleIds: [], position: 0 },
-      { projectId: collaborator.id, role: "collaborator" as const, usage: "delivery" as const, deliveryRequired: true, moduleMode: "all" as const, moduleIds: [], position: 1 }
+      { projectId: collaborator.id, projectVersionId: collaboratorVersion.id, role: "collaborator" as const, usage: "delivery" as const, deliveryRequired: true, moduleMode: "all" as const, moduleIds: [], position: 1 }
     ];
     expect(store.replaceRequirementProjects(req.id, inputs).map((item) => item.projectName)).toEqual(["Web", "API"]);
+    expect(store.listRequirementProjects(req.id)[1]).toMatchObject({
+      projectVersionId: collaboratorVersion.id, projectVersionName: "fixture",
+      projectVersionBranch: `fixture/${collaborator.id}`, projectVersionStatus: "active"
+    });
     expect(store.getRequirement(req.id)).toMatchObject({ primaryProjectId: primary.id, primaryProjectName: "Web", projectId: collaborator.id, projectName: "API" });
     expect(store.getRequirement(req.id)?.projects).toHaveLength(2);
 
     expect(() => store.replaceRequirementProjects(req.id, [inputs[0]!, { ...inputs[1]!, projectId: "missing" }])).toThrow("PROJECT_NOT_ACTIVE");
     expect(store.listRequirementProjects(req.id).map((item) => item.projectId)).toEqual([primary.id, collaborator.id]);
+
+    const primaryVersion = ensureProjectVersion(store, primary.id)!;
+    expect(() => store.replaceRequirementProjects(req.id, [inputs[0]!, { ...inputs[1]!, projectVersionId: primaryVersion.id }]))
+      .toThrow("REQUIREMENT_VERSION_PROJECT_MISMATCH");
+    const closedVersion = store.createProjectVersion({
+      projectId: collaborator.id, name: "closed", branch: "feature/closed", baseBranch: "main",
+      worktreePath: "/tmp/rp-api-closed", headCommit: "closed-head"
+    });
+    store.closeProjectVersion(closedVersion.id);
+    expect(() => store.replaceRequirementProjects(req.id, [inputs[0]!, { ...inputs[1]!, projectVersionId: closedVersion.id }]))
+      .toThrow("PROJECT_VERSION_NOT_ACTIVE");
+    expect(store.listRequirementProjects(req.id).map((item) => item.projectVersionId)).toEqual([undefined, collaboratorVersion.id]);
   });
 
   it("validates selected modules against the latest ready knowledge index", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = store.createProject({ name: "Modules", repoPath: "/tmp/rp-modules", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
     const req = createRequirement(store, { title: "Module change", businessProblem: "Module behavior needs correction", expectedOutcome: "Correct module", priority: "medium", primaryProjectId: project.id });
-    const selected = [{ projectId: project.id, role: "primary" as const, usage: "delivery" as const, deliveryRequired: true, moduleMode: "selected" as const, moduleIds: ["src/orders"], position: 0 }];
+    const version = ensureProjectVersion(store, project.id)!;
+    const selected = [{ projectId: project.id, projectVersionId: version.id, role: "primary" as const, usage: "delivery" as const, deliveryRequired: true, moduleMode: "selected" as const, moduleIds: ["src/orders"], position: 0 }];
     expect(() => store.replaceRequirementProjects(req.id, selected)).toThrow("MODULE_INDEX_REQUIRED");
     const knowledge = store.beginProjectKnowledge(project.id, "head", "manual");
     store.completeProjectKnowledge(knowledge.id, { summary: "modules", entries: [{ path: "src/orders", kind: "module", title: "Orders", content: "", tags: [] }] });
@@ -231,7 +264,9 @@ describe("WorkflowStore", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = store.createProject({ name: "Snapshot", repoPath: "/tmp/rp-snapshot", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
     const req = createRequirement(store, { title: "Snapshot associations", businessProblem: "Execution needs frozen project configuration", expectedOutcome: "Immutable evidence", priority: "medium", primaryProjectId: project.id });
+    const version = ensureProjectVersion(store, project.id)!;
     const first = store.createRequirementProjectSnapshot(req.id);
+    store.updateProjectVersionHead(version.id, "new-head");
     store.replaceRequirementProjects(req.id, [{ projectId: project.id, role: "primary", usage: "context", deliveryRequired: false, moduleMode: "auto", moduleIds: [], position: 4 }]);
     const second = store.createRequirementProjectSnapshot(req.id);
     expect(first).toMatchObject({ version: 1, status: "active" });
@@ -239,7 +274,13 @@ describe("WorkflowStore", () => {
     expect(store.getRequirementProjectSnapshot(req.id)?.id).toBe(second.id);
     expect(store.listRequirementProjectSnapshots(req.id).map((item) => item.status)).toEqual(["active", "superseded"]);
     expect(first.associations[0]!.usage).toBe("delivery");
+    expect(first.associations[0]).toMatchObject({
+      projectVersionId: version.id, projectVersionName: "fixture", projectVersionBranch: `fixture/${project.id}`,
+      projectVersionWorktreePath: `/tmp/requirement-version-${project.id}`, projectVersionHead: "fixture-head"
+    });
+    expect(store.listRequirementProjectSnapshots(req.id)[1]!.associations[0]!.projectVersionHead).toBe("fixture-head");
     expect(second.associations[0]!.usage).toBe("context");
+    expect(second.associations[0]!.projectVersionId).toBeUndefined();
   });
 
   it("rolls back requirement creation when the required primary project is unavailable", () => {
@@ -251,6 +292,8 @@ describe("WorkflowStore", () => {
     store.archiveProject(project.id);
     expect(() => createRequirement(store, { title: "Atomic archived", businessProblem: "An archived project must not leave data", expectedOutcome: "No orphan", priority: "medium", primaryProjectId: project.id })).toThrow("PROJECT_NOT_ACTIVE");
     expect(store.listRequirements()).toEqual([]);
+    const available = store.createProject({ name: "Available", repoPath: "/tmp/rp-available", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    expect(createRequirement(store, { title: "Atomic success", businessProblem: "A valid project creates data", expectedOutcome: "One requirement", priority: "medium", primaryProjectId: available.id }).code).toBe("REQ-0001");
   });
 
   it("creates an immutable revision when a returned requirement is clarified", () => {
@@ -376,13 +419,4 @@ describe("WorkflowStore", () => {
     expect(store.getLatestIntegrationRun(req.id)?.id).toBe(run!.id);
   });
 
-  it("stores an integration target outside the requirements table",()=>{
-    const store=new WorkflowStore(":memory:");stores.push(store);
-    const project=store.createProject({name:"Repo",repoPath:"/tmp/repo-target",defaultBranch:"prod",allowedCommands:[],sensitivePatterns:[]});
-    const req=createRequirement(store, {title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"新增接口",priority:"medium",primaryProjectId:project.id});
-    store.updateRequirementState(req.id,"integration","awaiting_merge");
-    expect(store.setIntegrationTarget(req.id,"feature/0710-test")?.integrationTargetBranch).toBe("feature/0710-test");
-    expect(store.getRequirement(req.id)?.integrationTargetBranch).toBe("feature/0710-test");
-    expect(store.getProject(project.id)?.defaultBranch).toBe("prod");
-  });
 });

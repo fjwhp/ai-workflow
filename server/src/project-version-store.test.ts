@@ -29,15 +29,27 @@ function columns(database: DatabaseSync, table: string) {
   return (database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(({ name }) => name);
 }
 
-function requirementInput(projectId: string, title: string) {
+function requirementInput(projectId: string, projectVersionId: string, title: string) {
   return {
     title,
     businessProblem: `${title} business problem`,
     expectedOutcome: `${title} expected outcome`,
     priority: "medium" as const,
     primaryProjectId: projectId,
-    primaryProjectVersionId: "version-1"
+    primaryProjectVersionId: projectVersionId
   };
+}
+
+function createProject(store: WorkflowStore, name: string, repoPath: string) {
+  return store.createProject({
+    name, repoPath, defaultBranch: "main", allowedCommands: [], sensitivePatterns: []
+  });
+}
+
+function createVersion(store: WorkflowStore, projectId: string, name = "1.0.0", worktreePath = `/tmp/version-${projectId}`) {
+  return store.createProjectVersion({
+    projectId, name, branch: `feature/${name}`, baseBranch: "main", worktreePath, headCommit: `head-${name}`
+  });
 }
 
 describe("project versions fresh schema", () => {
@@ -78,16 +90,11 @@ describe("requirement code allocation", () => {
     const path = databasePath();
     const store = new WorkflowStore(path);
     stores.push(store);
-    const project = store.createProject({
-      name: "Concurrent project",
-      repoPath: join(path, "..", "concurrent-project"),
-      defaultBranch: "main",
-      allowedCommands: [],
-      sensitivePatterns: []
-    });
-    const first = spawnCreator(path, requirementInput(project.id, "Concurrent first"));
+    const project = createProject(store, "Concurrent project", join(path, "..", "concurrent-project"));
+    const version = createVersion(store, project.id, "1.0.0", join(path, "..", "concurrent-version"));
+    const first = spawnCreator(path, requirementInput(project.id, version.id, "Concurrent first"));
     await first.waitFor("ready");
-    const second = spawnCreator(path, requirementInput(project.id, "Concurrent second"));
+    const second = spawnCreator(path, requirementInput(project.id, version.id, "Concurrent second"));
     await second.waitFor("ready");
     const locker = new DatabaseSync(path);
     databases.push(locker);
@@ -114,21 +121,16 @@ describe("requirement code allocation", () => {
     stores.push(store);
     const database = new DatabaseSync(path);
     databases.push(database);
-    const project = store.createProject({
-      name: "Counter recovery project",
-      repoPath: join(path, "..", "counter-recovery-project"),
-      defaultBranch: "main",
-      allowedCommands: [],
-      sensitivePatterns: []
-    });
+    const project = createProject(store, "Counter recovery project", join(path, "..", "counter-recovery-project"));
+    const version = createVersion(store, project.id, "1.0.0", join(path, "..", "counter-recovery-version"));
     database.prepare("DELETE FROM counters WHERE key = 'requirement'").run();
 
-    expect(() => store.createRequirement(requirementInput(project.id, "Missing counter")))
+    expect(() => store.createRequirement(requirementInput(project.id, version.id, "Missing counter")))
       .toThrow("REQUIREMENT_COUNTER_MISSING");
     expect(store.listRequirements()).toEqual([]);
 
     database.prepare("INSERT INTO counters (key, value) VALUES ('requirement', 0)").run();
-    expect(store.createRequirement(requirementInput(project.id, "Recovered counter")).code).toBe("REQ-0001");
+    expect(store.createRequirement(requirementInput(project.id, version.id, "Recovered counter")).code).toBe("REQ-0001");
   });
 
   it("allocates committed codes across interleaved connections and rolls back failed allocations", () => {
@@ -140,13 +142,8 @@ describe("requirement code allocation", () => {
     databases.push(database);
     database.exec("PRAGMA foreign_keys = ON");
 
-    const project = firstStore.createProject({
-      name: "Shared project",
-      repoPath: join(path, "..", "shared-project"),
-      defaultBranch: "main",
-      allowedCommands: [],
-      sensitivePatterns: []
-    });
+    const project = createProject(firstStore, "Shared project", join(path, "..", "shared-project"));
+    const version = createVersion(firstStore, project.id, "1.0.0", join(path, "..", "shared-version"));
     database.exec(`
       CREATE TRIGGER fail_next_requirement
       BEFORE INSERT ON requirements
@@ -156,21 +153,103 @@ describe("requirement code allocation", () => {
       END;
     `);
 
-    expect(() => firstStore.createRequirement(requirementInput(project.id, "Forced rollback"))).toThrow("forced rollback");
+    expect(() => firstStore.createRequirement(requirementInput(project.id, version.id, "Forced rollback"))).toThrow("forced rollback");
     expect(database.prepare("SELECT value FROM counters WHERE key = 'requirement'").get()).toEqual({ value: 0 });
     database.exec("DROP TRIGGER fail_next_requirement");
 
-    const firstCommitted = secondStore.createRequirement(requirementInput(project.id, "First committed"));
+    const firstCommitted = secondStore.createRequirement(requirementInput(project.id, version.id, "First committed"));
     database.exec("BEGIN");
     database.prepare("DELETE FROM requirement_projects WHERE requirement_id = ?").run(firstCommitted.id);
     database.prepare("DELETE FROM requirement_revisions WHERE requirement_id = ?").run(firstCommitted.id);
     database.prepare("DELETE FROM requirements WHERE id = ?").run(firstCommitted.id);
     database.exec("COMMIT");
-    const secondCommitted = firstStore.createRequirement(requirementInput(project.id, "Second committed"));
+    const secondCommitted = firstStore.createRequirement(requirementInput(project.id, version.id, "Second committed"));
 
     expect([firstCommitted.code, secondCommitted.code]).toEqual(["REQ-0001", "REQ-0002"]);
     expect(new Set([firstCommitted.code, secondCommitted.code]).size).toBe(2);
     expect(database.prepare("SELECT value FROM counters WHERE key = 'requirement'").get()).toEqual({ value: 2 });
+  });
+
+  it("validates the primary version inside the allocation transaction and rolls back the code", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Atomic project", "/tmp/atomic-project");
+    const other = createProject(store, "Other project", "/tmp/atomic-other");
+    const version = createVersion(store, project.id, "1.0.0", "/tmp/atomic-version");
+    const otherVersion = createVersion(store, other.id, "1.0.0", "/tmp/atomic-other-version");
+
+    expect(() => store.createRequirement(requirementInput(project.id, otherVersion.id, "Wrong version")))
+      .toThrow("REQUIREMENT_VERSION_PROJECT_MISMATCH");
+    expect(store.createRequirement(requirementInput(project.id, version.id, "Committed version")).code).toBe("REQ-0001");
+  });
+});
+
+describe("project version persistence", () => {
+  it("creates, lists, gets, and updates a complete joined project version", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "API", "/tmp/project-version-api");
+    const version = createVersion(store, project.id, "2.2.1", "/tmp/api-v221");
+
+    expect(version).toMatchObject({
+      projectId: project.id, projectName: "API", name: "2.2.1", branch: "feature/2.2.1",
+      baseBranch: "main", worktreePath: "/tmp/api-v221", status: "active", headCommit: "head-2.2.1",
+      pendingRequirementId: undefined, pendingIntegrationRunId: undefined, closedAt: undefined
+    });
+    expect(version.createdAt).toBe(version.updatedAt);
+    expect(store.getProjectVersion(version.id)).toEqual(version);
+    expect(store.getProjectVersion("missing")).toBeNull();
+    expect(store.listProjectVersions(project.id, "active")).toEqual([version]);
+    expect(store.listProjectVersions(project.id, "closed")).toEqual([]);
+
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    const updated = store.updateProjectVersionHead(version.id, "def456");
+    expect(updated).toMatchObject({ id: version.id, headCommit: "def456" });
+    expect(updated!.updatedAt > version.updatedAt).toBe(true);
+    expect(store.getProjectVersion(version.id)?.headCommit).toBe("def456");
+    expect(store.updateProjectVersionHead("missing", "noop")).toBeNull();
+  });
+
+  it("maps unique conflicts to stable errors while scoping name and branch per project", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const first = createProject(store, "First", "/tmp/version-first");
+    const second = createProject(store, "Second", "/tmp/version-second");
+    createVersion(store, first.id, "2.0.0", "/tmp/version-first-v2");
+
+    expect(() => store.createProjectVersion({ projectId: first.id, name: "2.0.0", branch: "other", baseBranch: "main", worktreePath: "/tmp/version-name-clash", headCommit: "a" }))
+      .toThrow("PROJECT_VERSION_NAME_EXISTS");
+    expect(() => store.createProjectVersion({ projectId: first.id, name: "other", branch: "feature/2.0.0", baseBranch: "main", worktreePath: "/tmp/version-branch-clash", headCommit: "b" }))
+      .toThrow("PROJECT_VERSION_BRANCH_EXISTS");
+    expect(() => store.createProjectVersion({ projectId: second.id, name: "2.0.0", branch: "feature/2.0.0", baseBranch: "main", worktreePath: "/tmp/version-first-v2", headCommit: "c" }))
+      .toThrow("PROJECT_VERSION_WORKTREE_EXISTS");
+    expect(createVersion(store, second.id, "2.0.0", "/tmp/version-second-v2")).toMatchObject({ name: "2.0.0", branch: "feature/2.0.0" });
+    store.archiveProject(second.id);
+    expect(() => createVersion(store, second.id, "3.0.0", "/tmp/version-archived"))
+      .toThrow("PROJECT_NOT_ACTIVE");
+  });
+
+  it("blocks close for pending ownership or active requirements and keeps closed history readable", () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const project = createProject(store, "Close policy", join(path, "..", "close-project"));
+    const pending = createVersion(store, project.id, "pending", join(path, "..", "pending-version"));
+    const database = new DatabaseSync(path); databases.push(database);
+    database.prepare("UPDATE project_versions SET pending_requirement_id = ? WHERE id = ?").run("owner", pending.id);
+    expect(() => store.closeProjectVersion(pending.id)).toThrow("PROJECT_VERSION_CLOSE_BLOCKED");
+
+    const version = createVersion(store, project.id, "delivery", join(path, "..", "delivery-version"));
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Active delivery"));
+    expect(store.listVersionRequirements(version.id).map((item) => item.id)).toEqual([requirement.id]);
+    expect(() => store.closeProjectVersion(version.id)).toThrow("PROJECT_VERSION_HAS_ACTIVE_REQUIREMENTS");
+    store.updateRequirementState(requirement.id, "integration", "completed");
+    const closed = store.closeProjectVersion(version.id);
+    expect(closed).toMatchObject({ id: version.id, status: "closed" });
+    expect(closed.closedAt).toBeTruthy();
+    expect(store.closeProjectVersion(version.id)).toEqual(closed);
+    expect(store.listProjectVersions(project.id, "active").map((item) => item.id)).toEqual([pending.id]);
+    expect(store.listProjectVersions(project.id, "closed")).toEqual([closed]);
+    expect(store.listProjectVersions(project.id, "all")).toHaveLength(2);
+    expect(store.getProjectVersion(version.id)).toEqual(closed);
+    expect(store.listVersionRequirements(version.id).map((item) => item.id)).toEqual([requirement.id]);
+    expect(() => store.closeProjectVersion("missing")).toThrow("PROJECT_VERSION_NOT_FOUND");
   });
 });
 

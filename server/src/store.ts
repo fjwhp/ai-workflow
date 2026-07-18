@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type RequirementInput, type RequirementProject, type RequirementProjectInput, type WorkflowStage } from "@ai-workflow/shared";
+import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type ProjectVersion, type RequirementInput, type RequirementProject, type RequirementProjectInput, type WorkflowStage } from "@ai-workflow/shared";
 import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./human-override.js";
 import { validateRequirementProjects } from "./requirement-projects.js";
 
@@ -225,13 +225,16 @@ export class WorkflowStore {
   createRequirement(input: RequirementInput) {
     const now = new Date().toISOString();
     const id = randomUUID();
-    const association = validateRequirementProjects([{
-      projectId: input.primaryProjectId, projectVersionId: input.primaryProjectVersionId,
-      role: "primary", usage: "delivery", deliveryRequired: true,
-      moduleMode: "auto", moduleIds: [], position: 0
-    }], { projects: this.projectValidationRows([input.primaryProjectId]) })[0]!;
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const association = validateRequirementProjects([{
+        projectId: input.primaryProjectId, projectVersionId: input.primaryProjectVersionId,
+        role: "primary", usage: "delivery", deliveryRequired: true,
+        moduleMode: "auto", moduleIds: [], position: 0
+      }], {
+        projects: this.projectValidationRows([input.primaryProjectId]),
+        versions: this.versionValidationRows([input.primaryProjectVersionId])
+      })[0]!;
       const code = this.nextRequirementCode();
       this.db.prepare(`INSERT INTO requirements
         (id, code, title, business_problem, expected_outcome, priority, stage, status, created_at, updated_at)
@@ -262,52 +265,62 @@ export class WorkflowStore {
     return row ? this.mapRequirementWithProjects(row as any) : null;
   }
 
-  setRequirementProject(id: string, projectId: string | null): any {
+  setRequirementProject(id: string, projectId: string | null, projectVersionId?: string): any {
     if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(id)) return null;
-    if (!projectId || !this.db.prepare("SELECT id FROM projects WHERE id = ? AND status = 'active'").get(projectId)) return null;
-    this.replaceRequirementProjects(id, [{ projectId, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0 }]);
+    if (!projectId || !projectVersionId || !this.db.prepare("SELECT id FROM projects WHERE id = ? AND status = 'active'").get(projectId)) return null;
+    this.replaceRequirementProjects(id, [{ projectId, projectVersionId, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0 }]);
     return this.getRequirement(id);
   }
 
   private insertRequirementAssociation(requirementId: string, input: RequirementProjectInput, now: string) {
     this.db.prepare(`INSERT INTO requirement_projects
-      (id, requirement_id, project_id, role, usage, delivery_required, module_mode, module_ids_json, position, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`)
-      .run(randomUUID(), requirementId, input.projectId, input.role, input.usage, input.deliveryRequired ? 1 : 0,
+      (id, requirement_id, project_id, project_version_id, role, usage, delivery_required, module_mode, module_ids_json, position, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`)
+      .run(randomUUID(), requirementId, input.projectId, input.projectVersionId ?? null, input.role, input.usage, input.deliveryRequired ? 1 : 0,
         input.moduleMode, JSON.stringify(input.moduleIds), input.position, now, now);
   }
 
   listRequirementProjects(requirementId: string): RequirementProject[] {
-    return (this.db.prepare(`SELECT rp.*, p.name AS project_name, p.status AS project_status
+    return (this.db.prepare(`SELECT rp.*, p.name AS project_name, p.status AS project_status,
+        pv.name AS project_version_name, pv.branch AS project_version_branch,
+        pv.status AS project_version_status, pv.worktree_path AS project_version_worktree_path,
+        pv.head_commit AS project_version_head
       FROM requirement_projects rp JOIN projects p ON p.id = rp.project_id
+      LEFT JOIN project_versions pv ON pv.id = rp.project_version_id
       WHERE rp.requirement_id = ? AND rp.status = 'active' ORDER BY rp.position, rp.created_at`).all(requirementId) as any[])
       .map(mapRequirementProject);
   }
 
   listArchivedRequirementProjectHistory(requirementId: string): RequirementProject[] {
-    return (this.db.prepare(`SELECT rp.*, p.name AS project_name, p.status AS project_status
+    return (this.db.prepare(`SELECT rp.*, p.name AS project_name, p.status AS project_status,
+        pv.name AS project_version_name, pv.branch AS project_version_branch,
+        pv.status AS project_version_status, pv.worktree_path AS project_version_worktree_path,
+        pv.head_commit AS project_version_head
       FROM requirement_projects rp JOIN projects p ON p.id = rp.project_id
+      LEFT JOIN project_versions pv ON pv.id = rp.project_version_id
       WHERE rp.requirement_id = ? AND rp.status = 'archived' AND p.status = 'archived'
       ORDER BY rp.position, rp.created_at`).all(requirementId) as any[]).map(mapRequirementProject);
   }
 
   replaceRequirementProjects(requirementId: string, inputs: RequirementProjectInput[]): RequirementProject[] {
-    if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
     const projectIds = [...new Set(inputs.map((item) => item.projectId))];
-    const validated = validateRequirementProjects(inputs, {
-      projects: this.projectValidationRows(projectIds),
-      modulesByProject: this.moduleIndexes(projectIds)
-    });
+    const versionIds = [...new Set(inputs.flatMap((item) => item.projectVersionId ? [item.projectVersionId] : []))];
     const now = new Date().toISOString();
-    this.db.exec("BEGIN");
+    this.db.exec("BEGIN IMMEDIATE");
     try {
+      if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
+      const validated = validateRequirementProjects(inputs, {
+        projects: this.projectValidationRows(projectIds),
+        versions: this.versionValidationRows(versionIds),
+        modulesByProject: this.moduleIndexes(projectIds)
+      });
       this.db.prepare("UPDATE requirement_projects SET status = 'archived', updated_at = ? WHERE requirement_id = ? AND status = 'active'").run(now, requirementId);
       for (const input of validated) {
         const existing = this.db.prepare("SELECT id FROM requirement_projects WHERE requirement_id = ? AND project_id = ?").get(requirementId, input.projectId) as { id: string } | undefined;
         if (existing) {
-          this.db.prepare(`UPDATE requirement_projects SET role = ?, usage = ?, delivery_required = ?, module_mode = ?,
+          this.db.prepare(`UPDATE requirement_projects SET project_version_id = ?, role = ?, usage = ?, delivery_required = ?, module_mode = ?,
             module_ids_json = ?, position = ?, status = 'active', updated_at = ? WHERE id = ?`)
-            .run(input.role, input.usage, input.deliveryRequired ? 1 : 0, input.moduleMode, JSON.stringify(input.moduleIds), input.position, now, existing.id);
+            .run(input.projectVersionId ?? null, input.role, input.usage, input.deliveryRequired ? 1 : 0, input.moduleMode, JSON.stringify(input.moduleIds), input.position, now, existing.id);
         } else this.insertRequirementAssociation(requirementId, input, now);
       }
       this.db.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?").run(now, requirementId);
@@ -317,20 +330,20 @@ export class WorkflowStore {
   }
 
   createRequirementProjectSnapshot(requirementId: string) {
-    if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
-    const associations = this.listRequirementProjects(requirementId);
-    const version = (this.db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM requirement_project_snapshots WHERE requirement_id = ?").get(requirementId) as { version: number }).version;
     const now = new Date().toISOString();
-    const item = { id: randomUUID(), requirementId, version, associations, status: "active" as const, supersededAt: null, createdAt: now };
-    this.db.exec("BEGIN");
+    this.db.exec("BEGIN IMMEDIATE");
     try {
+      if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
+      const associations = this.listRequirementProjects(requirementId);
+      const version = (this.db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM requirement_project_snapshots WHERE requirement_id = ?").get(requirementId) as { version: number }).version;
+      const item = { id: randomUUID(), requirementId, version, associations, status: "active" as const, supersededAt: null, createdAt: now };
       this.db.prepare("UPDATE requirement_project_snapshots SET status = 'superseded', superseded_at = ? WHERE requirement_id = ? AND status = 'active'").run(now, requirementId);
       this.db.prepare(`INSERT INTO requirement_project_snapshots
         (id, requirement_id, version, associations_json, status, superseded_at, created_at) VALUES (?, ?, ?, ?, 'active', NULL, ?)`)
         .run(item.id, requirementId, version, JSON.stringify(associations), now);
       this.db.exec("COMMIT");
+      return item;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
-    return item;
   }
 
   getRequirementProjectSnapshot(requirementId: string) {
@@ -371,6 +384,16 @@ export class WorkflowStore {
     if (!projectIds.length) return [];
     const placeholders = projectIds.map(() => "?").join(",");
     return this.db.prepare(`SELECT id, status FROM projects WHERE id IN (${placeholders})`).all(...projectIds) as Array<{ id: string; status: string }>;
+  }
+
+  private versionValidationRows(versionIds: string[]) {
+    const result = new Map<string, { id: string; projectId: string; status: string }>();
+    if (!versionIds.length) return result;
+    const placeholders = versionIds.map(() => "?").join(",");
+    const rows = this.db.prepare(`SELECT id, project_id, status FROM project_versions WHERE id IN (${placeholders})`)
+      .all(...versionIds) as Array<{ id: string; project_id: string; status: string }>;
+    for (const row of rows) result.set(row.id, { id: row.id, projectId: row.project_id, status: row.status });
+    return result;
   }
 
   private moduleIndexes(projectIds: string[]) {
@@ -628,6 +651,98 @@ export class WorkflowStore {
     return item;
   }
 
+  createProjectVersion(input: {
+    projectId: string;
+    name: string;
+    branch: string;
+    baseBranch: string;
+    worktreePath: string;
+    headCommit: string;
+  }): ProjectVersion {
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (!this.db.prepare("SELECT id FROM projects WHERE id = ? AND status = 'active'").get(input.projectId)) {
+        throw new Error("PROJECT_NOT_ACTIVE");
+      }
+      if (this.db.prepare("SELECT id FROM project_versions WHERE project_id = ? AND name = ?").get(input.projectId, input.name)) {
+        throw new Error("PROJECT_VERSION_NAME_EXISTS");
+      }
+      if (this.db.prepare("SELECT id FROM project_versions WHERE project_id = ? AND branch = ?").get(input.projectId, input.branch)) {
+        throw new Error("PROJECT_VERSION_BRANCH_EXISTS");
+      }
+      if (this.db.prepare("SELECT id FROM project_versions WHERE worktree_path = ?").get(input.worktreePath)) {
+        throw new Error("PROJECT_VERSION_WORKTREE_EXISTS");
+      }
+      this.db.prepare(`INSERT INTO project_versions
+        (id, project_id, name, branch, base_branch, worktree_path, status, head_commit,
+         pending_requirement_id, pending_integration_run_id, created_at, updated_at, closed_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, NULL, ?, ?, NULL)`)
+        .run(id, input.projectId, input.name, input.branch, input.baseBranch, input.worktreePath, input.headCommit, now, now);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw mapProjectVersionConstraint(error);
+    }
+    return this.getProjectVersion(id)!;
+  }
+
+  listProjectVersions(projectId: string, status: "active" | "closed" | "all"): ProjectVersion[] {
+    const statusClause = status === "all" ? "" : " AND pv.status = ?";
+    const parameters = status === "all" ? [projectId] : [projectId, status];
+    return (this.db.prepare(`SELECT pv.*, p.name AS project_name FROM project_versions pv
+      JOIN projects p ON p.id = pv.project_id WHERE pv.project_id = ?${statusClause}
+      ORDER BY pv.created_at DESC`).all(...parameters) as any[]).map(mapProjectVersion);
+  }
+
+  getProjectVersion(id: string): ProjectVersion | null {
+    const row = this.db.prepare(`SELECT pv.*, p.name AS project_name FROM project_versions pv
+      JOIN projects p ON p.id = pv.project_id WHERE pv.id = ?`).get(id);
+    return row ? mapProjectVersion(row as any) : null;
+  }
+
+  updateProjectVersionHead(id: string, headCommit: string): ProjectVersion | null {
+    const result = this.db.prepare("UPDATE project_versions SET head_commit = ?, updated_at = ? WHERE id = ?")
+      .run(headCommit, new Date().toISOString(), id);
+    return result.changes ? this.getProjectVersion(id) : null;
+  }
+
+  closeProjectVersion(id: string): ProjectVersion {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const version = this.db.prepare("SELECT * FROM project_versions WHERE id = ?").get(id) as any;
+      if (!version) throw new Error("PROJECT_VERSION_NOT_FOUND");
+      if (version.status === "closed") {
+        this.db.exec("COMMIT");
+        return this.getProjectVersion(id)!;
+      }
+      if (version.pending_requirement_id || version.pending_integration_run_id) {
+        throw new Error("PROJECT_VERSION_CLOSE_BLOCKED");
+      }
+      const activeRequirement = this.db.prepare(`SELECT r.id FROM requirements r
+        JOIN requirement_projects rp ON rp.requirement_id = r.id
+        WHERE rp.project_version_id = ? AND rp.status = 'active'
+          AND r.status NOT IN ('completed', 'closed', 'cancelled') LIMIT 1`).get(id);
+      if (activeRequirement) throw new Error("PROJECT_VERSION_HAS_ACTIVE_REQUIREMENTS");
+      const now = new Date().toISOString();
+      this.db.prepare("UPDATE project_versions SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?")
+        .run(now, now, id);
+      this.db.exec("COMMIT");
+      return this.getProjectVersion(id)!;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listVersionRequirements(id: string): any[] {
+    return (this.db.prepare(`SELECT DISTINCT r.* FROM requirements r
+      JOIN requirement_projects rp ON rp.requirement_id = r.id
+      WHERE rp.project_version_id = ? ORDER BY r.created_at DESC`).all(id) as any[])
+      .map((row) => this.mapRequirementWithProjects(row));
+  }
+
   updateProject(id: string, input: any) {
     const current = this.getProject(id);
     if (!current) return null;
@@ -773,9 +888,18 @@ function mapRequirement(row: any) {
   };
 }
 
-function mapRequirementProject(row: any): RequirementProject {
+function mapRequirementProject(row: any): RequirementProject & {
+  projectVersionWorktreePath?: string;
+  projectVersionHead?: string;
+} {
   return {
     id: row.id, requirementId: row.requirement_id, projectId: row.project_id, projectName: row.project_name,
+    projectVersionId: row.project_version_id ?? undefined,
+    projectVersionName: row.project_version_name ?? undefined,
+    projectVersionBranch: row.project_version_branch ?? undefined,
+    projectVersionStatus: row.project_version_status ?? undefined,
+    projectVersionWorktreePath: row.project_version_worktree_path ?? undefined,
+    projectVersionHead: row.project_version_head ?? undefined,
     role: row.role, usage: row.usage, deliveryRequired: Boolean(row.delivery_required), moduleMode: row.module_mode,
     moduleIds: JSON.parse(row.module_ids_json || "[]"), position: row.position, status: row.status,
     projectStatus: row.project_status,
@@ -796,6 +920,33 @@ function mapProject(row: any) {
     allowedCommands: JSON.parse(row.allowed_commands || "[]"), sensitivePatterns: JSON.parse(row.sensitive_patterns || "[]"),
     category: row.category ?? null, technology: JSON.parse(row.technology_json || "[]"), status: row.status || "active",
     createdAt: row.created_at, updatedAt: row.updated_at || row.created_at };
+}
+
+function mapProjectVersion(row: any): ProjectVersion {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    projectName: row.project_name ?? undefined,
+    name: row.name,
+    branch: row.branch,
+    baseBranch: row.base_branch,
+    worktreePath: row.worktree_path,
+    status: row.status,
+    headCommit: row.head_commit,
+    pendingRequirementId: row.pending_requirement_id ?? undefined,
+    pendingIntegrationRunId: row.pending_integration_run_id ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    closedAt: row.closed_at ?? undefined
+  };
+}
+
+function mapProjectVersionConstraint(error: unknown): unknown {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("project_versions.project_id, project_versions.name")) return new Error("PROJECT_VERSION_NAME_EXISTS");
+  if (message.includes("project_versions.project_id, project_versions.branch")) return new Error("PROJECT_VERSION_BRANCH_EXISTS");
+  if (message.includes("project_versions.worktree_path")) return new Error("PROJECT_VERSION_WORKTREE_EXISTS");
+  return error;
 }
 
 function canonicalRepoPath(repoPath: string) {
