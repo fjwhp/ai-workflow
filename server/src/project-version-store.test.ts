@@ -184,6 +184,21 @@ describe("requirement code allocation", () => {
 });
 
 describe("project version persistence", () => {
+  it("persists a caller-provided id and maps duplicate ids to a stable error", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Explicit ID", "/tmp/project-version-explicit-id");
+    const input = {
+      id: "version-explicit", projectId: project.id, name: "1.0.0", branch: "feature/explicit",
+      baseBranch: "main", worktreePath: "/tmp/version-explicit", headCommit: "explicit-head"
+    };
+
+    expect(store.createProjectVersion(input)).toMatchObject({ id: "version-explicit" });
+    expect(store.getProjectVersion("version-explicit")).toMatchObject({ name: "1.0.0" });
+    expect(() => store.createProjectVersion({
+      ...input, name: "2.0.0", branch: "feature/explicit-two", worktreePath: "/tmp/version-explicit-two"
+    })).toThrow("PROJECT_VERSION_ID_EXISTS");
+  });
+
   it("creates, lists, gets, and updates a complete joined project version", async () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = createProject(store, "API", "/tmp/project-version-api");

@@ -19,6 +19,7 @@ import { publishRequirementKnowledge, refreshRequirementKnowledge } from "./proj
 import { inspectProjectRepository } from "./project-service.js";
 import { hasMaterialAssociationChange, normalizeModuleId, resolveSoleDeliveryProject } from "./requirement-projects.js";
 import { buildRequirementProjectContext, ProjectContextError, resolveProjectContextBudget } from "./project-context.js";
+import { registerProjectVersionRoutes } from "./project-version-routes.js";
 
 const requirementRevisionSchema = requirementInputSchema.extend({
   clarifications: requirementInputSchema.shape.businessProblem,
@@ -29,6 +30,7 @@ export async function buildApp(store: WorkflowStore) {
   const app = Fastify({ logger: true });
   for(const item of store.listRequirements())if(item.status==="completed"&&item.projectId&&!store.getKnowledgeChangeSet(item.id).id){try{publishRequirementKnowledge(store,item.id)}catch{/* Existing completed data remains usable if backfill fails. */}}
   await app.register(cors, { origin: /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/ });
+  await registerProjectVersionRoutes(app, { store });
   app.get("/api/health", async () => ({
     ok: true,
     openAiConfigured: Boolean(process.env.OPENAI_API_KEY),

@@ -675,6 +675,7 @@ export class WorkflowStore {
   }
 
   createProjectVersion(input: {
+    id?: string;
     projectId: string;
     name: string;
     branch: string;
@@ -683,7 +684,7 @@ export class WorkflowStore {
     headCommit: string;
   }): ProjectVersion {
     const now = new Date().toISOString();
-    const id = randomUUID();
+    const id = input.id ?? randomUUID();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       if (!this.db.prepare("SELECT id FROM projects WHERE id = ? AND status = 'active'").get(input.projectId)) {
@@ -969,6 +970,7 @@ function mapProjectVersion(row: any): ProjectVersion {
 
 function mapProjectVersionConstraint(error: unknown): unknown {
   const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("project_versions.id")) return new Error("PROJECT_VERSION_ID_EXISTS");
   if (message.includes("project_versions.project_id, project_versions.name")) return new Error("PROJECT_VERSION_NAME_EXISTS");
   if (message.includes("project_versions.project_id, project_versions.branch")) return new Error("PROJECT_VERSION_BRANCH_EXISTS");
   if (message.includes("project_versions.worktree_path")) return new Error("PROJECT_VERSION_WORKTREE_EXISTS");
