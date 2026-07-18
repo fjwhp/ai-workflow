@@ -47,7 +47,8 @@ describe("project and requirement association APIs",()=>{
 
     expect(response.statusCode).toBe(202);const run=store.getStageRun(response.json().id) as any;
     expect(run.input.projectContext.projects.map((project:any)=>project.projectId)).toEqual([primary.id,delivery.id]);
-    expect(run.events.filter((event:any)=>event.type==="knowledge.retrieved").map((event:any)=>event.payload.projectId)).toEqual([primary.id,delivery.id]);
+    expect(run.input.projectContext).toMatchObject({budgetMaxChars:200_000,truncated:false});
+    expect(run.events.filter((event:any)=>event.type==="knowledge.retrieved").map((event:any)=>event.payload)).toMatchObject([{projectId:primary.id,budgetMaxChars:200_000},{projectId:delivery.id,budgetMaxChars:200_000}]);
     for(let attempt=0;attempt<50&&store.getStageRun(run.id)?.status==="running";attempt++)await new Promise(resolve=>setTimeout(resolve,10));
     await app.close();
   });

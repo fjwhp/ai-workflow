@@ -428,7 +428,7 @@ Create two ready knowledge snapshots and assert technical design receives both w
 const context = await buildRequirementProjectContext(store, requirement.id, "technical_design");
 expect(context.projects.map(item => item.projectId)).toEqual(["backend", "web"]);
 expect(context.projects[0]).toMatchObject({ role: "primary", usage: "context" });
-expect(context.totalChars).toBeLessThanOrEqual(60000);
+expect(context.totalChars).toBeLessThanOrEqual(context.budgetMaxChars);
 ```
 
 Add a test that two delivery projects produce `MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED` at coding and that PRD/review can still run.
@@ -441,13 +441,13 @@ Expected: FAIL because context assembly does not exist.
 
 - [ ] **Step 3: Implement role-aware bounded retrieval**
 
-`buildRequirementProjectContext(store, requirementId, stage)` loads all active associations in position order. For `technical_design`, retrieve at most 24 entries and 20,000 characters per project, then enforce a 60,000-character aggregate cap. Each project block contains identity, role, usage, module scope, knowledge version, source head, summary, and bounded entries.
+`buildRequirementProjectContext(store, requirementId, stage, budget)` loads all active associations in position order. Retrieve at most 24 entries per project and allocate the configurable aggregate serialized-JSON character budget fairly across active projects. `AI_PROJECT_CONTEXT_MAX_CHARS` defaults to 200,000, rejects unsafe low/invalid values, and has a 1,000,000-character hard ceiling. The exact serialized project array must fit the applied budget; this character count is not a model-token estimate. Each project block contains identity, role, usage, module scope, knowledge version, source head, summary, and bounded entries.
 
 For coding and later project-execution stages in phase 1, call `resolveSoleDeliveryProject`; inject only that project's knowledge and module scope. Do not let the coding runner write outside that repository worktree.
 
 - [ ] **Step 4: Update run evidence**
 
-Record one `knowledge.retrieved` event per project with project ID, knowledge version, source head, paths, and truncation. Store the frozen association snapshot when technical design is approved.
+Record one `knowledge.retrieved` event per project with project ID, knowledge version, source head, paths, applied character budget, serialized size, and truncation. Store the frozen association snapshot when technical design is approved.
 
 - [ ] **Step 5: Run AI and API tests**
 

@@ -3,8 +3,9 @@ import { ensureProjectKnowledge, retrieveProjectKnowledge } from "./knowledge-se
 import { MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED, resolveSoleDeliveryProject } from "./requirement-projects.js";
 import type { WorkflowStore } from "./store.js";
 
-const PROJECT_CHAR_CAP = 20_000;
-const AGGREGATE_CHAR_CAP = 60_000;
+export const DEFAULT_PROJECT_CONTEXT_MAX_CHARS = 200_000;
+export const MIN_PROJECT_CONTEXT_MAX_CHARS = 4_000;
+export const MAX_PROJECT_CONTEXT_MAX_CHARS = 1_000_000;
 const ENTRY_CAP = 24;
 const EXECUTION_STAGES = new Set<WorkflowStage>(["coding", "code_review", "testing", "acceptance", "integration"]);
 
@@ -20,9 +21,16 @@ export interface ProjectContextBlock {
   entries: any[]; totalAvailable: number; totalChars: number; truncated: boolean; status: "ready";
 }
 
-export interface RequirementProjectContext { projects: ProjectContextBlock[]; totalChars: number; truncated: boolean }
+export interface ProjectContextBudget { maxChars: number }
+export interface RequirementProjectContext { projects: ProjectContextBlock[]; budgetMaxChars: number; totalChars: number; truncated: boolean }
 
-export async function buildRequirementProjectContext(store: WorkflowStore, requirementId: string, stage: WorkflowStage): Promise<RequirementProjectContext> {
+export function resolveProjectContextBudget(value: unknown = process.env.AI_PROJECT_CONTEXT_MAX_CHARS): ProjectContextBudget {
+  const parsed = typeof value === "number" ? value : typeof value === "string" && /^\d+$/.test(value.trim()) ? Number(value) : NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < MIN_PROJECT_CONTEXT_MAX_CHARS) return { maxChars: DEFAULT_PROJECT_CONTEXT_MAX_CHARS };
+  return { maxChars: Math.min(parsed, MAX_PROJECT_CONTEXT_MAX_CHARS) };
+}
+
+export async function buildRequirementProjectContext(store: WorkflowStore, requirementId: string, stage: WorkflowStage, budget: ProjectContextBudget = resolveProjectContextBudget()): Promise<RequirementProjectContext> {
   const requirement: any = store.getRequirement(requirementId);
   if (!requirement) throw new ProjectContextError("REQUIREMENT_NOT_FOUND");
   const active = store.listRequirementProjects(requirementId);
@@ -60,11 +68,12 @@ export async function buildRequirementProjectContext(store: WorkflowStore, requi
   if (failed.length) throw new ProjectContextError("PROJECT_KNOWLEDGE_UNAVAILABLE", failed);
   if (unavailable.length) throw new ProjectContextError("PROJECT_KNOWLEDGE_BUILDING", unavailable);
 
+  const appliedBudget = resolveProjectContextBudget(budget.maxChars);
   const arrayOverhead = 2 + Math.max(0, associations.length - 1);
-  const fairCap = Math.min(PROJECT_CHAR_CAP, Math.floor((AGGREGATE_CHAR_CAP - arrayOverhead) / Math.max(associations.length, 1)));
+  const fairCap = Math.floor((appliedBudget.maxChars - arrayOverhead) / Math.max(associations.length, 1));
   const projects = associations.map((association) => {
     const knowledge: any = ready.get(association.projectId);
-    const retrieved = retrieveProjectKnowledge(knowledge, requirement);
+    const retrieved = retrieveProjectKnowledge(knowledge, requirement, { maxChars: fairCap, maxEntries: ENTRY_CAP });
     return capBlock({
       projectId: association.projectId, name: nameOf(association), role: association.role, usage: association.usage,
       deliveryRequired: association.deliveryRequired, moduleMode: association.moduleMode, moduleIds: association.moduleIds,
@@ -72,11 +81,12 @@ export async function buildRequirementProjectContext(store: WorkflowStore, requi
       totalAvailable: retrieved.totalAvailable, totalChars: 0, truncated: retrieved.truncated, status: "ready" as const
     }, fairCap);
   });
-  const totalChars = projects.reduce((sum, project) => sum + project.totalChars, 0);
-  return { projects, totalChars, truncated: projects.some((project) => project.truncated) };
+  const totalChars = JSON.stringify(projects).length;
+  return { projects, budgetMaxChars: appliedBudget.maxChars, totalChars, truncated: projects.some((project) => project.truncated) };
 }
 
 function capBlock(input: ProjectContextBlock, cap: number): ProjectContextBlock {
+  const contentCap = Math.max(0, cap - 12);
   let changed = input.truncated;
   const text = (value: unknown, limit: number) => {
     const original = typeof value === "string" ? value : String(value ?? "");
@@ -96,16 +106,28 @@ function capBlock(input: ProjectContextBlock, cap: number): ProjectContextBlock 
   };
   const candidates = input.entries.slice(0, ENTRY_CAP).map((entry) => ({
     path: text(entry?.path, 512), kind: text(entry?.kind, 64), title: text(entry?.title, 256),
-    content: text(entry?.content, 4_000), tags: list(entry?.tags, 16, 128)
+    content: text(entry?.content, Math.min(16_000, cap)), tags: list(entry?.tags, 16, 128)
   }));
   if (input.entries.length > candidates.length) changed = true;
   block.truncated = changed;
-  while (JSON.stringify(block).length > cap && block.moduleIds.length) { block.moduleIds.pop(); block.truncated = true; }
-  while (JSON.stringify(block).length > cap && block.summary.length) { block.summary = block.summary.slice(0, Math.floor(block.summary.length / 2)); block.truncated = true; }
-  while (JSON.stringify(block).length > cap && block.name.length > 1) { block.name = block.name.slice(0, Math.floor(block.name.length / 2)); block.truncated = true; }
+  while (JSON.stringify(block).length > contentCap && block.moduleIds.length) { block.moduleIds.pop(); block.truncated = true; }
+  while (JSON.stringify(block).length > contentCap && block.summary.length) { block.summary = block.summary.slice(0, Math.floor(block.summary.length / 2)); block.truncated = true; }
+  while (JSON.stringify(block).length > contentCap && block.name.length > 1) { block.name = block.name.slice(0, Math.floor(block.name.length / 2)); block.truncated = true; }
   for (const candidate of candidates) {
     block.entries.push(candidate);
-    if (JSON.stringify(block).length > cap) { block.entries.pop(); block.truncated = true; break; }
+    if (JSON.stringify(block).length > contentCap) {
+      const originalContent = candidate.content;
+      let low = 0, high = candidate.content.length;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        candidate.content = originalContent.slice(0, middle);
+        if (JSON.stringify(block).length <= contentCap) low = middle; else high = middle - 1;
+      }
+      candidate.content = originalContent.slice(0, low);
+      if (!candidate.content || JSON.stringify(block).length > contentCap) block.entries.pop();
+      block.truncated = true;
+      break;
+    }
   }
   if (input.totalAvailable > block.entries.length || input.entries.length > block.entries.length) block.truncated = true;
   do { block.totalChars = JSON.stringify(block).length; } while (block.totalChars !== JSON.stringify(block).length);

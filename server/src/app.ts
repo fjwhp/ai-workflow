@@ -18,7 +18,7 @@ import { buildVerificationPlan } from "./verification-plan.js";
 import { publishRequirementKnowledge, refreshRequirementKnowledge } from "./project-memory-service.js";
 import { inspectProjectRepository } from "./project-service.js";
 import { hasMaterialAssociationChange, resolveSoleDeliveryProject } from "./requirement-projects.js";
-import { buildRequirementProjectContext, ProjectContextError } from "./project-context.js";
+import { buildRequirementProjectContext, ProjectContextError, resolveProjectContextBudget } from "./project-context.js";
 
 const requirementRevisionSchema = requirementInputSchema.extend({
   clarifications: requirementInputSchema.shape.businessProblem,
@@ -101,13 +101,14 @@ export async function buildApp(store: WorkflowStore) {
     const reworkContext=item.status==="returned"?store.getLatestReworkContext(item.id):null;
     let projectContext:any=undefined;
     if(["prd","requirement_review","technical_design","coding","code_review","testing","acceptance"].includes(item.stage)){
-      try{projectContext=await buildRequirementProjectContext(store,item.id,item.stage);}
+      const projectContextBudget=resolveProjectContextBudget(process.env.AI_PROJECT_CONTEXT_MAX_CHARS);
+      try{projectContext=await buildRequirementProjectContext(store,item.id,item.stage,projectContextBudget);}
       catch(error){return sendProjectContextError(reply,error);}
     }
     const context = { requirement: item, priorArtifacts: store.listArtifacts(item.id), approvalHistory: store.listApprovals(item.id), projectContext, reworkRequired:Boolean(reworkContext), reworkContext, userContext: req.body?.context };
     const model = item.stage === "coding" ? (process.env.OPENAI_CODING_MODEL || process.env.OPENAI_MODEL || "gpt-5.5") : (process.env.OPENAI_MODEL || "gpt-5.5");
     const run = store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: redactSensitive(context, project?.sensitivePatterns || []) });
-    for(const block of projectContext?.projects??[])store.appendStageRunEvent(run.id,"knowledge.retrieved",{projectId:block.projectId,version:block.version,sourceHead:block.sourceHead,paths:block.entries.map((entry:any)=>entry.path),totalAvailable:block.totalAvailable,truncated:block.truncated});
+    for(const block of projectContext?.projects??[])store.appendStageRunEvent(run.id,"knowledge.retrieved",{projectId:block.projectId,version:block.version,sourceHead:block.sourceHead,paths:block.entries.map((entry:any)=>entry.path),totalAvailable:block.totalAvailable,budgetMaxChars:projectContext.budgetMaxChars,totalChars:block.totalChars,contextTotalChars:projectContext.totalChars,truncated:block.truncated});
     store.updateRequirementState(item.id, item.stage, "ai_running");
     void executeRun(run.id, item, context, project);
     return reply.code(202).send(run);

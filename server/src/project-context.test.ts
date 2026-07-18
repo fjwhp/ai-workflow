@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { WorkflowStore } from "./store.js";
-import { buildRequirementProjectContext } from "./project-context.js";
+import { DEFAULT_PROJECT_CONTEXT_MAX_CHARS, MAX_PROJECT_CONTEXT_MAX_CHARS, buildRequirementProjectContext, resolveProjectContextBudget } from "./project-context.js";
 import { execFile, execFileSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -44,7 +44,7 @@ describe("buildRequirementProjectContext", () => {
     ]);
   });
 
-  it("enforces entry, project, and aggregate caps with truthful truncation", async () => {
+  it("fairly shares a custom aggregate budget with truthful truncation", async () => {
     const { store, primary, delivery, requirement } = fixture();
     const third = store.createProject({ name: "Ledger", repoPath: join(process.cwd(), "shared"), defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
     store.replaceRequirementProjects(requirement.id, [
@@ -54,23 +54,40 @@ describe("buildRequirementProjectContext", () => {
     ]);
     for (const project of [primary, delivery, third]) ready(store, project.id, `${project.name} summary`, Array.from({ length: 30 }, (_, index) => ({ path: `src/${index}`, kind: "module", title: `Module ${index}`, content: "x".repeat(1500), tags: [] })));
 
-    const context = await buildRequirementProjectContext(store, requirement.id, "technical_design");
+    const context = await buildRequirementProjectContext(store, requirement.id, "technical_design", { maxChars: 12_000 });
 
     expect(context.projects).toHaveLength(3);
-    expect(context.projects.every((project) => project.entries.length <= 24 && project.totalChars <= 20_000)).toBe(true);
-    expect(context.projects.every((project) => JSON.stringify(project).length <= 20_000)).toBe(true);
+    expect(context.projects.every((project) => project.entries.length > 0 && project.totalChars <= 4_000)).toBe(true);
     expect(context.projects.every((project) => project.truncated && project.totalAvailable === 30)).toBe(true);
-    expect(context.totalChars).toBeLessThanOrEqual(60_000);
-    expect(context.projects.reduce((sum, project) => sum + JSON.stringify(project).length, 0)).toBeLessThanOrEqual(60_000);
-    expect(JSON.stringify(context.projects).length).toBeLessThanOrEqual(60_000);
+    expect(context.budgetMaxChars).toBe(12_000);
+    expect(JSON.stringify(context.projects).length).toBeLessThanOrEqual(12_000);
     expect(context.truncated).toBe(true);
+  });
+
+  it("uses a 200k default that permits more than 60k of useful coding context", async () => {
+    const { store, delivery, requirement } = fixture();
+    ready(store, delivery.id, "Orders", Array.from({ length: 24 }, (_, index) => ({ path: `src/orders/${index}`, kind: "module", title: `Orders ${index}`, content: `order ${"x".repeat(3_900)}`, tags: ["order"] })));
+
+    const context = await buildRequirementProjectContext(store, requirement.id, "coding");
+
+    expect(context.budgetMaxChars).toBe(DEFAULT_PROJECT_CONTEXT_MAX_CHARS);
+    expect(JSON.stringify(context.projects).length).toBeGreaterThan(60_000);
+    expect(JSON.stringify(context.projects).length).toBeLessThanOrEqual(DEFAULT_PROJECT_CONTEXT_MAX_CHARS);
+  });
+
+  it("resolves invalid, too-small, and excessive configured budgets safely", () => {
+    expect(resolveProjectContextBudget(undefined).maxChars).toBe(DEFAULT_PROJECT_CONTEXT_MAX_CHARS);
+    expect(resolveProjectContextBudget("nope").maxChars).toBe(DEFAULT_PROJECT_CONTEXT_MAX_CHARS);
+    expect(resolveProjectContextBudget("100").maxChars).toBe(DEFAULT_PROJECT_CONTEXT_MAX_CHARS);
+    expect(resolveProjectContextBudget("20000").maxChars).toBe(20_000);
+    expect(resolveProjectContextBudget("2000000").maxChars).toBe(MAX_PROJECT_CONTEXT_MAX_CHARS);
   });
 
   it("uses only the sole delivery project for coding", async () => {
     const { store, primary, delivery, requirement } = fixture();
     ready(store, primary.id, "Architecture", []); ready(store, delivery.id, "Orders", []);
 
-    const context = await buildRequirementProjectContext(store, requirement.id, "coding");
+    const context = await buildRequirementProjectContext(store, requirement.id, "coding", { maxChars: 20_000 });
 
     expect(context.projects.map((project) => project.projectId)).toEqual([delivery.id]);
   });
@@ -115,11 +132,11 @@ describe("buildRequirementProjectContext", () => {
     ready(store, project.id, "summary".repeat(8_000), moduleIds.map((path, index) => ({ path, kind: "module", title: `Title-${index}-${"t".repeat(1_000)}`, content: "content".repeat(1_000), tags: Array.from({ length: 50 }, (_, tag) => `tag-${tag}-${"z".repeat(100)}`) })));
     store.replaceRequirementProjects(requirement.id, [{ projectId: project.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "selected", moduleIds, position: 0 }]);
 
-    const context = await buildRequirementProjectContext(store, requirement.id, "coding");
+    const context = await buildRequirementProjectContext(store, requirement.id, "coding", { maxChars: 20_000 });
     const block = context.projects[0]!;
     expect(block.projectId).toBe(project.id); expect(block.name.length).toBeGreaterThan(0); expect(block.truncated).toBe(true);
     expect(JSON.stringify(block).length).toBeLessThanOrEqual(20_000);
-    expect(JSON.stringify(context.projects).length).toBeLessThanOrEqual(60_000);
-    expect(context.totalChars).toBe(JSON.stringify(block).length);
+    expect(JSON.stringify(context.projects).length).toBeLessThanOrEqual(20_000);
+    expect(context.totalChars).toBe(JSON.stringify(context.projects).length);
   });
 });
