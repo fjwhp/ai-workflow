@@ -6,6 +6,21 @@ import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type P
 import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./human-override.js";
 import { validateRequirementProjects } from "./requirement-projects.js";
 
+export type RequirementProjectWithVersionMetadata = RequirementProject & {
+  projectVersionWorktreePath?: string;
+  projectVersionHead?: string;
+};
+
+export interface RequirementProjectSnapshot {
+  id: string;
+  requirementId: string;
+  version: number;
+  associations: RequirementProjectWithVersionMetadata[];
+  status: "active" | "superseded";
+  supersededAt: string | null;
+  createdAt: string;
+}
+
 export class WorkflowStore {
   private db: DatabaseSync;
 
@@ -280,7 +295,7 @@ export class WorkflowStore {
         input.moduleMode, JSON.stringify(input.moduleIds), input.position, now, now);
   }
 
-  listRequirementProjects(requirementId: string): RequirementProject[] {
+  listRequirementProjects(requirementId: string): RequirementProjectWithVersionMetadata[] {
     return (this.db.prepare(`SELECT rp.*, p.name AS project_name, p.status AS project_status,
         pv.name AS project_version_name, pv.branch AS project_version_branch,
         pv.status AS project_version_status, pv.worktree_path AS project_version_worktree_path,
@@ -291,7 +306,7 @@ export class WorkflowStore {
       .map(mapRequirementProject);
   }
 
-  listArchivedRequirementProjectHistory(requirementId: string): RequirementProject[] {
+  listArchivedRequirementProjectHistory(requirementId: string): RequirementProjectWithVersionMetadata[] {
     return (this.db.prepare(`SELECT rp.*, p.name AS project_name, p.status AS project_status,
         pv.name AS project_version_name, pv.branch AS project_version_branch,
         pv.status AS project_version_status, pv.worktree_path AS project_version_worktree_path,
@@ -299,6 +314,16 @@ export class WorkflowStore {
       FROM requirement_projects rp JOIN projects p ON p.id = rp.project_id
       LEFT JOIN project_versions pv ON pv.id = rp.project_version_id
       WHERE rp.requirement_id = ? AND rp.status = 'archived' AND p.status = 'archived'
+        AND NOT EXISTS (
+          SELECT 1 FROM requirement_projects active
+          WHERE active.requirement_id = rp.requirement_id AND active.project_id = rp.project_id AND active.status = 'active'
+        )
+        AND rp.rowid = (
+          SELECT historical.rowid FROM requirement_projects historical
+          WHERE historical.requirement_id = rp.requirement_id AND historical.project_id = rp.project_id
+            AND historical.status = 'archived'
+          ORDER BY historical.updated_at DESC, historical.created_at DESC, historical.rowid DESC LIMIT 1
+        )
       ORDER BY rp.position, rp.created_at`).all(requirementId) as any[]).map(mapRequirementProject);
   }
 
@@ -324,14 +349,17 @@ export class WorkflowStore {
     return this.listRequirementProjects(requirementId);
   }
 
-  createRequirementProjectSnapshot(requirementId: string) {
+  createRequirementProjectSnapshot(requirementId: string): RequirementProjectSnapshot {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
       const associations = this.listRequirementProjects(requirementId);
       const version = (this.db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM requirement_project_snapshots WHERE requirement_id = ?").get(requirementId) as { version: number }).version;
-      const item = { id: randomUUID(), requirementId, version, associations, status: "active" as const, supersededAt: null, createdAt: now };
+      const item: RequirementProjectSnapshot = {
+        id: randomUUID(), requirementId, version, associations,
+        status: "active", supersededAt: null, createdAt: now
+      };
       this.db.prepare("UPDATE requirement_project_snapshots SET status = 'superseded', superseded_at = ? WHERE requirement_id = ? AND status = 'active'").run(now, requirementId);
       this.db.prepare(`INSERT INTO requirement_project_snapshots
         (id, requirement_id, version, associations_json, status, superseded_at, created_at) VALUES (?, ?, ?, ?, 'active', NULL, ?)`)
@@ -341,12 +369,12 @@ export class WorkflowStore {
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
-  getRequirementProjectSnapshot(requirementId: string) {
+  getRequirementProjectSnapshot(requirementId: string): RequirementProjectSnapshot | null {
     const row = this.db.prepare("SELECT * FROM requirement_project_snapshots WHERE requirement_id = ? AND status = 'active' ORDER BY version DESC LIMIT 1").get(requirementId) as any;
     return row ? mapRequirementProjectSnapshot(row) : null;
   }
 
-  listRequirementProjectSnapshots(requirementId: string) {
+  listRequirementProjectSnapshots(requirementId: string): RequirementProjectSnapshot[] {
     return (this.db.prepare("SELECT * FROM requirement_project_snapshots WHERE requirement_id = ? ORDER BY version DESC").all(requirementId) as any[])
       .map(mapRequirementProjectSnapshot);
   }
@@ -883,10 +911,7 @@ function mapRequirement(row: any) {
   };
 }
 
-function mapRequirementProject(row: any): RequirementProject & {
-  projectVersionWorktreePath?: string;
-  projectVersionHead?: string;
-} {
+function mapRequirementProject(row: any): RequirementProjectWithVersionMetadata {
   return {
     id: row.id, requirementId: row.requirement_id, projectId: row.project_id, projectName: row.project_name,
     projectVersionId: row.project_version_id ?? undefined,
@@ -902,12 +927,18 @@ function mapRequirementProject(row: any): RequirementProject & {
   };
 }
 
-function mapRequirementProjectSnapshot(row: any) {
+function mapRequirementProjectSnapshot(row: any): RequirementProjectSnapshot {
   return {
     id: row.id, requirementId: row.requirement_id, version: row.version,
-    associations: JSON.parse(row.associations_json || "[]"), status: row.status,
+    associations: parseRequirementProjectSnapshotAssociations(row.associations_json), status: row.status,
     supersededAt: row.superseded_at, createdAt: row.created_at
   };
+}
+
+function parseRequirementProjectSnapshotAssociations(value: unknown): RequirementProjectWithVersionMetadata[] {
+  if (typeof value !== "string") return [];
+  const parsed: unknown = JSON.parse(value);
+  return Array.isArray(parsed) ? parsed as RequirementProjectWithVersionMetadata[] : [];
 }
 
 function mapProject(row: any) {

@@ -2,8 +2,12 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { WorkflowStore } from "./store.js";
+import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
+import {
+  WorkflowStore,
+  type RequirementProjectSnapshot,
+  type RequirementProjectWithVersionMetadata
+} from "./store.js";
 
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
@@ -249,6 +253,68 @@ describe("WorkflowStore", () => {
     expect(store.listRequirementProjects(req.id).map((item) => item.projectVersionId)).toEqual([undefined, collaboratorVersion.id]);
   });
 
+  it("omits archived project history when the same project remains actively associated", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject({ name: "Archived active", repoPath: "/tmp/archived-active", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const firstVersion = ensureProjectVersion(store, project.id)!;
+    const secondVersion = store.createProjectVersion({
+      projectId: project.id, name: "v2", branch: "feature/v2", baseBranch: "main",
+      worktreePath: "/tmp/archived-active-v2", headCommit: "v2-head"
+    });
+    const requirement = createRequirement(store, {
+      title: "Archived active history", businessProblem: "Active and archived rows duplicate projects",
+      expectedOutcome: "One project entry", priority: "medium", primaryProjectId: project.id,
+      primaryProjectVersionId: firstVersion.id
+    });
+    store.replaceRequirementProjects(requirement.id, [{
+      projectId: project.id, projectVersionId: secondVersion.id, role: "primary", usage: "delivery",
+      deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0
+    }]);
+    store.archiveProject(project.id);
+
+    const active = store.listRequirementProjects(requirement.id);
+    const archived = store.listArchivedRequirementProjectHistory(requirement.id);
+    expect(active[0]).toMatchObject({ projectId: project.id, projectVersionId: secondVersion.id, projectStatus: "archived" });
+    expect(archived).toEqual([]);
+    expect(new Set([...active, ...archived].map((item) => item.projectId)).size).toBe(active.length + archived.length);
+  });
+
+  it("returns only the latest archived association per removed project", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const removed = store.createProject({ name: "Removed", repoPath: "/tmp/removed-history", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const replacement = store.createProject({ name: "Replacement", repoPath: "/tmp/replacement-history", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const firstVersion = ensureProjectVersion(store, removed.id)!;
+    const secondVersion = store.createProjectVersion({
+      projectId: removed.id, name: "v2", branch: "feature/v2", baseBranch: "main",
+      worktreePath: "/tmp/removed-history-v2", headCommit: "v2-head"
+    });
+    const replacementVersion = ensureProjectVersion(store, replacement.id)!;
+    const requirement = createRequirement(store, {
+      title: "Latest archived history", businessProblem: "Version changes create duplicate project history",
+      expectedOutcome: "Latest project history only", priority: "medium", primaryProjectId: removed.id,
+      primaryProjectVersionId: firstVersion.id
+    });
+    for (const projectVersionId of [secondVersion.id, firstVersion.id, secondVersion.id]) {
+      store.replaceRequirementProjects(requirement.id, [{
+        projectId: removed.id, projectVersionId, role: "primary", usage: "delivery",
+        deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0
+      }]);
+    }
+    store.replaceRequirementProjects(requirement.id, [{
+      projectId: replacement.id, projectVersionId: replacementVersion.id, role: "primary", usage: "delivery",
+      deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0
+    }]);
+    store.archiveProject(removed.id);
+
+    const active = store.listRequirementProjects(requirement.id);
+    const archived = store.listArchivedRequirementProjectHistory(requirement.id);
+    expect(archived).toHaveLength(1);
+    expect(archived[0]).toMatchObject({
+      projectId: removed.id, projectVersionId: secondVersion.id, status: "archived", projectStatus: "archived"
+    });
+    expect(new Set([...active, ...archived].map((item) => item.projectId)).size).toBe(active.length + archived.length);
+  });
+
   it("validates selected modules against the latest ready knowledge index", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = store.createProject({ name: "Modules", repoPath: "/tmp/rp-modules", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
@@ -268,6 +334,10 @@ describe("WorkflowStore", () => {
     const req = createRequirement(store, { title: "Snapshot associations", businessProblem: "Execution needs frozen project configuration", expectedOutcome: "Immutable evidence", priority: "medium", primaryProjectId: project.id });
     const version = ensureProjectVersion(store, project.id)!;
     const first = store.createRequirementProjectSnapshot(req.id);
+    expectTypeOf(first).toEqualTypeOf<RequirementProjectSnapshot>();
+    expectTypeOf(first.associations).toEqualTypeOf<RequirementProjectWithVersionMetadata[]>();
+    expect(first.associations[0]!.projectVersionHead).toBe("fixture-head");
+    expect(first.associations[0]!.projectVersionWorktreePath).toBe(`/tmp/requirement-version-${project.id}`);
     store.updateProjectVersionHead(version.id, "new-head");
     store.replaceRequirementProjects(req.id, [{ projectId: project.id, role: "primary", usage: "context", deliveryRequired: false, moduleMode: "auto", moduleIds: [], position: 4 }]);
     const second = store.createRequirementProjectSnapshot(req.id);
