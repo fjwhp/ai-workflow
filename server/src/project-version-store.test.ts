@@ -620,6 +620,75 @@ describe("project version application leases", () => {
     }
   );
 
+  it("atomically claims a failed application retest while keeping the requirement externally failed", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Retest claim", "/tmp/retest-claim");
+    const version = createVersion(store, project.id, "retest-claim", "/tmp/retest-claim-v1");
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Retest claim"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "retest-claim")
+    });
+    store.completeVersionApplicationApply({
+      runId: "run-retest-claim", sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
+      status: "merge_test_failed"
+    });
+
+    expect(store.beginVersionApplicationRetest({ versionId: version.id, runId: "run-retest-claim" }))
+      .toMatchObject({ status: "retesting" });
+    expect(store.getRequirement(requirement.id)?.status).toBe("merge_test_failed");
+    expect(() => store.beginVersionApplicationRetest({ versionId: version.id, runId: "run-retest-claim" }))
+      .toThrow("VERSION_APPLICATION_RETEST_BUSY");
+    expect(store.getProjectVersion(version.id)?.pendingIntegrationRunId).toBe("run-retest-claim");
+  });
+
+  it("completes an application retest only from the claimed retesting state", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Retest completion", "/tmp/retest-completion");
+    const version = createVersion(store, project.id, "retest-completion", "/tmp/retest-completion-v1");
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Retest completion"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "retest-completion")
+    });
+    store.completeVersionApplicationApply({
+      runId: "run-retest-completion", sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
+      status: "merge_test_failed"
+    });
+
+    expect(() => store.completeVersionApplicationRetest({
+      versionId: version.id, runId: "run-retest-completion", status: "awaiting_local_resolution",
+      commandResults: []
+    })).toThrow("PROJECT_VERSION_APPLICATION_MISMATCH");
+    store.beginVersionApplicationRetest({ versionId: version.id, runId: "run-retest-completion" });
+    expect(store.completeVersionApplicationRetest({
+      versionId: version.id, runId: "run-retest-completion", status: "awaiting_local_resolution",
+      commandResults: []
+    })).toMatchObject({ status: "awaiting_local_resolution" });
+    expect(store.getRequirement(requirement.id)?.status).toBe("awaiting_local_resolution");
+  });
+
+  it("recovers interrupted application retests without releasing their version leases", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Retest recovery", "/tmp/retest-recovery");
+    const version = createVersion(store, project.id, "retest-recovery", "/tmp/retest-recovery-v1");
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Retest recovery"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "retest-recovery")
+    });
+    store.completeVersionApplicationApply({
+      runId: "run-retest-recovery", sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
+      status: "merge_test_failed"
+    });
+    store.beginVersionApplicationRetest({ versionId: version.id, runId: "run-retest-recovery" });
+
+    expect(store.recoverInterruptedVersionApplicationRetests()).toBe(1);
+    expect(store.getIntegrationRun("run-retest-recovery")).toMatchObject({ status: "merge_test_failed" });
+    expect(store.getRequirement(requirement.id)?.status).toBe("merge_test_failed");
+    expect(store.getProjectVersion(version.id)?.pendingIntegrationRunId).toBe("run-retest-recovery");
+  });
+
   it("atomically records a failed application and releases its lease", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = createProject(store, "Failed application", "/tmp/failed-application");
@@ -631,13 +700,13 @@ describe("project version application leases", () => {
     });
 
     expect(() => store.releaseFailedVersionApplication({
-      versionId: version.id, runId: "wrong-run", sourceCommit: "c".repeat(40), error: "conflict"
+      versionId: version.id, runId: "wrong-run", status: "conflict", sourceCommit: "c".repeat(40), error: "conflict"
     })).toThrow("PROJECT_VERSION_APPLICATION_MISMATCH");
     expect(store.getIntegrationRun("run-failed")?.status).toBe("running");
     expect(store.getProjectVersion(version.id)?.pendingIntegrationRunId).toBe("run-failed");
 
     const run = store.releaseFailedVersionApplication({
-      versionId: version.id, runId: "run-failed", sourceCommit: "c".repeat(40),
+      versionId: version.id, runId: "run-failed", status: "conflict", sourceCommit: "c".repeat(40),
       conflictFiles: ["value.txt"], error: "CONFLICT (content): value.txt"
     });
 
@@ -666,7 +735,7 @@ describe("project version application leases", () => {
     store.updateRequirementState(requirement.id, "integration", "cancelled");
 
     expect(() => store.releaseFailedVersionApplication({
-      versionId: version.id, runId: "run-late-failed", sourceCommit: "c".repeat(40), error: "conflict"
+      versionId: version.id, runId: "run-late-failed", status: "conflict", sourceCommit: "c".repeat(40), error: "conflict"
     })).toThrow("PROJECT_VERSION_APPLICATION_MISMATCH");
     expect(store.getIntegrationRun("run-late-failed")?.status).toBe("running");
     expect(store.getRequirement(requirement.id)?.status).toBe("cancelled");

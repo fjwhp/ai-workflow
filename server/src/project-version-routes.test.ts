@@ -660,6 +660,27 @@ describe("project version item routes", () => {
     apps.splice(apps.indexOf(app), 1);
   });
 
+  it("recovers an integration run already marked failed by startup interruption", async () => {
+    const { repoPath } = await setupRepository();
+    const store = createStore();
+    const project = createProject(store, repoPath);
+    const setupApp = await routeApp(store);
+    const interrupted = await pendingApplication(store, setupApp, project.id, "startup-already-failed", false);
+    expect(store.interruptActiveIntegrationRuns()).toBe(1);
+    await setupApp.close();
+    apps.splice(apps.indexOf(setupApp), 1);
+
+    const app = await fullApp(store);
+
+    expect(store.getIntegrationRun(interrupted.runId)).toMatchObject({
+      status: "failed", resolutionStatus: "ambiguous"
+    });
+    expect(store.getRequirement(interrupted.requirement.id)?.status).toBe("manual_resolution_required");
+    expect(store.getProjectVersion(interrupted.version.id)?.pendingIntegrationRunId).toBe(interrupted.runId);
+    await app.close();
+    apps.splice(apps.indexOf(app), 1);
+  });
+
   it("revalidates project activity after Git inspection before recheck or close writes", async () => {
     const { repoPath } = await setupRepository();
     const store = new ArchivingReadStore(":memory:"); stores.push(store);

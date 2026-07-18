@@ -6,9 +6,10 @@ import { buildApp, resolveReusableSourceCommit } from "./app.js";
 import { runCodexCoding } from "./codex-runner.js";
 import { WorkflowStore } from "./store.js";
 import { execFile } from "node:child_process";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { rmSync, writeFileSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { publishRequirementKnowledge } from "./project-memory-service.js";
 import { buildAgentPrompt } from "./ai.js";
@@ -51,14 +52,15 @@ async function versionApplicationFixture(store: WorkflowStore, options: { failin
   const repoPath = await projectRepo("workflow-api-version-application-");
   const root = join(repoPath, "..");
   const targetWorktreePath = join(root, `version-${crypto.randomUUID()}`);
-  const sourceWorktreePath = join(root, `requirement-${crypto.randomUUID()}`);
+  const sourceWorktreePath = join(root, ".ai-workflow-worktrees", basename(repoPath), "requirements", "REQ-0001");
   tempDirs.push(targetWorktreePath, sourceWorktreePath);
   const targetBranch = `release/${crypto.randomUUID()}`;
-  const sourceBranch = `ai/${crypto.randomUUID()}`;
+  const sourceBranch = "ai/REQ-0001";
   await writeFile(join(repoPath, "value.txt"), "base\n");
   await execFileAsync("git", ["-C", repoPath, "add", "--all"]);
   await execFileAsync("git", ["-C", repoPath, "commit", "-m", "application base"]);
   await execFileAsync("git", ["-C", repoPath, "worktree", "add", "-b", targetBranch, targetWorktreePath, "main"]);
+  await mkdir(join(sourceWorktreePath, ".."), { recursive: true });
   await execFileAsync("git", ["-C", repoPath, "worktree", "add", "-b", sourceBranch, sourceWorktreePath, "main"]);
   if (options.conflict) {
     await writeFile(join(sourceWorktreePath, "value.txt"), "source\n");
@@ -96,6 +98,28 @@ async function versionApplicationFixture(store: WorkflowStore, options: { failin
   });
   store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
   return { repoPath, targetWorktreePath, sourceWorktreePath, project, version, requirement, targetHead };
+}
+
+class SourceRemovingApplicationStore extends WorkflowStore {
+  override beginVersionApplication(input: Parameters<WorkflowStore["beginVersionApplication"]>[0]) {
+    const acquired = super.beginVersionApplication(input);
+    rmSync(input.run.worktreePath, { recursive: true, force: true });
+    return acquired;
+  }
+}
+
+class TargetEditingApplicationStore extends WorkflowStore {
+  override beginVersionApplication(input: Parameters<WorkflowStore["beginVersionApplication"]>[0]) {
+    const acquired = super.beginVersionApplication(input);
+    writeFileSync(join(acquired.version.worktreePath, "human-after-lease.txt"), "preserve me\n");
+    return acquired;
+  }
+}
+
+class ApplyCompletionFailingStore extends WorkflowStore {
+  override completeVersionApplicationApply(_input: Parameters<WorkflowStore["completeVersionApplicationApply"]>[0]): never {
+    throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
+  }
 }
 
 const projectPayload=(repoPath:string,extra:any={})=>({name:"API project",repoPath,defaultBranch:"main",allowedCommands:[],sensitivePatterns:[],...extra});
@@ -571,5 +595,126 @@ describe("stage run API", () => {
     expect(retried.json()).toMatchObject({ status: "awaiting_local_resolution", sourceCommit: sourceHead });
     expect((await execFileAsync("git", ["-C", fixture.sourceWorktreePath, "rev-parse", "HEAD"])).stdout.trim()).toBe(sourceHead);
     await app.close();
+  });
+
+  it("releases a safely untouched lease when the source disappears after acquisition", async () => {
+    const store = new SourceRemovingApplicationStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store);
+    const app = await buildApp(store);
+
+    const response = await app.inject({
+      method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {}
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("INTEGRATION_APPLICATION_FAILED");
+    expect(store.getLatestIntegrationRun(fixture.requirement.id)).toMatchObject({ status: "failed" });
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("awaiting_merge");
+    expect(store.getProjectVersion(fixture.version.id)?.pendingIntegrationRunId).toBeUndefined();
+    expect((await execFileAsync("git", ["-C", fixture.targetWorktreePath, "status", "--porcelain"])).stdout).toBe("");
+    await app.close();
+  });
+
+  it("retains the lease and preserves target edits introduced after acquisition", async () => {
+    const store = new TargetEditingApplicationStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store);
+    const app = await buildApp(store);
+
+    const response = await app.inject({
+      method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {}
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("INTEGRATION_APPLICATION_AMBIGUOUS");
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("manual_resolution_required");
+    expect(store.getProjectVersion(fixture.version.id)?.pendingIntegrationRunId).toBeTruthy();
+    expect(await readFile(join(fixture.targetWorktreePath, "human-after-lease.txt"), "utf8")).toBe("preserve me\n");
+    await app.close();
+  });
+
+  it("marks the retained lease ambiguous when apply completion loses its CAS", async () => {
+    const store = new ApplyCompletionFailingStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store);
+    const app = await buildApp(store);
+
+    const response = await app.inject({
+      method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {}
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("INTEGRATION_APPLICATION_AMBIGUOUS");
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("manual_resolution_required");
+    expect(store.getProjectVersion(fixture.version.id)?.pendingIntegrationRunId).toBeTruthy();
+    expect(store.getLatestIntegrationRun(fixture.requirement.id)).toMatchObject({ resolutionStatus: "ambiguous" });
+    await app.close();
+  });
+
+  it("rejects a retest target with the wrong identity before executing commands", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store, { failingTests: true });
+    const app = await buildApp(store);
+    const applied = await app.inject({
+      method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {}
+    });
+    expect(applied.statusCode).toBe(200);
+    const marker = join(fixture.repoPath, "retest-command-ran.txt");
+    await writeFile(join(fixture.targetWorktreePath, "package.json"), JSON.stringify({
+      scripts: { marker: `node -e \"require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')\"` }
+    }));
+    store.updateProject(fixture.project.id, {
+      allowedCommands: [{ command: "npm", argsPrefix: ["run", "marker"] }]
+    });
+    await execFileAsync("git", ["-C", fixture.targetWorktreePath, "checkout", "--detach"]);
+
+    const response = await app.inject({
+      method: "POST", url: `/api/requirements/${fixture.requirement.id}/integration-test`, payload: {}
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("INTEGRATION_TARGET_IDENTITY_INVALID");
+    await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("manual_resolution_required");
+    expect(store.getProjectVersion(fixture.version.id)?.pendingIntegrationRunId).toBe(applied.json().id);
+    await app.close();
+  });
+
+  it("allows only one of two concurrent integration retests to execute", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store, { failingTests: true });
+    const app = await buildApp(store);
+    expect((await app.inject({
+      method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {}
+    })).statusCode).toBe(200);
+    store.updateProject(fixture.project.id, {
+      allowedCommands: [{ command: "npm", argsPrefix: ["--version"] }]
+    });
+
+    const responses = await Promise.all([1, 2].map(() => app.inject({
+      method: "POST", url: `/api/requirements/${fixture.requirement.id}/integration-test`, payload: {}
+    })));
+
+    expect(responses.map((response) => response.statusCode).sort()).toEqual([200, 409]);
+    expect(responses.find((response) => response.statusCode === 409)?.json().error)
+      .toBe("VERSION_APPLICATION_RETEST_BUSY");
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("awaiting_local_resolution");
+    await app.close();
+  });
+
+  it("restores an interrupted retest claim during application startup", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store, { failingTests: true });
+    const firstApp = await buildApp(store);
+    const applied = await firstApp.inject({
+      method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {}
+    });
+    store.beginVersionApplicationRetest({ versionId: fixture.version.id, runId: applied.json().id });
+    await firstApp.close();
+
+    const restarted = await buildApp(store);
+
+    expect(store.getLatestIntegrationRun(fixture.requirement.id)).toMatchObject({ status: "merge_test_failed" });
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("merge_test_failed");
+    expect(store.getProjectVersion(fixture.version.id)?.pendingIntegrationRunId).toBe(applied.json().id);
+    await restarted.close();
   });
 });

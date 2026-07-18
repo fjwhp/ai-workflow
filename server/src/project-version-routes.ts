@@ -108,7 +108,8 @@ export async function recheckVersionApplication(
   const ambiguous = (currentHead: string) => {
     store.markVersionResolutionAmbiguous({
       versionId: version.id, runId: run.id, currentHead,
-      allowRunning: run.status === "running" && options.allowInterruptedRun
+      allowRunning: run.status === "running" && options.allowInterruptedRun,
+      allowFailed: run.status === "failed" && options.allowInterruptedRun
     });
     return { status: "ambiguous" as const, currentHead };
   };

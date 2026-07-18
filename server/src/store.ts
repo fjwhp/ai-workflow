@@ -992,7 +992,8 @@ export class WorkflowStore {
   releaseFailedVersionApplication(input: {
     versionId: string;
     runId: string;
-    sourceCommit: string;
+    status: "failed" | "conflict";
+    sourceCommit?: string;
     error: string;
     conflictFiles?: string[];
   }): IntegrationRun {
@@ -1015,9 +1016,9 @@ export class WorkflowStore {
         conflictFiles: input.conflictFiles ?? []
       };
       const runUpdated = this.db.prepare(`UPDATE integration_runs
-        SET status = 'conflict', source_commit = ?, preflight_json = ?, error = ?, completed_at = ?
+        SET status = ?, source_commit = ?, preflight_json = ?, error = ?, completed_at = ?
         WHERE id = ? AND status = 'running'`)
-        .run(input.sourceCommit, JSON.stringify(preflight), input.error, now, input.runId);
+        .run(input.status, input.sourceCommit ?? null, JSON.stringify(preflight), input.error, now, input.runId);
       if (runUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       const requirementUpdated = this.db.prepare(`UPDATE requirements
         SET stage = 'integration', status = 'awaiting_merge', updated_at = ?
@@ -1037,6 +1038,42 @@ export class WorkflowStore {
     }
   }
 
+  beginVersionApplicationRetest(input: { versionId: string; runId: string }): IntegrationRun {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const lease = this.db.prepare(`SELECT ir.status AS run_status, r.status AS requirement_status
+        FROM project_versions pv JOIN integration_runs ir
+          ON ir.id = pv.pending_integration_run_id
+         AND ir.requirement_id = pv.pending_requirement_id
+         AND ir.project_version_id = pv.id
+        JOIN requirements r ON r.id = ir.requirement_id
+        WHERE pv.id = ? AND pv.pending_integration_run_id = ?
+          AND r.stage = 'integration'`).get(input.versionId, input.runId) as any;
+      if (!lease) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
+      if (lease.run_status === "retesting") throw new Error("VERSION_APPLICATION_RETEST_BUSY");
+      if (lease.run_status !== "merge_test_failed" || lease.requirement_status !== "merge_test_failed") {
+        throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
+      }
+      const claimed = this.db.prepare(`UPDATE integration_runs
+        SET status = 'retesting', completed_at = NULL
+        WHERE id = ? AND status = 'merge_test_failed'`).run(input.runId);
+      if (claimed.changes !== 1) throw new Error("VERSION_APPLICATION_RETEST_BUSY");
+      this.db.exec("COMMIT");
+      return this.getIntegrationRun(input.runId)!;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  recoverInterruptedVersionApplicationRetests(): number {
+    const now = new Date().toISOString();
+    const restored = this.db.prepare(`UPDATE integration_runs
+      SET status = 'merge_test_failed', completed_at = ?
+      WHERE status = 'retesting'`).run(now);
+    return Number(restored.changes);
+  }
+
   completeVersionApplicationRetest(input: {
     versionId: string;
     runId: string;
@@ -1054,15 +1091,18 @@ export class WorkflowStore {
          AND ir.project_version_id = pv.id
         JOIN requirements r ON r.id = ir.requirement_id
         WHERE pv.id = ? AND pv.pending_integration_run_id = ?
-          AND ir.status = 'merge_test_failed' AND r.status = 'merge_test_failed'`)
+          AND ir.status = 'retesting' AND r.status = 'merge_test_failed'`)
         .get(input.versionId, input.runId) as any;
       if (!lease) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      this.db.prepare(`UPDATE integration_runs
-        SET status = ?, commands_json = ?, error = ?, completed_at = ? WHERE id = ?`)
+      const runUpdated = this.db.prepare(`UPDATE integration_runs
+        SET status = ?, commands_json = ?, error = ?, completed_at = ?
+        WHERE id = ? AND status = 'retesting'`)
         .run(input.status, JSON.stringify(input.commandResults), input.error ?? null, now, input.runId);
-      this.db.prepare(`UPDATE requirements SET status = ?, updated_at = ?
+      if (runUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
+      const requirementUpdated = this.db.prepare(`UPDATE requirements SET status = ?, updated_at = ?
         WHERE id = ? AND stage = 'integration' AND status = 'merge_test_failed'`)
         .run(input.status, now, lease.requirement_id);
+      if (requirementUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       this.db.exec("COMMIT");
       return this.getIntegrationRun(input.runId)!;
     } catch (error) {
@@ -1120,6 +1160,9 @@ export class WorkflowStore {
     runId: string;
     currentHead: string;
     allowRunning?: boolean;
+    allowFailed?: boolean;
+    allowRetesting?: boolean;
+    error?: string;
   }): IntegrationRun {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
@@ -1134,16 +1177,20 @@ export class WorkflowStore {
           AND ((ir.status IN ('awaiting_local_resolution', 'merge_test_failed')
                 AND (r.status = ir.status OR
                   (ir.resolution_status = 'ambiguous' AND r.status = 'manual_resolution_required')))
-            OR (? = 1 AND ir.status = 'running' AND r.status = 'awaiting_merge'))`)
-        .get(input.versionId, input.runId, input.allowRunning ? 1 : 0) as any;
+            OR (? = 1 AND ir.status = 'running' AND r.status = 'awaiting_merge')
+            OR (? = 1 AND ir.status = 'failed' AND r.status = 'awaiting_merge')
+            OR (? = 1 AND ir.status = 'retesting' AND r.status = 'merge_test_failed'))`)
+        .get(input.versionId, input.runId, input.allowRunning ? 1 : 0,
+          input.allowFailed ? 1 : 0, input.allowRetesting ? 1 : 0) as any;
       if (!lease) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       this.db.prepare(`UPDATE integration_runs
-        SET status = CASE WHEN status = 'running' THEN 'failed' ELSE status END,
+        SET status = CASE WHEN status = 'running' THEN 'failed'
+                          WHEN status = 'retesting' THEN 'merge_test_failed' ELSE status END,
             resolution_status = 'ambiguous', resolution_commit = ?,
-            error = CASE WHEN status = 'running' THEN '服务进程重启后无法确认本地应用状态' ELSE error END,
+            error = COALESCE(?, CASE WHEN status = 'running' THEN '服务进程重启后无法确认本地应用状态' ELSE error END),
             completed_at = COALESCE(completed_at, ?)
         WHERE id = ?`)
-        .run(input.currentHead, now, input.runId);
+        .run(input.currentHead, input.error ?? null, now, input.runId);
       this.db.prepare(`UPDATE requirements SET stage = 'integration',
         status = 'manual_resolution_required', updated_at = ? WHERE id = ?`)
         .run(now, lease.requirement_id);

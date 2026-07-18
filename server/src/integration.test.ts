@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { executeLocalIntegration, preflightLocalIntegration } from "./integration.js";
@@ -14,30 +14,62 @@ afterEach(() => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: 
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "flowgate-integration-")); roots.push(root);
-  const repo = join(root, "repo"), targetWorktree = join(root, "version"), sourceWorktree = join(root, "requirement");
+  const repo = join(root, "repo"), targetWorktree = join(root, "version");
+  const sourceWorktree = join(root, ".ai-workflow-worktrees", "repo", "requirements", "REQ-0001");
   await exec("git", ["init", "-b", "main", repo]);
   await exec("git", ["-C", repo, "config", "user.email", "test@example.com"]);
   await exec("git", ["-C", repo, "config", "user.name", "Flowgate Test"]);
   await writeFile(join(repo, "value.txt"), "base\n");
   await exec("git", ["-C", repo, "add", "--all"]); await exec("git", ["-C", repo, "commit", "-m", "base"]);
   await exec("git", ["-C", repo, "worktree", "add", "-b", "release/1.0", targetWorktree, "main"]);
-  await exec("git", ["-C", repo, "worktree", "add", "-b", "ai/req-1", sourceWorktree, "main"]);
+  await mkdir(dirname(sourceWorktree), { recursive: true });
+  await exec("git", ["-C", repo, "worktree", "add", "-b", "ai/REQ-0001", sourceWorktree, "main"]);
   await writeFile(join(sourceWorktree, "feature.txt"), "implemented\n");
   const snapshot = await getWorktreeSnapshot(sourceWorktree);
-  return { repo, targetWorktree, sourceWorktree, diffHash: hashDiff(snapshot.diff) };
+  return { root, repo, targetWorktree, sourceWorktree, diffHash: hashDiff(snapshot.diff) };
 }
 
 function integrationInput(item: Awaited<ReturnType<typeof fixture>>) {
   return {
+    projectRepoPath: item.repo,
     targetWorktreePath: item.targetWorktree,
     targetBranch: "release/1.0",
     sourceWorktreePath: item.sourceWorktree,
-    sourceBranch: "ai/req-1",
+    sourceBranch: "ai/REQ-0001",
     evidenceDiffHash: item.diffHash
   };
 }
 
 describe("local integration", () => {
+  it("rejects the registered project root as an integration target", async () => {
+    const item = await fixture();
+    const check = await preflightLocalIntegration({
+      ...integrationInput(item), targetWorktreePath: item.repo, targetBranch: "main"
+    });
+
+    expect(check.allowed).toBe(false);
+    expect(check.checks.find((entry) => entry.id === "target_identity")?.ok).toBe(false);
+  });
+
+  it("rejects a source path replaced by a worktree from another repository", async () => {
+    const item = await fixture();
+    const impostor = join(item.root, "impostor");
+    await exec("git", ["init", "-b", "ai/REQ-0001", impostor]);
+    await exec("git", ["-C", impostor, "config", "user.email", "test@example.com"]);
+    await exec("git", ["-C", impostor, "config", "user.name", "Impostor"]);
+    await writeFile(join(impostor, "value.txt"), "base\n");
+    await exec("git", ["-C", impostor, "add", "--all"]);
+    await exec("git", ["-C", impostor, "commit", "-m", "base"]);
+    await writeFile(join(impostor, "feature.txt"), "implemented\n");
+    await rm(item.sourceWorktree, { recursive: true, force: true });
+    await symlink(impostor, item.sourceWorktree);
+
+    const check = await preflightLocalIntegration(integrationInput(item));
+
+    expect(check.allowed).toBe(false);
+    expect(check.checks.find((entry) => entry.id === "source_identity")?.ok).toBe(false);
+  });
+
   it("returns the calculated verification plan in preflight", async () => {
     const item=await fixture(),fallbackCommands=[{command:"mvn",argsPrefix:["test"]}];
     const check=await preflightLocalIntegration({...integrationInput(item),changedFiles:["README.md"],fallbackCommands});
@@ -101,7 +133,7 @@ describe("local integration", () => {
     await exec("git", ["-C", item.targetWorktree, "add", "--all"]); await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target"]);
     const targetHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
     const result = await executeLocalIntegration({ ...integrationInput(item), evidenceDiffHash: hashDiff(sourceSnapshot.diff), commitMessage: "REQ-0001 conflict", commands: [] });
-    expect(result.status).toBe("conflict");
+    expect(result.status, JSON.stringify(result)).toBe("conflict");
     expect(result.conflictFiles).toEqual(["value.txt"]);
     expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
     expect(await readFile(join(item.targetWorktree, "value.txt"), "utf8")).toBe("target\n");
@@ -129,5 +161,47 @@ describe("local integration", () => {
     expect(result.statusPorcelain).toContain("A  feature.txt");
     expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
     expect((await exec("git", ["-C", item.targetWorktree, "diff", "--cached", "--name-only"])).stdout).toContain("feature.txt");
+  });
+
+  it("rejects source evidence changed by a pre-commit hook before touching the target", async () => {
+    const item = await fixture();
+    const hook = join(item.repo, ".git", "hooks", "pre-commit");
+    await writeFile(hook, [
+      "#!/bin/sh",
+      "printf 'hook-added\\n' > hook-added.txt",
+      "git add hook-added.txt"
+    ].join("\n"));
+    await chmod(hook, 0o755);
+    const targetHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), commitMessage: "REQ-0001 hook", commands: []
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("编码证据");
+    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
+    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toBe("");
+  });
+
+  it("preserves a tracked target edit injected after preflight without applying evidence", async () => {
+    const item = await fixture();
+    await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
+    const snapshot = await getWorktreeSnapshot(item.sourceWorktree);
+    const hook = join(item.repo, ".git", "hooks", "pre-commit");
+    await writeFile(hook, [
+      "#!/bin/sh",
+      `printf 'human after preflight\\n' > ${JSON.stringify(join(item.targetWorktree, "value.txt"))}`
+    ].join("\n"));
+    await chmod(hook, 0o755);
+
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), evidenceDiffHash: hashDiff(snapshot.diff),
+      commitMessage: "REQ-0001 target race", commands: []
+    });
+
+    expect(result.status).toBe("ambiguous");
+    expect(await readFile(join(item.targetWorktree, "value.txt"), "utf8")).toBe("human after preflight\n");
+    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).not.toContain("feature.txt");
   });
 });
