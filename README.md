@@ -4,6 +4,12 @@
 
 仓库现已包含本地 Web 应用。开发与启动方法见 [`docs/getting-started.md`](docs/getting-started.md)。
 
+## 多项目第一阶段
+
+`multi-project-v1` 首次启动会为旧 SQLite 主文件及现有 WAL/SHM 伴随文件创建同一时间戳的完整备份集，然后建立空数据库。旧项目和需求不会迁移；启动后需重新登记项目、等待项目知识库重建，再创建需求。具体备份格式、恢复步骤和上下文预算配置见 [`docs/getting-started.md`](docs/getting-started.md)。
+
+登记或重建知识库只读取本地 Git 仓库，不会修改源码、创建提交或分支，也不会推送。第一阶段可为需求配置多个上下文项目，但真实编码和后续集成必须恰好只有一个交付项目；两个或更多交付项目会在编码前停止并提示等待第二阶段。
+
 ## 使用顺序
 
 1. 阅读 [`docs/workflow-sop.md`](docs/workflow-sop.md)，确定角色和流程实例负责人。

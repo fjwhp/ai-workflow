@@ -43,7 +43,7 @@
 - Modify: `shared/src/index.ts`
 - Test: `shared/src/schemas.test.ts`
 
-- [ ] **Step 1: Write failing schema and selector tests**
+- [x] **Step 1: Write failing schema and selector tests**
 
 Add tests that prove one primary association can be selected, context-only primary is valid, duplicate projects are rejected by the collection schema, and selected module mode requires module IDs:
 
@@ -65,13 +65,13 @@ it("rejects duplicate projects and selected mode without modules", () => {
 });
 ```
 
-- [ ] **Step 2: Run the shared tests and verify RED**
+- [x] **Step 2: Run the shared tests and verify RED**
 
 Run: `npm test -- shared/src/schemas.test.ts`
 
 Expected: FAIL because `requirementProjectsInputSchema` and selector functions do not exist.
 
-- [ ] **Step 3: Add the contracts and schemas**
+- [x] **Step 3: Add the contracts and schemas**
 
 Define the exact shared contract:
 
@@ -107,13 +107,13 @@ export function selectDeliveryProjects(items: RequirementProject[]) {
 
 Add `projectInputSchema`, `projectUpdateSchema`, `requirementProjectInputSchema`, and `requirementProjectsInputSchema`. The collection schema must enforce exactly one primary, unique `projectId`, `deliveryRequired === false` for context associations, and non-empty unique `moduleIds` for selected mode. Replace `RequirementInput.projectId` with required `primaryProjectId`.
 
-- [ ] **Step 4: Run shared tests and typecheck**
+- [x] **Step 4: Run shared tests and typecheck**
 
 Run: `npm test -- shared/src/schemas.test.ts && npm run typecheck -w shared`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the shared contracts**
+- [x] **Step 5: Commit the shared contracts**
 
 ```bash
 git add shared/src/project-association.ts shared/src/schemas.ts shared/src/schemas.test.ts shared/src/index.ts
@@ -129,7 +129,7 @@ git commit -m "feat: define multi-project requirement contracts"
 - Modify: `server/src/store.test.ts`
 - Modify: `server/src/index.ts`
 
-- [ ] **Step 1: Write failing clean-reset tests**
+- [x] **Step 1: Write failing clean-reset tests**
 
 Use a temporary directory and assert that an old database is backed up once and replaced with a fresh database marker:
 
@@ -148,13 +148,13 @@ it("backs up an incompatible database and requests a fresh schema", async () => 
 
 Add a second test proving a database with the current schema marker is not reset.
 
-- [ ] **Step 2: Run reset tests and verify RED**
+- [x] **Step 2: Run reset tests and verify RED**
 
 Run: `npm test -- server/src/database-reset.test.ts`
 
 Expected: FAIL because `prepareCleanDatabase` does not exist.
 
-- [ ] **Step 3: Implement explicit schema-version reset**
+- [x] **Step 3: Implement explicit schema-version reset**
 
 Implement `prepareCleanDatabase(dbPath, expectedVersion)` so it:
 
@@ -167,7 +167,7 @@ Implement `prepareCleanDatabase(dbPath, expectedVersion)` so it:
 
 After `WorkflowStore` creates the new schema successfully, write the `multi-project-v1` marker atomically. Do not add a reset HTTP endpoint.
 
-- [ ] **Step 4: Replace the requirement-project schema**
+- [x] **Step 4: Replace the requirement-project schema**
 
 Create these tables directly in the fresh schema:
 
@@ -205,17 +205,17 @@ CREATE TABLE requirement_project_snapshots (
 
 Remove `requirements.project_id` and `requirements.integration_target_branch` from the fresh requirement schema. Keep execution tables unchanged in phase 1 because their adapter receives one resolved delivery project.
 
-- [ ] **Step 5: Add store tests for fresh schema constraints**
+- [x] **Step 5: Add store tests for fresh schema constraints**
 
 Test that a new store starts empty, can create one primary association, rejects a second active primary, and contains no legacy `project_id` column in `requirements` using `PRAGMA table_info(requirements)`.
 
-- [ ] **Step 6: Run store and reset tests**
+- [x] **Step 6: Run store and reset tests**
 
 Run: `npm test -- server/src/database-reset.test.ts server/src/store.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit the clean schema reset**
+- [x] **Step 7: Commit the clean schema reset**
 
 ```bash
 git add server/src/database-reset.ts server/src/database-reset.test.ts server/src/store.ts server/src/store.test.ts server/src/index.ts
@@ -230,7 +230,7 @@ git commit -m "feat: reset local data for multi-project schema"
 - Modify: `server/src/repository.ts`
 - Modify: `server/src/store.ts`
 
-- [ ] **Step 1: Write failing project lifecycle tests**
+- [x] **Step 1: Write failing project lifecycle tests**
 
 Create a temporary Git repository with `package.json` and assert validation detects Git, Node, npm, and the local branch. Add tests for a missing path, duplicate repository path, branch absence, editing, and archiving:
 
@@ -245,13 +245,13 @@ expect(archived.status).toBe("archived");
 expect(store.listProjects({ activeOnly: true })).toEqual([]);
 ```
 
-- [ ] **Step 2: Run project service tests and verify RED**
+- [x] **Step 2: Run project service tests and verify RED**
 
 Run: `npm test -- server/src/project-service.test.ts`
 
 Expected: FAIL because inspection and lifecycle methods do not exist.
 
-- [ ] **Step 3: Implement bounded repository inspection**
+- [x] **Step 3: Implement bounded repository inspection**
 
 `inspectProjectRepository(repoPath, defaultBranch)` must use argument-array Git calls and bounded file reads. It verifies repository root and local branch, then detects:
 
@@ -262,7 +262,7 @@ Expected: FAIL because inspection and lifecycle methods do not exist.
 
 Return `{ valid, repoPath, defaultBranch, category, technology, packageManager, modules, warnings }`. Do not run build or test commands during inspection.
 
-- [ ] **Step 4: Add project persistence methods**
+- [x] **Step 4: Add project persistence methods**
 
 Extend projects with `category`, `technology_json`, `status`, and `updated_at`. Add:
 
@@ -275,13 +275,13 @@ findProjectByRepoPath(repoPath: string)
 
 Reject duplicate normalized repository paths. An archived project remains readable by ID but is excluded from active selectors.
 
-- [ ] **Step 5: Run project lifecycle tests**
+- [x] **Step 5: Run project lifecycle tests**
 
 Run: `npm test -- server/src/project-service.test.ts server/src/repository.test.ts server/src/store.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit project lifecycle support**
+- [x] **Step 6: Commit project lifecycle support**
 
 ```bash
 git add server/src/project-service.ts server/src/project-service.test.ts server/src/repository.ts server/src/store.ts server/src/store.test.ts
@@ -296,7 +296,7 @@ git commit -m "feat: manage validated local projects"
 - Modify: `server/src/store.ts`
 - Modify: `server/src/store.test.ts`
 
-- [ ] **Step 1: Write failing invariant and adapter tests**
+- [x] **Step 1: Write failing invariant and adapter tests**
 
 Cover exactly one primary, archived project rejection, selected-module validation against indexed modules, context-only primary, and sole-delivery resolution:
 
@@ -312,13 +312,13 @@ expect(() => resolveSoleDeliveryProject([
 ])).toThrowError("MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED");
 ```
 
-- [ ] **Step 2: Run requirement-project tests and verify RED**
+- [x] **Step 2: Run requirement-project tests and verify RED**
 
 Run: `npm test -- server/src/requirement-projects.test.ts`
 
 Expected: FAIL because association validation and resolution do not exist.
 
-- [ ] **Step 3: Implement transactional association replacement**
+- [x] **Step 3: Implement transactional association replacement**
 
 Add store methods:
 
@@ -331,21 +331,21 @@ getRequirementProjectSnapshot(requirementId: string): RequirementProjectSnapshot
 
 `replaceRequirementProjects` validates all projects before a transaction, replaces active rows atomically, and updates requirement time. It must not partially save a malformed collection.
 
-- [ ] **Step 4: Implement material-change invalidation**
+- [x] **Step 4: Implement material-change invalidation**
 
 Create `hasMaterialAssociationChange(before, after)` comparing project ID, role, usage, required flag, module mode, and sorted module IDs. When technical design or a later stage has an approved snapshot and the change is material, return `{ invalidateTechnicalDesign: true }`; display-order-only changes return false.
 
-- [ ] **Step 5: Add requirement creation through associations**
+- [x] **Step 5: Add requirement creation through associations**
 
 Change `createRequirement` to accept `primaryProjectId`, create the requirement and its primary required-delivery association in one transaction, and return `projects`. A missing or archived primary project fails without creating the requirement.
 
-- [ ] **Step 6: Run focused store and association tests**
+- [x] **Step 6: Run focused store and association tests**
 
 Run: `npm test -- server/src/requirement-projects.test.ts server/src/store.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit association persistence**
+- [x] **Step 7: Commit association persistence**
 
 ```bash
 git add server/src/requirement-projects.ts server/src/requirement-projects.test.ts server/src/store.ts server/src/store.test.ts
@@ -358,7 +358,7 @@ git commit -m "feat: persist requirement project associations"
 - Modify: `server/src/app.ts`
 - Modify: `server/src/app.test.ts`
 
-- [ ] **Step 1: Write failing API tests**
+- [x] **Step 1: Write failing API tests**
 
 Add API tests for:
 
@@ -373,13 +373,13 @@ Add API tests for:
 
 Use real temporary Git repositories in validation tests; never point tests at Soto Dine.
 
-- [ ] **Step 2: Run API tests and verify RED**
+- [x] **Step 2: Run API tests and verify RED**
 
 Run: `npm test -- server/src/app.test.ts`
 
 Expected: FAIL with 404 or missing response fields for the new routes.
 
-- [ ] **Step 3: Implement project routes with Zod validation**
+- [x] **Step 3: Implement project routes with Zod validation**
 
 Every mutation parses shared schemas and maps errors consistently:
 
@@ -389,7 +389,7 @@ Every mutation parses shared schemas and maps errors consistently:
 
 Repository path/branch edits must validate before store mutation. Archive returns `409 PROJECT_IN_ACTIVE_DELIVERY` only when a phase-2-active delivery exists; during phase 1 no old history exists after reset.
 
-- [ ] **Step 4: Implement association routes and design invalidation**
+- [x] **Step 4: Implement association routes and design invalidation**
 
 The PUT route validates module selections, replaces rows transactionally, and if material change occurs at or after approved technical design:
 
@@ -398,13 +398,13 @@ The PUT route validates module selections, replaces rows transactionally, and if
 3. marks the prior snapshot superseded;
 4. returns the refreshed requirement detail.
 
-- [ ] **Step 5: Run API tests**
+- [x] **Step 5: Run API tests**
 
 Run: `npm test -- server/src/app.test.ts server/src/project-service.test.ts server/src/requirement-projects.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the APIs**
+- [x] **Step 6: Commit the APIs**
 
 ```bash
 git add server/src/app.ts server/src/app.test.ts
@@ -420,7 +420,7 @@ git commit -m "feat: expose project and association APIs"
 - Modify: `server/src/ai.ts`
 - Modify: `server/src/app.test.ts`
 
-- [ ] **Step 1: Write failing context tests**
+- [x] **Step 1: Write failing context tests**
 
 Create two ready knowledge snapshots and assert technical design receives both while coding resolves only the sole delivery project:
 
@@ -433,29 +433,29 @@ expect(context.totalChars).toBeLessThanOrEqual(context.budgetMaxChars);
 
 Add a test that two delivery projects produce `MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED` at coding and that PRD/review can still run.
 
-- [ ] **Step 2: Run context tests and verify RED**
+- [x] **Step 2: Run context tests and verify RED**
 
 Run: `npm test -- server/src/project-context.test.ts`
 
 Expected: FAIL because context assembly does not exist.
 
-- [ ] **Step 3: Implement role-aware bounded retrieval**
+- [x] **Step 3: Implement role-aware bounded retrieval**
 
 `buildRequirementProjectContext(store, requirementId, stage, budget)` loads all active associations in position order. Retrieve at most 24 entries per project and allocate the configurable aggregate serialized-JSON character budget fairly across active projects. `AI_PROJECT_CONTEXT_MAX_CHARS` defaults to 200,000, rejects unsafe low/invalid values, and has a 1,000,000-character hard ceiling. The exact serialized project array must fit the applied budget; this character count is not a model-token estimate. If irreducible identity metadata cannot fit, return `PROJECT_CONTEXT_BUDGET_TOO_SMALL`; raise the environment budget or reduce associations. Each project block contains identity, role, usage, module scope, knowledge version, source head, summary, and bounded entries.
 
 For coding and later project-execution stages in phase 1, call `resolveSoleDeliveryProject`; inject only that project's knowledge and module scope. Do not let the coding runner write outside that repository worktree.
 
-- [ ] **Step 4: Update run evidence**
+- [x] **Step 4: Update run evidence**
 
 Record one `knowledge.retrieved` event per project with project ID, knowledge version, source head, paths, applied character budget, serialized size, and truncation. Store the frozen association snapshot when technical design is approved.
 
-- [ ] **Step 5: Run AI and API tests**
+- [x] **Step 5: Run AI and API tests**
 
 Run: `npm test -- server/src/project-context.test.ts server/src/ai.test.ts server/src/app.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit multi-project context**
+- [x] **Step 6: Commit multi-project context**
 
 ```bash
 git add server/src/project-context.ts server/src/project-context.test.ts server/src/app.ts server/src/app.test.ts server/src/ai.ts
@@ -470,7 +470,7 @@ git commit -m "feat: assemble multi-project design context"
 - Modify: `web/src/main.tsx`
 - Modify: `web/src/associations.css`
 
-- [ ] **Step 1: Write failing project view-model tests**
+- [x] **Step 1: Write failing project view-model tests**
 
 Extract and test pure helpers:
 
@@ -481,13 +481,13 @@ expect(projectValidationLabel({ valid: true, technology: ["node"], packageManage
   .toBe("Git 可用 · Node · pnpm");
 ```
 
-- [ ] **Step 2: Run UI helper tests and verify RED**
+- [x] **Step 2: Run UI helper tests and verify RED**
 
 Run: `npm test -- web/src/project-management.test.ts`
 
 Expected: FAIL because the helpers do not exist.
 
-- [ ] **Step 3: Implement the project list and drawer**
+- [x] **Step 3: Implement the project list and drawer**
 
 Replace the inline `Projects`/`ProjectRow` implementation with a focused component that provides:
 
@@ -500,17 +500,17 @@ Replace the inline `Projects`/`ProjectRow` implementation with a focused compone
 
 Use Lucide icons, accessible labels, 8px-or-less radii, and no nested cards. Archive requires a confirmation modal naming the project and explaining that history remains unavailable only because this clean install has none.
 
-- [ ] **Step 4: Add request-state handling**
+- [x] **Step 4: Add request-state handling**
 
 Disable duplicate submissions, retain entered values after API failure, display server error messages next to the relevant field, refresh the list after create/edit/archive, and keep knowledge rebuild polling scoped to projects in `building` status.
 
-- [ ] **Step 5: Run UI tests and typecheck**
+- [x] **Step 5: Run UI tests and typecheck**
 
 Run: `npm test -- web/src/project-management.test.ts web/src/project-knowledge-view.test.ts && npm run typecheck -w web`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit project management UI**
+- [x] **Step 6: Commit project management UI**
 
 ```bash
 git add web/src/project-management.tsx web/src/project-management.test.ts web/src/main.tsx web/src/associations.css
@@ -525,7 +525,7 @@ git commit -m "feat: add maintainable project management UI"
 - Modify: `web/src/main.tsx`
 - Modify: `web/src/associations.css`
 
-- [ ] **Step 1: Write failing association view-model tests**
+- [x] **Step 1: Write failing association view-model tests**
 
 Test summary text, archived exclusion, module selection, exactly one primary, and the phase-1 execution guard:
 
@@ -541,17 +541,17 @@ expect(phaseOneDeliveryGate([delivery("api"), delivery("web")])).toEqual({
 });
 ```
 
-- [ ] **Step 2: Run association UI tests and verify RED**
+- [x] **Step 2: Run association UI tests and verify RED**
 
 Run: `npm test -- web/src/requirement-projects.test.ts`
 
 Expected: FAIL because the helpers and component do not exist.
 
-- [ ] **Step 3: Update new-requirement creation**
+- [x] **Step 3: Update new-requirement creation**
 
 Replace the legacy optional project select with a required active primary-project select posting `primaryProjectId`. If no active project exists, show a direct `前往项目配置` command rather than a disabled empty selector.
 
-- [ ] **Step 4: Implement association summary and editor**
+- [x] **Step 4: Implement association summary and editor**
 
 The requirement sidebar shows primary project and delivery count. `Manage Associated Projects` opens a modal/table where users can:
 
@@ -566,17 +566,17 @@ The requirement sidebar shows primary project and delivery count. `Manage Associ
 
 Show a design-invalidation warning before saving a material change at or after technical design.
 
-- [ ] **Step 5: Add the planned-delivery section and guard**
+- [x] **Step 5: Add the planned-delivery section and guard**
 
 At technical design and coding, show one row per delivery project with project name, module scope, and `第二期启用分项目执行`. Disable `启动 AI` at coding when more than one delivery project exists and display the exact guard message. One delivery project continues to use the current coding modal.
 
-- [ ] **Step 6: Run UI tests and typecheck**
+- [x] **Step 6: Run UI tests and typecheck**
 
 Run: `npm test -- web/src/requirement-projects.test.ts web/src/navigation-view.test.ts && npm run typecheck -w web`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit requirement association UI**
+- [x] **Step 7: Commit requirement association UI**
 
 ```bash
 git add web/src/requirement-projects.tsx web/src/requirement-projects.test.ts web/src/main.tsx web/src/associations.css
@@ -590,7 +590,7 @@ git commit -m "feat: manage requirement project associations"
 - Modify: `docs/getting-started.md`
 - Test: `server/src/app.test.ts`
 
-- [ ] **Step 1: Add the reset and usage documentation**
+- [x] **Step 1: Add the reset and usage documentation**
 
 Document that the first startup of this version:
 
@@ -603,7 +603,7 @@ Document that the first startup of this version:
 
 Include the backup filename pattern and manual recovery command that stops the service, moves the fresh database aside, and restores the backup.
 
-- [ ] **Step 2: Run all automated verification**
+- [x] **Step 2: Run all automated verification**
 
 Run:
 
@@ -615,7 +615,7 @@ npm test
 
 Expected: all commands exit 0 and Vitest reports no failed files or tests.
 
-- [ ] **Step 3: Verify clean reset with a copied database**
+- [x] **Step 3: Verify clean reset with a copied database**
 
 Copy the current local database to a temporary directory, start the server against that temporary data directory, and verify:
 
@@ -647,7 +647,7 @@ Capture browser console errors and require zero application errors.
 
 Run `git status --short` in every linked acceptance repository and confirm the project-registration and knowledge operations created no source changes, commits, branches, pushes, or pull requests.
 
-- [ ] **Step 6: Commit documentation**
+- [x] **Step 6: Commit documentation**
 
 ```bash
 git add README.md docs/getting-started.md server/src/app.test.ts
