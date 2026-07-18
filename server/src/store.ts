@@ -11,7 +11,7 @@ export class WorkflowStore {
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
-    this.db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     this.migrate();
   }
 
@@ -230,7 +230,7 @@ export class WorkflowStore {
       role: "primary", usage: "delivery", deliveryRequired: true,
       moduleMode: "auto", moduleIds: [], position: 0
     }], { projects: this.projectValidationRows([input.primaryProjectId]) })[0]!;
-    this.db.exec("BEGIN");
+    this.db.exec("BEGIN IMMEDIATE");
     try {
       const code = this.nextRequirementCode();
       this.db.prepare(`INSERT INTO requirements
@@ -247,7 +247,8 @@ export class WorkflowStore {
   private nextRequirementCode() {
     const row = this.db.prepare(
       "UPDATE counters SET value = value + 1 WHERE key = 'requirement' RETURNING value"
-    ).get() as { value: number };
+    ).get() as { value: number } | undefined;
+    if (!row) throw new Error("REQUIREMENT_COUNTER_MISSING");
     return `REQ-${String(row.value).padStart(4, "0")}`;
   }
 
