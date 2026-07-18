@@ -251,6 +251,73 @@ describe("project version persistence", () => {
     expect(store.listVersionRequirements(version.id).map((item) => item.id)).toEqual([requirement.id]);
     expect(() => store.closeProjectVersion("missing")).toThrow("PROJECT_VERSION_NOT_FOUND");
   });
+
+  it("preserves archived version associations when a project moves to a new version", () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const project = createProject(store, "Version history", join(path, "..", "history-project"));
+    const firstVersion = createVersion(store, project.id, "1.0.0", join(path, "..", "history-v1"));
+    const secondVersion = createVersion(store, project.id, "2.0.0", join(path, "..", "history-v2"));
+    const requirement = store.createRequirement(requirementInput(project.id, firstVersion.id, "Version history"));
+    const snapshot = store.createRequirementProjectSnapshot(requirement.id);
+
+    store.replaceRequirementProjects(requirement.id, [{
+      projectId: project.id, projectVersionId: secondVersion.id, role: "primary", usage: "delivery",
+      deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0
+    }]);
+
+    expect(store.listRequirementProjects(requirement.id)[0]).toMatchObject({
+      projectVersionId: secondVersion.id, status: "active"
+    });
+    const database = new DatabaseSync(path); databases.push(database);
+    expect(database.prepare(`SELECT project_version_id, status FROM requirement_projects
+      WHERE requirement_id = ? ORDER BY status`).all(requirement.id)).toEqual([
+      { project_version_id: secondVersion.id, status: "active" },
+      { project_version_id: firstVersion.id, status: "archived" }
+    ]);
+    expect(store.listVersionRequirements(firstVersion.id).map((item) => item.id)).toEqual([requirement.id]);
+    expect(store.listVersionRequirements(secondVersion.id).map((item) => item.id)).toEqual([requirement.id]);
+    expect(snapshot.associations[0]).toMatchObject({ projectVersionId: firstVersion.id, projectVersionHead: "head-1.0.0" });
+    expect(store.getRequirementProjectSnapshot(requirement.id)?.associations[0]).toMatchObject({
+      projectVersionId: firstVersion.id, projectVersionHead: "head-1.0.0"
+    });
+  });
+
+  it.each(["completed", "closed", "cancelled"])(
+    "blocks closing a historical version until its requirement is %s",
+    (terminalStatus) => {
+      const store = new WorkflowStore(":memory:"); stores.push(store);
+      const project = createProject(store, `Historical close ${terminalStatus}`, `/tmp/historical-close-${terminalStatus}`);
+      const firstVersion = createVersion(store, project.id, "1.0.0", `/tmp/historical-close-${terminalStatus}-v1`);
+      const secondVersion = createVersion(store, project.id, "2.0.0", `/tmp/historical-close-${terminalStatus}-v2`);
+      const requirement = store.createRequirement(requirementInput(project.id, firstVersion.id, `Historical ${terminalStatus}`));
+      store.replaceRequirementProjects(requirement.id, [{
+        projectId: project.id, projectVersionId: secondVersion.id, role: "primary", usage: "delivery",
+        deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0
+      }]);
+
+      expect(() => store.closeProjectVersion(firstVersion.id)).toThrow("PROJECT_VERSION_HAS_ACTIVE_REQUIREMENTS");
+      store.updateRequirementState(requirement.id, "integration", terminalStatus);
+      expect(store.closeProjectVersion(firstVersion.id)).toMatchObject({ id: firstVersion.id, status: "closed" });
+    }
+  );
+
+  it("deduplicates requirements linked to the same version multiple times", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Deduplicated history", "/tmp/deduplicated-history");
+    const firstVersion = createVersion(store, project.id, "1.0.0", "/tmp/deduplicated-history-v1");
+    const secondVersion = createVersion(store, project.id, "2.0.0", "/tmp/deduplicated-history-v2");
+    const requirement = store.createRequirement(requirementInput(project.id, firstVersion.id, "Deduplicated history"));
+    for (const projectVersionId of [secondVersion.id, firstVersion.id, secondVersion.id]) {
+      store.replaceRequirementProjects(requirement.id, [{
+        projectId: project.id, projectVersionId, role: "primary", usage: "delivery",
+        deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0
+      }]);
+    }
+
+    expect(store.listVersionRequirements(firstVersion.id).map((item) => item.id)).toEqual([requirement.id]);
+    expect(store.listVersionRequirements(secondVersion.id).map((item) => item.id)).toEqual([requirement.id]);
+  });
 });
 
 type ChildMessage =

@@ -133,6 +133,8 @@ describe("WorkflowStore", () => {
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'requirement_projects'").get()).toBeTruthy();
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'requirement_project_snapshots'").get()).toBeTruthy();
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_requirement_projects_active_primary'").get()).toBeTruthy();
+    expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_requirement_projects_active_project'").get())
+      .toMatchObject({ sql: expect.stringMatching(/UNIQUE.*requirement_id,\s*project_id.*WHERE status = 'active'/i) });
     db.close();
   });
 

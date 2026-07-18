@@ -68,7 +68,6 @@ export class WorkflowStore {
         status TEXT NOT NULL DEFAULT 'active',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        UNIQUE(requirement_id, project_id),
         FOREIGN KEY(requirement_id) REFERENCES requirements(id),
         FOREIGN KEY(project_id) REFERENCES projects(id),
         FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
@@ -196,6 +195,7 @@ export class WorkflowStore {
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_runs_active ON integration_runs(requirement_id) WHERE status = 'running'");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_project_knowledge_active ON project_knowledge_versions(project_id) WHERE status = 'building'");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_projects_active_primary ON requirement_projects(requirement_id) WHERE role = 'primary' AND status = 'active'");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_projects_active_project ON requirement_projects(requirement_id, project_id) WHERE status = 'active'");
     this.migrateRequirementProjectSnapshots();
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_project_snapshots_active ON requirement_project_snapshots(requirement_id) WHERE status = 'active'");
   }
@@ -316,12 +316,7 @@ export class WorkflowStore {
       });
       this.db.prepare("UPDATE requirement_projects SET status = 'archived', updated_at = ? WHERE requirement_id = ? AND status = 'active'").run(now, requirementId);
       for (const input of validated) {
-        const existing = this.db.prepare("SELECT id FROM requirement_projects WHERE requirement_id = ? AND project_id = ?").get(requirementId, input.projectId) as { id: string } | undefined;
-        if (existing) {
-          this.db.prepare(`UPDATE requirement_projects SET project_version_id = ?, role = ?, usage = ?, delivery_required = ?, module_mode = ?,
-            module_ids_json = ?, position = ?, status = 'active', updated_at = ? WHERE id = ?`)
-            .run(input.projectVersionId ?? null, input.role, input.usage, input.deliveryRequired ? 1 : 0, input.moduleMode, JSON.stringify(input.moduleIds), input.position, now, existing.id);
-        } else this.insertRequirementAssociation(requirementId, input, now);
+        this.insertRequirementAssociation(requirementId, input, now);
       }
       this.db.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?").run(now, requirementId);
       this.db.exec("COMMIT");
@@ -722,7 +717,7 @@ export class WorkflowStore {
       }
       const activeRequirement = this.db.prepare(`SELECT r.id FROM requirements r
         JOIN requirement_projects rp ON rp.requirement_id = r.id
-        WHERE rp.project_version_id = ? AND rp.status = 'active'
+        WHERE rp.project_version_id = ?
           AND r.status NOT IN ('completed', 'closed', 'cancelled') LIMIT 1`).get(id);
       if (activeRequirement) throw new Error("PROJECT_VERSION_HAS_ACTIVE_REQUIREMENTS");
       const now = new Date().toISOString();
