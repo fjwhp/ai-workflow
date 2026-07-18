@@ -50,6 +50,12 @@ export class WorkflowStore {
         created_at TEXT NOT NULL,
         FOREIGN KEY(requirement_id) REFERENCES requirements(id)
       );
+      CREATE TABLE IF NOT EXISTS requirement_integration_targets (
+        requirement_id TEXT PRIMARY KEY,
+        target_branch TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
+      );
       CREATE TABLE IF NOT EXISTS stage_runs (
         id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL,
         status TEXT NOT NULL, model TEXT, input_json TEXT NOT NULL, output_json TEXT,
@@ -166,31 +172,66 @@ export class WorkflowStore {
     const id = randomUUID();
     const row = this.db.prepare("SELECT COUNT(*) AS count FROM requirements").get() as { count: number };
     const code = `REQ-${String(row.count + 1).padStart(4, "0")}`;
-    this.db.prepare(`INSERT INTO requirements
-      (id, code, title, business_problem, expected_outcome, priority, stage, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'prd', 'ai_ready', ?, ?)`)
-      .run(id, code, input.title, input.businessProblem, input.expectedOutcome, input.priority, now, now);
-    this.insertRequirementRevision(id, 1, { ...input, clarifications: "" }, "创建需求", now);
+    const primaryProjectId = (input as any).primaryProjectId ?? (input as any).projectId;
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare(`INSERT INTO requirements
+        (id, code, title, business_problem, expected_outcome, priority, stage, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'prd', 'ai_ready', ?, ?)`)
+        .run(id, code, input.title, input.businessProblem, input.expectedOutcome, input.priority, now, now);
+      this.insertRequirementRevision(id, 1, { ...input, clarifications: "" }, "创建需求", now);
+      if (primaryProjectId) this.insertInterimPrimaryAssociation(id, primaryProjectId, now);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.getRequirement(id)!;
   }
 
   listRequirements() {
-    return this.db.prepare("SELECT * FROM requirements ORDER BY created_at DESC").all().map(mapRequirement);
+    return this.db.prepare(`SELECT r.*, rp.project_id, p.name AS project_name, rit.target_branch AS integration_target_branch
+      FROM requirements r
+      LEFT JOIN requirement_projects rp ON rp.requirement_id = r.id AND rp.role = 'primary' AND rp.usage = 'delivery' AND rp.status = 'active'
+      LEFT JOIN projects p ON p.id = rp.project_id
+      LEFT JOIN requirement_integration_targets rit ON rit.requirement_id = r.id
+      ORDER BY r.created_at DESC`).all().map(mapRequirement);
   }
 
   getRequirement(id: string) {
-    const row = this.db.prepare("SELECT * FROM requirements WHERE id = ?").get(id);
+    const row = this.db.prepare(`SELECT r.*, rp.project_id, p.name AS project_name, rit.target_branch AS integration_target_branch
+      FROM requirements r
+      LEFT JOIN requirement_projects rp ON rp.requirement_id = r.id AND rp.role = 'primary' AND rp.usage = 'delivery' AND rp.status = 'active'
+      LEFT JOIN projects p ON p.id = rp.project_id
+      LEFT JOIN requirement_integration_targets rit ON rit.requirement_id = r.id
+      WHERE r.id = ?`).get(id);
     return row ? mapRequirement(row as Record<string, unknown>) : null;
   }
 
   setRequirementProject(id: string, projectId: string | null): any {
-    void id; void projectId;
-    throw new Error("REQUIREMENT_PROJECT_ASSOCIATIONS_NOT_IMPLEMENTED");
+    if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(id)) return null;
+    if (projectId && !this.db.prepare("SELECT id FROM projects WHERE id = ?").get(projectId)) return null;
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("DELETE FROM requirement_projects WHERE requirement_id = ? AND role = 'primary'").run(id);
+      if (projectId) this.insertInterimPrimaryAssociation(id, projectId, now);
+      this.db.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?").run(now, id);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.getRequirement(id);
   }
 
   setIntegrationTarget(id:string,branch:string): any {
-    void id; void branch;
-    throw new Error("REQUIREMENT_PROJECT_ASSOCIATIONS_NOT_IMPLEMENTED");
+    if (!this.db.prepare("SELECT id FROM requirements WHERE id = ? AND stage = 'integration'").get(id)) return null;
+    const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO requirement_integration_targets (requirement_id, target_branch, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(requirement_id) DO UPDATE SET target_branch = excluded.target_branch, updated_at = excluded.updated_at`).run(id, branch, now);
+    return this.getRequirement(id);
+  }
+
+  private insertInterimPrimaryAssociation(requirementId: string, projectId: string, now: string) {
+    this.db.prepare(`INSERT INTO requirement_projects
+      (id, requirement_id, project_id, role, usage, delivery_required, module_mode, module_ids_json, position, status, created_at, updated_at)
+      VALUES (?, ?, ?, 'primary', 'delivery', 1, 'auto', '[]', 0, 'active', ?, ?)`)
+      .run(randomUUID(), requirementId, projectId, now, now);
   }
 
   reviseRequirement(id: string, input: any) {

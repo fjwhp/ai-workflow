@@ -53,7 +53,7 @@ describe("WorkflowStore", () => {
   it("persists candidates and publishes only safe non-conflicting knowledge",()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Memory Repo",repoPath:"/tmp/repo-memory",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
-    const req=store.createRequirement({title:"用户规则",businessProblem:"缺少规则",expectedOutcome:"形成规则",priority:"medium",projectId:project.id});
+    const req=store.createRequirement({title:"用户规则",businessProblem:"缺少规则",expectedOutcome:"形成规则",priority:"medium",primaryProjectId:project.id});
     const base={projectId:project.id,requirementId:req.id,layer:"decision",type:"product_decision",modules:[],tags:[],sourceStage:"prd",confidence:0.9,riskLevel:"normal",publishDecision:"auto_publish",evidence:[{artifactId:"a1",stage:"prd",version:1}]};
     store.replaceKnowledgeCandidates(req.id,project.id,[{...base,subjectKey:"subject-1",title:"用户名唯一",content:"用户名必须唯一"},{...base,subjectKey:"subject-2",title:"权限规则",content:"仅管理员可创建",riskLevel:"high",publishDecision:"human_review"}]);
     expect(store.listKnowledgeCandidates(req.id)).toHaveLength(2);
@@ -91,7 +91,7 @@ describe("WorkflowStore", () => {
     expect(store.listArtifacts(req.id)).toHaveLength(2);
   });
 
-  it("rejects the legacy single-project mutator until association methods are implemented", () => {
+  it("creates and replaces the interim primary project association", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = store.createProject({
       name: "Soto Dine", repoPath: "/tmp/soto-dine", defaultBranch: "prod",
@@ -99,9 +99,14 @@ describe("WorkflowStore", () => {
     });
     const req = store.createRequirement({
       title: "订单备注规则统一", businessProblem: "三个入口的备注规则存在不一致风险",
-      expectedOutcome: "所有下单入口行为一致", priority: "medium"
+      expectedOutcome: "所有下单入口行为一致", priority: "medium", primaryProjectId: project.id
     });
-    expect(() => store.setRequirementProject(req.id, project.id)).toThrow("REQUIREMENT_PROJECT_ASSOCIATIONS_NOT_IMPLEMENTED");
+    expect(req).toMatchObject({ projectId: project.id, projectName: "Soto Dine" });
+    const replacement = store.createProject({
+      name: "Admin", repoPath: "/tmp/admin", defaultBranch: "main",
+      allowedCommands: [], sensitivePatterns: []
+    });
+    expect(store.setRequirementProject(req.id, replacement.id)).toMatchObject({ projectId: replacement.id, projectName: "Admin" });
   });
 
   it("creates an immutable revision when a returned requirement is clarified", () => {
@@ -184,7 +189,7 @@ describe("WorkflowStore", () => {
   it("stores one immutable coding evidence snapshot per execution", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = store.createProject({ name: "Repo", repoPath: "/tmp/repo", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
-    const req = store.createRequirement({ title: "接口", businessProblem: "缺少", expectedOutcome: "新增", priority: "medium", projectId: project.id });
+    const req = store.createRequirement({ title: "接口", businessProblem: "缺少", expectedOutcome: "新增", priority: "medium", primaryProjectId: project.id });
     const execution = store.addExecution({ requirementId: req.id, stage: "coding", projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", status: "completed", diff: "diff", events: [] });
     const evidence = store.addCodingEvidence({ executionId: execution.id, requirementId: req.id, projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", diffHash: "abc", diff: "diff", originalChars: 4, truncated: false, files: ["a.ts"], additions: 1, deletions: 0, diagnostics: "" });
     expect(store.getLatestCodingEvidence(req.id)?.id).toBe(evidence.id);
@@ -227,12 +232,13 @@ describe("WorkflowStore", () => {
     expect(store.getLatestIntegrationRun(req.id)?.id).toBe(run!.id);
   });
 
-  it("rejects the legacy requirement-level integration target",()=>{
+  it("stores an integration target outside the requirements table",()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Repo",repoPath:"/tmp/repo-target",defaultBranch:"prod",allowedCommands:[],sensitivePatterns:[]});
-    const req=store.createRequirement({title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"新增接口",priority:"medium",projectId:project.id});
+    const req=store.createRequirement({title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"新增接口",priority:"medium",primaryProjectId:project.id});
     store.updateRequirementState(req.id,"integration","awaiting_merge");
-    expect(()=>store.setIntegrationTarget(req.id,"feature/0710-test")).toThrow("REQUIREMENT_PROJECT_ASSOCIATIONS_NOT_IMPLEMENTED");
+    expect(store.setIntegrationTarget(req.id,"feature/0710-test")?.integrationTargetBranch).toBe("feature/0710-test");
+    expect(store.getRequirement(req.id)?.integrationTargetBranch).toBe("feature/0710-test");
     expect(store.getProject(project.id)?.defaultBranch).toBe("prod");
   });
 });

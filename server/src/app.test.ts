@@ -19,7 +19,7 @@ describe("stage run API", () => {
   it("exposes project memory and requirement knowledge changes",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Memory",repoPath:"/tmp/api-memory",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
-    const req=store.createRequirement({title:"用户规则",businessProblem:"缺少",expectedOutcome:"明确",priority:"medium",projectId:project.id});
+    const req=store.createRequirement({title:"用户规则",businessProblem:"缺少",expectedOutcome:"明确",priority:"medium",primaryProjectId:project.id});
     const artifact=store.addArtifact(req.id,"prd","PRD",{productDecisions:[{decision:"用户名唯一",rationale:"登录标识",evidence:"User.java"}]});store.addApproval(req.id,"prd",{decision:"approve",comment:"通过",artifactId:artifact.id});publishRequirementKnowledge(store,req.id);
     const app=await buildApp(store);
     expect((await app.inject({method:"GET",url:`/api/projects/${project.id}/memory`})).json()).toMatchObject({total:1});
@@ -131,7 +131,7 @@ describe("stage run API", () => {
   it("lists and saves a requirement-local integration target branch",async()=>{
     const repo=await branchRepo(),store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Repo",repoPath:repo,defaultBranch:"prod",allowedCommands:[],sensitivePatterns:[]});
-    const req=store.createRequirement({title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"增加接口",priority:"medium",projectId:project.id});store.updateRequirementState(req.id,"integration","awaiting_merge");
+    const req=store.createRequirement({title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"增加接口",priority:"medium",primaryProjectId:project.id});store.updateRequirementState(req.id,"integration","awaiting_merge");
     const app=await buildApp(store);
     const list=await app.inject({method:"GET",url:`/api/requirements/${req.id}/integration-branches`});
     expect(list.json()).toMatchObject({currentBranch:"feature/0710-test",selectedTarget:"feature/0710-test"});
@@ -146,7 +146,7 @@ describe("stage run API", () => {
   it("requires exact confirmation before integrating into a protected branch",async()=>{
     const repo=await branchRepo(),store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Repo",repoPath:repo,defaultBranch:"prod",allowedCommands:[],sensitivePatterns:[]});
-    const req=store.createRequirement({title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"增加接口",priority:"medium",projectId:project.id});
+    const req=store.createRequirement({title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"增加接口",priority:"medium",primaryProjectId:project.id});
     const execution=store.addExecution({requirementId:req.id,stage:"coding",projectId:project.id,branch:"ai/req",worktreePath:repo,status:"completed",diff:"diff",events:[]});
     store.addCodingEvidence({executionId:execution.id,requirementId:req.id,projectId:project.id,branch:"ai/req",worktreePath:repo,diffHash:"abc",diff:"diff",originalChars:4,truncated:false,files:["README.md"],additions:1,deletions:0,diagnostics:""});
     store.updateRequirementState(req.id,"integration","awaiting_merge");store.setIntegrationTarget(req.id,"main");

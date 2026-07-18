@@ -1,6 +1,7 @@
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { prepareCleanDatabase, writeDatabaseVersionMarker } from "./database-reset.js";
 
@@ -29,8 +30,14 @@ describe("prepareCleanDatabase", () => {
       now: () => new Date("2026-07-18T10:11:12.345Z")
     });
 
-    expect(result).toEqual({ reset: true, backupPath: `${path}.backup-2026-07-18T10-11-12-345Z` });
+    expect(result).toEqual({
+      reset: true,
+      backupPath: `${path}.backup-2026-07-18T10-11-12-345Z`,
+      sidecarBackupPaths: [`${path}.backup-2026-07-18T10-11-12-345Z-wal`, `${path}.backup-2026-07-18T10-11-12-345Z-shm`]
+    });
     await expect(readFile(result.backupPath!, "utf8")).resolves.toBe("old database bytes");
+    await expect(readFile(`${result.backupPath}-wal`, "utf8")).resolves.toBe("wal");
+    await expect(readFile(`${result.backupPath}-shm`, "utf8")).resolves.toBe("shm");
     for (const removedPath of [path, `${path}-wal`, `${path}-shm`, `${path}.schema-version`]) {
       await expect(readFile(removedPath)).rejects.toMatchObject({ code: "ENOENT" });
     }
@@ -48,6 +55,43 @@ describe("prepareCleanDatabase", () => {
   it("does nothing when the database does not exist", async () => {
     const path = await databasePath();
     await expect(prepareCleanDatabase(path, "multi-project-v1")).resolves.toEqual({ reset: false, backupPath: null });
+  });
+
+  it("does not overwrite a colliding backup and retries with a unique name", async () => {
+    const path = await databasePath();
+    const firstBackup = `${path}.backup-2026-07-18T10-11-12-345Z`;
+    await writeFile(path, "new backup bytes");
+    await writeFile(firstBackup, "existing backup bytes");
+
+    const result = await prepareCleanDatabase(path, "multi-project-v1", {
+      now: () => new Date("2026-07-18T10:11:12.345Z")
+    });
+
+    await expect(readFile(firstBackup, "utf8")).resolves.toBe("existing backup bytes");
+    expect(result.backupPath).toBe(`${firstBackup}-1`);
+    await expect(readFile(result.backupPath!, "utf8")).resolves.toBe("new backup bytes");
+  });
+
+  it("preserves committed WAL data in a restorable backup set", async () => {
+    const path = await databasePath();
+    const db = new DatabaseSync(path);
+    db.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0; CREATE TABLE records (value TEXT NOT NULL); INSERT INTO records VALUES ('committed-in-wal')");
+    await writeFile(`${path}.schema-version`, "legacy-v1");
+
+    const result = await prepareCleanDatabase(path, "multi-project-v1", {
+      now: () => new Date("2026-07-18T10:11:12.345Z")
+    });
+    db.close();
+
+    const restoredPath = join(path, "..", "restored.db");
+    await copyFile(result.backupPath!, restoredPath);
+    await copyFile(`${result.backupPath}-wal`, `${restoredPath}-wal`);
+    if (result.sidecarBackupPaths?.includes(`${result.backupPath}-shm`)) {
+      await copyFile(`${result.backupPath}-shm`, `${restoredPath}-shm`);
+    }
+    const restored = new DatabaseSync(restoredPath);
+    expect(restored.prepare("SELECT value FROM records").get()).toEqual({ value: "committed-in-wal" });
+    restored.close();
   });
 });
 

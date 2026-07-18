@@ -1,5 +1,6 @@
 import { copyFile, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 
 export interface DatabaseResetOptions {
   now?: () => Date;
@@ -8,6 +9,7 @@ export interface DatabaseResetOptions {
 export interface DatabaseResetResult {
   reset: boolean;
   backupPath: string | null;
+  sidecarBackupPaths?: string[];
 }
 
 const markerPathFor = (dbPath: string) => `${dbPath}.schema-version`;
@@ -42,15 +44,36 @@ export async function prepareCleanDatabase(
   }
   if (currentVersion === expectedVersion) return { reset: false, backupPath: null };
 
-  const backupPath = `${dbPath}.backup-${safeTimestamp((options.now ?? (() => new Date()))())}`;
-  await copyFile(dbPath, backupPath);
+  const sourcePaths = [dbPath, `${dbPath}-wal`, `${dbPath}-shm`];
+  const existingSources = (await Promise.all(sourcePaths.map(async (path) => ({ path, exists: await exists(path) })))).filter((item) => item.exists);
+  const backupBase = `${dbPath}.backup-${safeTimestamp((options.now ?? (() => new Date()))())}`;
+  let backupPath = backupBase;
+  let backupPaths: string[] = [];
+  for (let attempt = 0; ; attempt += 1) {
+    backupPath = attempt === 0 ? backupBase : `${backupBase}-${attempt}`;
+    const createdPaths: string[] = [];
+    try {
+      for (const source of existingSources) {
+        const suffix = source.path.slice(dbPath.length);
+        const target = `${backupPath}${suffix}`;
+        await copyFile(source.path, target, constants.COPYFILE_EXCL);
+        createdPaths.push(target);
+      }
+      backupPaths = createdPaths;
+      break;
+    } catch (error) {
+      await Promise.all(createdPaths.map((path) => rm(path, { force: true })));
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
+  }
   await Promise.all([
     rm(dbPath, { force: true }),
     rm(`${dbPath}-wal`, { force: true }),
     rm(`${dbPath}-shm`, { force: true }),
     rm(markerPath, { force: true })
   ]);
-  return { reset: true, backupPath };
+  return { reset: true, backupPath, sidecarBackupPaths: backupPaths.slice(1) };
 }
 
 export async function writeDatabaseVersionMarker(dbPath: string, version: string) {
