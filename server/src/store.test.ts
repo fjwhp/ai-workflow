@@ -94,6 +94,20 @@ describe("WorkflowStore", () => {
     expect(store.archiveProject("missing")).toBeNull();
   });
 
+  it("blocks archiving delivery projects throughout unfinished delivery stages",()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject({name:"Delivery",repoPath:"/tmp/archive-lifecycle",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
+    const req=store.createRequirement({title:"交付生命周期",businessProblem:"需要保护活动项目交付",expectedOutcome:"阻止错误归档",priority:"medium",primaryProjectId:project.id});
+    for(const [stage,status] of [["coding","ai_ready"],["code_review","awaiting_approval"],["testing","returned"],["acceptance","blocked"],["integration","awaiting_merge"]] as const){store.updateRequirementState(req.id,stage,status);expect(store.projectHasActiveDelivery(project.id)).toBe(true);}
+    store.updateRequirementState(req.id,"integration","completed");expect(store.projectHasActiveDelivery(project.id)).toBe(false);
+  });
+
+  it("cancels building knowledge and ignores its late completion",()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject({name:"Race",repoPath:"/tmp/knowledge-race",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
+    const old=store.beginProjectKnowledge(project.id,"old-head","project_created");expect(store.cancelBuildingProjectKnowledge(project.id,"项目仓库配置已变更")).toBe(1);expect(store.getProjectKnowledgeVersion(old.id)).toMatchObject({status:"canceled",error:"项目仓库配置已变更"});
+    const next=store.beginProjectKnowledge(project.id,"new-head","project_updated");expect(store.completeProjectKnowledge(old.id,{summary:"stale",entries:[]})).toMatchObject({status:"canceled"});expect(store.failProjectKnowledge(old.id,"late failure")).toMatchObject({status:"canceled"});
+    expect(store.completeProjectKnowledge(next.id,{summary:"fresh",entries:[]})).toMatchObject({status:"ready",sourceHead:"new-head"});expect(store.getLatestProjectKnowledge(project.id)?.id).toBe(next.id);
+  });
+
   it("creates the multi-project tables without legacy requirement columns", () => {
     const directory = mkdtempSync(join(tmpdir(), "workflow-store-")); directories.push(directory);
     const path = join(directory, "workflow.db");

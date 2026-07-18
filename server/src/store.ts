@@ -338,7 +338,7 @@ export class WorkflowStore {
   projectHasActiveDelivery(projectId: string) {
     return Boolean(this.db.prepare(`SELECT r.id FROM requirements r JOIN requirement_projects rp ON rp.requirement_id = r.id
       WHERE rp.project_id = ? AND rp.status = 'active' AND rp.usage = 'delivery'
-      AND ((r.stage = 'coding' AND r.status = 'ai_running') OR (r.stage = 'integration' AND r.status != 'completed')) LIMIT 1`).get(projectId));
+      AND r.stage IN ('coding','code_review','testing','acceptance','integration') AND r.status != 'completed' LIMIT 1`).get(projectId));
   }
 
   private projectValidationRows(projectIds: string[]) {
@@ -629,11 +629,12 @@ export class WorkflowStore {
 
   completeProjectKnowledge(id:string,input:{summary:string;entries:any[]}){
     const completedAt=new Date().toISOString(),modules=new Set(input.entries.filter(entry=>entry.kind==="module").map(entry=>entry.path)).size;
-    this.db.prepare("UPDATE project_knowledge_versions SET status='ready',summary=?,entries_json=?,entry_count=?,module_count=?,completed_at=? WHERE id=?").run(input.summary,JSON.stringify(input.entries),input.entries.length,modules,completedAt,id);
-    return this.getProjectKnowledgeVersion(id)!;
+    this.db.prepare("UPDATE project_knowledge_versions SET status='ready',summary=?,entries_json=?,entry_count=?,module_count=?,completed_at=? WHERE id=? AND status='building'").run(input.summary,JSON.stringify(input.entries),input.entries.length,modules,completedAt,id);
+    return this.getProjectKnowledgeVersion(id);
   }
 
-  failProjectKnowledge(id:string,error:string){this.db.prepare("UPDATE project_knowledge_versions SET status='failed',error=?,completed_at=? WHERE id=?").run(error,new Date().toISOString(),id);return this.getProjectKnowledgeVersion(id);}
+  failProjectKnowledge(id:string,error:string){this.db.prepare("UPDATE project_knowledge_versions SET status='failed',error=?,completed_at=? WHERE id=? AND status='building'").run(error,new Date().toISOString(),id);return this.getProjectKnowledgeVersion(id);}
+  cancelBuildingProjectKnowledge(projectId:string,reason:string){return Number(this.db.prepare("UPDATE project_knowledge_versions SET status='canceled',error=?,completed_at=? WHERE project_id=? AND status='building'").run(reason,new Date().toISOString(),projectId).changes);}
   getProjectKnowledgeVersion(id:string){const row:any=this.db.prepare("SELECT * FROM project_knowledge_versions WHERE id=?").get(id);return row?mapProjectKnowledge(row):null;}
   getLatestProjectKnowledge(projectId:string){const row:any=this.db.prepare("SELECT * FROM project_knowledge_versions WHERE project_id=? ORDER BY version DESC LIMIT 1").get(projectId);return row?mapProjectKnowledge(row):null;}
   getProjectKnowledgeStatus(projectId:string){return this.getLatestProjectKnowledge(projectId)??{projectId,status:"missing",version:0};}

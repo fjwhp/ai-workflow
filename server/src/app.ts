@@ -92,6 +92,7 @@ export async function buildApp(store: WorkflowStore) {
     const item = store.getRequirement(req.params.id);
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
     let deliveryProject:any;try{deliveryProject=resolveSoleDeliveryProject(item.projects);}catch(error){return sendDomainError(reply,error);}
+    if(deliveryProject?.projectStatus==="archived")return reply.code(409).send({error:"PROJECT_ARCHIVED",message:"归档项目不能启动新执行"});
     if(item.stage==="integration")return reply.code(409).send({error:"INTEGRATION_REQUIRES_MANUAL_ACTION",message:"代码应用节点不会启动 AI，请执行应用预检"});
     const existing = store.listStageRuns(item.id, item.stage).find((run: any) => run.status === "running");
     if (existing) return reply.code(409).send({ error: "RUN_ALREADY_ACTIVE", message: "当前阶段已有 AI 正在执行" });
@@ -245,13 +246,13 @@ export async function buildApp(store: WorkflowStore) {
   app.get("/api/requirements/:id/integration-check",async(req:any,reply)=>{
     const context=integrationContext(store,req.params.id);
     if(!context.item)return reply.code(404).send({error:"NOT_FOUND"});
-    if(!context.allowed)return reply.code(409).send({error:"INTEGRATION_NOT_ALLOWED",message:context.reason,allowed:false,checks:[]});
+    if(!context.allowed)return reply.code(409).send({error:context.error??"INTEGRATION_NOT_ALLOWED",message:context.reason,allowed:false,checks:[]});
     try{return await preflightLocalIntegration(context.input!);}catch(error){return reply.code(409).send({error:"INTEGRATION_PREFLIGHT_FAILED",message:error instanceof Error?error.message:"预检失败",allowed:false,checks:[]});}
   });
   app.post("/api/requirements/:id/integrate",async(req:any,reply)=>{
     const context=integrationContext(store,req.params.id);
     if(!context.item)return reply.code(404).send({error:"NOT_FOUND"});
-    if(!context.allowed)return reply.code(409).send({error:"INTEGRATION_NOT_ALLOWED",message:context.reason});
+    if(!context.allowed)return reply.code(409).send({error:context.error??"INTEGRATION_NOT_ALLOWED",message:context.reason});
     const targetBranch=context.item.integrationTargetBranch;
     if(isProtectedBranch(targetBranch)&&req.body?.protectedBranchConfirmation!==targetBranch)return reply.code(409).send({error:"PROTECTED_BRANCH_CONFIRMATION_REQUIRED",message:`请输入目标分支名称 ${targetBranch} 以确认应用改动`});
     const preflight=await preflightLocalIntegration(context.input!);
@@ -321,7 +322,7 @@ export async function buildApp(store: WorkflowStore) {
     const parsed=projectUpdateSchema.safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:"VALIDATION_ERROR",issues:parsed.error.issues});
     let update:any={...parsed.data};
     if(parsed.data.repoPath!==undefined||parsed.data.defaultBranch!==undefined){const inspection=await inspectProjectRepository(parsed.data.repoPath??current.repoPath,parsed.data.defaultBranch??current.defaultBranch);if(!inspection.valid)return invalidRepository(reply,inspection);update={...update,repoPath:inspection.repoPath,technology:inspection.technology,category:parsed.data.category===undefined?inspection.category:parsed.data.category};}
-    try{const project=store.updateProject(current.id,update);if(parsed.data.repoPath!==undefined||parsed.data.defaultBranch!==undefined)void ensureProjectKnowledge(store,project!,"project_updated",true).catch(()=>{});return project;}
+    try{if(parsed.data.repoPath!==undefined||parsed.data.defaultBranch!==undefined)store.cancelBuildingProjectKnowledge(current.id,"项目仓库配置已变更");const project=store.updateProject(current.id,update);if(parsed.data.repoPath!==undefined||parsed.data.defaultBranch!==undefined)void ensureProjectKnowledge(store,project!,"project_updated",true).catch(()=>{});return project;}
     catch(error){return sendDomainError(reply,error);}
   });
   app.post("/api/projects/:id/archive",async(req:any,reply)=>{const project=store.getProject(req.params.id);if(!project)return reply.code(404).send({error:"NOT_FOUND"});if(store.projectHasActiveDelivery(project.id))return reply.code(409).send({error:"PROJECT_IN_ACTIVE_DELIVERY",message:"项目正在用于活动交付"});return store.archiveProject(project.id);});
@@ -355,6 +356,7 @@ function integrationContext(store:WorkflowStore,id:string){
   if(item.stage!=="integration"||item.status!=="awaiting_merge")return {item,allowed:false,reason:"需求当前不处于待应用状态"};
   const project=item.projectId?store.getProject(item.projectId):null,evidence:any=store.getLatestCodingEvidence(item.id);
   if(!project)return {item,allowed:false,reason:"需求尚未关联有效项目"};
+  if(project.status==="archived")return {item,project,allowed:false,error:"PROJECT_ARCHIVED",reason:"归档项目不能启动新的集成操作"};
   if(!evidence)return {item,project,allowed:false,reason:"缺少编码证据"};
   if(!item.integrationTargetBranch)return {item,project,evidence,allowed:false,reason:"尚未选择本次需求的目标分支"};
   const latestRun=store.getLatestIntegrationRun(item.id);
