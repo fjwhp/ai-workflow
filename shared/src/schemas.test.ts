@@ -3,6 +3,7 @@ import {
   productArtifactSchema,
   projectInputSchema,
   projectUpdateSchema,
+  projectVersionInputSchema,
   requirementInputSchema,
   requirementProjectsInputSchema
 } from "./schemas.js";
@@ -48,6 +49,7 @@ describe("requirementProjectsInputSchema", () => {
       association({ projectId: " primary " }),
       association({
         projectId: " delivery ", role: "collaborator", usage: "delivery",
+        projectVersionId: " version-delivery ",
         deliveryRequired: true, moduleMode: "selected", moduleIds: [" api ", "web"], position: 1
       })
     ]);
@@ -62,6 +64,7 @@ describe("requirementProjectsInputSchema", () => {
       { ...records[1]!, id: "association-archived", projectId: "archived", position: 0, status: "archived" }
     );
     expect(input[0]?.projectId).toBe("primary");
+    expect(input[1]?.projectVersionId).toBe("version-delivery");
     expect(input[1]?.moduleIds).toEqual(["api", "web"]);
     expect(selectPrimaryProject(records)?.projectId).toBe("primary");
     expect(selectDeliveryProjects(records).map((item) => item.projectId)).toEqual(["delivery", "later"]);
@@ -69,7 +72,10 @@ describe("requirementProjectsInputSchema", () => {
 
   it("rejects duplicate projects", () => {
     const result = requirementProjectsInputSchema.safeParse([
-      association(), association({ role: "collaborator", usage: "delivery", deliveryRequired: true, position: 1 })
+      association(), association({
+        role: "collaborator", usage: "delivery", projectVersionId: "version-delivery",
+        deliveryRequired: true, position: 1
+      })
     ]);
     expect(result.success).toBe(false);
     if (!result.success) expect(result.error.issues[0]?.path).toEqual([1, "projectId"]);
@@ -114,6 +120,29 @@ describe("requirementProjectsInputSchema", () => {
       association({ deliveryRequired: true })
     ]).success).toBe(false);
   });
+
+  it("requires delivery associations to select a project version", () => {
+    const result = requirementProjectsInputSchema.safeParse([
+      association({ usage: "delivery", deliveryRequired: true })
+    ]);
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.issues[0]?.path).toEqual([0, "projectVersionId"]);
+  });
+
+  it("rejects a project version on context associations with a clear error", () => {
+    const result = requirementProjectsInputSchema.safeParse([
+      association({ projectVersionId: "version-context" })
+    ]);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(expect.objectContaining({
+        path: [0, "projectVersionId"],
+        message: "Context projects cannot select a version"
+      }));
+    }
+  });
 });
 
 describe("project schemas", () => {
@@ -133,10 +162,25 @@ describe("project schemas", () => {
   });
 });
 
+describe("projectVersionInputSchema", () => {
+  it("trims project version input strings", () => {
+    expect(projectVersionInputSchema.parse({
+      name: " Release 1 ", branch: " feature/release-1 ", baseBranch: " main "
+    })).toEqual({ name: "Release 1", branch: "feature/release-1", baseBranch: "main" });
+  });
+
+  it.each(["name", "branch", "baseBranch"])("rejects an empty %s", (field) => {
+    expect(projectVersionInputSchema.safeParse({
+      name: "Release 1", branch: "feature/release-1", baseBranch: "main", [field]: "   "
+    }).success).toBe(false);
+  });
+});
+
 describe("requirementInputSchema", () => {
   const input = {
     title: "Requirement", businessProblem: "A concrete business problem",
-    expectedOutcome: "Useful outcome", priority: "medium" as const
+    expectedOutcome: "Useful outcome", priority: "medium" as const,
+    primaryProjectVersionId: "version-1"
   };
 
   it("requires a primary project ID", () => {
@@ -145,5 +189,22 @@ describe("requirementInputSchema", () => {
 
   it("trims the primary project ID", () => {
     expect(requirementInputSchema.parse({ ...input, primaryProjectId: " project-1 " }).primaryProjectId).toBe("project-1");
+  });
+
+  it("requires a primary project version ID", () => {
+    const { primaryProjectVersionId: _, ...withoutVersion } = {
+      ...input,
+      primaryProjectId: "project-1"
+    };
+
+    expect(requirementInputSchema.safeParse(withoutVersion).success).toBe(false);
+  });
+
+  it("trims the primary project version ID", () => {
+    expect(requirementInputSchema.parse({
+      ...input,
+      primaryProjectId: "project-1",
+      primaryProjectVersionId: " version-1 "
+    }).primaryProjectVersionId).toBe("version-1");
   });
 });

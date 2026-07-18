@@ -20,6 +20,13 @@ export const projectInputSchema = z.object({
   category: projectCategorySchema.optional()
 });
 
+export const projectVersionInputSchema = z.object({
+  name: z.string().trim().min(1),
+  branch: z.string().trim().min(1),
+  baseBranch: z.string().trim().min(1),
+  reuseExistingWorktree: z.boolean().optional()
+});
+
 export const projectUpdateSchema = projectInputSchema.partial().extend({
   category: projectCategorySchema.nullable().optional()
 }).refine(
@@ -29,6 +36,7 @@ export const projectUpdateSchema = projectInputSchema.partial().extend({
 
 export const requirementProjectInputSchema = z.object({
   projectId: nonEmptyIdSchema,
+  projectVersionId: nonEmptyIdSchema.optional(),
   role: z.enum(projectRoles),
   usage: z.enum(projectUsages),
   deliveryRequired: z.boolean(),
@@ -36,6 +44,12 @@ export const requirementProjectInputSchema = z.object({
   moduleIds: z.array(nonEmptyIdSchema),
   position: z.number().int().nonnegative()
 }).superRefine((value, ctx) => {
+  if (value.usage === "delivery" && !value.projectVersionId) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["projectVersionId"], message: "Delivery projects must select a version" });
+  }
+  if (value.usage === "context" && value.projectVersionId) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["projectVersionId"], message: "Context projects cannot select a version" });
+  }
   if (value.usage === "context" && value.deliveryRequired) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["deliveryRequired"], message: "Context projects cannot require delivery" });
   }
@@ -72,7 +86,8 @@ export const requirementInputSchema = z.object({
   businessProblem: z.string().trim().min(10),
   expectedOutcome: z.string().trim().min(4),
   priority: prioritySchema.default("medium"),
-  primaryProjectId: nonEmptyIdSchema
+  primaryProjectId: nonEmptyIdSchema,
+  primaryProjectVersionId: nonEmptyIdSchema
 });
 
 export const findingSchema = z.object({
@@ -116,6 +131,7 @@ export const requirementSchema = requirementInputSchema.extend({
 export type Requirement = z.infer<typeof requirementSchema>;
 export type RequirementInput = z.infer<typeof requirementInputSchema>;
 export type ProjectInput = z.infer<typeof projectInputSchema>;
+export type ProjectVersionInput = z.infer<typeof projectVersionInputSchema>;
 export type ProjectUpdate = z.infer<typeof projectUpdateSchema>;
 export type RequirementProjectInput = z.infer<typeof requirementProjectInputSchema>;
 export type AiArtifact = z.infer<typeof aiArtifactSchema>;

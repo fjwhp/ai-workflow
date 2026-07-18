@@ -12,6 +12,20 @@ describe("workflow transitions", () => {
     expect(canTransition("closed", "draft")).toBe(false);
   });
 
+  it("awaits local resolution when an applied change creates no commit", () => {
+    expect(canTransition("awaiting_merge", "awaiting_local_resolution")).toBe(true);
+    expect(canTransition("merge_test_failed", "awaiting_local_resolution")).toBe(true);
+    expect(canTransition("awaiting_merge", "completed")).toBe(false);
+  });
+
+  it("supports resolution and manual escalation after a no-commit application", () => {
+    expect(canTransition("awaiting_local_resolution", "completed")).toBe(true);
+    expect(canTransition("awaiting_local_resolution", "awaiting_merge")).toBe(true);
+    expect(canTransition("awaiting_local_resolution", "manual_resolution_required")).toBe(true);
+    expect(canTransition("manual_resolution_required", "completed")).toBe(true);
+    expect(canTransition("manual_resolution_required", "awaiting_merge")).toBe(true);
+  });
+
   it("places local code integration after acceptance", () => {
     expect(workflowStages.at(-1)).toBe("integration");
     expect(stageLabels.integration).toBe("本地应用");
@@ -27,7 +41,8 @@ describe("requirement input", () => {
       title: "订单备注规则统一",
       businessProblem: "",
       expectedOutcome: "三个入口行为一致",
-      priority: "medium"
+      priority: "medium",
+      primaryProjectVersionId: "version-1"
     });
     expect(result.success).toBe(false);
   });
