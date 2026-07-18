@@ -15,8 +15,8 @@
 **Files:**
 - Modify: `web/src/styles.css`
 
-- [ ] Capture the current 390px DOM geometry and verify the action panel follows the artifact section.
-- [ ] Change the mobile `.detail-grid` to `display:flex; flex-direction:column` and retain `.action-panel{order:-1}`.
-- [ ] Add desktop-only sticky positioning to `.action-panel` with `top:16px`.
-- [ ] Run `npm test`, `npm run typecheck`, and `npm run build`.
-- [ ] Verify at 390px, 760px, and desktop width that the action panel precedes or remains beside the artifact, with no overlap or horizontal overflow.
+- [x] Capture the current 390px DOM geometry and verify the action panel follows the artifact section.
+- [x] Change the mobile `.detail-grid` to `display:flex; flex-direction:column` and retain `.action-panel{order:-1}`.
+- [x] Add desktop-only sticky positioning to `.action-panel` with `top:16px`.
+- [x] Run `npm test`, `npm run typecheck`, and `npm run build`.
+- [x] Verify at 390px, 760px, and desktop width that the action panel precedes or remains beside the artifact, with no overlap or horizontal overflow.

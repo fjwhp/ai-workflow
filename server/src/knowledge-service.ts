@@ -1,0 +1,12 @@
+import { execFile } from "node:child_process";import { promisify } from "node:util";import { buildProjectKnowledge } from "./project-knowledge.js";import type { WorkflowStore } from "./store.js";
+const exec=promisify(execFile);
+export async function ensureProjectKnowledge(store:WorkflowStore,project:any,reason:string,force=false){
+  const head=(await exec("git",["-C",project.repoPath,"rev-parse","HEAD"])).stdout.trim(),latest:any=store.getLatestProjectKnowledge(project.id);
+  if(!force&&latest?.status==="ready"&&latest.sourceHead===head)return latest;
+  if(latest?.status==="building")return latest;
+  const run=store.beginProjectKnowledge(project.id,head,reason);
+  try{const built=await buildProjectKnowledge({repoPath:project.repoPath,sensitivePatterns:project.sensitivePatterns||[]});return store.completeProjectKnowledge(run.id,built);}
+  catch(error){store.failProjectKnowledge(run.id,error instanceof Error?error.message:String(error));throw error;}
+}
+function termsOf(input:any){const text=`${input.title||""} ${input.businessProblem||""} ${input.expectedOutcome||""}`.toLowerCase(),terms=new Set(text.split(/[^a-z0-9\u4e00-\u9fa5]+/).filter((x:string)=>x.length>1));for(const seq of text.match(/[\u4e00-\u9fa5]{2,}/g)||[])for(let n=2;n<=Math.min(4,seq.length);n++)for(let i=0;i<=seq.length-n;i++)terms.add(seq.slice(i,i+n));const aliases:Record<string,string[]>={用户:["user","account"],系统:["sys","admin","system"],批量:["batch","list"],订单:["order"],商品:["product","goods"],供应商:["supplier"],门店:["store","shop"],角色:["role"],权限:["permission","auth"]};for(const [word,values] of Object.entries(aliases))if(text.includes(word))values.forEach(value=>terms.add(value));return [...terms];}
+export function retrieveProjectKnowledge(knowledge:any,requirement:any){const terms=termsOf(requirement),ranked=(knowledge.entries||[]).map((entry:any)=>{const hay=`${entry.path} ${entry.title} ${(entry.tags||[]).join(" ")} ${entry.content}`.toLowerCase();return {entry,score:(entry.kind==="overview"||entry.kind==="module"?5:0)+terms.filter(term=>hay.includes(term)).length};}).filter((x:any)=>x.score>0).sort((a:any,b:any)=>b.score-a.score);const entries:any[]=[];let chars=0,truncated=false;for(const {entry} of ranked){if(entries.length>=24||chars>=40000){truncated=true;break}const content=entry.content.slice(0,40000-chars);entries.push({...entry,content});chars+=content.length}return {version:knowledge.version,sourceHead:knowledge.sourceHead,summary:knowledge.summary,entries,totalAvailable:knowledge.entries?.length||0,totalChars:chars,truncated};}

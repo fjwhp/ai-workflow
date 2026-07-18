@@ -1,0 +1,1 @@
+export function projectKnowledgeView(value:any){const labels:any={missing:"尚未生成",building:"生成中",ready:"可用",stale:"需更新",failed:"失败"};return {label:labels[value?.status]||"尚未生成",version:value?.version?`v${value.version}`:"-",head:value?.sourceHead||"-",entryCount:value?.entryCount||0,moduleCount:value?.moduleCount||0,error:value?.error||"",canRebuild:value?.status!=="building"};}

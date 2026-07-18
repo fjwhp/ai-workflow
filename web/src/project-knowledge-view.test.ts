@@ -1,0 +1,2 @@
+import { describe,expect,it } from "vitest";import { projectKnowledgeView } from "./project-knowledge-view.js";
+describe("projectKnowledgeView",()=>{it("maps durable statuses",()=>{expect(projectKnowledgeView({status:"ready",version:2,sourceHead:"abcdef123456",entryCount:30,moduleCount:4})).toMatchObject({label:"可用",version:"v2",head:"abcdef123456",canRebuild:true});expect(projectKnowledgeView({status:"building"}).label).toBe("生成中");expect(projectKnowledgeView({status:"failed",error:"bad"}).error).toBe("bad");});});

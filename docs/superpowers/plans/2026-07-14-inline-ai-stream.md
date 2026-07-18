@@ -14,25 +14,25 @@
 
 **Files:** `web/src/stream-view.ts`, `web/src/stream-view.test.ts`
 
-- [ ] Add failing tests for reasoning filtering, output-delta merging, sequence deduplication, Codex command/file normalization and terminal entries.
-- [ ] Run the focused test and verify it fails because the module is missing.
-- [ ] Implement the pure normalization and merge functions.
-- [ ] Run the focused test and verify all cases pass.
+- [x] Add failing tests for reasoning filtering, output-delta merging, sequence deduplication, Codex command/file normalization and terminal entries.
+- [x] Run the focused test and verify it fails because the module is missing.
+- [x] Implement the pure normalization and merge functions.
+- [x] Run the focused test and verify all cases pass.
 
 ### Task 2: Inline SSE component
 
 **Files:** `web/src/inline-run-stream.tsx`, `web/src/main.tsx`, `web/src/run-observability.css`
 
-- [ ] Add the component with snapshot recovery, last-sequence SSE connection, reconnect indicator and terminal refresh callback.
-- [ ] Add safe visible-event cards, merged model output, collapsible command/diagnostic output and full-detail action.
-- [ ] Add bounded internal scrolling, auto-follow pause and “回到最新”.
-- [ ] Replace the current empty/artifact body with the inline stream only while the current stage is `ai_running`.
-- [ ] Keep stop disabled with a clear unsupported explanation.
+- [x] Add the component with snapshot recovery, last-sequence SSE connection, reconnect indicator and terminal refresh callback.
+- [x] Add safe visible-event cards, merged model output, collapsible command/diagnostic output and full-detail action.
+- [x] Add bounded internal scrolling, auto-follow pause and “回到最新”.
+- [x] Replace the current empty/artifact body with the inline stream only while the current stage is `ai_running`.
+- [x] Keep stop disabled with a clear unsupported explanation.
 
 ### Task 3: Verification
 
 **Files:** only files required by defects found during verification.
 
-- [ ] Run `npm test`, `npm run typecheck`, and `npm run build`.
-- [ ] Browser-verify running and recovered streams at desktop and mobile widths without modifying the point-of-sale main worktree.
-- [ ] Confirm no internal reasoning appears and the full execution modal remains accessible.
+- [x] Run `npm test`, `npm run typecheck`, and `npm run build`.
+- [x] Browser-verify running and recovered streams at desktop and mobile widths without modifying the point-of-sale main worktree.
+- [x] Confirm no internal reasoning appears and the full execution modal remains accessible.

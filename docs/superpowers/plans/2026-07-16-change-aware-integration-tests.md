@@ -1,6 +1,6 @@
 # Change-Aware Integration Tests Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Automatically select safe module-scoped verification commands from each requirement's coding evidence when applying changes locally.
 
@@ -16,10 +16,10 @@
 - Create: `server/src/verification-plan.ts`
 - Create: `server/src/verification-plan.test.ts`
 
-- [ ] Write failing tests for one module, duplicate files, multiple modules, root build changes, and fallback.
-- [ ] Run `npm test -- server/src/verification-plan.test.ts` and verify RED.
-- [ ] Implement `buildVerificationPlan({ repoPath, changedFiles, fallbackCommands })` using nearest `pom.xml` discovery and safe `{command,argsPrefix}` descriptors.
-- [ ] Run the test and verify GREEN.
+- [x] Write failing tests for one module, duplicate files, multiple modules, root build changes, and fallback.
+- [x] Run `npm test -- server/src/verification-plan.test.ts` and verify RED.
+- [x] Implement `buildVerificationPlan({ repoPath, changedFiles, fallbackCommands })` using nearest `pom.xml` discovery and safe `{command,argsPrefix}` descriptors.
+- [x] Run the test and verify GREEN.
 
 ### Task 2: Integration preflight and execution
 
@@ -28,10 +28,10 @@
 - Modify: `server/src/integration.test.ts`
 - Modify: `server/src/app.ts`
 
-- [ ] Write failing tests requiring preflight to expose `changedModules`, `plannedCommands`, and `commandSource`.
-- [ ] Run focused tests and verify RED.
-- [ ] Pass evidence files and fallback commands through integration context, calculate the plan in preflight, block when no safe command exists, and execute only `preflight.plannedCommands`.
-- [ ] Run focused tests and verify GREEN.
+- [x] Write failing tests requiring preflight to expose `changedModules`, `plannedCommands`, and `commandSource`.
+- [x] Run focused tests and verify RED.
+- [x] Pass evidence files and fallback commands through integration context, calculate the plan in preflight, block when no safe command exists, and execute only `preflight.plannedCommands`.
+- [x] Run focused tests and verify GREEN.
 
 ### Task 3: Integration UI
 
@@ -39,18 +39,18 @@
 - Modify: `web/src/main.tsx`
 - Modify: `web/src/styles.css`
 
-- [ ] Render detected modules and planned commands in the integration panel before confirmation.
-- [ ] Preserve existing conflict, retry, protected-branch, and no-push behavior.
-- [ ] Run web typecheck and integration view tests.
+- [x] Render detected modules and planned commands in the integration panel before confirmation.
+- [x] Preserve existing conflict, retry, protected-branch, and no-push behavior.
+- [x] Run web typecheck and integration view tests.
 
 ### Task 4: Verification
 
 **Files:**
 - Verify only
 
-- [ ] Run `npm test`.
-- [ ] Run `npm run typecheck`.
-- [ ] Run `npm run build`.
-- [ ] Restart one dev-service instance.
-- [ ] Verify current REQ-0001 planning selects `dine-service/dine-admin-service` rather than `dine-product-service`.
-- [ ] Confirm Soto Dine remains uncommitted and unpushed.
+- [x] Run `npm test`.
+- [x] Run `npm run typecheck`.
+- [x] Run `npm run build`.
+- [x] Restart one dev-service instance.
+- [x] Verify current REQ-0001 planning selects `dine-service/dine-admin-service` rather than `dine-product-service`.
+- [x] Confirm Soto Dine remains uncommitted and unpushed.
