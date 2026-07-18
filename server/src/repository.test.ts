@@ -1,10 +1,10 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { getLocalBranches, getWorktreeSnapshot, isProtectedBranch } from "./repository.js";
+import { createOrReuseRequirementWorktree, getLocalBranches, getWorktreeSnapshot, isProtectedBranch } from "./repository.js";
 
 const exec = promisify(execFile); const dirs: string[] = [];
 afterEach(async()=>{for(const dir of dirs.splice(0))await rm(dir,{recursive:true,force:true})});
@@ -35,5 +35,92 @@ describe("local integration branches",()=>{
       {name:"main",current:false,protected:true}
     ]);
     expect(isProtectedBranch("prod")).toBe(true);expect(isProtectedBranch("feature/prod-fix")).toBe(false);
+  });
+});
+
+async function git(path: string, ...args: string[]) { return (await exec("git", ["-C", path, ...args])).stdout.trim(); }
+
+async function setupVersionRepository() {
+  const root = await mkdtemp(join(tmpdir(), "workflow-requirements-")); dirs.push(root);
+  const repoPath = join(root, "project");
+  await exec("git", ["init", "-b", "prod", repoPath]);
+  await git(repoPath, "config", "user.email", "test@example.com"); await git(repoPath, "config", "user.name", "Test");
+  await writeFile(join(repoPath, "README.md"), "base\n"); await git(repoPath, "add", "--all"); await git(repoPath, "commit", "-m", "base");
+  await git(repoPath, "branch", "feature/2.2.1");
+  return { root, repoPath };
+}
+
+async function mainState(repoPath: string) {
+  return {
+    branch: await git(repoPath, "branch", "--show-current"),
+    head: await git(repoPath, "rev-parse", "HEAD"),
+    status: await git(repoPath, "status", "--porcelain=v1", "--untracked-files=all")
+  };
+}
+
+describe("requirement worktree lifecycle", () => {
+  it("creates independent deterministic worktrees from a version branch current HEAD", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const before = await mainState(repoPath);
+    const versionHead = await git(repoPath, "rev-parse", "feature/2.2.1");
+    const first = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0001");
+    expect(first).toEqual({
+      branch: "ai/REQ-0001",
+      worktreePath: resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "requirements", "REQ-0001"),
+      baseCommit: versionHead,
+      reused: false
+    });
+
+    const versionTree = await git(repoPath, "rev-parse", "feature/2.2.1^{tree}");
+    const advancedHead = await git(repoPath, "commit-tree", versionTree, "-p", versionHead, "-m", "advance version");
+    await git(repoPath, "update-ref", "refs/heads/feature/2.2.1", advancedHead, versionHead);
+    const second = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0002");
+    expect(second.branch).toBe("ai/REQ-0002");
+    expect(second.worktreePath).not.toBe(first.worktreePath);
+    expect(second.baseCommit).toBe(await git(repoPath, "rev-parse", "feature/2.2.1"));
+    expect(await git(first.worktreePath, "rev-parse", "HEAD")).toBe(versionHead);
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("reuses the same managed worktree and preserves uncommitted changes", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const first = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0001");
+    await writeFile(join(first.worktreePath, "unfinished.txt"), "keep me\n");
+    const second = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0001");
+    expect(second).toEqual({ ...first, reused: true });
+    expect(await git(first.worktreePath, "status", "--porcelain")).toContain("?? unfinished.txt");
+  });
+
+  it("attaches an existing unmounted requirement branch at the deterministic path", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const before = await mainState(repoPath);
+    await git(repoPath, "branch", "ai/REQ-0004", "feature/2.2.1");
+    const created = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0004");
+    expect(created).toMatchObject({ branch: "ai/REQ-0004", reused: false, baseCommit: await git(repoPath, "rev-parse", "feature/2.2.1") });
+    expect(await git(created.worktreePath, "branch", "--show-current")).toBe("ai/REQ-0004");
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("rejects unsafe requirement codes and a matching branch mounted outside the managed root", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const before = await mainState(repoPath);
+    await expect(createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "../escape"))
+      .rejects.toThrow("REQUIREMENT_CODE_INVALID");
+    await git(repoPath, "branch", "ai/REQ-0003", "feature/2.2.1");
+    await git(repoPath, "worktree", "add", join(root, "user-worktree"), "ai/REQ-0003");
+    await expect(createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0003"))
+      .rejects.toThrow("REQUIREMENT_WORKTREE_OUTSIDE_MANAGED_ROOT");
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("rejects a symlinked managed requirements root that escapes its canonical location", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const managedRoot = resolve(repoPath, "..", ".ai-workflow-worktrees");
+    const outside = join(root, "outside-requirements");
+    await mkdir(outside);
+    await symlink(outside, managedRoot);
+    await expect(createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0005"))
+      .rejects.toThrow("REQUIREMENT_WORKTREE_PATH_ESCAPE");
+    expect(await readdir(outside)).toEqual([]);
   });
 });

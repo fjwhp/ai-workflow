@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, realpath } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { lstat, mkdir, readFile, realpath } from "node:fs/promises";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -30,13 +30,140 @@ export async function validateRepository(repoPath: string) {
   }
 }
 
-export async function createIsolatedWorktree(repoPath: string, defaultBranch: string, requirementCode: string, runId: string) {
-  const root = resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath));
-  await mkdir(root, { recursive: true });
-  const branch = `ai/${requirementCode.toLowerCase()}-${runId.slice(0, 8)}`;
-  const worktreePath = resolve(root, branch.replaceAll("/", "-"));
-  await execFileAsync("git", ["-C", repoPath, "worktree", "add", "-b", branch, worktreePath, defaultBranch]);
-  return { branch, worktreePath };
+interface RegisteredWorktree { path: string; branch?: string; baseCommit: string }
+
+function parseRegisteredWorktrees(output: string): RegisteredWorktree[] {
+  const result: RegisteredWorktree[] = [];
+  let current: Partial<RegisteredWorktree> = {};
+  const finish = () => {
+    if (current.path && current.baseCommit) result.push(current as RegisteredWorktree);
+    current = {};
+  };
+  for (const field of output.split("\0")) {
+    if (!field) { finish(); continue; }
+    const separator = field.indexOf(" ");
+    const key = separator < 0 ? field : field.slice(0, separator);
+    const value = separator < 0 ? "" : field.slice(separator + 1);
+    if (key === "worktree") current.path = value;
+    if (key === "HEAD") current.baseCommit = value;
+    if (key === "branch") current.branch = value;
+  }
+  finish();
+  return result;
+}
+
+async function requirementRepoPath(repoPath: string) {
+  const requested = resolve(repoPath);
+  let canonical: string;
+  try {
+    canonical = await realpath(requested);
+    const { stdout } = await execFileAsync("git", ["-C", canonical, "rev-parse", "--show-toplevel"]);
+    if (await realpath(stdout.trim()) !== canonical) throw new Error("REPOSITORY_INVALID");
+  } catch (error) {
+    if (error instanceof Error && error.message === "REPOSITORY_INVALID") throw error;
+    throw new Error("REPOSITORY_INVALID");
+  }
+  return requested;
+}
+
+async function validateLocalBranch(repoPath: string, branch: string, invalidCode: string, missingCode: string) {
+  try { await execFileAsync("git", ["-C", repoPath, "check-ref-format", "--branch", branch]); }
+  catch { throw new Error(invalidCode); }
+  try { await execFileAsync("git", ["-C", repoPath, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`]); }
+  catch { throw new Error(missingCode); }
+}
+
+async function localBranchExists(repoPath: string, branch: string) {
+  try {
+    await execFileAsync("git", ["-C", repoPath, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+    return true;
+  } catch { return false; }
+}
+
+function isInside(root: string, candidate: string) {
+  const pathFromRoot = relative(root, candidate);
+  return pathFromRoot === "" || (pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot));
+}
+
+async function ensureRequirementDirectory(parent: string, segments: string[]) {
+  let path = resolve(parent);
+  let canonicalPath = await realpath(path);
+  for (const segment of segments) {
+    path = resolve(path, segment);
+    canonicalPath = resolve(canonicalPath, segment);
+    let entry;
+    try { entry = await lstat(path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE");
+      try { await mkdir(path); }
+      catch (mkdirError) {
+        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE");
+      }
+      try { entry = await lstat(path); }
+      catch { throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE"); }
+    }
+    if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE");
+    if (await realpath(path) !== canonicalPath) throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE");
+  }
+  return { path, canonicalPath };
+}
+
+async function findRegisteredWorktree(repoPath: string, branch: string, managedRoot: string) {
+  const { stdout } = await execFileAsync("git", ["-C", repoPath, "worktree", "list", "--porcelain", "-z"]);
+  const matches = parseRegisteredWorktrees(stdout).filter((item) => item.branch === `refs/heads/${branch}`);
+  if (!matches.length) return undefined;
+  if (matches.length !== 1) throw new Error("REQUIREMENT_WORKTREE_AMBIGUOUS");
+  let canonicalPath: string;
+  try { canonicalPath = await realpath(matches[0]!.path); }
+  catch { throw new Error("REQUIREMENT_WORKTREE_INVALID"); }
+  const canonicalParent = await realpath(resolve(repoPath, ".."));
+  const expectedCanonicalRoot = resolve(canonicalParent, ".ai-workflow-worktrees", basename(repoPath), "requirements");
+  let canonicalRoot = expectedCanonicalRoot;
+  try {
+    canonicalRoot = await realpath(managedRoot);
+    if (canonicalRoot !== expectedCanonicalRoot) throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE");
+  } catch (error) {
+    if (error instanceof Error && error.message === "REQUIREMENT_WORKTREE_PATH_ESCAPE") throw error;
+  }
+  if (!isInside(canonicalRoot, canonicalPath)) throw new Error("REQUIREMENT_WORKTREE_OUTSIDE_MANAGED_ROOT");
+  const deterministicPath = resolve(managedRoot, branch.slice("ai/".length));
+  let returnedPath = canonicalPath;
+  try { if (await realpath(deterministicPath) === canonicalPath) returnedPath = deterministicPath; } catch { /* use registered path */ }
+  return { ...matches[0]!, path: returnedPath };
+}
+
+export async function createOrReuseRequirementWorktree(repoPath: string, baseBranch: string, requirementCode: string) {
+  if (!/^REQ-[0-9]{4,}$/.test(requirementCode)) throw new Error("REQUIREMENT_CODE_INVALID");
+  repoPath = await requirementRepoPath(repoPath);
+  await validateLocalBranch(repoPath, baseBranch, "REQUIREMENT_BASE_BRANCH_INVALID", "REQUIREMENT_BASE_BRANCH_NOT_FOUND");
+  const branch = `ai/${requirementCode}`;
+  const root = resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "requirements");
+  const worktreePath = resolve(root, requirementCode);
+  const existing = await findRegisteredWorktree(repoPath, branch, root);
+  if (existing) return { branch, worktreePath: existing.path, baseCommit: existing.baseCommit, reused: true };
+
+  await ensureRequirementDirectory(resolve(repoPath, ".."), [
+    ".ai-workflow-worktrees", basename(repoPath), "requirements"
+  ]);
+  if (!isInside(root, worktreePath)) throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE");
+  try {
+    await lstat(worktreePath);
+    throw new Error("REQUIREMENT_WORKTREE_PATH_IN_USE");
+  } catch (error) {
+    if (error instanceof Error && error.message === "REQUIREMENT_WORKTREE_PATH_IN_USE") throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("REQUIREMENT_WORKTREE_PATH_IN_USE");
+  }
+  if (await localBranchExists(repoPath, branch)) {
+    await execFileAsync("git", ["-C", repoPath, "worktree", "add", worktreePath, branch]);
+  } else {
+    await execFileAsync("git", ["-C", repoPath, "worktree", "add", "-b", branch, worktreePath, baseBranch]);
+  }
+  const baseCommit = (await execFileAsync("git", ["-C", worktreePath, "rev-parse", "HEAD"])).stdout.trim();
+  return { branch, worktreePath, baseCommit, reused: false };
+}
+
+export async function createIsolatedWorktree(repoPath: string, defaultBranch: string, requirementCode: string, _runId: string) {
+  return createOrReuseRequirementWorktree(repoPath, defaultBranch, requirementCode);
 }
 
 export async function getWorktreeDiff(worktreePath: string) {
