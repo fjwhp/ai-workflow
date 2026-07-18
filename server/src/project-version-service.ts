@@ -191,7 +191,7 @@ export async function createProjectVersionWorktree(input: {
   repoPath: string; versionId: string; branch: string; baseBranch: string;
   mode: "create_branch" | "attach_branch" | "reuse_worktree";
   existingWorktreePath?: string; reuseExistingWorktree?: boolean;
-}): Promise<{ worktreePath: string; headCommit: string; createdBranch: boolean; createdWorktree: boolean }> {
+}): Promise<{ worktreePath: string; headCommit: string; createdBranchHead?: string; createdBranch: boolean; createdWorktree: boolean }> {
   const repoPath = await validateRepo(input.repoPath);
   if (!validVersionId(input.versionId)) fail("PROJECT_VERSION_ID_INVALID");
   return withRepoWorktreeMutationLock(repoPath, async () => {
@@ -233,6 +233,7 @@ export async function createProjectVersionWorktree(input: {
       return {
         worktreePath,
         headCommit: identity.headCommit,
+        ...(ownedHead ? { createdBranchHead: ownedHead } : {}),
         createdBranch: input.mode === "create_branch",
         createdWorktree: true
       };

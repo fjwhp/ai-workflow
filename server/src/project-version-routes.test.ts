@@ -331,6 +331,14 @@ class ClosingVersionReadStore extends WorkflowStore {
   }
 }
 
+class ArchivingVersionUpdateStore extends WorkflowStore {
+  override updateProjectVersionHead(id: string, headCommit: string) {
+    const version = this.getProjectVersion(id)!;
+    this.archiveProject(version.projectId);
+    return super.updateProjectVersionHead(id, headCommit);
+  }
+}
+
 describe("project version persistence rollback", () => {
   it("removes only the managed worktree and branch created by the failed request", async () => {
     const { repoPath } = await setupRepository();
@@ -558,6 +566,25 @@ describe("project version item routes", () => {
     expect(response.statusCode).toBe(409);
     expect(response.json().error).toBe("PROJECT_VERSION_NOT_ACTIVE");
     expect(store.getProjectVersion(version.id)).toMatchObject({ status: "closed", headCommit: version.headCommit });
+  });
+
+  it("reports an archived project when archival wins the atomic head update", async () => {
+    const { repoPath } = await setupRepository();
+    const store = new ArchivingVersionUpdateStore(":memory:"); stores.push(store);
+    const project = createProject(store, repoPath);
+    const app = await routeApp(store);
+    const version = await createVersion(app, project.id, {
+      name: "archive-update-race", branch: "feature/archive-update-race", baseBranch: "prod"
+    });
+    await writeFile(join(version.worktreePath, "advanced.txt"), "advanced\n");
+    await git(version.worktreePath, "add", "--all");
+    await git(version.worktreePath, "commit", "-m", "advance before archive update race");
+
+    const response = await app.inject({ method: "POST", url: `/api/project-versions/${version.id}/recheck` });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("PROJECT_ARCHIVED");
+    expect(store.getProjectVersion(version.id)).toMatchObject({ status: "active", headCommit: version.headCommit });
   });
 
   it("closes a clean valid version idempotently without deleting Git state", async () => {

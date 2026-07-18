@@ -214,7 +214,9 @@ export async function cleanupFailedManagedWorktreeCreation(input: {
   targetReserved: boolean;
   worktreeAddAttempted: boolean;
   worktreeAdded: boolean;
+  requireClean?: boolean;
 }) {
+  let removed = false;
   const mayOwnTarget = input.targetReserved && (input.worktreeAddAttempted || input.worktreeAdded);
   if (mayOwnTarget) {
     let targetRegistration: RegisteredWorktree | undefined;
@@ -227,13 +229,23 @@ export async function cleanupFailedManagedWorktreeCreation(input: {
       }
     } catch { /* do not touch an unverified target */ }
 
+    if (input.requireClean && targetRegistration && targetRegistration.branch !== `refs/heads/${input.branch}`) return false;
     if (targetRegistration?.branch === `refs/heads/${input.branch}`) {
       const identity = await inspectActualWorktreeIdentity(input.repoPath, input.worktreePath, input.branch);
       if (identity.valid && identity.path === input.worktreePath) {
-        await execFileAsync("git", ["-C", input.repoPath, "worktree", "remove", "--force", input.worktreePath]).catch(() => undefined);
-        await rm(input.worktreePath, { recursive: true, force: true }).catch(() => undefined);
+        if (input.requireClean) {
+          try {
+            await execFileAsync("git", ["-C", input.repoPath, "worktree", "remove", input.worktreePath]);
+            removed = true;
+          } catch { return false; }
+        } else {
+          await execFileAsync("git", ["-C", input.repoPath, "worktree", "remove", "--force", input.worktreePath]).catch(() => undefined);
+          await rm(input.worktreePath, { recursive: true, force: true }).catch(() => undefined);
+          removed = true;
+        }
       }
     } else if (!targetRegistration) {
+      if (input.requireClean) return false;
       let safeToRemove = false;
       try {
         safeToRemove = (await readdir(input.worktreePath)).length === 0;
@@ -246,7 +258,7 @@ export async function cleanupFailedManagedWorktreeCreation(input: {
     }
   }
 
-  if (!input.ownedHead) return;
+  if (!input.ownedHead) return removed;
   try {
     const { stdout } = await execFileAsync("git", ["-C", input.repoPath, "worktree", "list", "--porcelain", "-z"]);
     const stillInUse = parseRegisteredWorktrees(stdout).some((item) => item.branch === `refs/heads/${input.branch}`);
@@ -254,6 +266,7 @@ export async function cleanupFailedManagedWorktreeCreation(input: {
       await execFileAsync("git", ["-C", input.repoPath, "update-ref", "-d", `refs/heads/${input.branch}`, input.ownedHead]);
     }
   } catch { /* best-effort rollback without touching pre-existing refs */ }
+  return removed;
 }
 
 export async function createOrReuseRequirementWorktree(repoPath: string, baseBranch: string, requirementCode: string) {

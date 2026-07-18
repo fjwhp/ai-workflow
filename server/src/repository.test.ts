@@ -279,4 +279,52 @@ describe("requirement worktree lifecycle", () => {
     expect(await git(target, "branch", "--show-current")).toBe(branch);
     expect(await git(target, "show", "HEAD:FOREIGN.md")).toBe("foreign");
   });
+
+  it("refuses to remove a dirty owned worktree when clean rollback is required", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const branch = "feature/dirty-cleanup";
+    const target = resolve(
+      await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "versions", "dirty-cleanup"
+    );
+    await mkdir(resolve(target, ".."), { recursive: true });
+    const ownedHead = await git(repoPath, "rev-parse", "prod");
+    await git(repoPath, "branch", branch, ownedHead);
+    await git(repoPath, "worktree", "add", target, branch);
+    await writeFile(join(target, "recovery.txt"), "keep this work\n");
+
+    const removed = await cleanupFailedManagedWorktreeCreation({
+      repoPath: await realpath(repoPath), worktreePath: target, branch, ownedHead,
+      targetReserved: true, worktreeAddAttempted: true, worktreeAdded: true, requireClean: true
+    });
+
+    expect(removed).toBe(false);
+    expect(await pathExists(target)).toBe(true);
+    expect(await git(target, "status", "--porcelain")).toContain("?? recovery.txt");
+    expect(await localBranchExistsForTest(repoPath, branch)).toBe(true);
+    expect(await registeredPaths(repoPath, branch)).toEqual([target]);
+  });
+
+  it("preserves both refs when a clean rollback target belongs to another branch", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const branch = "feature/expected-owner";
+    const winner = "feature/external-winner";
+    const target = resolve(
+      await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "versions", "external-winner"
+    );
+    await mkdir(resolve(target, ".."), { recursive: true });
+    const ownedHead = await git(repoPath, "rev-parse", "prod");
+    await git(repoPath, "branch", branch, ownedHead);
+    await git(repoPath, "branch", winner, ownedHead);
+    await git(repoPath, "worktree", "add", target, winner);
+
+    const removed = await cleanupFailedManagedWorktreeCreation({
+      repoPath: await realpath(repoPath), worktreePath: target, branch, ownedHead,
+      targetReserved: true, worktreeAddAttempted: true, worktreeAdded: true, requireClean: true
+    });
+
+    expect(removed).toBe(false);
+    expect(await localBranchExistsForTest(repoPath, branch)).toBe(true);
+    expect(await localBranchExistsForTest(repoPath, winner)).toBe(true);
+    expect(await git(target, "branch", "--show-current")).toBe(winner);
+  });
 });

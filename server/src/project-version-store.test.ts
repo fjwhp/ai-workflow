@@ -233,6 +233,30 @@ describe("project version persistence", () => {
     expect(store.getProjectVersion(version.id)).toMatchObject({ status: "closed", headCommit: version.headCommit });
   });
 
+  it("does not update an active version head after its project is archived externally", () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const database = new DatabaseSync(path); databases.push(database);
+    const project = createProject(store, "Archived update", join(path, "..", "archived-update"));
+    const version = createVersion(store, project.id, "archived-update", join(path, "..", "archived-update-version"));
+    database.prepare("UPDATE projects SET status = 'archived' WHERE id = ?").run(project.id);
+
+    expect(store.updateProjectVersionHead(version.id, "unexpected-head")).toBeNull();
+    expect(store.getProjectVersion(version.id)).toMatchObject({ status: "active", headCommit: version.headCommit });
+  });
+
+  it("does not close an active version after its project is archived externally", () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const database = new DatabaseSync(path); databases.push(database);
+    const project = createProject(store, "Archived close", join(path, "..", "archived-close"));
+    const version = createVersion(store, project.id, "archived-close", join(path, "..", "archived-close-version"));
+    database.prepare("UPDATE projects SET status = 'archived' WHERE id = ?").run(project.id);
+
+    expect(() => store.closeProjectVersion(version.id)).toThrow("PROJECT_NOT_ACTIVE");
+    expect(store.getProjectVersion(version.id)).toMatchObject({ status: "active", closedAt: undefined });
+  });
+
   it("maps unique conflicts to stable errors while scoping name and branch per project", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const first = createProject(store, "First", "/tmp/version-first");

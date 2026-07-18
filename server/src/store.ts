@@ -727,7 +727,9 @@ export class WorkflowStore {
   }
 
   updateProjectVersionHead(id: string, headCommit: string): ProjectVersion | null {
-    const result = this.db.prepare("UPDATE project_versions SET head_commit = ?, updated_at = ? WHERE id = ? AND status = 'active'")
+    const result = this.db.prepare(`UPDATE project_versions SET head_commit = ?, updated_at = ?
+      WHERE id = ? AND status = 'active'
+        AND EXISTS (SELECT 1 FROM projects p WHERE p.id = project_versions.project_id AND p.status = 'active')`)
       .run(headCommit, new Date().toISOString(), id);
     return result.changes ? this.getProjectVersion(id) : null;
   }
@@ -735,8 +737,10 @@ export class WorkflowStore {
   closeProjectVersion(id: string): ProjectVersion {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const version = this.db.prepare("SELECT * FROM project_versions WHERE id = ?").get(id) as any;
+      const version = this.db.prepare(`SELECT pv.*, p.status AS project_status FROM project_versions pv
+        JOIN projects p ON p.id = pv.project_id WHERE pv.id = ?`).get(id) as any;
       if (!version) throw new Error("PROJECT_VERSION_NOT_FOUND");
+      if (version.project_status !== "active") throw new Error("PROJECT_NOT_ACTIVE");
       if (version.status === "closed") {
         this.db.exec("COMMIT");
         return this.getProjectVersion(id)!;

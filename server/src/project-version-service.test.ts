@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -100,11 +100,53 @@ describe("project version worktree lifecycle", () => {
     expect(created).toEqual({
       worktreePath: resolve(await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "versions", "version-23"),
       headCommit: baseHead,
+      createdBranchHead: baseHead,
       createdBranch: true,
       createdWorktree: true
     });
     expect(await git(created.worktreePath, "branch", "--show-current")).toBe("feature/2.3");
     expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("returns the base head resolved inside creation after an earlier inspection becomes stale", async () => {
+    const { repoPath } = await setupRepository();
+    const inspected = await inspectProjectVersion({
+      repoPath, name: "stale-base", branch: "feature/stale-base", baseBranch: "prod"
+    });
+    await writeFile(join(repoPath, "advanced-base.txt"), "advanced base\n");
+    await git(repoPath, "add", "--all");
+    await git(repoPath, "commit", "-m", "advance base after inspection");
+    const creationBase = await git(repoPath, "rev-parse", "prod");
+
+    const created = await createProjectVersionWorktree({
+      repoPath, versionId: "stale-base", branch: "feature/stale-base", baseBranch: "prod", mode: "create_branch"
+    });
+
+    expect(inspected.headCommit).not.toBe(creationBase);
+    expect(created.createdBranchHead).toBe(creationBase);
+    expect(created.headCommit).toBe(creationBase);
+  });
+
+  it("keeps the lock-time branch head separate from a checkout hook advanced final head", async () => {
+    const { repoPath } = await setupRepository();
+    const creationBase = await git(repoPath, "rev-parse", "prod");
+    const hookPath = join(repoPath, ".git", "hooks", "post-checkout");
+    await writeFile(hookPath, [
+      "#!/bin/sh",
+      "printf 'hook advance\\n' > hook-advance.txt",
+      "git add hook-advance.txt",
+      "git commit -m 'hook advance' >/dev/null 2>&1",
+      ""
+    ].join("\n"));
+    await chmod(hookPath, 0o755);
+
+    const created = await createProjectVersionWorktree({
+      repoPath, versionId: "hook-head", branch: "feature/hook-head", baseBranch: "prod", mode: "create_branch"
+    });
+
+    expect(created.createdBranchHead).toBe(creationBase);
+    expect(created.headCommit).not.toBe(creationBase);
+    expect(created.headCommit).toBe(await git(created.worktreePath, "rev-parse", "HEAD"));
   });
 
   it("attaches an existing unmounted branch", async () => {

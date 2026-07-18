@@ -99,12 +99,6 @@ async function rollbackCreatedGitState(input: {
 }) {
   if (!input.createdBranch && !input.createdWorktree) return;
   await withRepoWorktreeMutationLock(input.repoPath, async () => {
-    const inspection = await inspectVersionWorktree({
-      repoPath: input.repoPath,
-      worktreePath: input.worktreePath,
-      branch: input.branch
-    });
-    if (!inspection.valid || !inspection.clean) return;
     await cleanupFailedManagedWorktreeCreation({
       repoPath: input.repoPath,
       worktreePath: input.worktreePath,
@@ -112,7 +106,8 @@ async function rollbackCreatedGitState(input: {
       ownedHead: input.createdBranch ? input.expectedBranchHead : undefined,
       targetReserved: input.createdWorktree,
       worktreeAddAttempted: input.createdWorktree,
-      worktreeAdded: input.createdWorktree
+      worktreeAdded: input.createdWorktree,
+      requireClean: true
     });
   });
 }
@@ -184,7 +179,7 @@ export async function registerProjectVersionRoutes(app: FastifyInstance, { store
             repoPath: project.repoPath,
             branch: parsed.data.branch,
             worktreePath: created.worktreePath,
-            expectedBranchHead: created.createdBranch ? inspection.headCommit : undefined,
+            expectedBranchHead: created.createdBranchHead,
             createdBranch: created.createdBranch,
             createdWorktree: created.createdWorktree
           });
@@ -230,6 +225,7 @@ export async function registerProjectVersionRoutes(app: FastifyInstance, { store
       if (!updated) {
         const latest = store.getProjectVersion(version.id);
         if (!latest) throw new Error("PROJECT_VERSION_NOT_FOUND");
+        requireProject(store, latest.projectId, true);
         if (latest.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
         throw new Error("PROJECT_VERSION_OPERATION_FAILED");
       }
