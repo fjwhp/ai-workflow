@@ -12,12 +12,13 @@ import { getWorktreeSnapshot } from "./repository.js";
 import { buildReworkContext } from "./rework-context.js";
 import { buildHumanOverrideEligibility } from "./human-override.js";
 import { executeLocalIntegration, preflightLocalIntegration, rerunIntegrationTests } from "./integration.js";
-import { ensureProjectKnowledge, retrieveProjectKnowledge } from "./knowledge-service.js";
+import { ensureProjectKnowledge } from "./knowledge-service.js";
 import { getRepositoryHead } from "./project-knowledge.js";
 import { buildVerificationPlan } from "./verification-plan.js";
 import { publishRequirementKnowledge, refreshRequirementKnowledge } from "./project-memory-service.js";
 import { inspectProjectRepository } from "./project-service.js";
 import { hasMaterialAssociationChange, resolveSoleDeliveryProject } from "./requirement-projects.js";
+import { buildRequirementProjectContext, ProjectContextError } from "./project-context.js";
 
 const requirementRevisionSchema = requirementInputSchema.extend({
   clarifications: requirementInputSchema.shape.businessProblem,
@@ -98,15 +99,15 @@ export async function buildApp(store: WorkflowStore) {
     if (existing) return reply.code(409).send({ error: "RUN_ALREADY_ACTIVE", message: "当前阶段已有 AI 正在执行" });
     const project = deliveryProject ? store.getProject(deliveryProject.projectId) : null;
     const reworkContext=item.status==="returned"?store.getLatestReworkContext(item.id):null;
-    let projectKnowledge:any=undefined;
-    if(project&&["prd","requirement_review","technical_design","code_review","testing","acceptance"].includes(item.stage)){
-      try{const knowledge=await ensureProjectKnowledge(store,project,"ai_run");if(knowledge.status!=="ready")return reply.code(409).send({error:"PROJECT_KNOWLEDGE_BUILDING",message:"项目知识库正在生成，请稍后重试"});projectKnowledge=retrieveProjectKnowledge(knowledge,item);}
-      catch(error){return reply.code(409).send({error:"PROJECT_KNOWLEDGE_UNAVAILABLE",message:error instanceof Error?error.message:"项目知识库不可用"});}
+    let projectContext:any=undefined;
+    if(["prd","requirement_review","technical_design","coding","code_review","testing","acceptance"].includes(item.stage)){
+      try{projectContext=await buildRequirementProjectContext(store,item.id,item.stage);}
+      catch(error){return sendProjectContextError(reply,error);}
     }
-    const context = { requirement: item, priorArtifacts: store.listArtifacts(item.id), approvalHistory: store.listApprovals(item.id), projectKnowledge, reworkRequired:Boolean(reworkContext), reworkContext, userContext: req.body?.context };
+    const context = { requirement: item, priorArtifacts: store.listArtifacts(item.id), approvalHistory: store.listApprovals(item.id), projectContext, reworkRequired:Boolean(reworkContext), reworkContext, userContext: req.body?.context };
     const model = item.stage === "coding" ? (process.env.OPENAI_CODING_MODEL || process.env.OPENAI_MODEL || "gpt-5.5") : (process.env.OPENAI_MODEL || "gpt-5.5");
     const run = store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: redactSensitive(context, project?.sensitivePatterns || []) });
-    if(projectKnowledge)store.appendStageRunEvent(run.id,"knowledge.retrieved",{version:projectKnowledge.version,sourceHead:projectKnowledge.sourceHead,paths:projectKnowledge.entries.map((entry:any)=>entry.path),totalAvailable:projectKnowledge.totalAvailable,truncated:projectKnowledge.truncated});
+    for(const block of projectContext?.projects??[])store.appendStageRunEvent(run.id,"knowledge.retrieved",{projectId:block.projectId,version:block.version,sourceHead:block.sourceHead,paths:block.entries.map((entry:any)=>entry.path),totalAvailable:block.totalAvailable,truncated:block.truncated});
     store.updateRequirementState(item.id, item.stage, "ai_running");
     void executeRun(run.id, item, context, project);
     return reply.code(202).send(run);
@@ -345,6 +346,11 @@ function applyRequirementProjects(store:WorkflowStore,requirementId:string,input
   return {requirement:store.getRequirement(requirementId),projects,snapshot:store.getRequirementProjectSnapshot(requirementId),materialChange,technicalDesignInvalidated:Boolean(technicalDesignInvalidated)};
 }
 function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
+function sendProjectContextError(reply:any,error:unknown){
+  if(!(error instanceof ProjectContextError))return reply.code(409).send({error:"PROJECT_KNOWLEDGE_UNAVAILABLE",message:error instanceof Error?error.message:"项目知识库不可用"});
+  const messages:Record<string,string>={PROJECT_REQUIRED:"当前阶段必须关联一个交付项目",PROJECT_ARCHIVED:"归档项目不能启动新执行",MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED:"多项目交付执行将在第二阶段提供",PROJECT_KNOWLEDGE_BUILDING:"项目知识库正在生成，请稍后重试",PROJECT_KNOWLEDGE_UNAVAILABLE:"项目知识库不可用"};
+  return reply.code(error.code==="REQUIREMENT_NOT_FOUND"?404:409).send({error:error.code,message:messages[error.code]??error.code,projects:error.projects});
+}
 
 export function resolveReusableSourceCommit(run:any,evidence:any,targetBranch:string){
   if(!run||run.status!=="conflict"||!run.sourceCommit)return undefined;
