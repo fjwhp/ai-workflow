@@ -17,7 +17,7 @@ import { getRepositoryHead } from "./project-knowledge.js";
 import { buildVerificationPlan } from "./verification-plan.js";
 import { publishRequirementKnowledge, refreshRequirementKnowledge } from "./project-memory-service.js";
 import { inspectProjectRepository } from "./project-service.js";
-import { hasMaterialAssociationChange, resolveSoleDeliveryProject } from "./requirement-projects.js";
+import { hasMaterialAssociationChange, normalizeModuleId, resolveSoleDeliveryProject } from "./requirement-projects.js";
 import { buildRequirementProjectContext, ProjectContextError, resolveProjectContextBudget } from "./project-context.js";
 
 const requirementRevisionSchema = requirementInputSchema.extend({
@@ -307,7 +307,8 @@ export async function buildApp(store: WorkflowStore) {
   app.get("/api/projects/:id/modules",async(req:any,reply)=>{
     const project=store.getProject(req.params.id);if(!project)return reply.code(404).send({error:"NOT_FOUND"});
     const knowledge:any=store.getProjectKnowledgeStatus(project.id);if(knowledge.status!=="ready")return reply.code(409).send({error:"PROJECT_MODULES_UNAVAILABLE",message:knowledge.status==="building"?"项目知识库正在生成":"项目模块索引不可用"});
-    const seen=new Set<string>(),modules=[] as Array<{id:string;name:string;path:string}>;for(const entry of knowledge.entries??[]){if(entry.kind!=="module")continue;const id=String(entry.moduleId||entry.id||entry.path||"").trim(),path=String(entry.path||id).trim();if(!id||seen.has(id))continue;seen.add(id);modules.push({id,name:String(entry.name||entry.title||id),path});if(modules.length>=256)break;}return {modules};
+    const all=[] as Array<{id:string;name:string;path:string}>,seen=new Set<string>();for(const entry of knowledge.entries??[]){if(entry.kind!=="module")continue;const id=normalizeModuleId(String(entry.moduleId||entry.id||entry.path||"")),path=normalizeModuleId(String(entry.path||id));if(!id||seen.has(id))continue;seen.add(id);all.push({id,name:String(entry.name||entry.title||id).slice(0,256),path});}
+    const q=typeof req.query?.q==="string"?req.query.q.trim().toLowerCase().slice(0,128):"",filtered=q?all.filter(module=>`${module.id}\n${module.name}\n${module.path}`.toLowerCase().includes(q)):all,modules=filtered.slice(0,256),included=new Set(modules.map(module=>module.id));const rawIncludes=Array.isArray(req.query?.include)?req.query.include:[req.query?.include];const requested:string[]=rawIncludes.flatMap((value:unknown)=>typeof value==="string"?value.split(","):[]).map((value:string)=>normalizeModuleId(value)).filter((value:string)=>value&&value.length<=256&&!value.startsWith("/")&&!value.split("/").some((part:string)=>part==="."||part===".."));for(const include of requested){const module=all.find(item=>item.id===include||item.path===include);if(module&&!included.has(module.id)){included.add(module.id);modules.push(module);}}return {modules,total:filtered.length,truncated:filtered.length>256};
   });
   app.get("/api/projects/:id/memory",async(req:any,reply)=>{const project=store.getProject(req.params.id);if(!project)return reply.code(404).send({error:"NOT_FOUND"});return store.listProjectMemory(project.id);});
   app.get("/api/requirements/:id/knowledge-changes",async(req:any,reply)=>{if(!store.getRequirement(req.params.id))return reply.code(404).send({error:"NOT_FOUND"});return store.getKnowledgeChangeSet(req.params.id);});

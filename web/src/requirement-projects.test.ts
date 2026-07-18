@@ -4,6 +4,7 @@ import {
   associationSummary, associationApiErrors, associationReducer, availableProjectChoices,
   activeAssociations, historyAssociations, moveAssociation, requirementProjectsPayload,
   saveAssociationThenRefresh, selectedModuleProjectIds, shouldRequestModules,
+  moduleRequestPath, mergeKnownModules,
   hasMaterialAssociationEdit, initialAssociationState, phaseOneDeliveryGate,
   setPrimary, setUsage, validateAssociations, type Association
 } from "./requirement-projects.js";
@@ -19,6 +20,11 @@ describe("requirement project helpers", () => {
     expect(shouldRequestModules({ api: { status: "loading", modules: [] } }, "api")).toBe(false);
     expect(shouldRequestModules({ api: { status: "ready", modules: ["src"] } }, "api")).toBe(false);
     expect(shouldRequestModules({ api: { status: "error", modules: [], error: "offline" } }, "api")).toBe(true);
+  });
+  it("encodes selected module includes and merges paged results without dropping known IDs", () => {
+    expect(moduleRequestPath("api", ["src/orders & returns", "模块/三百"])).toBe("/projects/api/modules?include=src%2Forders+%26+returns&include=%E6%A8%A1%E5%9D%97%2F%E4%B8%89%E7%99%BE");
+    expect(mergeKnownModules(["known", "src/old"], [{ id: "new", path: "src/new" }, { id: "known", path: "src/known" }])).toEqual(["known", "src/old", "new", "src/new", "src/known"]);
+    expect(validateAssociations([{ ...primary, moduleMode: "selected", moduleIds: ["module-300"] }], { web: { status: "ready", modules: mergeKnownModules([], [{ id: "module-300", path: "src/300" }]) } }).valid).toBe(true);
   });
   it("closes after PUT success even when refresh fails", async () => {
     const events: string[] = [];
