@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ApiError } from "./api.js";
 import {
   archiveErrorMessage,
+  addBusyOperation,
   beginProjectDetails,
   canCloseDialog,
   filterProjects,
@@ -15,6 +16,8 @@ import {
   mergeProjectDetails,
   nextFocusIndex,
   shouldStartSubmission,
+  isOperationBusy,
+  removeBusyOperation,
   submissionReducer,
   validationAfterChange,
 } from "./project-management.js";
@@ -88,6 +91,29 @@ describe("project management helpers", () => {
     expect(canCloseDialog("Escape", false)).toBe(true);
     expect(canCloseDialog("Escape", true)).toBe(false);
     expect(canCloseDialog("Enter", false)).toBe(false);
+  });
+
+  it("isolates concurrent project operations and rejects duplicates", () => {
+    const a = addBusyOperation(new Set<string>(), "rebuild", "a");
+    expect(a.started).toBe(true);
+    const duplicate = addBusyOperation(a.busy, "rebuild", "a");
+    expect(duplicate.started).toBe(false);
+    const b = addBusyOperation(duplicate.busy, "archive", "b");
+    expect(isOperationBusy(b.busy, "rebuild", "a")).toBe(true);
+    expect(isOperationBusy(b.busy, "archive", "b")).toBe(true);
+    const afterA = removeBusyOperation(b.busy, "rebuild", "a");
+    expect(isOperationBusy(afterA, "rebuild", "a")).toBe(false);
+    expect(isOperationBusy(afterA, "archive", "b")).toBe(true);
+  });
+
+  it("retains building knowledge through a transient poll failure then clears the error", () => {
+    const initial = { generation: 3, knowledge: { p1: { status: "building", version: 2 } }, memory: {}, errors: {} };
+    const failed = mergeProjectDetails(initial, 3, "p1", "knowledge", { status: "rejected", reason: "temporary" }, { retainRejected: true });
+    expect(failed.knowledge.p1).toEqual({ status: "building", version: 2 });
+    expect(failed.errors.p1).toEqual({ knowledge: "temporary" });
+    const recovered = mergeProjectDetails(failed, 3, "p1", "knowledge", { status: "fulfilled", value: { status: "ready", version: 2 } }, { retainRejected: true });
+    expect(recovered.knowledge.p1.status).toBe("ready");
+    expect(recovered.errors.p1).toBeUndefined();
   });
 
   it("maps structured project API errors to repository fields", () => {
