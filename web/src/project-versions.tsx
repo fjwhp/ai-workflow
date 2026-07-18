@@ -36,11 +36,27 @@ export type VersionSnapshot = {
   error?: string;
 };
 
+export type VersionRefreshState = {
+  generation: number;
+  versions: ProjectVersion[];
+  snapshots: Record<string, VersionSnapshot>;
+};
+
+export function beginVersionRefresh(state: VersionRefreshState, _generation: number): VersionRefreshState {
+  return { ...state, generation: _generation };
+}
+
+export function mergeVersionRefresh(state: VersionRefreshState, _generation: number, value: Omit<VersionRefreshState, "generation">): VersionRefreshState {
+  return state.generation === _generation ? { generation: _generation, ...value } : state;
+}
+
 type SnapshotResult =
   | { status: "fulfilled"; value: Pick<VersionSnapshot, "requirements" | "queue"> }
   | { status: "rejected"; reason: string };
 
 export type ProjectVersionView = {
+  canMaintain: boolean;
+  maintenanceReason: string;
   canClose: boolean;
   closeReason: string;
   pendingOwner: string;
@@ -50,6 +66,77 @@ export type ProjectVersionView = {
   activeRequirementCount: number;
   stageCounts: Record<string, number>;
 };
+
+export type ClosePreflight = {
+  status: "checking" | "ready" | "blocked";
+  blocker: string;
+};
+
+export function closePreflightFromRecheck(result: unknown): ClosePreflight {
+  const value = result as { inspection?: { valid?: boolean; clean?: boolean }; status?: string } | null;
+  if (value?.inspection) {
+    if (!value.inspection.valid) return { status: "blocked", blocker: "worktree 状态异常，请先重新检查" };
+    return value.inspection.clean
+      ? { status: "ready", blocker: "" }
+      : { status: "blocked", blocker: "worktree 仍有未提交改动，无法关闭" };
+  }
+  if (value?.status === "committed" || value?.status === "reverted") return { status: "ready", blocker: "" };
+  if (value?.status === "pending") return { status: "blocked", blocker: "版本仍在等待本地提交或撤销" };
+  if (value?.status === "ambiguous") return { status: "blocked", blocker: "本地应用状态需要人工处理，无法关闭版本" };
+  return { status: "blocked", blocker: "无法确认版本当前状态，请重新检查" };
+}
+
+export function closePreflightFromError(error: unknown): ClosePreflight {
+  return { status: "blocked", blocker: projectVersionErrorMessage(error, "无法确认版本当前状态，请重新检查") };
+}
+
+export type CloseAuthority = {
+  version: ProjectVersion;
+  snapshot: Pick<VersionSnapshot, "requirements" | "queue">;
+  preflight: ClosePreflight;
+  error: string;
+};
+
+type CloseAuthorityDependencies = {
+  recheck: (versionId: string) => Promise<unknown>;
+  listVersions: (projectId: string) => Promise<ProjectVersion[]>;
+  loadSnapshot: (versionId: string) => Promise<Pick<VersionSnapshot, "requirements" | "queue">>;
+};
+
+export async function loadCloseAuthority(projectId: string, version: ProjectVersion, snapshot: Pick<VersionSnapshot, "requirements" | "queue">, dependencies: CloseAuthorityDependencies): Promise<CloseAuthority> {
+  let preflight: ClosePreflight;
+  let stableError = "";
+  let requestFailure = "";
+  try {
+    preflight = closePreflightFromRecheck(await dependencies.recheck(version.id));
+  } catch (error) {
+    preflight = closePreflightFromError(error);
+    if (error instanceof ApiError) stableError = preflight.blocker;
+    else requestFailure = error instanceof Error ? error.message : "重新检查失败";
+  }
+  const [versionsResult, snapshotResult] = await Promise.allSettled([
+    dependencies.listVersions(projectId),
+    dependencies.loadSnapshot(version.id),
+  ]);
+  if (requestFailure || versionsResult.status === "rejected" || snapshotResult.status === "rejected") {
+    const reason = requestFailure ||
+      (versionsResult.status === "rejected" ? versionsResult.reason : snapshotResult.status === "rejected" ? snapshotResult.reason : "");
+    const detail = reason instanceof Error ? reason.message : String(reason || "刷新失败");
+    const blocker = `无法确认版本当前状态，请重新检查${detail ? `：${detail}` : ""}`;
+    return { version, snapshot, preflight: { status: "blocked", blocker }, error: blocker };
+  }
+  const latest = versionsResult.value.find((item) => item.id === version.id);
+  if (!latest) {
+    const blocker = "项目版本不存在或已被删除";
+    return { version, snapshot, preflight: { status: "blocked", blocker }, error: blocker };
+  }
+  return { version: latest, snapshot: snapshotResult.value, preflight, error: stableError };
+}
+
+export function closeAuthorityAfterFailure(authority: CloseAuthority, error: unknown): CloseAuthority {
+  const message = projectVersionErrorMessage(error, "关闭版本失败，请重新检查关闭条件");
+  return { ...authority, preflight: { status: "blocked", blocker: message }, error: message };
+}
 
 type VersionProject = {
   id: string;
@@ -119,6 +206,8 @@ export function projectVersionView(
   version: ProjectVersion,
   queue: readonly VersionApplicationQueueEntry[],
   requirements: readonly VersionRequirement[] = [],
+  projectStatus: VersionProject["status"] = "active",
+  preflight?: ClosePreflight,
 ): ProjectVersionView {
   const owner = queue.find((entry) => entry.owner || entry.requirementId === version.pendingRequirementId);
   const activeRequirements = requirements.filter((requirement) => !terminalRequirementStatuses.has(requirement.status));
@@ -127,12 +216,15 @@ export function projectVersionView(
     return counts;
   }, {});
   const pendingOwner = owner?.code || owner?.requirementId || version.pendingRequirementId || "";
-  const closeReason = pendingOwner
+  const maintenanceReason = projectStatus === "archived" ? "项目已归档，版本仅供查看" : "";
+  const closeReason = maintenanceReason || (pendingOwner
     ? `${pendingOwner} 正在等待本地提交或撤销`
     : activeRequirements.length
       ? `${activeRequirements[0]?.code || activeRequirements[0]?.id} 等 ${activeRequirements.length} 个需求仍在进行中`
-      : "";
+      : preflight?.status !== "ready" ? preflight?.blocker || "" : "");
   return {
+    canMaintain: version.status === "active" && !maintenanceReason,
+    maintenanceReason,
     canClose: version.status === "active" && !closeReason,
     closeReason: version.status === "closed" ? "版本已关闭" : closeReason,
     pendingOwner,
@@ -149,22 +241,43 @@ export function mergeVersionSnapshot(current: VersionSnapshot | undefined, resul
   return { requirements: current?.requirements || [], queue: current?.queue || [], error: result.reason };
 }
 
-function errorMessage(error: unknown, fallback: string) {
+export function projectVersionErrorMessage(error: unknown, fallback: string) {
   if (!(error instanceof ApiError)) return error instanceof Error ? error.message : fallback;
   const labels: Record<string, string> = {
+    VALIDATION_ERROR: "版本输入无效，请检查后重试",
+    PROJECT_ARCHIVED: "项目已归档，不能修改版本",
+    PROJECT_NOT_ACTIVE: "项目已归档，不能修改版本",
+    PROJECT_NOT_FOUND: "项目不存在或已被删除",
+    PROJECT_VERSION_APPLICATION_BUSY: "版本正在处理其他需求，请稍后重试",
+    PROJECT_VERSION_APPLICATION_MISMATCH: "本地应用状态与版本不一致，请重新检查",
+    PROJECT_VERSION_BASE_BRANCH_INVALID: "基础分支名称无效",
+    PROJECT_VERSION_BASE_BRANCH_NOT_FOUND: "基础分支不存在",
+    PROJECT_VERSION_BRANCH_IN_USE: "分支已被其他 worktree 使用",
     PROJECT_VERSION_NAME_EXISTS: "版本名称已存在",
     PROJECT_VERSION_BRANCH_EXISTS: "版本分支已被占用",
     PROJECT_VERSION_BRANCH_INVALID: "分支名称无效",
-    PROJECT_VERSION_BASE_BRANCH_INVALID: "基础分支名称无效",
-    PROJECT_VERSION_BASE_BRANCH_NOT_FOUND: "基础分支不存在",
-    PROJECT_VERSION_REUSE_NOT_CONFIRMED: "复用已有 worktree 前需要明确确认",
-    PROJECT_VERSION_WORKTREE_DIRTY: "worktree 仍有未提交改动，无法关闭",
-    PROJECT_VERSION_WORKTREE_INVALID: "worktree 状态异常，请先重新检查",
     PROJECT_VERSION_CLOSE_BLOCKED: "版本仍在等待本地提交或撤销",
+    PROJECT_VERSION_GIT_UNAVAILABLE: "Git 当前不可用，请检查仓库后重试",
     PROJECT_VERSION_HAS_ACTIVE_REQUIREMENTS: "版本仍关联进行中的需求",
-    PROJECT_ARCHIVED: "归档项目不能修改版本",
+    PROJECT_VERSION_ID_INVALID: "项目版本标识无效",
+    PROJECT_VERSION_MODE_MISMATCH: "版本分支或 worktree 状态已变化，请重新验证",
+    PROJECT_VERSION_NOT_ACTIVE: "版本已关闭，不能再执行维护操作",
+    PROJECT_VERSION_NOT_FOUND: "项目版本不存在或已被删除",
+    PROJECT_VERSION_OPERATION_FAILED: "版本操作失败，请重新检查后重试",
+    PROJECT_VERSION_PATH_ESCAPE: "worktree 路径超出受管理目录",
+    PROJECT_VERSION_PATH_IN_USE: "worktree 路径已被占用",
+    PROJECT_VERSION_PERSISTENCE_FAILED: "版本记录保存失败，已回滚 Git 改动",
+    PROJECT_VERSION_REPOSITORY_INVALID: "项目仓库无法用于版本管理",
+    PROJECT_VERSION_REUSE_NOT_CONFIRMED: "复用已有 worktree 前需要明确确认",
+    PROJECT_VERSION_WORKTREE_CREATE_FAILED: "创建版本 worktree 失败",
+    PROJECT_VERSION_WORKTREE_DIRTY: "worktree 仍有未提交改动，无法关闭",
+    PROJECT_VERSION_WORKTREE_EXISTS: "worktree 已被其他版本占用",
+    PROJECT_VERSION_WORKTREE_IDENTITY_MISMATCH: "worktree 仓库身份与项目不一致",
+    PROJECT_VERSION_WORKTREE_INVALID: "worktree 状态异常，请先重新检查",
+    PROJECT_VERSION_WORKTREE_MISMATCH: "worktree 与版本分支不一致",
+    PROJECT_VERSION_WORKTREE_POSTCONDITION_FAILED: "worktree 创建后的状态检查失败",
   };
-  return labels[error.code] || error.message || fallback;
+  return labels[error.code] || (/^[A-Z][A-Z0-9_]+$/.test(error.message) ? fallback : error.message) || fallback;
 }
 
 function versionPayload(values: VersionFormState["values"]) {
@@ -196,7 +309,7 @@ export function VersionDialog({ project, onClose, onSaved }: { project: VersionP
         ? recordVersionValidation({ ...current, busy: null }, result)
         : { ...current, busy: null });
     } catch (error) {
-      setState((current) => ({ ...current, busy: null, validation: undefined, validatedIdentity: undefined, error: errorMessage(error, "版本验证失败") }));
+      setState((current) => ({ ...current, busy: null, validation: undefined, validatedIdentity: undefined, error: projectVersionErrorMessage(error, "版本验证失败") }));
     } finally {
       busyRef.current = false;
     }
@@ -211,7 +324,7 @@ export function VersionDialog({ project, onClose, onSaved }: { project: VersionP
       await post<ProjectVersion>(`/projects/${project.id}/versions`, versionPayload(snapshot));
       await onSaved();
     } catch (error) {
-      setState((current) => ({ ...current, busy: null, error: errorMessage(error, "创建版本失败") }));
+      setState((current) => ({ ...current, busy: null, error: projectVersionErrorMessage(error, "创建版本失败") }));
       busyRef.current = false;
     }
   };
@@ -228,12 +341,12 @@ export function VersionDialog({ project, onClose, onSaved }: { project: VersionP
   </AccessibleDialog>;
 }
 
-export function CloseVersionDialog({ version, view, busy, error, onCancel, onClose }: { version: ProjectVersion; view: ProjectVersionView; busy: boolean; error: string; onCancel: () => void; onClose: () => Promise<void> }) {
+export function CloseVersionDialog({ version, view, busy, error, onCancel, onClose, onRefresh }: { version: ProjectVersion; view: ProjectVersionView; busy: boolean; error: string; onCancel: () => void; onClose: () => Promise<void>; onRefresh: () => Promise<void> }) {
   return <AccessibleDialog className="close-version-dialog" role="alertdialog" title={`关闭版本“${version.name}”`} subtitle="关闭后保留分支、worktree 与需求历史，但不能再用于新的本地应用。" titleId={`close-version-${version.id}`} descriptionId={`close-version-description-${version.id}`} busy={busy} onClose={onCancel}>
     <div className="version-close-context"><span>分支 <code>{version.branch}</code></span><span>worktree <code>{version.worktreePath}</code></span></div>
     {view.closeReason && <p className="version-close-blocker" role="alert">{view.closeReason}</p>}
-    {error && <p className="form-error" role="alert">{error}</p>}
-    <div className="modal-actions"><button type="button" className="secondary" data-autofocus disabled={busy} onClick={onCancel}>取消</button><button type="button" className="primary danger-action" disabled={busy || !view.canClose} onClick={() => void onClose()}>{busy ? <RefreshCw className="spin" size={16} /> : <Archive size={16} />}确认关闭</button></div>
+    {error && error !== view.closeReason && <p className="form-error" role="alert">{error}</p>}
+    <div className="modal-actions"><button type="button" className="secondary" data-autofocus disabled={busy} onClick={onCancel}>取消</button>{!view.canClose && <button type="button" className="secondary" disabled={busy} onClick={() => void onRefresh()}><RefreshCw className={busy ? "spin" : ""} size={16} />重新检查关闭条件</button>}<button type="button" className="primary danger-action" disabled={busy || !view.canClose} onClick={() => void onClose()}>{busy ? <RefreshCw className="spin" size={16} /> : <Archive size={16} />}确认关闭</button></div>
   </AccessibleDialog>;
 }
 
@@ -247,22 +360,21 @@ async function fetchVersionSnapshot(versionId: string): Promise<Pick<VersionSnap
 
 export function ProjectVersions({ project }: { project: VersionProject }) {
   const [expanded, setExpanded] = useState(false);
-  const [versions, setVersions] = useState<ProjectVersion[]>([]);
-  const [snapshots, setSnapshots] = useState<Record<string, VersionSnapshot>>({});
+  const [refresh, setRefresh] = useState<VersionRefreshState>({ generation: 0, versions: [], snapshots: {} });
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [creatorOpen, setCreatorOpen] = useState(false);
-  const [closeTarget, setCloseTarget] = useState<ProjectVersion | null>(null);
-  const [closeError, setCloseError] = useState("");
+  const [closeAuthority, setCloseAuthority] = useState<CloseAuthority | null>(null);
   const [busyOperations, setBusyOperations] = useState<ReadonlySet<string>>(new Set());
   const activeRef = useRef(true);
   const loadGeneration = useRef(0);
   const busyRef = useRef<ReadonlySet<string>>(new Set());
+  const versions = refresh.versions, snapshots = refresh.snapshots;
 
   useEffect(() => () => { activeRef.current = false; loadGeneration.current += 1; }, []);
 
-  const setOperation = (operation: "recheck" | "close", versionId: string, busy: boolean) => {
+  const setOperation = (operation: "recheck" | "preflight" | "close", versionId: string, busy: boolean) => {
     const key = `${operation}:${versionId}`;
     const next = new Set(busyRef.current);
     if (busy) next.add(key); else next.delete(key);
@@ -272,6 +384,7 @@ export function ProjectVersions({ project }: { project: VersionProject }) {
 
   const load = useCallback(async (showLoading = true) => {
     const generation = ++loadGeneration.current;
+    setRefresh((current) => beginVersionRefresh(current, generation));
     if (showLoading) setLoading(true);
     setError("");
     try {
@@ -281,14 +394,16 @@ export function ProjectVersions({ project }: { project: VersionProject }) {
         catch (reason) { return [version.id, { status: "rejected", reason: reason instanceof Error ? reason.message : "版本详情读取失败" } as SnapshotResult] as const; }
       }));
       if (!activeRef.current || generation !== loadGeneration.current) return;
-      setVersions(nextVersions);
-      setSnapshots((current) => results.reduce<Record<string, VersionSnapshot>>((next, [id, result]) => {
-        next[id] = mergeVersionSnapshot(current[id], result);
-        return next;
-      }, {}));
+      setRefresh((current) => mergeVersionRefresh(current, generation, {
+        versions: nextVersions,
+        snapshots: results.reduce<Record<string, VersionSnapshot>>((next, [id, result]) => {
+          next[id] = mergeVersionSnapshot(current.snapshots[id], result);
+          return next;
+        }, {}),
+      }));
       setLoaded(true);
     } catch (reason) {
-      if (activeRef.current && generation === loadGeneration.current) setError(errorMessage(reason, "项目版本读取失败"));
+      if (activeRef.current && generation === loadGeneration.current) setError(projectVersionErrorMessage(reason, "项目版本读取失败"));
     } finally {
       if (activeRef.current && generation === loadGeneration.current) setLoading(false);
     }
@@ -300,18 +415,27 @@ export function ProjectVersions({ project }: { project: VersionProject }) {
     let current = true;
     let timer = 0;
     const poll = async () => {
+      if (busyRef.current.size) {
+        if (current) timer = window.setTimeout(poll, 1500);
+        return;
+      }
+      const generation = ++loadGeneration.current;
+      setRefresh((state) => beginVersionRefresh(state, generation));
       const results = await Promise.all(pendingIds.map(async (id) => {
         try { return [id, { status: "fulfilled", value: await fetchVersionSnapshot(id) } as SnapshotResult] as const; }
         catch (reason) { return [id, { status: "rejected", reason: reason instanceof Error ? reason.message : "版本状态刷新失败" } as SnapshotResult] as const; }
       }));
       if (!current || !activeRef.current) return;
-      setSnapshots((snapshots) => results.reduce((next, [id, result]) => ({ ...next, [id]: mergeVersionSnapshot(next[id], result) }), snapshots));
+      let refreshed: ProjectVersion[] | null = null;
       try {
-        const refreshed = await api<ProjectVersion[]>(`/projects/${project.id}/versions?status=all`);
-        if (current && activeRef.current) setVersions(refreshed);
+        refreshed = await api<ProjectVersion[]>(`/projects/${project.id}/versions?status=all`);
       } catch {
         // Detail snapshots remain usable while a project-level poll briefly fails.
       }
+      if (current && activeRef.current) setRefresh((state) => mergeVersionRefresh(state, generation, {
+        versions: refreshed || state.versions,
+        snapshots: results.reduce((next, [id, result]) => ({ ...next, [id]: mergeVersionSnapshot(next[id], result) }), state.snapshots),
+      }));
       if (current) timer = window.setTimeout(poll, 1500);
     };
     timer = window.setTimeout(poll, 1500);
@@ -319,24 +443,62 @@ export function ProjectVersions({ project }: { project: VersionProject }) {
   }, [expanded, pendingIds.join(","), project.id]);
 
   const grouped = groupProjectVersions(versions);
+  const authorityDependencies: CloseAuthorityDependencies = {
+    recheck: (versionId) => post(`/project-versions/${versionId}/recheck`, {}),
+    listVersions: (projectId) => api<ProjectVersion[]>(`/projects/${projectId}/versions?status=all`),
+    loadSnapshot: fetchVersionSnapshot,
+  };
+  const mergeAuthority = (generation: number, authority: CloseAuthority) => {
+    if (!activeRef.current || generation !== loadGeneration.current) return;
+    setRefresh((state) => mergeVersionRefresh(state, generation, {
+      versions: state.versions.map((item) => item.id === authority.version.id ? authority.version : item),
+      snapshots: { ...state.snapshots, [authority.version.id]: authority.snapshot },
+    }));
+    setCloseAuthority(authority);
+  };
+  const prepareClose = async (version: ProjectVersion) => {
+    const key = `preflight:${version.id}`;
+    if (busyRef.current.has(key) || busyRef.current.has(`close:${version.id}`)) return;
+    setOperation("preflight", version.id, true);
+    setCloseAuthority((current) => current?.version.id === version.id
+      ? { ...current, preflight: { status: "checking", blocker: "正在刷新版本关闭条件" }, error: "" }
+      : current);
+    const generation = ++loadGeneration.current;
+    setRefresh((current) => beginVersionRefresh(current, generation));
+    try {
+      const authority = await loadCloseAuthority(project.id, version, snapshots[version.id] || { requirements: [], queue: [] }, authorityDependencies);
+      mergeAuthority(generation, authority);
+    } finally {
+      setOperation("preflight", version.id, false);
+    }
+  };
   const recheck = async (version: ProjectVersion) => {
     const key = `recheck:${version.id}`;
     if (busyRef.current.has(key)) return;
     setOperation("recheck", version.id, true);
     setError("");
     try { await post(`/project-versions/${version.id}/recheck`, {}); await load(false); }
-    catch (reason) { setError(errorMessage(reason, "版本重新检查失败")); }
+    catch (reason) { setError(projectVersionErrorMessage(reason, "版本重新检查失败")); }
     finally { setOperation("recheck", version.id, false); }
   };
   const close = async () => {
-    if (!closeTarget) return;
-    const target = closeTarget;
+    if (!closeAuthority) return;
+    const authorityBeforeClose = closeAuthority;
+    const target = authorityBeforeClose.version;
     const key = `close:${target.id}`;
     if (busyRef.current.has(key)) return;
     setOperation("close", target.id, true);
-    setCloseError("");
-    try { await post(`/project-versions/${target.id}/close`, {}); setCloseTarget(null); await load(false); }
-    catch (reason) { setCloseError(errorMessage(reason, "关闭版本失败")); }
+    setCloseAuthority((current) => current ? { ...current, error: "" } : current);
+    try { await post(`/project-versions/${target.id}/close`, {}); setCloseAuthority(null); await load(false); }
+    catch (reason) {
+      const generation = ++loadGeneration.current;
+      setRefresh((current) => beginVersionRefresh(current, generation));
+      const refreshed = await loadCloseAuthority(project.id, target, authorityBeforeClose.snapshot, {
+        ...authorityDependencies,
+        recheck: async () => { throw reason; },
+      });
+      mergeAuthority(generation, closeAuthorityAfterFailure(refreshed, reason));
+    }
     finally { setOperation("close", target.id, false); }
   };
 
@@ -350,23 +512,23 @@ export function ProjectVersions({ project }: { project: VersionProject }) {
       <div className="version-section-head"><span>{loading ? "正在读取项目版本" : `共 ${versions.length} 个版本`}</span>{project.status !== "archived" && <button type="button" className="secondary" onClick={() => setCreatorOpen(true)}><Plus size={15} />创建版本</button>}</div>
       {error && <p className="project-inline-error version-error" role="alert">{error}</p>}
       {!loading && loaded && versions.length === 0 && <div className="version-empty">还没有项目版本</div>}
-      <VersionGroup title="使用中" versions={grouped.active} snapshots={snapshots} busyOperations={busyOperations} onRecheck={recheck} onClose={(version) => { setCloseError(""); setCloseTarget(version); }} />
-      <VersionGroup title="已关闭" versions={grouped.closed} snapshots={snapshots} busyOperations={busyOperations} onRecheck={recheck} onClose={(version) => { setCloseError(""); setCloseTarget(version); }} />
+      <VersionGroup title="使用中" projectStatus={project.status} versions={grouped.active} snapshots={snapshots} busyOperations={busyOperations} onRecheck={recheck} onClose={(version) => void prepareClose(version)} />
+      <VersionGroup title="已关闭" projectStatus={project.status} versions={grouped.closed} snapshots={snapshots} busyOperations={busyOperations} onRecheck={recheck} onClose={(version) => void prepareClose(version)} />
     </details>
     {creatorOpen && <VersionDialog project={project} onClose={() => setCreatorOpen(false)} onSaved={async () => { setCreatorOpen(false); await load(false); }} />}
-    {closeTarget && <CloseVersionDialog version={closeTarget} view={projectVersionView(closeTarget, snapshots[closeTarget.id]?.queue || [], snapshots[closeTarget.id]?.requirements || [])} busy={busyOperations.has(`close:${closeTarget.id}`)} error={closeError} onCancel={() => { if (!busyRef.current.has(`close:${closeTarget.id}`)) setCloseTarget(null); }} onClose={close} />}
+    {closeAuthority && <CloseVersionDialog version={closeAuthority.version} view={projectVersionView(closeAuthority.version, closeAuthority.snapshot.queue, closeAuthority.snapshot.requirements, project.status, closeAuthority.preflight)} busy={busyOperations.has(`preflight:${closeAuthority.version.id}`) || busyOperations.has(`close:${closeAuthority.version.id}`)} error={closeAuthority.error} onCancel={() => { if (!busyRef.current.has(`preflight:${closeAuthority.version.id}`) && !busyRef.current.has(`close:${closeAuthority.version.id}`)) setCloseAuthority(null); }} onClose={close} onRefresh={() => prepareClose(closeAuthority.version)} />}
   </>;
 }
 
-function VersionGroup({ title, versions, snapshots, busyOperations, onRecheck, onClose }: { title: string; versions: ProjectVersion[]; snapshots: Record<string, VersionSnapshot>; busyOperations: ReadonlySet<string>; onRecheck: (version: ProjectVersion) => Promise<void>; onClose: (version: ProjectVersion) => void }) {
+function VersionGroup({ title, projectStatus, versions, snapshots, busyOperations, onRecheck, onClose }: { title: string; projectStatus: VersionProject["status"]; versions: ProjectVersion[]; snapshots: Record<string, VersionSnapshot>; busyOperations: ReadonlySet<string>; onRecheck: (version: ProjectVersion) => Promise<void>; onClose: (version: ProjectVersion) => void }) {
   if (!versions.length) return null;
   return <section className="version-group"><h4>{title}<b>{versions.length}</b></h4>{versions.map((version) => {
     const snapshot = snapshots[version.id] || { requirements: [], queue: [] };
-    const view = projectVersionView(version, snapshot.queue, snapshot.requirements);
+    const view = projectVersionView(version, snapshot.queue, snapshot.requirements, projectStatus);
     return <article className="version-row" key={version.id}>
       <div className="version-identity"><div><b>{version.name}</b><span className={`version-status ${version.status}`}>{version.status === "active" ? "使用中" : "已关闭"}</span></div><code>{version.branch}</code><small>基础分支 {version.baseBranch}</small></div>
       <div className="version-metadata"><span>HEAD <code>{version.headCommit.slice(0, 12)}</code></span><span>worktree <code>{version.worktreePath}</code></span><div className="version-stage-counts">{Object.entries(view.stageCounts).map(([stage, count]) => <span key={stage}>{stageLabels[stage] || stage} <b>{count}</b></span>)}{!view.requirementCount && <span>暂无需求</span>}</div>{view.pendingOwner && <span className="version-pending">待本地处理 <b>{view.pendingOwner}</b></span>}<span>应用队列 <b>{view.queueLength}</b>{view.waitingCount ? ` · 等待 ${view.waitingCount}` : ""}</span>{snapshot.error && <small className="version-snapshot-error">刷新失败：{snapshot.error}</small>}</div>
-      {version.status === "active" && <div className="version-actions"><button type="button" className="icon-btn" title="重新检查版本" aria-label="重新检查版本" disabled={busyOperations.has(`recheck:${version.id}`) || busyOperations.has(`close:${version.id}`)} onClick={() => void onRecheck(version)}><RefreshCw className={busyOperations.has(`recheck:${version.id}`) ? "spin" : ""} size={16} /></button><button type="button" className="icon-btn" title={view.closeReason || "关闭版本"} aria-label="关闭版本" disabled={busyOperations.has(`recheck:${version.id}`) || busyOperations.has(`close:${version.id}`)} onClick={() => onClose(version)}><Archive size={16} /></button></div>}
+      {view.canMaintain && <div className="version-actions"><button type="button" className="icon-btn" title="重新检查版本" aria-label="重新检查版本" disabled={busyOperations.has(`recheck:${version.id}`) || busyOperations.has(`preflight:${version.id}`) || busyOperations.has(`close:${version.id}`)} onClick={() => void onRecheck(version)}><RefreshCw className={busyOperations.has(`recheck:${version.id}`) ? "spin" : ""} size={16} /></button><button type="button" className="icon-btn" title={view.closeReason || "关闭版本"} aria-label="关闭版本" disabled={busyOperations.has(`recheck:${version.id}`) || busyOperations.has(`preflight:${version.id}`) || busyOperations.has(`close:${version.id}`)} onClick={() => onClose(version)}>{busyOperations.has(`preflight:${version.id}`) ? <RefreshCw className="spin" size={16} /> : <Archive size={16} />}</button></div>}
       {view.closeReason && version.status === "active" && <small className="version-row-blocker">{view.closeReason}</small>}
     </article>;
   })}</section>;
