@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type RequirementInput, type RequirementProject, type RequirementProjectInput, type WorkflowStage } from "@ai-workflow/shared";
 import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./human-override.js";
-import { resolveSoleDeliveryProject, validateRequirementProjects } from "./requirement-projects.js";
+import { validateRequirementProjects } from "./requirement-projects.js";
 
 export class WorkflowStore {
   private db: DatabaseSync;
@@ -317,6 +317,30 @@ export class WorkflowStore {
       .map(mapRequirementProjectSnapshot);
   }
 
+  supersedeRequirementProjectSnapshot(requirementId: string) {
+    this.db.prepare("UPDATE requirement_project_snapshots SET status = 'superseded', superseded_at = ? WHERE requirement_id = ? AND status = 'active'")
+      .run(new Date().toISOString(), requirementId);
+  }
+
+  invalidateTechnicalDesignForProjectChange(requirementId: string) {
+    const requirement = this.getRequirement(requirementId);
+    if (!requirement || workflowStages.indexOf(requirement.stage) < workflowStages.indexOf("technical_design")) return false;
+    const approved = this.db.prepare("SELECT id FROM approvals WHERE requirement_id = ? AND stage = 'technical_design' AND decision = 'approve' LIMIT 1").get(requirementId);
+    const artifact = this.db.prepare("SELECT id FROM artifacts WHERE requirement_id = ? AND stage = 'technical_design' LIMIT 1").get(requirementId);
+    if (!approved || !artifact || !this.getRequirementProjectSnapshot(requirementId)) return false;
+    const reason = "项目关联或模块范围发生变化";
+    this.addApproval(requirementId, "technical_design", { decision: "return", comment: reason, targetStage: "technical_design", actorType: "system", reasons: [reason] });
+    this.supersedeRequirementProjectSnapshot(requirementId);
+    this.updateRequirementState(requirementId, "technical_design", "ai_ready");
+    return true;
+  }
+
+  projectHasActiveDelivery(projectId: string) {
+    return Boolean(this.db.prepare(`SELECT r.id FROM requirements r JOIN requirement_projects rp ON rp.requirement_id = r.id
+      WHERE rp.project_id = ? AND rp.status = 'active' AND rp.usage = 'delivery'
+      AND ((r.stage = 'coding' AND r.status = 'ai_running') OR (r.stage = 'integration' AND r.status != 'completed')) LIMIT 1`).get(projectId));
+  }
+
   private projectValidationRows(projectIds: string[]) {
     if (!projectIds.length) return [];
     const placeholders = projectIds.map(() => "?").join(",");
@@ -340,7 +364,8 @@ export class WorkflowStore {
   private mapRequirementWithProjects(row: any) {
     const projects = this.listRequirementProjects(row.id);
     const primary = projects.find((item) => item.role === "primary");
-    const delivery = resolveSoleDeliveryProject(projects);
+    const deliveries = projects.filter((item) => item.status === "active" && item.usage === "delivery");
+    const delivery = deliveries.length === 1 ? deliveries[0] : null;
     return {
       ...mapRequirement(row), projects,
       primaryProjectId: primary?.projectId, primaryProjectName: primary?.projectName,

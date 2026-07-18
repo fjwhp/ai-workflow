@@ -1,9 +1,9 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { approvalInputSchema, evaluateGate, requirementInputSchema, returnStage, workflowStages } from "@ai-workflow/shared";
+import { approvalInputSchema, evaluateGate, projectInputSchema, projectUpdateSchema, requirementInputSchema, requirementProjectsInputSchema, returnStage, workflowStages } from "@ai-workflow/shared";
 import { WorkflowStore } from "./store.js";
 import { runAgent } from "./ai.js";
-import { getLocalBranches, isProtectedBranch, validateRepository } from "./repository.js";
+import { getLocalBranches, isProtectedBranch } from "./repository.js";
 import { createBackup } from "./backup.js";
 import { runCodexCoding } from "./codex-runner.js";
 import { redactSensitive } from "./redaction.js";
@@ -16,6 +16,8 @@ import { ensureProjectKnowledge, retrieveProjectKnowledge } from "./knowledge-se
 import { getRepositoryHead } from "./project-knowledge.js";
 import { buildVerificationPlan } from "./verification-plan.js";
 import { publishRequirementKnowledge, refreshRequirementKnowledge } from "./project-memory-service.js";
+import { inspectProjectRepository } from "./project-service.js";
+import { hasMaterialAssociationChange, resolveSoleDeliveryProject } from "./requirement-projects.js";
 
 const requirementRevisionSchema = requirementInputSchema.extend({
   clarifications: requirementInputSchema.shape.businessProblem,
@@ -69,17 +71,36 @@ export async function buildApp(store: WorkflowStore) {
   });
   app.patch("/api/requirements/:id/project", async (req: any, reply) => {
     const projectId = typeof req.body?.projectId === "string" ? req.body.projectId : null;
-    const item = store.setRequirementProject(req.params.id, projectId);
-    if (!item) return reply.code(404).send({ error: "REQUIREMENT_OR_PROJECT_NOT_FOUND", message: "需求或项目不存在" });
-    return item;
+    if (!store.getRequirement(req.params.id)) return reply.code(404).send({ error: "NOT_FOUND" });
+    if (!projectId) return reply.code(400).send({ error: "VALIDATION_ERROR", message: "必须选择项目" });
+    try {
+      store.replaceRequirementProjects(req.params.id, [{projectId,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]);
+      return store.getRequirement(req.params.id);
+    } catch (error) { return sendDomainError(reply,error); }
+  });
+  app.get("/api/requirements/:id/projects",async(req:any,reply)=>{
+    if(!store.getRequirement(req.params.id))return reply.code(404).send({error:"NOT_FOUND"});
+    return {projects:store.listRequirementProjects(req.params.id),snapshot:store.getRequirementProjectSnapshot(req.params.id),snapshots:store.listRequirementProjectSnapshots(req.params.id)};
+  });
+  app.put("/api/requirements/:id/projects",async(req:any,reply)=>{
+    if(!store.getRequirement(req.params.id))return reply.code(404).send({error:"NOT_FOUND"});
+    const parsed=requirementProjectsInputSchema.safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:"VALIDATION_ERROR",issues:parsed.error.issues});
+    const before=store.listRequirementProjects(req.params.id);
+    try{
+      const projects=store.replaceRequirementProjects(req.params.id,parsed.data);
+      const material=hasMaterialAssociationChange(before,projects);
+      const invalidated=material&&store.invalidateTechnicalDesignForProjectChange(req.params.id);
+      return {projects,snapshot:store.getRequirementProjectSnapshot(req.params.id),materialChange:material,technicalDesignInvalidated:Boolean(invalidated)};
+    }catch(error){return sendDomainError(reply,error);}
   });
   app.post("/api/requirements/:id/run", async (req: any, reply) => {
     const item = store.getRequirement(req.params.id);
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
+    let deliveryProject:any;try{deliveryProject=resolveSoleDeliveryProject(item.projects);}catch(error){return sendDomainError(reply,error);}
     if(item.stage==="integration")return reply.code(409).send({error:"INTEGRATION_REQUIRES_MANUAL_ACTION",message:"代码应用节点不会启动 AI，请执行应用预检"});
     const existing = store.listStageRuns(item.id, item.stage).find((run: any) => run.status === "running");
     if (existing) return reply.code(409).send({ error: "RUN_ALREADY_ACTIVE", message: "当前阶段已有 AI 正在执行" });
-    const project = item.projectId ? store.getProject(item.projectId) : null;
+    const project = deliveryProject ? store.getProject(deliveryProject.projectId) : null;
     const reworkContext=item.status==="returned"?store.getLatestReworkContext(item.id):null;
     let projectKnowledge:any=undefined;
     if(project&&["prd","requirement_review","technical_design","code_review","testing","acceptance"].includes(item.stage)){
@@ -181,6 +202,7 @@ export async function buildApp(store: WorkflowStore) {
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
     const approval = input.data.decision === "return" ? { ...input.data, targetStage: returnStage(item.stage) } : input.data;
     const approvalRecord=store.addApproval(item.id, item.stage, approval);
+    if(item.stage==="technical_design"&&input.data.decision!=="return"&&!store.getRequirementProjectSnapshot(item.id))store.createRequirementProjectSnapshot(item.id);
     refreshRequirementKnowledge(store,item.id);
     if (input.data.decision === "return") {const artifact=store.listArtifacts(item.id).find((entry:any)=>entry.stage===item.stage);store.addReworkContext(item.id,buildReworkContext({approval:approvalRecord,artifact}));return store.updateRequirementState(item.id, returnStage(item.stage), "returned");}
     const index = workflowStages.indexOf(item.stage);
@@ -261,7 +283,11 @@ export async function buildApp(store: WorkflowStore) {
     const completed=store.completeIntegrationRun(run!.id,{...result,sourceCommit:previous.sourceCommit,targetCommit:previous.targetCommit,error:result.status==="completed"?null:"本地应用后测试失败"});
     store.updateRequirementState(item.id,"integration",result.status==="completed"?"completed":"merge_test_failed");if(result.status==="completed")publishRequirementKnowledge(store,item.id);return completed;
   });
-  app.get("/api/projects", async () => store.listProjects());
+  app.get("/api/projects", async (req:any,reply) => {
+    const status=req.query?.status??"all";
+    if(!["active","archived","all"].includes(status))return reply.code(400).send({error:"VALIDATION_ERROR",message:"项目状态筛选无效"});
+    const projects=store.listProjects();return status==="all"?projects:projects.filter(project=>project.status===status);
+  });
   app.get("/api/projects/:id/knowledge",async(req:any,reply)=>{
     const project=store.getProject(req.params.id);if(!project)return reply.code(404).send({error:"NOT_FOUND"});
     const status:any=store.getProjectKnowledgeStatus(project.id);
@@ -285,11 +311,25 @@ export async function buildApp(store: WorkflowStore) {
     return store.updateGateConfig(body);
   });
   app.post("/api/projects", async (req: any, reply) => {
-    try {
-      if (!await validateRepository(req.body.repoPath)) return reply.code(400).send({ error: "INVALID_REPOSITORY" });
-      const project=store.createProject(req.body);void ensureProjectKnowledge(store,project,"project_created").catch(()=>{});return reply.code(201).send(project);
-    } catch { return reply.code(400).send({ error: "INVALID_REPOSITORY", message: "路径不是有效的 Git 仓库" }); }
+    const parsed=projectInputSchema.safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:"VALIDATION_ERROR",issues:parsed.error.issues});
+    const inspection=await inspectProjectRepository(parsed.data.repoPath,parsed.data.defaultBranch);if(!inspection.valid)return invalidRepository(reply,inspection);
+    try{const project=store.createProject({...parsed.data,repoPath:inspection.repoPath,category:parsed.data.category??inspection.category,technology:inspection.technology});void ensureProjectKnowledge(store,project,"project_created").catch(()=>{});return reply.code(201).send(project);}
+    catch(error){return sendDomainError(reply,error);}
   });
+  app.post("/api/projects/validate",async(req:any,reply)=>{
+    const repoPath=typeof req.body?.repoPath==="string"?req.body.repoPath.trim():"",defaultBranch=typeof req.body?.defaultBranch==="string"?req.body.defaultBranch.trim():"";
+    if(!repoPath||!defaultBranch)return reply.code(400).send({error:"VALIDATION_ERROR",message:"仓库路径和默认分支不能为空"});
+    const inspection=await inspectProjectRepository(repoPath,defaultBranch);return inspection.valid?inspection:invalidRepository(reply,inspection);
+  });
+  app.patch("/api/projects/:id",async(req:any,reply)=>{
+    const current=store.getProject(req.params.id);if(!current)return reply.code(404).send({error:"NOT_FOUND"});
+    const parsed=projectUpdateSchema.safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:"VALIDATION_ERROR",issues:parsed.error.issues});
+    let update:any={...parsed.data};
+    if(parsed.data.repoPath!==undefined||parsed.data.defaultBranch!==undefined){const inspection=await inspectProjectRepository(parsed.data.repoPath??current.repoPath,parsed.data.defaultBranch??current.defaultBranch);if(!inspection.valid)return invalidRepository(reply,inspection);update={...update,repoPath:inspection.repoPath,technology:inspection.technology,category:parsed.data.category===undefined?inspection.category:parsed.data.category};}
+    try{const project=store.updateProject(current.id,update);if(parsed.data.repoPath!==undefined||parsed.data.defaultBranch!==undefined)void ensureProjectKnowledge(store,project!,"project_updated",true).catch(()=>{});return project;}
+    catch(error){return sendDomainError(reply,error);}
+  });
+  app.post("/api/projects/:id/archive",async(req:any,reply)=>{const project=store.getProject(req.params.id);if(!project)return reply.code(404).send({error:"NOT_FOUND"});if(store.projectHasActiveDelivery(project.id))return reply.code(409).send({error:"PROJECT_IN_ACTIVE_DELIVERY",message:"项目正在用于活动交付"});return store.archiveProject(project.id);});
   app.post("/api/backups", async (_req, reply) => {
     const databasePath = process.env.DATABASE_PATH;
     if (!databasePath) return reply.code(400).send({ error: "BACKUP_UNAVAILABLE", message: "未配置 DATABASE_PATH" });
@@ -299,6 +339,9 @@ export async function buildApp(store: WorkflowStore) {
 }
 
 function stageLabel(stage: string) { return stage.replaceAll("_", " "); }
+
+function invalidRepository(reply:any,details:any){return reply.code(400).send({error:"PROJECT_REPOSITORY_INVALID",message:details.warnings?.[0]||"项目仓库无效",details});}
+function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
 
 export function resolveReusableSourceCommit(run:any,evidence:any,targetBranch:string){
   if(!run||run.status!=="conflict"||!run.sourceCommit)return undefined;

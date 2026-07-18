@@ -53,7 +53,9 @@ export function resolveSoleDeliveryProject<T extends Pick<RequirementProject, "u
   return delivery[0] ?? null;
 }
 
-export function hasMaterialAssociationChange(before: Array<RequirementProjectInput & Record<string, unknown>>, after: Array<RequirementProjectInput & Record<string, unknown>>): boolean {
+type MaterialAssociation = RequirementProjectInput & { id?: string; createdAt?: string; status?: string; projectName?: string; projectStatus?: string };
+
+export function hasMaterialAssociationChange(before: MaterialAssociation[], after: MaterialAssociation[]): boolean {
   const material = (items: RequirementProjectInput[]) => items.map((item) => ({
     projectId: item.projectId,
     role: item.role,
