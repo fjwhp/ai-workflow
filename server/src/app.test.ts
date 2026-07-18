@@ -11,6 +11,13 @@ import { publishRequirementKnowledge } from "./project-memory-service.js";
 const execFileAsync=promisify(execFile);const tempDirs:string[]=[];
 
 const stores: WorkflowStore[] = [];
+let fixtureProjectSequence = 0;
+function createRequirement(store: WorkflowStore, input: any) {
+  if (input.primaryProjectId) return store.createRequirement(input);
+  fixtureProjectSequence += 1;
+  const project = store.createProject({ name: `API fixture ${fixtureProjectSequence}`, repoPath: `/tmp/api-requirement-fixture-${fixtureProjectSequence}`, defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+  return store.createRequirement({ ...input, primaryProjectId: project.id });
+}
 afterEach(async() => {stores.splice(0).forEach((store) => store.close());for(const dir of tempDirs.splice(0))await rm(dir,{recursive:true,force:true})});
 
 async function branchRepo(){const dir=await mkdtemp(join(tmpdir(),"workflow-api-branches-"));tempDirs.push(dir);await execFileAsync("git",["init","-b","main",dir]);await execFileAsync("git",["-C",dir,"config","user.email","test@example.com"]);await execFileAsync("git",["-C",dir,"config","user.name","Test"]);await writeFile(join(dir,"README.md"),"base\n");await execFileAsync("git",["-C",dir,"add","--all"]);await execFileAsync("git",["-C",dir,"commit","-m","base"]);await execFileAsync("git",["-C",dir,"switch","-c","feature/0710-test"]);return dir;}
@@ -19,7 +26,7 @@ describe("stage run API", () => {
   it("exposes project memory and requirement knowledge changes",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Memory",repoPath:"/tmp/api-memory",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
-    const req=store.createRequirement({title:"用户规则",businessProblem:"缺少",expectedOutcome:"明确",priority:"medium",primaryProjectId:project.id});
+    const req=createRequirement(store, {title:"用户规则",businessProblem:"缺少",expectedOutcome:"明确",priority:"medium",primaryProjectId:project.id});
     const artifact=store.addArtifact(req.id,"prd","PRD",{productDecisions:[{decision:"用户名唯一",rationale:"登录标识",evidence:"User.java"}]});store.addApproval(req.id,"prd",{decision:"approve",comment:"通过",artifactId:artifact.id});publishRequirementKnowledge(store,req.id);
     const app=await buildApp(store);
     expect((await app.inject({method:"GET",url:`/api/projects/${project.id}/memory`})).json()).toMatchObject({total:1});
@@ -38,7 +45,7 @@ describe("stage run API", () => {
 
   it("lists runs by stage and returns a run snapshot", async () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
-    const req = store.createRequirement({ title: "接口", businessProblem: "缺少接口", expectedOutcome: "增加接口", priority: "medium" });
+    const req = createRequirement(store, { title: "接口", businessProblem: "缺少接口", expectedOutcome: "增加接口", priority: "medium" });
     const run = store.createStageRun({ requirementId: req.id, stage: "prd", model: "gpt-5.5", input: { prompt: "safe" } });
     const app = await buildApp(store);
     const list = await app.inject({ method: "GET", url: `/api/requirements/${req.id}/runs?stage=prd` });
@@ -51,7 +58,7 @@ describe("stage run API", () => {
 
   it("rejects starting a duplicate active stage run", async () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
-    const req = store.createRequirement({ title: "接口", businessProblem: "缺少接口", expectedOutcome: "增加接口", priority: "medium" });
+    const req = createRequirement(store, { title: "接口", businessProblem: "缺少接口", expectedOutcome: "增加接口", priority: "medium" });
     store.createStageRun({ requirementId: req.id, stage: "prd", model: "gpt-5.5", input: {} });
     const app = await buildApp(store);
     const response = await app.inject({ method: "POST", url: `/api/requirements/${req.id}/run`, payload: {} });
@@ -75,7 +82,7 @@ describe("stage run API", () => {
 
   it.each([["code_review", "testing"], ["testing", "acceptance"]] as const)("allows a human override from %s to %s", async (stage, target) => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
-    const req = store.createRequirement({ title: "接口", businessProblem: "缺少", expectedOutcome: "增加", priority: "medium" });
+    const req = createRequirement(store, { title: "接口", businessProblem: "缺少", expectedOutcome: "增加", priority: "medium" });
     store.updateRequirementState(req.id, stage, "awaiting_approval");
     store.addArtifact(req.id, stage, "AI 成果", { summary: "需要人工判断", risks: ["风险一"], openQuestions: ["问题一"] });
     const app = await buildApp(store);
@@ -92,7 +99,7 @@ describe("stage run API", () => {
 
   it("rejects invalid human overrides without changing state", async () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
-    const req = store.createRequirement({ title: "接口", businessProblem: "缺少", expectedOutcome: "增加", priority: "medium" });
+    const req = createRequirement(store, { title: "接口", businessProblem: "缺少", expectedOutcome: "增加", priority: "medium" });
     const app = await buildApp(store);
     expect((await app.inject({ method: "POST", url: `/api/requirements/${req.id}/human-override`, payload: { comment: "已核查" } })).statusCode).toBe(409);
     store.updateRequirementState(req.id, "code_review", "awaiting_approval");
@@ -109,7 +116,7 @@ describe("stage run API", () => {
 
   it("moves approved acceptance into the manual integration stage", async () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
-    const req = store.createRequirement({ title: "接口", businessProblem: "缺少接口能力", expectedOutcome: "增加接口", priority: "medium" });
+    const req = createRequirement(store, { title: "接口", businessProblem: "缺少接口能力", expectedOutcome: "增加接口", priority: "medium" });
     store.updateRequirementState(req.id, "acceptance", "awaiting_approval");
     const app = await buildApp(store);
     const approved = await app.inject({ method: "POST", url: `/api/requirements/${req.id}/approve`, payload: { decision: "approve", comment: "验收通过" } });
@@ -120,7 +127,7 @@ describe("stage run API", () => {
 
   it("rejects integration outside the awaiting-merge state", async () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
-    const req = store.createRequirement({ title: "接口", businessProblem: "缺少接口能力", expectedOutcome: "增加接口", priority: "medium" });
+    const req = createRequirement(store, { title: "接口", businessProblem: "缺少接口能力", expectedOutcome: "增加接口", priority: "medium" });
     const app = await buildApp(store);
     const response = await app.inject({ method: "POST", url: `/api/requirements/${req.id}/integrate`, payload: {} });
     expect(response.statusCode).toBe(409);
@@ -131,7 +138,7 @@ describe("stage run API", () => {
   it("lists and saves a requirement-local integration target branch",async()=>{
     const repo=await branchRepo(),store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Repo",repoPath:repo,defaultBranch:"prod",allowedCommands:[],sensitivePatterns:[]});
-    const req=store.createRequirement({title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"增加接口",priority:"medium",primaryProjectId:project.id});store.updateRequirementState(req.id,"integration","awaiting_merge");
+    const req=createRequirement(store, {title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"增加接口",priority:"medium",primaryProjectId:project.id});store.updateRequirementState(req.id,"integration","awaiting_merge");
     const app=await buildApp(store);
     const list=await app.inject({method:"GET",url:`/api/requirements/${req.id}/integration-branches`});
     expect(list.json()).toMatchObject({currentBranch:"feature/0710-test",selectedTarget:"feature/0710-test"});
@@ -146,7 +153,7 @@ describe("stage run API", () => {
   it("requires exact confirmation before integrating into a protected branch",async()=>{
     const repo=await branchRepo(),store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Repo",repoPath:repo,defaultBranch:"prod",allowedCommands:[],sensitivePatterns:[]});
-    const req=store.createRequirement({title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"增加接口",priority:"medium",primaryProjectId:project.id});
+    const req=createRequirement(store, {title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"增加接口",priority:"medium",primaryProjectId:project.id});
     const execution=store.addExecution({requirementId:req.id,stage:"coding",projectId:project.id,branch:"ai/req",worktreePath:repo,status:"completed",diff:"diff",events:[]});
     store.addCodingEvidence({executionId:execution.id,requirementId:req.id,projectId:project.id,branch:"ai/req",worktreePath:repo,diffHash:"abc",diff:"diff",originalChars:4,truncated:false,files:["README.md"],additions:1,deletions:0,diagnostics:""});
     store.updateRequirementState(req.id,"integration","awaiting_merge");store.setIntegrationTarget(req.id,"main");

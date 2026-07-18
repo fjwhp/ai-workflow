@@ -2,8 +2,9 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type RequirementInput, type WorkflowStage } from "@ai-workflow/shared";
+import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type RequirementInput, type RequirementProject, type RequirementProjectInput, type WorkflowStage } from "@ai-workflow/shared";
 import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./human-override.js";
+import { resolveSoleDeliveryProject, validateRequirementProjects } from "./requirement-projects.js";
 
 export class WorkflowStore {
   private db: DatabaseSync;
@@ -48,10 +49,13 @@ export class WorkflowStore {
       );
       CREATE TABLE IF NOT EXISTS requirement_project_snapshots (
         id TEXT PRIMARY KEY,
-        requirement_id TEXT NOT NULL UNIQUE,
+        requirement_id TEXT NOT NULL,
         version INTEGER NOT NULL,
         associations_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'superseded')),
+        superseded_at TEXT,
         created_at TEXT NOT NULL,
+        UNIQUE(requirement_id, version),
         FOREIGN KEY(requirement_id) REFERENCES requirements(id)
       );
       CREATE TABLE IF NOT EXISTS requirement_integration_targets (
@@ -168,6 +172,25 @@ export class WorkflowStore {
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_runs_active ON integration_runs(requirement_id) WHERE status = 'running'");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_project_knowledge_active ON project_knowledge_versions(project_id) WHERE status = 'building'");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_projects_active_primary ON requirement_projects(requirement_id) WHERE role = 'primary' AND status = 'active'");
+    this.migrateRequirementProjectSnapshots();
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_project_snapshots_active ON requirement_project_snapshots(requirement_id) WHERE status = 'active'");
+  }
+
+  private migrateRequirementProjectSnapshots() {
+    const columns = this.db.prepare("PRAGMA table_info(requirement_project_snapshots)").all() as { name: string }[];
+    if (columns.some(({ name }) => name === "status")) return;
+    this.db.exec(`
+      ALTER TABLE requirement_project_snapshots RENAME TO requirement_project_snapshots_legacy;
+      CREATE TABLE requirement_project_snapshots (
+        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, version INTEGER NOT NULL,
+        associations_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active', 'superseded')),
+        superseded_at TEXT, created_at TEXT NOT NULL, UNIQUE(requirement_id, version),
+        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
+      );
+      INSERT INTO requirement_project_snapshots (id, requirement_id, version, associations_json, status, created_at)
+        SELECT id, requirement_id, version, associations_json, 'active', created_at FROM requirement_project_snapshots_legacy;
+      DROP TABLE requirement_project_snapshots_legacy;
+    `);
   }
 
   private ensureColumn(table: string, column: string, definition: string) {
@@ -175,12 +198,15 @@ export class WorkflowStore {
     if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
-  createRequirement(input: RequirementInput | (Omit<RequirementInput, "primaryProjectId"> & { primaryProjectId?: string; projectId?: string })) {
+  createRequirement(input: RequirementInput) {
     const now = new Date().toISOString();
     const id = randomUUID();
     const row = this.db.prepare("SELECT COUNT(*) AS count FROM requirements").get() as { count: number };
     const code = `REQ-${String(row.count + 1).padStart(4, "0")}`;
-    const primaryProjectId = (input as any).primaryProjectId ?? (input as any).projectId;
+    const association = validateRequirementProjects([{
+      projectId: input.primaryProjectId, role: "primary", usage: "delivery", deliveryRequired: true,
+      moduleMode: "auto", moduleIds: [], position: 0
+    }], { projects: this.projectValidationRows([input.primaryProjectId]) })[0]!;
     this.db.exec("BEGIN");
     try {
       this.db.prepare(`INSERT INTO requirements
@@ -188,42 +214,31 @@ export class WorkflowStore {
         VALUES (?, ?, ?, ?, ?, ?, 'prd', 'ai_ready', ?, ?)`)
         .run(id, code, input.title, input.businessProblem, input.expectedOutcome, input.priority, now, now);
       this.insertRequirementRevision(id, 1, { ...input, clarifications: "" }, "创建需求", now);
-      if (primaryProjectId) this.insertInterimPrimaryAssociation(id, primaryProjectId, now);
+      this.insertRequirementAssociation(id, association, now);
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return this.getRequirement(id)!;
   }
 
   listRequirements() {
-    return this.db.prepare(`SELECT r.*, rp.project_id, p.name AS project_name, rit.target_branch AS integration_target_branch
+    return this.db.prepare(`SELECT r.*, rit.target_branch AS integration_target_branch
       FROM requirements r
-      LEFT JOIN requirement_projects rp ON rp.requirement_id = r.id AND rp.role = 'primary' AND rp.usage = 'delivery' AND rp.status = 'active'
-      LEFT JOIN projects p ON p.id = rp.project_id
       LEFT JOIN requirement_integration_targets rit ON rit.requirement_id = r.id
-      ORDER BY r.created_at DESC`).all().map(mapRequirement);
+      ORDER BY r.created_at DESC`).all().map((row) => this.mapRequirementWithProjects(row as any));
   }
 
   getRequirement(id: string) {
-    const row = this.db.prepare(`SELECT r.*, rp.project_id, p.name AS project_name, rit.target_branch AS integration_target_branch
+    const row = this.db.prepare(`SELECT r.*, rit.target_branch AS integration_target_branch
       FROM requirements r
-      LEFT JOIN requirement_projects rp ON rp.requirement_id = r.id AND rp.role = 'primary' AND rp.usage = 'delivery' AND rp.status = 'active'
-      LEFT JOIN projects p ON p.id = rp.project_id
       LEFT JOIN requirement_integration_targets rit ON rit.requirement_id = r.id
       WHERE r.id = ?`).get(id);
-    return row ? mapRequirement(row as Record<string, unknown>) : null;
+    return row ? this.mapRequirementWithProjects(row as any) : null;
   }
 
   setRequirementProject(id: string, projectId: string | null): any {
     if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(id)) return null;
-    if (projectId && !this.db.prepare("SELECT id FROM projects WHERE id = ? AND status = 'active'").get(projectId)) return null;
-    const now = new Date().toISOString();
-    this.db.exec("BEGIN");
-    try {
-      this.db.prepare("DELETE FROM requirement_projects WHERE requirement_id = ? AND role = 'primary'").run(id);
-      if (projectId) this.insertInterimPrimaryAssociation(id, projectId, now);
-      this.db.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?").run(now, id);
-      this.db.exec("COMMIT");
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    if (!projectId || !this.db.prepare("SELECT id FROM projects WHERE id = ? AND status = 'active'").get(projectId)) return null;
+    this.replaceRequirementProjects(id, [{ projectId, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0 }]);
     return this.getRequirement(id);
   }
 
@@ -235,12 +250,102 @@ export class WorkflowStore {
     return this.getRequirement(id);
   }
 
-  private insertInterimPrimaryAssociation(requirementId: string, projectId: string, now: string) {
-    if (!this.db.prepare("SELECT id FROM projects WHERE id = ? AND status = 'active'").get(projectId)) throw new Error("PROJECT_NOT_ACTIVE");
+  private insertRequirementAssociation(requirementId: string, input: RequirementProjectInput, now: string) {
     this.db.prepare(`INSERT INTO requirement_projects
       (id, requirement_id, project_id, role, usage, delivery_required, module_mode, module_ids_json, position, status, created_at, updated_at)
-      VALUES (?, ?, ?, 'primary', 'delivery', 1, 'auto', '[]', 0, 'active', ?, ?)`)
-      .run(randomUUID(), requirementId, projectId, now, now);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`)
+      .run(randomUUID(), requirementId, input.projectId, input.role, input.usage, input.deliveryRequired ? 1 : 0,
+        input.moduleMode, JSON.stringify(input.moduleIds), input.position, now, now);
+  }
+
+  listRequirementProjects(requirementId: string): RequirementProject[] {
+    return (this.db.prepare(`SELECT rp.*, p.name AS project_name, p.status AS project_status
+      FROM requirement_projects rp JOIN projects p ON p.id = rp.project_id
+      WHERE rp.requirement_id = ? AND rp.status = 'active' ORDER BY rp.position, rp.created_at`).all(requirementId) as any[])
+      .map(mapRequirementProject);
+  }
+
+  replaceRequirementProjects(requirementId: string, inputs: RequirementProjectInput[]): RequirementProject[] {
+    if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
+    const projectIds = [...new Set(inputs.map((item) => item.projectId))];
+    const validated = validateRequirementProjects(inputs, {
+      projects: this.projectValidationRows(projectIds),
+      modulesByProject: this.moduleIndexes(projectIds)
+    });
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("UPDATE requirement_projects SET status = 'archived', updated_at = ? WHERE requirement_id = ? AND status = 'active'").run(now, requirementId);
+      for (const input of validated) {
+        const existing = this.db.prepare("SELECT id FROM requirement_projects WHERE requirement_id = ? AND project_id = ?").get(requirementId, input.projectId) as { id: string } | undefined;
+        if (existing) {
+          this.db.prepare(`UPDATE requirement_projects SET role = ?, usage = ?, delivery_required = ?, module_mode = ?,
+            module_ids_json = ?, position = ?, status = 'active', updated_at = ? WHERE id = ?`)
+            .run(input.role, input.usage, input.deliveryRequired ? 1 : 0, input.moduleMode, JSON.stringify(input.moduleIds), input.position, now, existing.id);
+        } else this.insertRequirementAssociation(requirementId, input, now);
+      }
+      this.db.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?").run(now, requirementId);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.listRequirementProjects(requirementId);
+  }
+
+  createRequirementProjectSnapshot(requirementId: string) {
+    if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
+    const associations = this.listRequirementProjects(requirementId);
+    const version = (this.db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM requirement_project_snapshots WHERE requirement_id = ?").get(requirementId) as { version: number }).version;
+    const now = new Date().toISOString();
+    const item = { id: randomUUID(), requirementId, version, associations, status: "active" as const, supersededAt: null, createdAt: now };
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("UPDATE requirement_project_snapshots SET status = 'superseded', superseded_at = ? WHERE requirement_id = ? AND status = 'active'").run(now, requirementId);
+      this.db.prepare(`INSERT INTO requirement_project_snapshots
+        (id, requirement_id, version, associations_json, status, superseded_at, created_at) VALUES (?, ?, ?, ?, 'active', NULL, ?)`)
+        .run(item.id, requirementId, version, JSON.stringify(associations), now);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return item;
+  }
+
+  getRequirementProjectSnapshot(requirementId: string) {
+    const row = this.db.prepare("SELECT * FROM requirement_project_snapshots WHERE requirement_id = ? AND status = 'active' ORDER BY version DESC LIMIT 1").get(requirementId) as any;
+    return row ? mapRequirementProjectSnapshot(row) : null;
+  }
+
+  listRequirementProjectSnapshots(requirementId: string) {
+    return (this.db.prepare("SELECT * FROM requirement_project_snapshots WHERE requirement_id = ? ORDER BY version DESC").all(requirementId) as any[])
+      .map(mapRequirementProjectSnapshot);
+  }
+
+  private projectValidationRows(projectIds: string[]) {
+    if (!projectIds.length) return [];
+    const placeholders = projectIds.map(() => "?").join(",");
+    return this.db.prepare(`SELECT id, status FROM projects WHERE id IN (${placeholders})`).all(...projectIds) as Array<{ id: string; status: string }>;
+  }
+
+  private moduleIndexes(projectIds: string[]) {
+    const result = new Map<string, string[]>();
+    for (const projectId of projectIds) {
+      const project = this.getProject(projectId);
+      const row = this.db.prepare(`SELECT entries_json FROM project_knowledge_versions
+        WHERE project_id = ? AND status = 'ready' ORDER BY version DESC LIMIT 1`).get(projectId) as { entries_json: string } | undefined;
+      const entries = row ? JSON.parse(row.entries_json) as any[] : [];
+      const modules = entries.filter((entry) => entry.kind === "module").flatMap((entry) => [entry.moduleId, entry.id, entry.path].filter((value): value is string => typeof value === "string"));
+      const detected = (project?.technology ?? []).filter((value: unknown): value is string => typeof value === "string");
+      if (modules.length || detected.length) result.set(projectId, [...modules, ...detected]);
+    }
+    return result;
+  }
+
+  private mapRequirementWithProjects(row: any) {
+    const projects = this.listRequirementProjects(row.id);
+    const primary = projects.find((item) => item.role === "primary");
+    const delivery = resolveSoleDeliveryProject(projects);
+    return {
+      ...mapRequirement(row), projects,
+      primaryProjectId: primary?.projectId, primaryProjectName: primary?.projectName,
+      projectId: delivery?.projectId, projectName: delivery?.projectName
+    };
   }
 
   reviseRequirement(id: string, input: any) {
@@ -613,6 +718,23 @@ function mapRequirement(row: any) {
     expectedOutcome: row.expected_outcome, priority: row.priority, projectId: row.project_id ?? undefined,
     projectName: row.project_name ?? undefined, version: row.version ?? 1, clarifications: row.clarifications ?? "", integrationTargetBranch:row.integration_target_branch??undefined,
     stage: row.stage, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at
+  };
+}
+
+function mapRequirementProject(row: any): RequirementProject {
+  return {
+    id: row.id, requirementId: row.requirement_id, projectId: row.project_id, projectName: row.project_name,
+    role: row.role, usage: row.usage, deliveryRequired: Boolean(row.delivery_required), moduleMode: row.module_mode,
+    moduleIds: JSON.parse(row.module_ids_json || "[]"), position: row.position, status: row.status,
+    createdAt: row.created_at, updatedAt: row.updated_at
+  };
+}
+
+function mapRequirementProjectSnapshot(row: any) {
+  return {
+    id: row.id, requirementId: row.requirement_id, version: row.version,
+    associations: JSON.parse(row.associations_json || "[]"), status: row.status,
+    supersededAt: row.superseded_at, createdAt: row.created_at
   };
 }
 
