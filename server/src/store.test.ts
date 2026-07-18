@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
 import {
   WorkflowStore,
+  type ExecutionInput,
   type RequirementProjectSnapshot,
   type RequirementProjectWithVersionMetadata
 } from "./store.js";
@@ -157,6 +158,8 @@ describe("WorkflowStore", () => {
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'requirement_projects'").get()).toBeTruthy();
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'requirement_project_snapshots'").get()).toBeTruthy();
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_requirement_projects_active_primary'").get()).toBeTruthy();
+    expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_stage_runs_running'").get())
+      .toMatchObject({ sql: expect.stringMatching(/UNIQUE.*requirement_id,\s*stage.*WHERE status = 'running'/i) });
     expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_requirement_projects_active_project'").get())
       .toMatchObject({ sql: expect.stringMatching(/UNIQUE.*requirement_id,\s*project_id.*WHERE status = 'active'/i) });
     db.close();
@@ -429,6 +432,64 @@ describe("WorkflowStore", () => {
     expect(store.getStageRun(run.id)?.status).toBe("completed");
   });
 
+  it("atomically validates an execution-stage reservation against the prepared requirement version", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject({ name: "Reservation", repoPath: "/tmp/reservation", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const version = ensureProjectVersion(store, project.id)!;
+    const req = createRequirement(store, { title: "原子预留", businessProblem: "准备期间关联可能变化", expectedOutcome: "拒绝过期运行", priority: "medium", primaryProjectId: project.id });
+    const prepared = store.updateRequirementState(req.id, "coding", "ai_ready")!;
+    const replacement = store.createProjectVersion({ projectId: project.id, name: "next", branch: "next", baseBranch: "main", worktreePath: "/tmp/reservation-next", headCommit: "next-head" });
+    store.replaceRequirementProjects(req.id, [{ projectId: project.id, projectVersionId: replacement.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0 }]);
+
+    expect(() => store.createStageRun({ requirementId: req.id, stage: "coding", model: "gpt-5.5", input: {}, projectId: project.id, projectVersionId: version.id, expectedRequirementUpdatedAt: prepared.updatedAt }))
+      .toThrow("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
+    expect(store.listStageRuns(req.id)).toHaveLength(0);
+  });
+
+  it.each([
+    ["archived project", "PROJECT_ARCHIVED"],
+    ["closed version", "PROJECT_VERSION_NOT_ACTIVE"],
+    ["version ownership mismatch", "REQUIREMENT_VERSION_PROJECT_MISMATCH"]
+  ] as const)("revalidates %s inside the execution-stage reservation transaction", (scenario,errorCode) => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject({ name: `Reservation ${scenario}`, repoPath: `/tmp/reservation-${scenario}`, defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const version = ensureProjectVersion(store, project.id)!;
+    const req = createRequirement(store, { title: "事务复核", businessProblem: "准备后项目版本状态可能变化", expectedOutcome: "事务内拒绝", priority: "medium", primaryProjectId: project.id });
+    const prepared = store.updateRequirementState(req.id, "coding", "ai_ready")!;
+    if(scenario==="archived project")(store as any).db.prepare("UPDATE projects SET status = 'archived' WHERE id = ?").run(project.id);
+    if(scenario==="closed version")(store as any).db.prepare("UPDATE project_versions SET status = 'closed' WHERE id = ?").run(version.id);
+    if(scenario==="version ownership mismatch"){const other=store.createProject({name:"Other owner",repoPath:"/tmp/reservation-other-owner",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});(store as any).db.prepare("UPDATE project_versions SET project_id = ? WHERE id = ?").run(other.id,version.id);}
+
+    expect(() => store.createStageRun({ requirementId: req.id, stage: "coding", model: "gpt-5.5", input: {}, projectId: project.id, projectVersionId: version.id, expectedRequirementUpdatedAt: prepared.updatedAt })).toThrow(errorCode);
+    expect(store.listStageRuns(req.id)).toHaveLength(0);
+  });
+
+  it("prevents association replacement while any stage run is active", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject({ name: "Guard", repoPath: "/tmp/run-association-guard", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const version = ensureProjectVersion(store, project.id)!;
+    const req = createRequirement(store, { title: "运行关联", businessProblem: "运行期间关联必须稳定", expectedOutcome: "拒绝关联改写", priority: "medium", primaryProjectId: project.id });
+    store.createStageRun({ requirementId: req.id, stage: "prd", model: "gpt-5.5", input: {} });
+
+    expect(() => store.replaceRequirementProjects(req.id, [{ projectId: project.id, projectVersionId: version.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0 }]))
+      .toThrow("RUN_ALREADY_ACTIVE");
+  });
+
+  it("prevents two stores from reserving the same running requirement stage", () => {
+    const directory = mkdtempSync(join(tmpdir(), "workflow-run-reservation-")); directories.push(directory);
+    const path = join(directory, "workflow.db");
+    const first = new WorkflowStore(path), second = new WorkflowStore(path); stores.push(first, second);
+    const project = first.createProject({ name: "Shared", repoPath: join(directory, "repo"), defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const version = ensureProjectVersion(first, project.id)!;
+    const req = createRequirement(first, { title: "并发预留", businessProblem: "两个进程同时启动运行", expectedOutcome: "仅一个运行", priority: "medium", primaryProjectId: project.id });
+    const prepared = first.updateRequirementState(req.id, "coding", "ai_ready")!;
+    const input = { requirementId: req.id, stage: "coding" as const, model: "gpt-5.5", input: {}, projectId: project.id, projectVersionId: version.id, expectedRequirementUpdatedAt: prepared.updatedAt };
+
+    first.createStageRun(input);
+    expect(() => second.createStageRun(input)).toThrow("RUN_ALREADY_ACTIVE");
+    expect(first.listStageRuns(req.id)).toHaveLength(1);
+  });
+
   it("marks abandoned active runs as interrupted", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const req = createRequirement(store, { title: "接口实现", businessProblem: "缺少接口", expectedOutcome: "新增接口", priority: "medium" });
@@ -475,6 +536,20 @@ describe("WorkflowStore", () => {
     const evidence = store.addCodingEvidence({ executionId: execution.id, requirementId: req.id, projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", diffHash: "abc", diff: "diff", originalChars: 4, truncated: false, files: ["a.ts"], additions: 1, deletions: 0, diagnostics: "" });
     expect(store.getLatestCodingEvidence(req.id)?.id).toBe(evidence.id);
     expect(() => store.addCodingEvidence({ ...evidence, id: undefined })).toThrow();
+  });
+
+  it("validates execution project version provenance before inserting", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject({ name: "Execution", repoPath: "/tmp/execution-project", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const other = store.createProject({ name: "Other execution", repoPath: "/tmp/execution-other", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const version = ensureProjectVersion(store, project.id)!;
+    const otherVersion = ensureProjectVersion(store, other.id)!;
+    const req = createRequirement(store, { title: "执行来源", businessProblem: "执行来源必须与项目匹配", expectedOutcome: "拒绝无效来源", priority: "medium", primaryProjectId: project.id });
+    const base: ExecutionInput = { requirementId: req.id, stage: "coding", projectId: project.id, projectVersionId: version.id, branch: "ai/REQ-0001", worktreePath: "/tmp/execution-wt", baseCommit: "base", status: "completed", commands: [], diff: "", events: [] };
+
+    expect(() => store.addExecution({ ...base, baseCommit: undefined })).toThrow("REQUIREMENT_VERSION_REQUIRED");
+    expect(() => store.addExecution({ ...base, projectVersionId: otherVersion.id })).toThrow("REQUIREMENT_VERSION_PROJECT_MISMATCH");
+    expect(store.listExecutions(req.id)).toHaveLength(0);
   });
 
   it("stores one immutable rework context per return approval",()=>{

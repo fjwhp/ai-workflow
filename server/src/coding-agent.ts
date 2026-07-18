@@ -17,9 +17,10 @@ export function resolveWorktreePath(worktree: string, requested: string) {
 }
 
 type CodingProject = { id: string; repoPath: string; defaultBranch: string; allowedCommands: { command: string; argsPrefix?: string[] }[] };
-export type CodingVersion = { id: string; branch: string; worktreePath: string; status: "active" | "closed" };
+export type CodingVersion = { id: string; projectId: string; branch: string; worktreePath: string; status: "active" | "closed" };
 
 export async function prepareCodingWorktree(project: CodingProject, version: CodingVersion, requirementCode: string) {
+  if (version.projectId !== project.id) throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
   if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
   return createOrReuseRequirementWorktree(project.repoPath, version.branch, requirementCode);
 }

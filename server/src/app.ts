@@ -119,7 +119,10 @@ export async function buildApp(store: WorkflowStore) {
       if(context.projectContext.totalChars>context.projectContext.budgetMaxChars)return sendProjectContextError(reply,new ProjectContextError("PROJECT_CONTEXT_BUDGET_TOO_SMALL",[],{maxChars:context.projectContext.budgetMaxChars,minimumRequiredChars:context.projectContext.totalChars,projectCount:context.projectContext.projects.length}));
     }
     const model = item.stage === "coding" ? (process.env.OPENAI_CODING_MODEL || process.env.OPENAI_MODEL || "gpt-5.5") : (process.env.OPENAI_MODEL || "gpt-5.5");
-    const run = store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: context });
+    let run:any;
+    try{run=store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: context,
+      ...(executionStage?{projectId:deliveryProject.projectId,projectVersionId:deliveryVersion.id,expectedRequirementUpdatedAt:item.updatedAt}:{}) });}
+    catch(error){return sendDomainError(reply,error);}
     for(const block of context.projectContext?.projects??[])store.appendStageRunEvent(run.id,"knowledge.retrieved",{projectId:block.projectId,version:block.version,sourceHead:block.sourceHead,paths:block.entries.map((entry:any)=>entry.path),totalAvailable:block.totalAvailable,budgetMaxChars:context.projectContext.budgetMaxChars,totalChars:block.totalChars,contextTotalChars:context.projectContext.totalChars,truncated:block.truncated});
     store.updateRequirementState(item.id, item.stage, "ai_running");
     void executeRun(run.id, item, context, project, deliveryVersion, sensitivePatterns);
@@ -366,7 +369,7 @@ function applyRequirementProjects(store:WorkflowStore,requirementId:string,input
   const technicalDesignInvalidated=materialChange&&store.invalidateTechnicalDesignForProjectChange(requirementId);
   return {requirement:store.getRequirement(requirementId),projects,snapshot:store.getRequirementProjectSnapshot(requirementId),materialChange,technicalDesignInvalidated:Boolean(technicalDesignInvalidated)};
 }
-function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});if(["REQUIREMENT_VERSION_REQUIRED","REQUIREMENT_VERSION_PROJECT_MISMATCH","PROJECT_VERSION_NOT_ACTIVE"].includes(message))return reply.code(409).send({error:message,message});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
+function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});if(["RUN_ALREADY_ACTIVE","REQUIREMENT_CHANGED_DURING_RUN_PREPARATION","REQUIREMENT_VERSION_REQUIRED","REQUIREMENT_VERSION_PROJECT_MISMATCH","PROJECT_VERSION_NOT_ACTIVE","PROJECT_ARCHIVED"].includes(message))return reply.code(409).send({error:message,message});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
 
 export function resolveDeliveryVersion(store:WorkflowStore,deliveryProject:any){
   if(!deliveryProject?.projectVersionId)throw new Error("REQUIREMENT_VERSION_REQUIRED");

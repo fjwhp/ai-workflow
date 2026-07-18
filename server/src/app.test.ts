@@ -1,9 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("./codex-runner.js", () => ({ runCodexCoding: vi.fn().mockResolvedValue({
-  branch:"ai/REQ-0001",worktreePath:"/tmp/requirements/REQ-0001",baseCommit:"version-head",reused:false,
-  diff:"diff --git a/a.ts b/a.ts\n+change",files:["a.ts"],additions:1,deletions:0,codexThreadId:"thread-1",events:[],diagnostics:[],summary:"implemented"
-}) }));
+vi.mock("./codex-runner.js", () => ({ runCodexCoding: vi.fn() }));
 
 import { buildApp, resolveReusableSourceCommit } from "./app.js";
 import { runCodexCoding } from "./codex-runner.js";
@@ -17,6 +14,8 @@ import { publishRequirementKnowledge } from "./project-memory-service.js";
 import { buildAgentPrompt } from "./ai.js";
 
 const execFileAsync=promisify(execFile);const tempDirs:string[]=[];
+const codingResult={runId:crypto.randomUUID(),branch:"ai/REQ-0001",worktreePath:"/tmp/requirements/REQ-0001",baseCommit:"version-head",reused:false,diff:"diff --git a/a.ts b/a.ts\n+change",files:["a.ts"],additions:1,deletions:0,codexThreadId:"thread-1",events:[],diagnostics:[],summary:"implemented"};
+beforeEach(()=>vi.mocked(runCodexCoding).mockReset().mockResolvedValue(codingResult));
 
 const stores: WorkflowStore[] = [];
 const initialProjectContextBudget = process.env.AI_PROJECT_CONTEXT_MAX_CHARS;
@@ -206,10 +205,10 @@ describe("project and requirement association APIs",()=>{
   });
 
   it("invalidates technical design when the selected delivery version changes",async()=>{
-    const store=new WorkflowStore(":memory:");stores.push(store);const a=store.createProject(projectPayload(await projectRepo()));const b=store.createProject(projectPayload(await projectRepo(),{name:"B"}));
-    const req=createRequirement(store,{title:"旧接口变更",businessProblem:"旧接口也必须保持设计不变量",expectedOutcome:"统一失效行为",priority:"medium",primaryProjectId:a.id});store.updateRequirementState(req.id,"technical_design","awaiting_approval");
+    const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject(projectPayload(await projectRepo()));const first=ensureProjectVersion(store,project.id);const next=store.createProjectVersion({projectId:project.id,name:"next",branch:"release/next",baseBranch:"main",worktreePath:`/tmp/api-project-version-next-${project.id}`,headCommit:"next-head"});
+    const req=createRequirement(store,{title:"旧接口变更",businessProblem:"旧接口也必须保持设计不变量",expectedOutcome:"统一失效行为",priority:"medium",primaryProjectId:project.id,primaryProjectVersionId:first.id});store.updateRequirementState(req.id,"technical_design","awaiting_approval");
     store.addArtifact(req.id,"technical_design","技术设计",{summary:"approved"});store.addApproval(req.id,"technical_design",{decision:"approve",comment:"通过"});store.createRequirementProjectSnapshot(req.id);const app=await buildApp(store);
-    const response=await app.inject({method:"PUT",url:`/api/requirements/${req.id}/projects`,payload:[{projectId:b.id,projectVersionId:ensureProjectVersion(store,b.id).id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]});expect(response.statusCode).toBe(200);expect(response.json().requirement).toMatchObject({stage:"technical_design",status:"ai_ready",projects:[{projectId:b.id}]});
+    const response=await app.inject({method:"PUT",url:`/api/requirements/${req.id}/projects`,payload:[{projectId:project.id,projectVersionId:next.id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]});expect(response.statusCode).toBe(200);expect(response.json().requirement).toMatchObject({stage:"technical_design",status:"ai_ready",projects:[{projectId:project.id,projectVersionId:next.id}]});
     expect(store.listApprovals(req.id)[0]).toMatchObject({actor_type:"system",comment:"项目关联或模块范围发生变化"});expect(store.listRequirementProjectSnapshots(req.id)[0]).toMatchObject({status:"superseded"});await app.close();
   });
 
@@ -261,6 +260,22 @@ describe("project and requirement association APIs",()=>{
     for(let attempt=0;attempt<50&&!store.listExecutions(req.id).length;attempt++)await new Promise(resolve=>setTimeout(resolve,10));
 
     expect(response.statusCode).toBe(202);expect(runCodexCoding).toHaveBeenCalledWith(expect.objectContaining({project:expect.objectContaining({id:project.id}),version:expect.objectContaining({id:version.id,branch:version.branch,status:"active"})}));expect(store.listExecutions(req.id)[0]).toMatchObject({projectVersionId:version.id,baseCommit:"version-head"});await app.close();
+  });
+
+  it("maps a requirement change during context preparation to 409 without creating a run",async()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const repo=await projectRepo();const project=store.createProject(projectPayload(repo));const version=ensureProjectVersion(store,project.id);const next=store.createProjectVersion({projectId:project.id,name:"next",branch:"release/next",baseBranch:"main",worktreePath:`/tmp/api-run-next-${project.id}`,headCommit:"next-head"});const req=createRequirement(store,{title:"准备竞态",businessProblem:"上下文准备期间版本可能变化",expectedOutcome:"拒绝过期运行",priority:"medium",primaryProjectId:project.id});const knowledge=store.beginProjectKnowledge(project.id,(await execFileAsync("git",["-C",repo,"rev-parse","HEAD"])).stdout.trim(),"test");store.completeProjectKnowledge(knowledge.id,{summary:"ready",entries:[]});store.updateRequirementState(req.id,"coding","ai_ready");const reserve=store.createStageRun.bind(store);store.createStageRun=((input:any)=>{store.replaceRequirementProjects(req.id,[{projectId:project.id,projectVersionId:next.id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]);return reserve(input);}) as any;const app=await buildApp(store);
+
+    const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});
+
+    expect(response.statusCode).toBe(409);expect(response.json().error).toBe("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");expect(store.listStageRuns(req.id)).toHaveLength(0);expect(version.id).not.toBe(next.id);await app.close();
+  });
+
+  it("atomically allows only one of two concurrent coding run requests",async()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const repo=await projectRepo();const project=store.createProject(projectPayload(repo));ensureProjectVersion(store,project.id);const req=createRequirement(store,{title:"并发运行",businessProblem:"两个请求可能同时完成上下文准备",expectedOutcome:"只创建一个运行",priority:"medium",primaryProjectId:project.id});const knowledge=store.beginProjectKnowledge(project.id,(await execFileAsync("git",["-C",repo,"rev-parse","HEAD"])).stdout.trim(),"test");store.completeProjectKnowledge(knowledge.id,{summary:"ready",entries:[]});store.updateRequirementState(req.id,"coding","ai_ready");let release!:(value:any)=>void;const pending=new Promise(resolve=>{release=resolve});vi.mocked(runCodexCoding).mockImplementation(()=>pending as any);const app=await buildApp(store);
+
+    const responses=await Promise.all([app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}}),app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}})]);
+
+    release(codingResult);expect(responses.map((response)=>response.statusCode).sort()).toEqual([202,409]);expect(responses.find((response)=>response.statusCode===409)?.json().error).toBe("RUN_ALREADY_ACTIVE");expect(store.listStageRuns(req.id)).toHaveLength(1);for(let attempt=0;attempt<50&&store.getStageRun(store.listStageRuns(req.id)[0]!.id)?.status==="running";attempt++)await new Promise(resolve=>setTimeout(resolve,10));await app.close();
   });
 
   it("rejects phase-one execution when multiple delivery projects are associated",async()=>{

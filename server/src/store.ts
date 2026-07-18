@@ -21,6 +21,36 @@ export interface RequirementProjectSnapshot {
   createdAt: string;
 }
 
+export interface ExecutionInput {
+  requirementId: string;
+  stage: WorkflowStage;
+  projectId: string;
+  projectVersionId?: string;
+  branch: string;
+  worktreePath: string;
+  baseCommit?: string;
+  status: string;
+  commands?: unknown[];
+  diff?: string;
+  error?: string;
+  codexThreadId?: string;
+  events?: unknown[];
+  diagnostics?: string;
+  completedAt?: string;
+}
+
+export interface StageRunInput {
+  requirementId: string;
+  stage: WorkflowStage;
+  model: string;
+  input: unknown;
+  projectId?: string;
+  projectVersionId?: string;
+  expectedRequirementUpdatedAt?: string;
+}
+
+const executionStages = new Set<WorkflowStage>(["coding", "code_review", "testing", "acceptance", "integration"]);
+
 export class WorkflowStore {
   private db: DatabaseSync;
 
@@ -211,6 +241,7 @@ export class WorkflowStore {
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_ai_gate_artifact ON approvals(artifact_id) WHERE actor_type = 'ai_gate' AND artifact_id IS NOT NULL");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_runs_active ON integration_runs(requirement_id) WHERE status = 'running'");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_project_knowledge_active ON project_knowledge_versions(project_id) WHERE status = 'building'");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_stage_runs_running ON stage_runs(requirement_id, stage) WHERE status = 'running'");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_projects_active_primary ON requirement_projects(requirement_id) WHERE role = 'primary' AND status = 'active'");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_projects_active_project ON requirement_projects(requirement_id, project_id) WHERE status = 'active'");
     this.migrateRequirementProjectSnapshots();
@@ -336,6 +367,7 @@ export class WorkflowStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
+      if (this.db.prepare("SELECT id FROM stage_runs WHERE requirement_id = ? AND status = 'running'").get(requirementId)) throw new Error("RUN_ALREADY_ACTIVE");
       const validated = validateRequirementProjects(inputs, {
         projects: this.projectValidationRows(projectIds),
         versions: this.versionValidationRows(versionIds),
@@ -504,14 +536,41 @@ export class WorkflowStore {
     }));
   }
 
-  createStageRun(input: { requirementId: string; stage: WorkflowStage; model: string; input: unknown }) {
-    const active = this.db.prepare("SELECT id FROM stage_runs WHERE requirement_id = ? AND stage = ? AND status = 'running'").get(input.requirementId, input.stage);
-    if (active) throw new Error("RUN_ALREADY_ACTIVE");
-    const item = { id: randomUUID(), ...input, status: "running", createdAt: new Date().toISOString(), completedAt: null };
-    this.db.prepare("INSERT INTO stage_runs (id, requirement_id, stage, status, model, input_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(item.id, item.requirementId, item.stage, item.status, item.model, JSON.stringify(item.input), item.createdAt);
-    this.appendStageRunEvent(item.id, "run.started", { stage: item.stage, model: item.model });
-    return item;
+  createStageRun(input: StageRunInput) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const requirement = this.db.prepare("SELECT stage, updated_at FROM requirements WHERE id = ?").get(input.requirementId) as { stage: string; updated_at: string } | undefined;
+      if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
+      if (this.db.prepare("SELECT id FROM stage_runs WHERE requirement_id = ? AND stage = ? AND status = 'running'").get(input.requirementId, input.stage)) {
+        throw new Error("RUN_ALREADY_ACTIVE");
+      }
+      if (input.expectedRequirementUpdatedAt !== undefined && (requirement.updated_at !== input.expectedRequirementUpdatedAt || requirement.stage !== input.stage)) {
+        throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
+      }
+      if (executionStages.has(input.stage)) {
+        if (!input.projectId || !input.projectVersionId || !input.expectedRequirementUpdatedAt) throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
+        const delivery = this.db.prepare(`SELECT project_id, project_version_id FROM requirement_projects
+          WHERE requirement_id = ? AND status = 'active' AND usage = 'delivery' ORDER BY position`).all(input.requirementId) as Array<{ project_id: string; project_version_id: string | null }>;
+        if (delivery.length !== 1 || delivery[0]!.project_id !== input.projectId || delivery[0]!.project_version_id !== input.projectVersionId) {
+          throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
+        }
+        const project = this.db.prepare("SELECT status FROM projects WHERE id = ?").get(input.projectId) as { status: string } | undefined;
+        if (!project || project.status !== "active") throw new Error("PROJECT_ARCHIVED");
+        const version = this.db.prepare("SELECT project_id, status FROM project_versions WHERE id = ?").get(input.projectVersionId) as { project_id: string; status: string } | undefined;
+        if (!version || version.project_id !== input.projectId) throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
+        if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
+      }
+      const item = { id: randomUUID(), ...input, status: "running", createdAt: new Date().toISOString(), completedAt: null };
+      this.db.prepare("INSERT INTO stage_runs (id, requirement_id, stage, status, model, input_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run(item.id, item.requirementId, item.stage, item.status, item.model, JSON.stringify(item.input), item.createdAt);
+      this.appendStageRunEvent(item.id, "run.started", { stage: item.stage, model: item.model });
+      this.db.exec("COMMIT");
+      return item;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      if (error instanceof Error && error.message.includes("UNIQUE constraint failed: stage_runs.requirement_id, stage_runs.stage")) throw new Error("RUN_ALREADY_ACTIVE");
+      throw error;
+    }
   }
 
   appendStageRunEvent(runId: string, type: string, payload: unknown) {
@@ -855,17 +914,29 @@ export class WorkflowStore {
     return row ? mapProject(row as any) : null;
   }
 
-  addExecution(input: any) {
-    const item = { id: randomUUID(), createdAt: new Date().toISOString(), ...input };
-    this.db.prepare(`INSERT INTO executions
-      (id, requirement_id, stage, project_id, project_version_id, branch, worktree_path, base_commit, status, commands_json, diff_text, error, created_at, completed_at, codex_thread_id, events_json, diagnostics_text)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
-      item.id, item.requirementId, item.stage, item.projectId, item.projectVersionId ?? null, item.branch, item.worktreePath, item.baseCommit ?? null,
-      item.status, JSON.stringify(item.commands ?? []), item.diff ?? "", item.error ?? null,
-      item.createdAt, item.completedAt ?? null, item.codexThreadId ?? null,
-      JSON.stringify(item.events ?? []), item.diagnostics ?? ""
-    );
-    return item;
+  addExecution(input: ExecutionInput) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (input.projectVersionId && !input.baseCommit) throw new Error("REQUIREMENT_VERSION_REQUIRED");
+      if (input.projectVersionId) {
+        const version = this.db.prepare("SELECT project_id FROM project_versions WHERE id = ?").get(input.projectVersionId) as { project_id: string } | undefined;
+        if (!version || version.project_id !== input.projectId) throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
+      }
+      const item = { id: randomUUID(), createdAt: new Date().toISOString(), ...input };
+      this.db.prepare(`INSERT INTO executions
+        (id, requirement_id, stage, project_id, project_version_id, branch, worktree_path, base_commit, status, commands_json, diff_text, error, created_at, completed_at, codex_thread_id, events_json, diagnostics_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
+        item.id, item.requirementId, item.stage, item.projectId, item.projectVersionId ?? null, item.branch, item.worktreePath, item.baseCommit ?? null,
+        item.status, JSON.stringify(item.commands ?? []), item.diff ?? "", item.error ?? null,
+        item.createdAt, item.completedAt ?? null, item.codexThreadId ?? null,
+        JSON.stringify(item.events ?? []), item.diagnostics ?? ""
+      );
+      this.db.exec("COMMIT");
+      return item;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   listExecutions(requirementId: string) {

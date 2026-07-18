@@ -39,6 +39,7 @@ export function buildCodexArgs(input: { model: string; baseUrl: string; cwd: str
 type CodexProject = { id: string; repoPath: string; defaultBranch: string };
 
 export async function prepareCodexCodingWorktree(project: CodexProject, version: CodingVersion, requirementCode: string) {
+  if (version.projectId !== project.id) throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
   if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
   return createOrReuseRequirementWorktree(project.repoPath, version.branch, requirementCode);
 }
@@ -62,11 +63,11 @@ PROJECT_CONTEXT_JSON_END`;
 }
 
 export async function runCodexCoding(input: { requirement: any; artifacts: any[]; project: CodexProject; version: CodingVersion; projectContext: ProjectContextBlock; reworkContext?: any; onEvent?: (type: string, payload: unknown) => void }) {
+  if (!process.env.OPENAI_API_KEY || !process.env.OPENAI_BASE_URL) throw new Error("Codex 中转执行需要 OPENAI_API_KEY 和 OPENAI_BASE_URL");
   const runId = crypto.randomUUID();
   const worktree = await prepareCodexCodingWorktree(input.project, input.version, input.requirement.code);
   const prompt = buildCodingPrompt(input);
   const model = process.env.CODEX_MODEL || process.env.OPENAI_CODING_MODEL || "gpt-5.5";
-  if (!process.env.OPENAI_API_KEY || !process.env.OPENAI_BASE_URL) throw new Error("Codex 中转执行需要 OPENAI_API_KEY 和 OPENAI_BASE_URL");
   const args = buildCodexArgs({ model, baseUrl: process.env.OPENAI_BASE_URL, cwd: worktree.worktreePath, prompt });
   const events: CodexEvent[] = [], diagnostics: string[] = [];
   const emit = input.onEvent ?? (() => {});

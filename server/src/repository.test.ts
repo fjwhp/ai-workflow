@@ -1,6 +1,6 @@
-import { lstat, mkdtemp, mkdir, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
@@ -126,10 +126,25 @@ describe("requirement worktree lifecycle", () => {
   it("reuses the same managed worktree and preserves uncommitted changes", async () => {
     const { repoPath } = await setupVersionRepository();
     const first = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0001");
+    await writeFile(join(first.worktreePath, "committed.txt"), "requirement commit\n");
+    await git(first.worktreePath, "add", "--all");await git(first.worktreePath, "commit", "-m", "requirement progress");
+    await git(repoPath, "branch", "feature/3.0.0", "prod");
     await writeFile(join(first.worktreePath, "unfinished.txt"), "keep me\n");
-    const second = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0001");
+    const second = await createOrReuseRequirementWorktree(repoPath, "feature/3.0.0", "REQ-0001");
     expect(second).toEqual({ ...first, reused: true });
     expect(await git(first.worktreePath, "status", "--porcelain")).toContain("?? unfinished.txt");
+    const metadataOutput=await git(first.worktreePath,"rev-parse","--git-path","ai-workflow-base-commit");const metadataPath=isAbsolute(metadataOutput)?metadataOutput:resolve(first.worktreePath,metadataOutput);
+    expect((await readFile(metadataPath,"utf8")).trim()).toBe(first.baseCommit);
+  });
+
+  it("recovers immutable base metadata for a legacy requirement worktree from its earliest reflog entry",async()=>{
+    const {repoPath}=await setupVersionRepository();const first=await createOrReuseRequirementWorktree(repoPath,"feature/2.2.1","REQ-0010");
+    const metadataOutput=await git(first.worktreePath,"rev-parse","--git-path","ai-workflow-base-commit");const metadataPath=isAbsolute(metadataOutput)?metadataOutput:resolve(first.worktreePath,metadataOutput);await rm(metadataPath,{force:true});
+    await writeFile(join(first.worktreePath,"progress.txt"),"progress\n");await git(first.worktreePath,"add","--all");await git(first.worktreePath,"commit","-m","progress");
+
+    const reused=await createOrReuseRequirementWorktree(repoPath,"feature/2.2.1","REQ-0010");
+
+    expect(reused).toEqual({...first,reused:true});expect((await readFile(metadataPath,"utf8")).trim()).toBe(first.baseCommit);
   });
 
   it("attaches an existing unmounted requirement branch at the deterministic path", async () => {

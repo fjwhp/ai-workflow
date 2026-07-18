@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, readdir, readFile, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -206,6 +206,42 @@ async function findRegisteredWorktree(repoPath: string, branch: string, managedR
   return { ...matches[0]!, path: deterministicPath, baseCommit: identity.headCommit };
 }
 
+async function requirementBaseMetadataPath(worktreePath:string){
+  const {stdout}=await execFileAsync("git",["-C",worktreePath,"rev-parse","--git-path","ai-workflow-base-commit"]);
+  return resolve(worktreePath,stdout.trim());
+}
+
+async function validateRequirementBaseCommit(repoPath:string,branch:string,baseCommit:string){
+  if(!/^[0-9a-f]{40,64}$/i.test(baseCommit))throw new Error("REQUIREMENT_BASE_COMMIT_UNAVAILABLE");
+  try{
+    await execFileAsync("git",["-C",repoPath,"cat-file","-e",`${baseCommit}^{commit}`]);
+    await execFileAsync("git",["-C",repoPath,"merge-base","--is-ancestor",baseCommit,branch]);
+  }catch{throw new Error("REQUIREMENT_BASE_COMMIT_UNAVAILABLE");}
+  return baseCommit;
+}
+
+async function recoverRequirementBaseCommit(repoPath:string,branch:string){
+  try{
+    const {stdout}=await execFileAsync("git",["-C",repoPath,"reflog","show","--format=%H",`refs/heads/${branch}`]);
+    const baseCommit=stdout.split("\n").map((item)=>item.trim()).filter(Boolean).at(-1);
+    if(!baseCommit)throw new Error("REQUIREMENT_BASE_COMMIT_UNAVAILABLE");
+    return validateRequirementBaseCommit(repoPath,branch,baseCommit);
+  }catch(error){if(error instanceof Error&&error.message==="REQUIREMENT_BASE_COMMIT_UNAVAILABLE")throw error;throw new Error("REQUIREMENT_BASE_COMMIT_UNAVAILABLE",{cause:error});}
+}
+
+async function writeRequirementBaseCommit(worktreePath:string,baseCommit:string){
+  await writeFile(await requirementBaseMetadataPath(worktreePath),`${baseCommit}\n`,"utf8");
+}
+
+async function readOrRecoverRequirementBaseCommit(repoPath:string,worktreePath:string,branch:string){
+  const metadataPath=await requirementBaseMetadataPath(worktreePath);
+  try{return await validateRequirementBaseCommit(repoPath,branch,(await readFile(metadataPath,"utf8")).trim());}
+  catch(error){
+    if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error instanceof Error&&error.message==="REQUIREMENT_BASE_COMMIT_UNAVAILABLE"?error:new Error("REQUIREMENT_BASE_COMMIT_UNAVAILABLE",{cause:error});
+    const recovered=await recoverRequirementBaseCommit(repoPath,branch);await writeRequirementBaseCommit(worktreePath,recovered);return recovered;
+  }
+}
+
 export async function cleanupFailedManagedWorktreeCreation(input: {
   repoPath: string;
   worktreePath: string;
@@ -278,7 +314,7 @@ export async function createOrReuseRequirementWorktree(repoPath: string, baseBra
     const root = resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "requirements");
     const worktreePath = resolve(root, requirementCode);
     const existing = await findRegisteredWorktree(repoPath, branch, root);
-    if (existing) return { branch, worktreePath: existing.path, baseCommit: existing.baseCommit, reused: true };
+    if (existing) return { branch, worktreePath: existing.path, baseCommit: await readOrRecoverRequirementBaseCommit(repoPath,existing.path,branch), reused: true };
 
     await ensureRequirementDirectory(resolve(repoPath, ".."), [
       ".ai-workflow-worktrees", basename(repoPath), "requirements"
@@ -311,11 +347,14 @@ export async function createOrReuseRequirementWorktree(repoPath: string, baseBra
       worktreeAdded = true;
       const created = await findRegisteredWorktree(repoPath, branch, root);
       if (!created || created.path !== worktreePath) throw new Error("REQUIREMENT_WORKTREE_POSTCONDITION_FAILED");
-      return { branch, worktreePath, baseCommit: created.baseCommit, reused: false };
+      const baseCommit=ownedHead??await recoverRequirementBaseCommit(repoPath,branch);
+      await writeRequirementBaseCommit(worktreePath,baseCommit);
+      return { branch, worktreePath, baseCommit, reused: false };
     } catch (cause) {
       await cleanupFailedManagedWorktreeCreation({
         repoPath, worktreePath, branch, ownedHead, targetReserved, worktreeAddAttempted, worktreeAdded
       });
+      if(cause instanceof Error&&cause.message==="REQUIREMENT_BASE_COMMIT_UNAVAILABLE")throw cause;
       throw new Error("REQUIREMENT_WORKTREE_CREATE_FAILED", { cause });
     }
   });
