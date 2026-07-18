@@ -4,6 +4,8 @@ import { constants } from "node:fs";
 
 export interface DatabaseResetOptions {
   now?: () => Date;
+  copyFile?: typeof copyFile;
+  removeFile?: typeof rm;
 }
 
 export interface DatabaseResetResult {
@@ -33,14 +35,21 @@ export async function prepareCleanDatabase(
   expectedVersion: string,
   options: DatabaseResetOptions = {}
 ): Promise<DatabaseResetResult> {
-  if (!await exists(dbPath)) return { reset: false, backupPath: null };
-
+  const copyDatabaseFile = options.copyFile ?? copyFile;
+  const removeFile = options.removeFile ?? rm;
+  const databaseExists = await exists(dbPath);
   const markerPath = markerPathFor(dbPath);
   let currentVersion: string | null = null;
   try {
     currentVersion = await readFile(markerPath, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (!databaseExists) {
+    await removeFile(`${dbPath}-wal`, { force: true });
+    await removeFile(`${dbPath}-shm`, { force: true });
+    if (currentVersion !== null && currentVersion !== expectedVersion) await removeFile(markerPath, { force: true });
+    return { reset: false, backupPath: null };
   }
   if (currentVersion === expectedVersion) return { reset: false, backupPath: null };
 
@@ -56,23 +65,21 @@ export async function prepareCleanDatabase(
       for (const source of existingSources) {
         const suffix = source.path.slice(dbPath.length);
         const target = `${backupPath}${suffix}`;
-        await copyFile(source.path, target, constants.COPYFILE_EXCL);
+        await copyDatabaseFile(source.path, target, constants.COPYFILE_EXCL);
         createdPaths.push(target);
       }
       backupPaths = createdPaths;
       break;
     } catch (error) {
-      await Promise.all(createdPaths.map((path) => rm(path, { force: true })));
+      await Promise.all(createdPaths.map((path) => removeFile(path, { force: true })));
       if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
       throw error;
     }
   }
-  await Promise.all([
-    rm(dbPath, { force: true }),
-    rm(`${dbPath}-wal`, { force: true }),
-    rm(`${dbPath}-shm`, { force: true }),
-    rm(markerPath, { force: true })
-  ]);
+  await removeFile(`${dbPath}-wal`, { force: true });
+  await removeFile(`${dbPath}-shm`, { force: true });
+  await removeFile(markerPath, { force: true });
+  await removeFile(dbPath, { force: true });
   return { reset: true, backupPath, sidecarBackupPaths: backupPaths.slice(1) };
 }
 

@@ -1,4 +1,4 @@
-import { copyFile, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -55,6 +55,57 @@ describe("prepareCleanDatabase", () => {
   it("does nothing when the database does not exist", async () => {
     const path = await databasePath();
     await expect(prepareCleanDatabase(path, "multi-project-v1")).resolves.toEqual({ reset: false, backupPath: null });
+  });
+
+  it("cleans orphan sidecars and a stale marker when the main database is absent", async () => {
+    const path = await databasePath();
+    await writeFile(`${path}-wal`, "orphan wal");
+    await writeFile(`${path}-shm`, "orphan shm");
+    await writeFile(`${path}.schema-version`, "legacy-v1");
+
+    await expect(prepareCleanDatabase(path, "multi-project-v1")).resolves.toEqual({ reset: false, backupPath: null });
+
+    for (const removedPath of [`${path}-wal`, `${path}-shm`, `${path}.schema-version`]) {
+      await expect(readFile(removedPath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it("removes the main database last after a complete backup set", async () => {
+    const path = await databasePath();
+    await writeFile(path, "database");
+    await writeFile(`${path}-wal`, "wal");
+    await writeFile(`${path}-shm`, "shm");
+    await writeFile(`${path}.schema-version`, "legacy-v1");
+    const removals: string[] = [];
+
+    await prepareCleanDatabase(path, "multi-project-v1", {
+      removeFile: async (target, options) => {
+        removals.push(String(target));
+        await rm(target, options);
+      }
+    });
+
+    expect(removals.slice(-4)).toEqual([`${path}-wal`, `${path}-shm`, `${path}.schema-version`, path]);
+  });
+
+  it("leaves all originals intact when copying a sidecar fails", async () => {
+    const path = await databasePath();
+    await writeFile(path, "database");
+    await writeFile(`${path}-wal`, "wal");
+    await writeFile(`${path}-shm`, "shm");
+    await writeFile(`${path}.schema-version`, "legacy-v1");
+
+    await expect(prepareCleanDatabase(path, "multi-project-v1", {
+      copyFile: async (source, target, mode) => {
+        if (source === `${path}-wal`) throw Object.assign(new Error("copy failed"), { code: "EIO" });
+        await copyFile(source, target, mode);
+      }
+    })).rejects.toThrow("copy failed");
+
+    await expect(readFile(path, "utf8")).resolves.toBe("database");
+    await expect(readFile(`${path}-wal`, "utf8")).resolves.toBe("wal");
+    await expect(readFile(`${path}-shm`, "utf8")).resolves.toBe("shm");
+    await expect(readFile(`${path}.schema-version`, "utf8")).resolves.toBe("legacy-v1");
   });
 
   it("does not overwrite a colliding backup and retries with a unique name", async () => {
