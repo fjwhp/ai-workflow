@@ -4,7 +4,8 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type ProjectVersion, type RequirementInput, type RequirementProject, type RequirementProjectInput, type WorkflowStage } from "@ai-workflow/shared";
 import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./human-override.js";
-import { validateRequirementProjects } from "./requirement-projects.js";
+import { hasMaterialAssociationChange, validateRequirementProjects } from "./requirement-projects.js";
+import { buildReworkContext } from "./rework-context.js";
 
 export type RequirementProjectWithVersionMetadata = RequirementProject & {
   projectVersionWorktreePath?: string;
@@ -328,6 +329,15 @@ export class WorkflowStore {
     if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
+  private assertNoPendingVersionApplication(requirementId: string) {
+    if (this.hasPendingVersionApplication(requirementId)) throw new Error("PROJECT_VERSION_APPLICATION_PENDING");
+  }
+
+  hasPendingVersionApplication(requirementId: string) {
+    return Boolean(this.db.prepare(`SELECT id FROM project_versions
+      WHERE pending_requirement_id = ? AND pending_integration_run_id IS NOT NULL LIMIT 1`).get(requirementId));
+  }
+
   createRequirement(input: RequirementInput) {
     const now = new Date().toISOString();
     const id = randomUUID();
@@ -419,25 +429,48 @@ export class WorkflowStore {
   }
 
   replaceRequirementProjects(requirementId: string, inputs: RequirementProjectInput[]): RequirementProject[] {
-    const projectIds = [...new Set(inputs.map((item) => item.projectId))];
-    const versionIds = [...new Set(inputs.flatMap((item) => item.projectVersionId ? [item.projectVersionId] : []))];
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
-      if (this.db.prepare("SELECT id FROM stage_runs WHERE requirement_id = ? AND status = 'running'").get(requirementId)) throw new Error("RUN_ALREADY_ACTIVE");
-      const validated = validateRequirementProjects(inputs, {
-        projects: this.projectValidationRows(projectIds),
-        versions: this.versionValidationRows(versionIds),
-        modulesByProject: this.moduleIndexes(projectIds)
-      });
-      this.db.prepare("UPDATE requirement_projects SET status = 'archived', updated_at = ? WHERE requirement_id = ? AND status = 'active'").run(now, requirementId);
-      for (const input of validated) {
-        this.insertRequirementAssociation(requirementId, input, now);
-      }
-      this.db.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?").run(now, requirementId);
+      this.assertNoPendingVersionApplication(requirementId);
+      const projects = this.replaceRequirementProjectsInTransaction(requirementId, inputs, now);
       this.db.exec("COMMIT");
+      return projects;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  replaceRequirementProjectsAndInvalidate(requirementId: string, inputs: RequirementProjectInput[]) {
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.assertNoPendingVersionApplication(requirementId);
+      const before = this.listRequirementProjects(requirementId);
+      const projects = this.replaceRequirementProjectsInTransaction(requirementId, inputs, now);
+      const materialChange = hasMaterialAssociationChange(before, projects);
+      const technicalDesignInvalidated = materialChange &&
+        this.invalidateTechnicalDesignForProjectChangeInTransaction(requirementId, now);
+      this.db.exec("COMMIT");
+      return { projects, materialChange, technicalDesignInvalidated: Boolean(technicalDesignInvalidated) };
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  private replaceRequirementProjectsInTransaction(
+    requirementId: string,
+    inputs: RequirementProjectInput[],
+    now: string
+  ): RequirementProject[] {
+    if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
+    if (this.db.prepare("SELECT id FROM stage_runs WHERE requirement_id = ? AND status = 'running'").get(requirementId)) throw new Error("RUN_ALREADY_ACTIVE");
+    const projectIds = [...new Set(inputs.map((item) => item.projectId))];
+    const versionIds = [...new Set(inputs.flatMap((item) => item.projectVersionId ? [item.projectVersionId] : []))];
+    const validated = validateRequirementProjects(inputs, {
+      projects: this.projectValidationRows(projectIds),
+      versions: this.versionValidationRows(versionIds),
+      modulesByProject: this.moduleIndexes(projectIds)
+    });
+    this.db.prepare("UPDATE requirement_projects SET status = 'archived', updated_at = ? WHERE requirement_id = ? AND status = 'active'").run(now, requirementId);
+    for (const input of validated) this.insertRequirementAssociation(requirementId, input, now);
+    this.db.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?").run(now, requirementId);
     return this.listRequirementProjects(requirementId);
   }
 
@@ -445,20 +478,26 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
-      const associations = this.listRequirementProjects(requirementId);
-      const version = (this.db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM requirement_project_snapshots WHERE requirement_id = ?").get(requirementId) as { version: number }).version;
-      const item: RequirementProjectSnapshot = {
-        id: randomUUID(), requirementId, version, associations,
-        status: "active", supersededAt: null, createdAt: now
-      };
-      this.db.prepare("UPDATE requirement_project_snapshots SET status = 'superseded', superseded_at = ? WHERE requirement_id = ? AND status = 'active'").run(now, requirementId);
-      this.db.prepare(`INSERT INTO requirement_project_snapshots
-        (id, requirement_id, version, associations_json, status, superseded_at, created_at) VALUES (?, ?, ?, ?, 'active', NULL, ?)`)
-        .run(item.id, requirementId, version, JSON.stringify(associations), now);
+      this.assertNoPendingVersionApplication(requirementId);
+      const item = this.createRequirementProjectSnapshotInTransaction(requirementId, now);
       this.db.exec("COMMIT");
       return item;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  private createRequirementProjectSnapshotInTransaction(requirementId: string, now: string): RequirementProjectSnapshot {
+    if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
+    const associations = this.listRequirementProjects(requirementId);
+    const version = (this.db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM requirement_project_snapshots WHERE requirement_id = ?").get(requirementId) as { version: number }).version;
+    const item: RequirementProjectSnapshot = {
+      id: randomUUID(), requirementId, version, associations,
+      status: "active", supersededAt: null, createdAt: now
+    };
+    this.supersedeRequirementProjectSnapshotInTransaction(requirementId, now);
+    this.db.prepare(`INSERT INTO requirement_project_snapshots
+      (id, requirement_id, version, associations_json, status, superseded_at, created_at) VALUES (?, ?, ?, ?, 'active', NULL, ?)`)
+      .run(item.id, requirementId, version, JSON.stringify(associations), now);
+    return item;
   }
 
   getRequirementProjectSnapshot(requirementId: string): RequirementProjectSnapshot | null {
@@ -472,20 +511,43 @@ export class WorkflowStore {
   }
 
   supersedeRequirementProjectSnapshot(requirementId: string) {
-    this.db.prepare("UPDATE requirement_project_snapshots SET status = 'superseded', superseded_at = ? WHERE requirement_id = ? AND status = 'active'")
-      .run(new Date().toISOString(), requirementId);
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.assertNoPendingVersionApplication(requirementId);
+      const changed = this.supersedeRequirementProjectSnapshotInTransaction(requirementId, now);
+      this.db.exec("COMMIT");
+      return changed;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  private supersedeRequirementProjectSnapshotInTransaction(requirementId: string, now: string) {
+    return Number(this.db.prepare("UPDATE requirement_project_snapshots SET status = 'superseded', superseded_at = ? WHERE requirement_id = ? AND status = 'active'")
+      .run(now, requirementId).changes);
   }
 
   invalidateTechnicalDesignForProjectChange(requirementId: string) {
-    const requirement = this.getRequirement(requirementId);
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.assertNoPendingVersionApplication(requirementId);
+      const invalidated = this.invalidateTechnicalDesignForProjectChangeInTransaction(requirementId, now);
+      this.db.exec("COMMIT");
+      return invalidated;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  private invalidateTechnicalDesignForProjectChangeInTransaction(requirementId: string, now: string) {
+    const requirement = this.db.prepare("SELECT stage FROM requirements WHERE id = ?").get(requirementId) as { stage: WorkflowStage } | undefined;
     if (!requirement || workflowStages.indexOf(requirement.stage) < workflowStages.indexOf("technical_design")) return false;
     const approved = this.db.prepare("SELECT id FROM approvals WHERE requirement_id = ? AND stage = 'technical_design' AND decision = 'approve' LIMIT 1").get(requirementId);
     const artifact = this.db.prepare("SELECT id FROM artifacts WHERE requirement_id = ? AND stage = 'technical_design' LIMIT 1").get(requirementId);
     if (!approved || !artifact || !this.getRequirementProjectSnapshot(requirementId)) return false;
     const reason = "项目关联或模块范围发生变化";
-    this.addApproval(requirementId, "technical_design", { decision: "return", comment: reason, targetStage: "technical_design", actorType: "system", reasons: [reason] });
-    this.supersedeRequirementProjectSnapshot(requirementId);
-    this.updateRequirementState(requirementId, "technical_design", "ai_ready");
+    this.insertApproval(requirementId, "technical_design", { decision: "return", comment: reason, targetStage: "technical_design", actorType: "system", reasons: [reason] }, now);
+    this.supersedeRequirementProjectSnapshotInTransaction(requirementId, now);
+    this.db.prepare("UPDATE requirements SET stage = 'technical_design', status = 'ai_ready', updated_at = ? WHERE id = ?")
+      .run(now, requirementId);
     return true;
   }
 
@@ -538,12 +600,16 @@ export class WorkflowStore {
   }
 
   reviseRequirement(id: string, input: any) {
-    const current = this.getRequirement(id);
-    if (!current || !["returned", "blocked", "draft"].includes(current.status)) return null;
-    const version = (current.version ?? 1) + 1;
     const now = new Date().toISOString();
-    this.db.exec("BEGIN");
+    this.db.exec("BEGIN IMMEDIATE");
     try {
+      this.assertNoPendingVersionApplication(id);
+      const current = this.getRequirement(id);
+      if (!current || !["returned", "blocked", "draft"].includes(current.status)) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      const version = (current.version ?? 1) + 1;
       const resumeStage = current.stage === "intake" ? "prd" : current.stage;
       this.db.prepare(`UPDATE requirements SET title = ?, business_problem = ?, expected_outcome = ?, priority = ?,
         clarifications = ?, version = ?, stage = ?, status = 'ai_ready', updated_at = ? WHERE id = ?`)
@@ -573,9 +639,14 @@ export class WorkflowStore {
   }
 
   updateRequirementState(id: string, stage: WorkflowStage, status: string) {
-    this.db.prepare("UPDATE requirements SET stage = ?, status = ?, updated_at = ? WHERE id = ?")
-      .run(stage, status, new Date().toISOString(), id);
-    return this.getRequirement(id);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.assertNoPendingVersionApplication(id);
+      this.db.prepare("UPDATE requirements SET stage = ?, status = ?, updated_at = ? WHERE id = ?")
+        .run(stage, status, new Date().toISOString(), id);
+      this.db.exec("COMMIT");
+      return this.getRequirement(id);
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
   addArtifact(requirementId: string, stage: WorkflowStage, title: string, content: unknown) {
@@ -597,6 +668,7 @@ export class WorkflowStore {
   createStageRun(input: StageRunInput) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      this.assertNoPendingVersionApplication(input.requirementId);
       const requirement = this.db.prepare("SELECT stage, updated_at FROM requirements WHERE id = ?").get(input.requirementId) as { stage: string; updated_at: string } | undefined;
       if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
       if (this.db.prepare("SELECT id FROM stage_runs WHERE requirement_id = ? AND stage = ? AND status = 'running'").get(input.requirementId, input.stage)) {
@@ -686,6 +758,16 @@ export class WorkflowStore {
 
   addApproval(requirementId: string, stage: WorkflowStage, input: any) {
     const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.assertNoPendingVersionApplication(requirementId);
+      const approval = this.insertApproval(requirementId, stage, input, now);
+      this.db.exec("COMMIT");
+      return approval;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  private insertApproval(requirementId: string, stage: WorkflowStage, input: any, now: string) {
     const id = randomUUID();
     this.db.prepare(`INSERT INTO approvals
       (id, requirement_id, stage, decision, comment, condition_text, target_stage, created_at, actor_type, artifact_id, reasons_json, override_json, return_count)
@@ -695,6 +777,39 @@ export class WorkflowStore {
     return { id, requirement_id: requirementId, stage, decision: input.decision, comment: input.comment, target_stage: input.targetStage ?? null, created_at: now, actor_type: input.actorType ?? "human", artifact_id: input.artifactId ?? null, return_count: input.returnCount ?? null, override: input.override ?? null };
   }
 
+  applyRequirementApproval(input: { requirementId: string; expectedStage: WorkflowStage; approval: any }) {
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.assertNoPendingVersionApplication(input.requirementId);
+      const requirement = this.db.prepare("SELECT stage FROM requirements WHERE id = ?").get(input.requirementId) as { stage: WorkflowStage } | undefined;
+      if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
+      if (requirement.stage !== input.expectedStage) throw new Error("REQUIREMENT_APPROVAL_STATE_CHANGED");
+      const approval = input.approval.decision === "return"
+        ? { ...input.approval, targetStage: input.approval.targetStage ?? returnStage(requirement.stage) }
+        : input.approval;
+      const approvalRecord = this.insertApproval(input.requirementId, requirement.stage, approval, now);
+      if (requirement.stage === "technical_design" && approval.decision !== "return" && !this.getRequirementProjectSnapshot(input.requirementId)) {
+        this.createRequirementProjectSnapshotInTransaction(input.requirementId, now);
+      }
+      if (approval.decision === "return") {
+        const artifact = this.listArtifacts(input.requirementId).find((entry: any) => entry.stage === requirement.stage);
+        this.insertReworkContext(input.requirementId, buildReworkContext({ approval: approvalRecord, artifact }), now);
+        this.db.prepare("UPDATE requirements SET stage = ?, status = 'returned', updated_at = ? WHERE id = ?")
+          .run(approval.targetStage, now, input.requirementId);
+      } else {
+        const index = workflowStages.indexOf(requirement.stage);
+        const nextStage = workflowStages[index + 1];
+        const targetStage = requirement.stage === "acceptance" ? "integration" : nextStage ?? requirement.stage;
+        const status = requirement.stage === "acceptance" ? "awaiting_merge" : nextStage ? "ai_ready" : "completed";
+        this.db.prepare("UPDATE requirements SET stage = ?, status = ?, updated_at = ? WHERE id = ?")
+          .run(targetStage, status, now, input.requirementId);
+      }
+      this.db.exec("COMMIT");
+      return this.getRequirement(input.requirementId);
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
   listApprovals(requirementId: string) {
     return this.db.prepare("SELECT * FROM approvals WHERE requirement_id = ? ORDER BY created_at DESC").all(requirementId).map((row: any) => ({
       ...row, override: row.override_json ? JSON.parse(row.override_json) : null
@@ -702,18 +817,19 @@ export class WorkflowStore {
   }
 
   applyHumanOverride(requirementId: string, stage: "code_review" | "testing", comment: string) {
-    this.db.exec("BEGIN");
+    this.db.exec("BEGIN IMMEDIATE");
     try {
+      this.assertNoPendingVersionApplication(requirementId);
       const requirement: any = this.getRequirement(requirementId);
       const artifact = this.listArtifacts(requirementId).find((item: any) => item.stage === stage);
       const eligibility = buildHumanOverrideEligibility({ stage: requirement?.stage ?? "", status: requirement?.status ?? "", artifact });
       if (!requirement || requirement.stage !== stage || !eligibility.allowed) throw new Error(eligibility.reason || "HUMAN_OVERRIDE_NOT_ALLOWED");
       const countRow = this.db.prepare("SELECT COUNT(*) AS count FROM approvals WHERE requirement_id = ? AND stage = ? AND decision = 'return'").get(requirementId, stage) as { count: number };
       const snapshot = buildHumanOverrideSnapshot({ stage, comment, artifact, returnCount: countRow.count });
-      const approval = this.addApproval(requirementId, stage, {
+      const approval = this.insertApproval(requirementId, stage, {
         decision: "approve", comment: snapshot.comment, targetStage: snapshot.targetStage,
         actorType: "human_override", artifactId: snapshot.artifactId, returnCount: snapshot.returnCount, override: snapshot
-      });
+      }, new Date().toISOString());
       this.db.prepare("UPDATE requirements SET stage = ?, status = 'ai_ready', updated_at = ? WHERE id = ?")
         .run(snapshot.targetStage, new Date().toISOString(), requirementId);
       this.db.exec("COMMIT");
@@ -757,17 +873,21 @@ export class WorkflowStore {
   }
 
   applyGateDecision(input: { requirementId: string; stage: WorkflowStage; artifactId: string; decision: "auto_approve" | "auto_return" | "human_review"; reasons: string[] }) {
-    if (this.db.prepare("SELECT id FROM approvals WHERE actor_type = 'ai_gate' AND artifact_id = ?").get(input.artifactId)) return { applied: false, requirement: this.getRequirement(input.requirementId) };
     const now = new Date().toISOString();
     let gateApproval: any;
-    this.db.exec("BEGIN");
+    this.db.exec("BEGIN IMMEDIATE");
     try {
+      this.assertNoPendingVersionApplication(input.requirementId);
+      if (this.db.prepare("SELECT id FROM approvals WHERE actor_type = 'ai_gate' AND artifact_id = ?").get(input.artifactId)) {
+        this.db.exec("COMMIT");
+        return { applied: false, requirement: this.getRequirement(input.requirementId) };
+      }
       const approvalDecision = input.decision === "auto_approve" ? "approve" : input.decision === "auto_return" ? "return" : "review";
       const targetStage = input.decision === "auto_return" ? returnStage(input.stage) : null;
-      gateApproval = this.addApproval(input.requirementId, input.stage, {
+      gateApproval = this.insertApproval(input.requirementId, input.stage, {
         decision: approvalDecision, comment: input.reasons.join("；"), targetStage,
         actorType: "ai_gate", artifactId: input.artifactId, reasons: input.reasons
-      });
+      }, now);
       if (input.decision === "auto_approve") {
         const index = workflowStages.indexOf(input.stage);
         const nextStage = workflowStages[index + 1];
@@ -1403,7 +1523,18 @@ export class WorkflowStore {
   }
 
   addReworkContext(requirementId: string,input:any){
-    const item={id:randomUUID(),requirementId,createdAt:new Date().toISOString(),...input};
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.assertNoPendingVersionApplication(requirementId);
+      const item = this.insertReworkContext(requirementId, input, now);
+      this.db.exec("COMMIT");
+      return item;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  private insertReworkContext(requirementId: string,input: any, now: string){
+    const item={id:randomUUID(),requirementId,createdAt:now,...input};
     this.db.prepare(`INSERT INTO rework_contexts
       (id,requirement_id,approval_id,artifact_id,source_stage,target_stage,actor_type,decision_at,unstructured,items_json,risks_json,questions_json,created_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(item.id,requirementId,item.approvalId,item.artifactId??null,item.sourceStage,item.targetStage,item.actorType,item.decisionAt,item.unstructured?1:0,JSON.stringify(item.items||[]),JSON.stringify(item.risks||[]),JSON.stringify(item.openQuestions||[]),item.createdAt);

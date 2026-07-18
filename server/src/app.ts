@@ -16,7 +16,7 @@ import { getRepositoryHead } from "./project-knowledge.js";
 import { buildVerificationPlan } from "./verification-plan.js";
 import { publishRequirementKnowledge, refreshRequirementKnowledge } from "./project-memory-service.js";
 import { inspectProjectRepository } from "./project-service.js";
-import { hasMaterialAssociationChange, normalizeModuleId, resolveSoleDeliveryProject } from "./requirement-projects.js";
+import { normalizeModuleId, resolveSoleDeliveryProject } from "./requirement-projects.js";
 import { buildRequirementProjectContext, ProjectContextError, resolveProjectContextBudget } from "./project-context.js";
 import { recheckVersionApplication, registerProjectVersionRoutes } from "./project-version-routes.js";
 import { inspectVersionWorktree } from "./project-version-service.js";
@@ -73,9 +73,11 @@ export async function buildApp(store: WorkflowStore) {
   app.patch("/api/requirements/:id", async (req: any, reply) => {
     const input = requirementRevisionSchema.safeParse(req.body);
     if (!input.success) return reply.code(400).send({ error: "VALIDATION_ERROR", issues: input.error.issues });
-    const item = store.reviseRequirement(req.params.id, input.data);
-    if (!item) return reply.code(409).send({ error: "REQUIREMENT_NOT_EDITABLE", message: "只有草稿、已打回或已阻塞的需求可以纠正" });
-    return item;
+    try {
+      const item = store.reviseRequirement(req.params.id, input.data);
+      if (!item) return reply.code(409).send({ error: "REQUIREMENT_NOT_EDITABLE", message: "只有草稿、已打回或已阻塞的需求可以纠正" });
+      return item;
+    } catch (error) { return sendDomainError(reply, error); }
   });
   app.patch("/api/requirements/:id/project", async (req: any, reply) => {
     const projectId = typeof req.body?.projectId === "string" ? req.body.projectId : null;
@@ -99,6 +101,7 @@ export async function buildApp(store: WorkflowStore) {
   app.post("/api/requirements/:id/run", async (req: any, reply) => {
     const item = store.getRequirement(req.params.id);
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
+    if(store.hasPendingVersionApplication(item.id))return sendDomainError(reply,new Error("PROJECT_VERSION_APPLICATION_PENDING"));
     const executionStage=["coding","code_review","testing","acceptance","integration"].includes(item.stage);
     let deliveryProject:any,deliveryVersion:any;
     if(executionStage){try{deliveryProject=resolveSoleDeliveryProject(item.projects);}catch(error){return sendDomainError(reply,error);}}
@@ -221,26 +224,24 @@ export async function buildApp(store: WorkflowStore) {
     if (!input.success) return reply.code(400).send({ error: "VALIDATION_ERROR", issues: input.error.issues });
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
     const approval = input.data.decision === "return" ? { ...input.data, targetStage: returnStage(item.stage) } : input.data;
-    const approvalRecord=store.addApproval(item.id, item.stage, approval);
-    if(item.stage==="technical_design"&&input.data.decision!=="return"&&!store.getRequirementProjectSnapshot(item.id))store.createRequirementProjectSnapshot(item.id);
-    refreshRequirementKnowledge(store,item.id);
-    if (input.data.decision === "return") {const artifact=store.listArtifacts(item.id).find((entry:any)=>entry.stage===item.stage);store.addReworkContext(item.id,buildReworkContext({approval:approvalRecord,artifact}));return store.updateRequirementState(item.id, returnStage(item.stage), "returned");}
-    const index = workflowStages.indexOf(item.stage);
-    if(item.stage==="acceptance")return store.updateRequirementState(item.id,"integration","awaiting_merge");
-    if (index === workflowStages.length - 1) return store.updateRequirementState(item.id, item.stage, "completed");
-    return store.updateRequirementState(item.id, workflowStages[index + 1]!, "ai_ready");
+    try {
+      const result = store.applyRequirementApproval({ requirementId: item.id, expectedStage: item.stage, approval });
+      refreshRequirementKnowledge(store,item.id);
+      return result;
+    } catch (error) { return sendDomainError(reply, error); }
   });
   app.post("/api/requirements/:id/human-override", async (req: any, reply) => {
     const comment=typeof req.body?.comment==="string"?req.body.comment.trim():"";
     if(!comment)return reply.code(400).send({error:"VALIDATION_ERROR",message:"必须填写人工审核意见"});
     const item=store.getRequirement(req.params.id);
     if(!item)return reply.code(404).send({error:"NOT_FOUND"});
+    if(store.hasPendingVersionApplication(item.id))return sendDomainError(reply,new Error("PROJECT_VERSION_APPLICATION_PENDING"));
     const stage=item.stage as "code_review"|"testing";
     const artifact=store.listArtifacts(item.id).find((entry:any)=>entry.stage===item.stage);
     const eligibility=buildHumanOverrideEligibility({stage:item.stage,status:item.status,artifact});
     if(!eligibility.allowed)return reply.code(409).send({error:"HUMAN_OVERRIDE_NOT_ALLOWED",message:eligibility.reason});
     try{const result=store.applyHumanOverride(item.id,stage,comment);refreshRequirementKnowledge(store,item.id);return result;}
-    catch(error){return reply.code(409).send({error:"HUMAN_OVERRIDE_NOT_ALLOWED",message:error instanceof Error?error.message:"当前状态已变化，请刷新后重试"});}
+    catch(error){return error instanceof Error&&error.message==="PROJECT_VERSION_APPLICATION_PENDING"?sendDomainError(reply,error):reply.code(409).send({error:"HUMAN_OVERRIDE_NOT_ALLOWED",message:error instanceof Error?error.message:"当前状态已变化，请刷新后重试"});}
   });
   app.get("/api/requirements/:id/integration-check",async(req:any,reply)=>{
     const context=integrationContext(store,req.params.id);
@@ -385,12 +386,10 @@ function stageLabel(stage: string) { return stage.replaceAll("_", " "); }
 
 function invalidRepository(reply:any,details:any){return reply.code(400).send({error:"PROJECT_REPOSITORY_INVALID",message:details.warnings?.[0]||"项目仓库无效",details});}
 function applyRequirementProjects(store:WorkflowStore,requirementId:string,inputs:any[]){
-  const before=store.listRequirementProjects(requirementId),projects=store.replaceRequirementProjects(requirementId,inputs);
-  const materialChange=hasMaterialAssociationChange(before,projects);
-  const technicalDesignInvalidated=materialChange&&store.invalidateTechnicalDesignForProjectChange(requirementId);
-  return {requirement:store.getRequirement(requirementId),projects,snapshot:store.getRequirementProjectSnapshot(requirementId),materialChange,technicalDesignInvalidated:Boolean(technicalDesignInvalidated)};
+  const result=store.replaceRequirementProjectsAndInvalidate(requirementId,inputs);
+  return {requirement:store.getRequirement(requirementId),...result,snapshot:store.getRequirementProjectSnapshot(requirementId)};
 }
-function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});if(["RUN_ALREADY_ACTIVE","REQUIREMENT_CHANGED_DURING_RUN_PREPARATION","PROJECT_CHANGED_DURING_RUN_PREPARATION","PROJECT_IN_ACTIVE_EXECUTION","REQUIREMENT_VERSION_REQUIRED","REQUIREMENT_VERSION_PROJECT_MISMATCH","PROJECT_VERSION_NOT_ACTIVE","PROJECT_ARCHIVED","PROJECT_VERSION_APPLICATION_BUSY","VERSION_APPLICATION_NOT_ALLOWED","PROJECT_VERSION_APPLICATION_FAILED","VERSION_APPLICATION_RETEST_BUSY","PROJECT_VERSION_APPLICATION_MISMATCH"].includes(message))return reply.code(409).send({error:message,message});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
+function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_VERSION_APPLICATION_PENDING")return reply.code(409).send({error:message,message:"版本应用处理中，不能修改需求或项目关联"});if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});if(["RUN_ALREADY_ACTIVE","REQUIREMENT_CHANGED_DURING_RUN_PREPARATION","PROJECT_CHANGED_DURING_RUN_PREPARATION","PROJECT_IN_ACTIVE_EXECUTION","REQUIREMENT_VERSION_REQUIRED","REQUIREMENT_VERSION_PROJECT_MISMATCH","PROJECT_VERSION_NOT_ACTIVE","PROJECT_ARCHIVED","PROJECT_VERSION_APPLICATION_BUSY","VERSION_APPLICATION_NOT_ALLOWED","PROJECT_VERSION_APPLICATION_FAILED","VERSION_APPLICATION_RETEST_BUSY","PROJECT_VERSION_APPLICATION_MISMATCH","REQUIREMENT_APPROVAL_STATE_CHANGED"].includes(message))return reply.code(409).send({error:message,message});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
 
 export function resolveDeliveryVersion(store:WorkflowStore,deliveryProject:any){
   if(!deliveryProject?.projectVersionId)throw new Error("REQUIREMENT_VERSION_REQUIRED");

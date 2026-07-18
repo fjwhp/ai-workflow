@@ -724,15 +724,18 @@ describe("project version application leases", () => {
   });
 
   it("does not release a failed application after the requirement state has moved", () => {
-    const store = new WorkflowStore(":memory:"); stores.push(store);
-    const project = createProject(store, "Late failed application", "/tmp/late-failed-application");
-    const version = createVersion(store, project.id, "late-failed", "/tmp/late-failed-application-v1");
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const database = new DatabaseSync(path); databases.push(database);
+    const project = createProject(store, "Late failed application", join(path, "..", "late-failed-application"));
+    const version = createVersion(store, project.id, "late-failed", join(path, "..", "late-failed-application-v1"));
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Late failed application"));
     store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
     store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "late-failed")
     });
-    store.updateRequirementState(requirement.id, "integration", "cancelled");
+    database.prepare("UPDATE requirements SET status = 'cancelled', updated_at = ? WHERE id = ?")
+      .run("2000-01-01T00:00:00.000Z", requirement.id);
 
     expect(() => store.releaseFailedVersionApplication({
       versionId: version.id, runId: "run-late-failed", status: "conflict", sourceCommit: "c".repeat(40), error: "conflict"
@@ -1012,6 +1015,106 @@ describe("project version application leases", () => {
       .toEqual(expect.arrayContaining([validSnapshots[0], validSnapshots[1], validSnapshots[3]]));
     expect(serializedSnapshots.filter((snapshot) => !validSnapshots.includes(snapshot))).toEqual([]);
   });
+
+  it("guards generic requirement mutations while a version application lease is pending", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Guarded mutations", "/tmp/guarded-mutations");
+    const version = createVersion(store, project.id, "guarded", "/tmp/guarded-mutations-v1");
+    const replacement = createVersion(store, project.id, "replacement", "/tmp/guarded-mutations-v2");
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Guarded mutations"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "guarded-mutations")
+    });
+    const associationInput = [{
+      projectId: project.id, projectVersionId: replacement.id, role: "primary" as const,
+      usage: "delivery" as const, deliveryRequired: true, moduleMode: "auto" as const,
+      moduleIds: [], position: 0
+    }];
+    const revisionInput = {
+      title: "Changed title", businessProblem: "Must remain unchanged", expectedOutcome: "Frozen",
+      priority: "high", clarifications: "No changes", changeSummary: "Blocked"
+    };
+    const mutations = [
+      () => store.updateRequirementState(requirement.id, "acceptance", "returned"),
+      () => store.reviseRequirement(requirement.id, revisionInput),
+      () => store.replaceRequirementProjects(requirement.id, associationInput),
+      () => store.createRequirementProjectSnapshot(requirement.id),
+      () => store.supersedeRequirementProjectSnapshot(requirement.id),
+      () => store.invalidateTechnicalDesignForProjectChange(requirement.id),
+      () => store.addApproval(requirement.id, "integration", { decision: "approve", comment: "blocked" }),
+      () => store.applyGateDecision({
+        requirementId: requirement.id, stage: "integration", artifactId: "artifact-pending",
+        decision: "human_review", reasons: ["blocked"]
+      }),
+      () => store.applyHumanOverride(requirement.id, "code_review", "blocked"),
+      () => store.addReworkContext(requirement.id, {
+        approvalId: "approval-pending", artifactId: null, sourceStage: "integration",
+        targetStage: "acceptance", actorType: "human", decisionAt: new Date().toISOString(),
+        unstructured: true, items: [], risks: [], openQuestions: []
+      })
+    ];
+
+    for (const mutation of mutations) {
+      expect(mutation).toThrow("PROJECT_VERSION_APPLICATION_PENDING");
+    }
+    expect(store.getRequirement(requirement.id)).toMatchObject({ stage: "integration", status: "awaiting_merge" });
+    expect(store.listApprovals(requirement.id)).toEqual([]);
+    expect(store.listRequirementProjects(requirement.id)[0]?.projectVersionId).toBe(version.id);
+    expect(store.getRequirementProjectSnapshot(requirement.id)).toBeNull();
+  });
+
+  it("serializes lease acquisition against association mutation without partial writes", { timeout: 15_000 }, async () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const project = createProject(store, "Mutation race", join(path, "..", "mutation-race"));
+    const version = createVersion(store, project.id, "current", join(path, "..", "mutation-race-current"));
+    const replacement = createVersion(store, project.id, "replacement", join(path, "..", "mutation-race-replacement"));
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Mutation race"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    const application = spawnVersionApplicationWorker(path, {
+      mode: "begin", begin: {
+        versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "mutation-race")
+      }
+    });
+    const mutation = spawnRequirementMutationWorker(path, {
+      requirementId: requirement.id,
+      projects: [{
+        projectId: project.id, projectVersionId: replacement.id, role: "primary", usage: "delivery",
+        deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0
+      }]
+    });
+    await Promise.all([application.waitFor("ready"), mutation.waitFor("ready")]);
+    const locker = new DatabaseSync(path); databases.push(locker);
+    locker.exec("BEGIN IMMEDIATE");
+    const applicationStarting = application.waitFor("starting");
+    application.child.send("go");
+    await applicationStarting;
+    const mutationStarting = mutation.waitFor("starting");
+    mutation.child.send("go");
+    await mutationStarting;
+    locker.exec("COMMIT");
+
+    const [applicationOutcome, mutationOutcome] = await Promise.all([
+      application.waitForOutcome(), mutation.waitForOutcome()
+    ]);
+    if (applicationOutcome.type === "result") {
+      expect(applicationOutcome).toMatchObject({ code: "ACQUIRED" });
+      expect(mutationOutcome).toMatchObject({
+        type: "error", message: "PROJECT_VERSION_APPLICATION_PENDING"
+      });
+      expect(store.listRequirementProjects(requirement.id)[0]?.projectVersionId).toBe(version.id);
+      expect(store.getProjectVersion(version.id)?.pendingRequirementId).toBe(requirement.id);
+    } else {
+      expect(applicationOutcome).toMatchObject({
+        type: "error", message: "REQUIREMENT_VERSION_PROJECT_MISMATCH"
+      });
+      expect(mutationOutcome).toMatchObject({ type: "result", code: "MUTATED" });
+      expect(store.listRequirementProjects(requirement.id)[0]?.projectVersionId).toBe(replacement.id);
+      expect(store.getProjectVersion(version.id)?.pendingRequirementId).toBeUndefined();
+    }
+    await Promise.all([waitForExit(application.child), waitForExit(mutation.child)]);
+  });
 });
 
 type ChildMessage =
@@ -1085,6 +1188,31 @@ const versionApplicationScript = `
 });
 `;
 
+const requirementMutationScript = `
+(async () => {
+  const { WorkflowStore } = await import(process.env.STORE_MODULE_URL);
+  const store = new WorkflowStore(process.env.DATABASE_PATH);
+  const input = JSON.parse(process.env.REQUIREMENT_MUTATION_INPUT);
+  const finish = (message, exitCode) => process.send(message, () => {
+    store.close();
+    process.exit(exitCode);
+  });
+  process.on("message", (message) => {
+    if (message !== "go") return;
+    process.send({ type: "starting" });
+    try {
+      store.replaceRequirementProjects(input.requirementId, input.projects);
+      finish({ type: "result", code: "MUTATED" }, 0);
+    } catch (error) {
+      finish({ type: "error", message: error instanceof Error ? error.message : String(error) }, 0);
+    }
+  });
+  process.send({ type: "ready" });
+})().catch((error) => {
+  process.send({ type: "error", message: error instanceof Error ? error.message : String(error) }, () => process.exit(1));
+});
+`;
+
 type VersionApplicationWorkerInput = {
   mode: "begin" | "lifecycle";
   begin: {
@@ -1113,6 +1241,15 @@ function spawnCreator(path: string, input: ReturnType<typeof requirementInput>) 
 function spawnVersionApplicationWorker(path: string, input: VersionApplicationWorkerInput) {
   return spawnStoreWorker(path, versionApplicationScript, {
     VERSION_APPLICATION_INPUT: JSON.stringify(input)
+  });
+}
+
+function spawnRequirementMutationWorker(path: string, input: {
+  requirementId: string;
+  projects: Array<Record<string, unknown>>;
+}) {
+  return spawnStoreWorker(path, requirementMutationScript, {
+    REQUIREMENT_MUTATION_INPUT: JSON.stringify(input)
   });
 }
 

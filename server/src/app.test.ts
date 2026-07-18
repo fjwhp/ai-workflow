@@ -122,6 +122,54 @@ class ApplyCompletionFailingStore extends WorkflowStore {
   }
 }
 
+type PendingMutationRunStatus = "running" | "awaiting_local_resolution" | "merge_test_failed" | "retesting";
+
+function pendingMutationFixture(store: WorkflowStore, suffix: string) {
+  const project = store.createProject(projectPayload(`/tmp/pending-mutation-${suffix}-${crypto.randomUUID()}`));
+  const version = store.createProjectVersion({
+    projectId: project.id, name: `${suffix}-current`, branch: `release/${suffix}-current`, baseBranch: "main",
+    worktreePath: `/tmp/pending-mutation-${suffix}-current-${crypto.randomUUID()}`, headCommit: "a".repeat(40)
+  });
+  const replacement = store.createProjectVersion({
+    projectId: project.id, name: `${suffix}-replacement`, branch: `release/${suffix}-replacement`, baseBranch: "main",
+    worktreePath: `/tmp/pending-mutation-${suffix}-replacement-${crypto.randomUUID()}`, headCommit: "b".repeat(40)
+  });
+  const requirement = createRequirement(store, {
+    title: `Pending mutation ${suffix}`, businessProblem: "Freeze pending requirement",
+    expectedOutcome: "Reject public mutation", priority: "medium",
+    primaryProjectId: project.id, primaryProjectVersionId: version.id
+  });
+  return { project, version, replacement, requirement };
+}
+
+function acquirePendingMutationLease(
+  store: WorkflowStore,
+  fixture: ReturnType<typeof pendingMutationFixture>,
+  status: PendingMutationRunStatus,
+  suffix: string
+) {
+  store.updateRequirementState(fixture.requirement.id, "integration", "awaiting_merge");
+  const runId = `pending-mutation-${suffix}-${crypto.randomUUID()}`;
+  store.beginVersionApplication({
+    versionId: fixture.version.id, requirementId: fixture.requirement.id,
+    run: {
+      id: runId, projectId: fixture.project.id, executionId: `execution-${runId}`, evidenceId: `evidence-${runId}`,
+      sourceBranch: `ai/${suffix}`, worktreePath: `/tmp/source-${runId}`, targetBranch: fixture.version.branch,
+      preflight: { allowed: true }
+    }
+  });
+  if (status !== "running") {
+    store.completeVersionApplicationApply({
+      runId, sourceCommit: "c".repeat(40), preApplyHead: fixture.version.headCommit,
+      status: status === "awaiting_local_resolution" ? "awaiting_local_resolution" : "merge_test_failed"
+    });
+  }
+  if (status === "retesting") {
+    store.beginVersionApplicationRetest({ versionId: fixture.version.id, runId });
+  }
+  return runId;
+}
+
 const projectPayload=(repoPath:string,extra:any={})=>({name:"API project",repoPath,defaultBranch:"main",allowedCommands:[],sensitivePatterns:[],...extra});
 
 describe("project and requirement association APIs",()=>{
@@ -717,4 +765,91 @@ describe("stage run API", () => {
     expect(store.getProjectVersion(fixture.version.id)?.pendingIntegrationRunId).toBe(applied.json().id);
     await restarted.close();
   });
+
+  it.each(["running", "awaiting_local_resolution", "merge_test_failed", "retesting"] as const)(
+    "rejects public requirement mutations without partial writes while a version application is %s",
+    async (status) => {
+      const store = new WorkflowStore(":memory:"); stores.push(store);
+      const approvalFixture = pendingMutationFixture(store, `${status}-approval`);
+      const associationFixture = pendingMutationFixture(store, `${status}-association`);
+      const app = await buildApp(store);
+      acquirePendingMutationLease(store, approvalFixture, status, `${status}-approval`);
+      acquirePendingMutationLease(store, associationFixture, status, `${status}-association`);
+      const approvalBefore = {
+        requirement: store.getRequirement(approvalFixture.requirement.id),
+        approvals: store.listApprovals(approvalFixture.requirement.id),
+        revisions: store.listRequirementRevisions(approvalFixture.requirement.id),
+        associations: store.listRequirementProjects(approvalFixture.requirement.id),
+        snapshot: store.getRequirementProjectSnapshot(approvalFixture.requirement.id)
+      };
+      const associationBefore = {
+        requirement: store.getRequirement(associationFixture.requirement.id),
+        approvals: store.listApprovals(associationFixture.requirement.id),
+        revisions: store.listRequirementRevisions(associationFixture.requirement.id),
+        associations: store.listRequirementProjects(associationFixture.requirement.id),
+        snapshot: store.getRequirementProjectSnapshot(associationFixture.requirement.id)
+      };
+
+      const responses = [
+        await app.inject({
+          method: "POST", url: `/api/requirements/${approvalFixture.requirement.id}/approve`,
+          payload: { decision: "approve", comment: "must be frozen" }
+        }),
+        await app.inject({
+          method: "POST", url: `/api/requirements/${approvalFixture.requirement.id}/approve`,
+          payload: { decision: "return", comment: "must still be frozen" }
+        }),
+        await app.inject({
+          method: "PATCH", url: `/api/requirements/${approvalFixture.requirement.id}`,
+          payload: {
+            title: "Mutated title", businessProblem: "Must not change", expectedOutcome: "Must stay frozen",
+            priority: "high", clarifications: "No mutation", changeSummary: "Attempted mutation",
+            primaryProjectId: approvalFixture.project.id, primaryProjectVersionId: approvalFixture.version.id
+          }
+        }),
+        await app.inject({
+          method: "POST", url: `/api/requirements/${approvalFixture.requirement.id}/human-override`,
+          payload: { comment: "must remain frozen" }
+        }),
+        await app.inject({
+          method: "POST", url: `/api/requirements/${approvalFixture.requirement.id}/run`, payload: {}
+        }),
+        await app.inject({
+          method: "PUT", url: `/api/requirements/${associationFixture.requirement.id}/projects`,
+          payload: [{
+            projectId: associationFixture.project.id, projectVersionId: associationFixture.replacement.id,
+            role: "primary", usage: "delivery", deliveryRequired: true,
+            moduleMode: "auto", moduleIds: [], position: 0
+          }]
+        }),
+        await app.inject({
+          method: "PATCH", url: `/api/requirements/${associationFixture.requirement.id}/project`,
+          payload: { projectId: associationFixture.project.id }
+        })
+      ];
+
+      expect(responses.map((response) => response.statusCode)).toEqual([409, 409, 409, 409, 409, 409, 409]);
+      for (const response of responses) {
+        expect(response.json()).toMatchObject({
+          error: "PROJECT_VERSION_APPLICATION_PENDING",
+          message: "版本应用处理中，不能修改需求或项目关联"
+        });
+      }
+      expect({
+        requirement: store.getRequirement(approvalFixture.requirement.id),
+        approvals: store.listApprovals(approvalFixture.requirement.id),
+        revisions: store.listRequirementRevisions(approvalFixture.requirement.id),
+        associations: store.listRequirementProjects(approvalFixture.requirement.id),
+        snapshot: store.getRequirementProjectSnapshot(approvalFixture.requirement.id)
+      }).toEqual(approvalBefore);
+      expect({
+        requirement: store.getRequirement(associationFixture.requirement.id),
+        approvals: store.listApprovals(associationFixture.requirement.id),
+        revisions: store.listRequirementRevisions(associationFixture.requirement.id),
+        associations: store.listRequirementProjects(associationFixture.requirement.id),
+        snapshot: store.getRequirementProjectSnapshot(associationFixture.requirement.id)
+      }).toEqual(associationBefore);
+      await app.close();
+    }
+  );
 });
