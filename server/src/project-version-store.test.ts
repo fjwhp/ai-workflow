@@ -457,6 +457,41 @@ describe("project version application leases", () => {
     expect(store.listPendingVersionApplications()).toEqual([]);
   });
 
+  it("rejects a matching version when the requirement has multiple active deliveries without residue", () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const database = new DatabaseSync(path); databases.push(database);
+    const project = createProject(store, "Multiple deliveries", join(path, "..", "multiple-deliveries"));
+    const version = createVersion(store, project.id, "1.0.0", join(path, "..", "multiple-deliveries-v1"));
+    const otherProject = createProject(store, "Other delivery", join(path, "..", "other-delivery"));
+    const otherVersion = createVersion(store, otherProject.id, "1.0.0", join(path, "..", "other-delivery-v1"));
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Multiple deliveries"));
+    store.replaceRequirementProjects(requirement.id, [
+      {
+        projectId: project.id, projectVersionId: version.id, role: "primary", usage: "delivery",
+        deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0
+      },
+      {
+        projectId: otherProject.id, projectVersionId: otherVersion.id, role: "collaborator", usage: "delivery",
+        deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 1
+      }
+    ]);
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    database.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?")
+      .run("2000-01-01T00:00:00.000Z", requirement.id);
+
+    expect(() => store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "multiple-deliveries")
+    })).toThrow("REQUIREMENT_VERSION_PROJECT_MISMATCH");
+    expect(store.getProjectVersion(version.id)).toMatchObject({
+      pendingRequirementId: undefined, pendingIntegrationRunId: undefined
+    });
+    expect(store.getIntegrationRun("run-multiple-deliveries")).toBeNull();
+    expect(store.getRequirement(requirement.id)).toMatchObject({
+      stage: "integration", status: "awaiting_merge", updatedAt: "2000-01-01T00:00:00.000Z"
+    });
+  });
+
   it("rolls back the lease and requirement update when run insertion fails", () => {
     const path = databasePath();
     const store = new WorkflowStore(path); stores.push(store);

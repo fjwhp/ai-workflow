@@ -915,11 +915,16 @@ export class WorkflowStore {
       if (requirement.stage !== "integration" || requirement.status !== "awaiting_merge") {
         throw new Error("VERSION_APPLICATION_NOT_ALLOWED");
       }
-      const association = this.db.prepare(`SELECT id FROM requirement_projects
-        WHERE requirement_id = ? AND project_id = ? AND project_version_id = ?
-          AND usage = 'delivery' AND status = 'active' LIMIT 1`)
-        .get(input.requirementId, version.project_id, input.versionId);
-      if (!association || input.run.projectId !== version.project_id) {
+      const deliveries = this.db.prepare(`SELECT project_id, project_version_id
+        FROM requirement_projects
+        WHERE requirement_id = ? AND usage = 'delivery' AND status = 'active'
+        ORDER BY position`).all(input.requirementId) as Array<{
+          project_id: string;
+          project_version_id: string | null;
+        }>;
+      const delivery = deliveries[0];
+      if (deliveries.length !== 1 || delivery?.project_id !== version.project_id ||
+          delivery?.project_version_id !== input.versionId || input.run.projectId !== version.project_id) {
         throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
       }
 
