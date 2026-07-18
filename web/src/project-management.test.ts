@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { ApiError } from "./api.js";
 import {
   archiveErrorMessage,
+  beginProjectDetails,
+  canCloseDialog,
   filterProjects,
   initialSubmissionState,
   normalizeAllowedCommands,
@@ -10,6 +12,9 @@ import {
   projectHealth,
   projectFieldErrors,
   projectValidationLabel,
+  mergeProjectDetails,
+  nextFocusIndex,
+  shouldStartSubmission,
   submissionReducer,
   validationAfterChange,
 } from "./project-management.js";
@@ -57,6 +62,32 @@ describe("project management helpers", () => {
     const form = { name: "Orders", repoPath: "/repo" };
     const busy = submissionReducer(initialSubmissionState(form), { type: "submit" });
     expect(submissionReducer(busy, { type: "failure", error: "重复仓库" })).toEqual({ form, submitting: false, error: "重复仓库" });
+  });
+
+  it("does not let edits clear an in-flight submission", () => {
+    const busy = submissionReducer(initialSubmissionState({ name: "Orders" }), { type: "submit" });
+    const changed = submissionReducer(busy, { type: "change", form: { name: "Renamed" } });
+    expect(changed).toMatchObject({ form: { name: "Renamed" }, submitting: true });
+    expect(shouldStartSubmission(changed)).toBe(false);
+  });
+
+  it("merges independent detail results and rejects stale generations", () => {
+    const state = beginProjectDetails({ generation: 0, knowledge: { old: {}, p1: { status: "stale" } }, memory: { old: {}, p1: { total: 9 } }, errors: {} }, 2, ["p1"]);
+    expect(state).toEqual({ generation: 2, knowledge: {}, memory: {}, errors: {} });
+    const knowledge = mergeProjectDetails(state, 2, "p1", "knowledge", { status: "fulfilled", value: { status: "ready" } });
+    const partial = mergeProjectDetails(knowledge, 2, "p1", "memory", { status: "rejected", reason: "memory unavailable" });
+    expect(partial.knowledge.p1).toEqual({ status: "ready" });
+    expect(partial.memory.p1).toBeUndefined();
+    expect(partial.errors.p1).toEqual({ memory: "memory unavailable" });
+    expect(mergeProjectDetails(partial, 1, "p1", "knowledge", { status: "fulfilled", value: { status: "stale" } })).toBe(partial);
+  });
+
+  it("cycles dialog focus and blocks Escape while busy", () => {
+    expect(nextFocusIndex(2, 3, false)).toBe(0);
+    expect(nextFocusIndex(0, 3, true)).toBe(2);
+    expect(canCloseDialog("Escape", false)).toBe(true);
+    expect(canCloseDialog("Escape", true)).toBe(false);
+    expect(canCloseDialog("Enter", false)).toBe(false);
   });
 
   it("maps structured project API errors to repository fields", () => {
