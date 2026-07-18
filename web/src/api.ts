@@ -18,7 +18,7 @@ export async function parseApiResponse(response: Response) {
   }
   if (!response.ok) {
     const message = data?.message || data?.error || (text ? `请求失败（HTTP ${response.status}）` : "服务暂时不可用，请稍后重试");
-    throw new ApiError(data?.error || "HTTP_ERROR", message, data?.details ?? null, response.status);
+    throw new ApiError(data?.error || "HTTP_ERROR", message, data?.details ?? (data?.issues ? { issues: data.issues } : null), response.status);
   }
   return data;
 }

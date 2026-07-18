@@ -19,4 +19,11 @@ describe("parseApiResponse", () => {
     expect(error).toBeInstanceOf(ApiError);
     expect(error).toMatchObject({ code: "PROJECT_REPOSITORY_INVALID", message: "invalid", details, status: 400 });
   });
+
+  it("preserves top-level validation issues for field mapping", async () => {
+    const issues = [{ path: [1, "moduleIds"], message: "invalid" }];
+    const response = new Response(JSON.stringify({ error: "VALIDATION_ERROR", issues }), { status: 400 });
+    const error = await parseApiResponse(response).catch(value => value);
+    expect(error).toMatchObject({ details: { issues } });
+  });
 });

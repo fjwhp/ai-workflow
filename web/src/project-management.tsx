@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } 
 import { Archive, CheckCircle2, Eye, FolderGit2, Pencil, Plus, RefreshCw, RotateCw, X } from "lucide-react";
 import { ApiError, api, patch, post } from "./api.js";
 import { projectKnowledgeView } from "./project-knowledge-view.js";
+import { AccessibleDialog } from "./accessible-dialog.js";
 
 type ProjectStatus = "active" | "archived";
 type ProjectAction = "edit" | "validate" | "rebuild" | "archive" | "view";
@@ -117,14 +118,6 @@ function ProjectBand({ project, knowledge, memory, detailErrors, rebuildBusy, ar
 
 function ArchiveDialog({ project, busy, error, onCancel, onArchive }: { project: Project; busy: boolean; error: string; onCancel: () => void; onArchive: () => void }) {
   return <AccessibleDialog className="archive-dialog" role="alertdialog" title={`归档项目“${project.name}”`} subtitle="归档后，该项目将不再出现在新需求的项目选择中；已有交付历史和知识记录仍会保留。" titleId="archive-project-title" descriptionId="archive-project-description" busy={busy} onClose={onCancel}>{error && <p className="form-error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="secondary" data-autofocus disabled={busy} onClick={onCancel}>取消</button><button type="button" className="primary danger-action" disabled={busy} onClick={onArchive}>{busy ? <RefreshCw className="spin" size={16}/> : <Archive size={16}/>}确认归档</button></div></AccessibleDialog>;
-}
-
-function AccessibleDialog({ className = "", role = "dialog", title, subtitle, titleId, descriptionId, busy, onClose, children }: { className?: string; role?: "dialog" | "alertdialog"; title: string; subtitle: string; titleId: string; descriptionId?: string; busy: boolean; onClose: () => void; children: React.ReactNode }) {
-  const dialogRef = useRef<HTMLDivElement>(null), previousFocus = useRef<HTMLElement | null>(null), closeRef = useRef(onClose), busyRef = useRef(busy);
-  closeRef.current = onClose; busyRef.current = busy;
-  useEffect(() => { previousFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; const frame = window.requestAnimationFrame(() => { const root = dialogRef.current; (root?.querySelector<HTMLElement>("[data-autofocus]:not(:disabled)") || root?.querySelector<HTMLElement>("button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),[tabindex]:not([tabindex='-1'])"))?.focus(); }); return () => { window.cancelAnimationFrame(frame); previousFocus.current?.focus(); }; }, []);
-  const keyDown = (event: React.KeyboardEvent) => { if (canCloseDialog(event.key, busyRef.current)) { event.preventDefault(); closeRef.current(); return; } if (event.key !== "Tab") return; const items = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>("button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),[tabindex]:not([tabindex='-1'])") || []); if (!items.length) { event.preventDefault(); return; } const found = items.indexOf(document.activeElement as HTMLElement), current = found >= 0 ? found : event.shiftKey ? 0 : -1, next = nextFocusIndex(current, items.length, event.shiftKey); event.preventDefault(); items[next]?.focus(); };
-  return <div className="modal-backdrop"><div ref={dialogRef} className={`modal ${className}`} role={role} aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId} onKeyDown={keyDown}><div className="modal-head"><div><h2 id={titleId}>{title}</h2><p id={descriptionId}>{subtitle}</p></div><IconButton title="关闭" disabled={busy} onClick={onClose}><X/></IconButton></div>{children}</div></div>;
 }
 
 function IconButton({ title, children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement>) { return <button type="button" className="icon-btn" title={title} aria-label={title} {...props}>{React.isValidElement(children) ? React.cloneElement(children as React.ReactElement<any>, { size: 16 }) : children}</button>; }
