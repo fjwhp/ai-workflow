@@ -650,3 +650,58 @@ describe("project version item routes", () => {
     expect(historicalResponse.json().error).toBe("PROJECT_VERSION_HAS_ACTIVE_REQUIREMENTS");
   });
 });
+
+describe("project version application queue route", () => {
+  it("returns only the exact version queue and reports a missing version", async () => {
+    const store = createStore();
+    const firstProject = createProject(store, "/tmp/queue-route-first", "Queue first");
+    const secondProject = createProject(store, "/tmp/queue-route-second", "Queue second");
+    const firstVersion = store.createProjectVersion({
+      projectId: firstProject.id, name: "1.0.0", branch: "release/first", baseBranch: "prod",
+      worktreePath: "/tmp/queue-route-first-version", headCommit: "a".repeat(40)
+    });
+    const secondVersion = store.createProjectVersion({
+      projectId: secondProject.id, name: "1.0.0", branch: "release/second", baseBranch: "prod",
+      worktreePath: "/tmp/queue-route-second-version", headCommit: "b".repeat(40)
+    });
+    const owner = store.createRequirement({
+      title: "Queue owner", businessProblem: "Serialize application", expectedOutcome: "Own first version",
+      priority: "high", primaryProjectId: firstProject.id, primaryProjectVersionId: firstVersion.id
+    });
+    store.updateRequirementState(owner.id, "integration", "awaiting_merge");
+    store.beginVersionApplication({
+      versionId: firstVersion.id,
+      requirementId: owner.id,
+      run: {
+        id: "queue-route-run", projectId: firstProject.id, executionId: "queue-route-execution",
+        evidenceId: "queue-route-evidence", sourceBranch: "ai/queue-owner",
+        worktreePath: "/tmp/queue-route-requirement", targetBranch: firstVersion.branch,
+        preflight: { allowed: true }
+      }
+    });
+    const app = await routeApp(store);
+
+    const exact = await app.inject({
+      method: "GET", url: `/api/project-versions/${firstVersion.id}/application-queue`
+    });
+    expect(exact.statusCode).toBe(200);
+    expect(exact.json()).toMatchObject([{
+      requirementId: owner.id, code: owner.code, owner: true, position: 1
+    }]);
+
+    const other = await app.inject({
+      method: "GET", url: `/api/project-versions/${secondVersion.id}/application-queue`
+    });
+    expect(other.statusCode).toBe(200);
+    expect(other.json()).toEqual([]);
+    expect(store.getProjectVersion(firstVersion.id)).toMatchObject({
+      pendingRequirementId: owner.id, pendingIntegrationRunId: "queue-route-run"
+    });
+
+    const missing = await app.inject({
+      method: "GET", url: "/api/project-versions/missing/application-queue"
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json()).toMatchObject({ error: "PROJECT_VERSION_NOT_FOUND" });
+  });
+});

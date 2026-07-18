@@ -203,6 +203,15 @@ export async function registerProjectVersionRoutes(app: FastifyInstance, { store
     catch (error) { return sendError(reply, error); }
   });
 
+  app.get("/api/project-versions/:id/application-queue", async (request: any, reply) => {
+    const id = routeId(request.params?.id);
+    if (!id) return reply.code(400).send({ error: "VALIDATION_ERROR" });
+    try {
+      requireVersion(store, id);
+      return store.listVersionApplicationQueue(id);
+    } catch (error) { return sendError(reply, error); }
+  });
+
   app.post("/api/project-versions/:id/recheck", async (request: any, reply) => {
     const id = routeId(request.params?.id);
     if (!id) return reply.code(400).send({ error: "VALIDATION_ERROR" });

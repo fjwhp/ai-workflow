@@ -52,6 +52,19 @@ function createVersion(store: WorkflowStore, projectId: string, name = "1.0.0", 
   });
 }
 
+function applicationRun(version: ReturnType<typeof createVersion>, suffix: string) {
+  return {
+    id: `run-${suffix}`,
+    projectId: version.projectId,
+    executionId: `execution-${suffix}`,
+    evidenceId: `evidence-${suffix}`,
+    sourceBranch: `ai/${suffix}`,
+    worktreePath: `/tmp/requirement-${suffix}`,
+    targetBranch: version.branch,
+    preflight: { allowed: true, evidence: suffix }
+  };
+}
+
 describe("project versions fresh schema", () => {
   it("owns branch and worktree state and removes the free integration target", () => {
     const path = databasePath();
@@ -366,6 +379,305 @@ describe("project version persistence", () => {
 
     expect(store.listVersionRequirements(firstVersion.id).map((item) => item.id)).toEqual([requirement.id]);
     expect(store.listVersionRequirements(secondVersion.id).map((item) => item.id)).toEqual([requirement.id]);
+  });
+});
+
+describe("project version application leases", () => {
+  it("serializes one writer per version while allowing a different version", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Application leases", "/tmp/application-leases");
+    const firstVersion = createVersion(store, project.id, "1.0.0", "/tmp/application-leases-v1");
+    const secondVersion = createVersion(store, project.id, "2.0.0", "/tmp/application-leases-v2");
+    const owner = store.createRequirement(requirementInput(project.id, firstVersion.id, "Owner"));
+    const waiter = store.createRequirement(requirementInput(project.id, firstVersion.id, "Waiter"));
+    const independent = store.createRequirement(requirementInput(project.id, secondVersion.id, "Independent"));
+    for (const requirement of [owner, waiter, independent]) {
+      store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    }
+
+    const acquired = store.beginVersionApplication({
+      versionId: firstVersion.id, requirementId: owner.id, run: applicationRun(firstVersion, "owner")
+    });
+    expect(acquired.version).toMatchObject({
+      pendingRequirementId: owner.id, pendingIntegrationRunId: "run-owner"
+    });
+    expect(acquired.run).toMatchObject({
+      id: "run-owner", requirementId: owner.id, projectId: project.id,
+      projectVersionId: firstVersion.id, status: "running", evidenceId: "evidence-owner"
+    });
+
+    expect(() => store.beginVersionApplication({
+      versionId: firstVersion.id, requirementId: waiter.id, run: applicationRun(firstVersion, "waiter")
+    })).toThrow("PROJECT_VERSION_APPLICATION_BUSY");
+    expect(store.getIntegrationRun("run-waiter")).toBeNull();
+    expect(store.getRequirement(waiter.id)).toMatchObject({ stage: "integration", status: "awaiting_merge" });
+    expect(store.getProjectVersion(firstVersion.id)).toMatchObject({
+      pendingRequirementId: owner.id, pendingIntegrationRunId: "run-owner"
+    });
+
+    expect(store.beginVersionApplication({
+      versionId: secondVersion.id, requirementId: independent.id, run: applicationRun(secondVersion, "independent")
+    }).version).toMatchObject({ pendingRequirementId: independent.id });
+  });
+
+  it("validates active ownership and current version association before acquiring", () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const database = new DatabaseSync(path); databases.push(database);
+    const project = createProject(store, "Application validation", join(path, "..", "application-validation"));
+    const version = createVersion(store, project.id, "1.0.0", join(path, "..", "application-validation-v1"));
+    const otherVersion = createVersion(store, project.id, "2.0.0", join(path, "..", "application-validation-v2"));
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Validation"));
+
+    expect(() => store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "wrong-state")
+    })).toThrow("VERSION_APPLICATION_NOT_ALLOWED");
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.replaceRequirementProjects(requirement.id, [{
+      projectId: project.id, projectVersionId: otherVersion.id, role: "primary", usage: "delivery",
+      deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0
+    }]);
+    expect(() => store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "wrong-version")
+    })).toThrow("REQUIREMENT_VERSION_PROJECT_MISMATCH");
+
+    store.replaceRequirementProjects(requirement.id, [{
+      projectId: project.id, projectVersionId: version.id, role: "primary", usage: "delivery",
+      deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0
+    }]);
+    database.prepare("UPDATE project_versions SET status = 'closed' WHERE id = ?").run(version.id);
+    expect(() => store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "closed")
+    })).toThrow("PROJECT_VERSION_NOT_ACTIVE");
+    database.prepare("UPDATE project_versions SET status = 'active' WHERE id = ?").run(version.id);
+    store.archiveProject(project.id);
+    expect(() => store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "archived")
+    })).toThrow("PROJECT_NOT_ACTIVE");
+    expect(store.listPendingVersionApplications()).toEqual([]);
+  });
+
+  it("rolls back the lease and requirement update when run insertion fails", () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const database = new DatabaseSync(path); databases.push(database);
+    const project = createProject(store, "Application rollback", join(path, "..", "application-rollback"));
+    const version = createVersion(store, project.id, "1.0.0", join(path, "..", "application-rollback-v1"));
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Rollback"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    database.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", requirement.id);
+    database.exec(`CREATE TRIGGER fail_application_run BEFORE INSERT ON integration_runs
+      WHEN NEW.id = 'run-rollback' BEGIN SELECT RAISE(ABORT, 'forced raw sqlite failure'); END;`);
+
+    expect(() => store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "rollback")
+    })).toThrow("PROJECT_VERSION_APPLICATION_FAILED");
+    expect(store.getProjectVersion(version.id)).toMatchObject({
+      pendingRequirementId: undefined, pendingIntegrationRunId: undefined
+    });
+    expect(store.getIntegrationRun("run-rollback")).toBeNull();
+    expect(store.getRequirement(requirement.id)).toMatchObject({
+      stage: "integration", status: "awaiting_merge", updatedAt: "2000-01-01T00:00:00.000Z"
+    });
+  });
+
+  it("lets only one of two store connections acquire the same version", async () => {
+    const path = databasePath();
+    const firstStore = new WorkflowStore(path);
+    const secondStore = new WorkflowStore(path);
+    stores.push(firstStore, secondStore);
+    const project = createProject(firstStore, "Application race", join(path, "..", "application-race"));
+    const version = createVersion(firstStore, project.id, "1.0.0", join(path, "..", "application-race-v1"));
+    const firstRequirement = firstStore.createRequirement(requirementInput(project.id, version.id, "Race first"));
+    const secondRequirement = firstStore.createRequirement(requirementInput(project.id, version.id, "Race second"));
+    firstStore.updateRequirementState(firstRequirement.id, "integration", "awaiting_merge");
+    firstStore.updateRequirementState(secondRequirement.id, "integration", "awaiting_merge");
+
+    const outcomes = await Promise.allSettled([
+      Promise.resolve().then(() => firstStore.beginVersionApplication({
+        versionId: version.id, requirementId: firstRequirement.id, run: applicationRun(version, "race-first")
+      })),
+      Promise.resolve().then(() => secondStore.beginVersionApplication({
+        versionId: version.id, requirementId: secondRequirement.id, run: applicationRun(version, "race-second")
+      }))
+    ]);
+
+    expect(outcomes.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter(({ status }) => status === "rejected")).toHaveLength(1);
+    expect((outcomes.find(({ status }) => status === "rejected") as PromiseRejectedResult).reason)
+      .toMatchObject({ message: "PROJECT_VERSION_APPLICATION_BUSY" });
+    expect(firstStore.listPendingVersionApplications()).toHaveLength(1);
+  });
+
+  it.each(["awaiting_local_resolution", "merge_test_failed"] as const)(
+    "completes apply into %s while retaining its lease",
+    (status) => {
+      const store = new WorkflowStore(":memory:"); stores.push(store);
+      const project = createProject(store, `Apply ${status}`, `/tmp/apply-${status}`);
+      const version = createVersion(store, project.id, status, `/tmp/apply-${status}-v1`);
+      const requirement = store.createRequirement(requirementInput(project.id, version.id, `Apply ${status}`));
+      store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+      store.beginVersionApplication({
+        versionId: version.id, requirementId: requirement.id, run: applicationRun(version, status)
+      });
+
+      const run = store.completeVersionApplicationApply({
+        runId: `run-${status}`, sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40), status
+      });
+
+      expect(run).toMatchObject({
+        status, sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
+        projectVersionId: version.id
+      });
+      expect(store.getRequirement(requirement.id)).toMatchObject({ stage: "integration", status });
+      expect(store.getProjectVersion(version.id)).toMatchObject({
+        pendingRequirementId: requirement.id, pendingIntegrationRunId: `run-${status}`
+      });
+    }
+  );
+
+  it("atomically releases committed and reverted applications only for the matching run", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Application release", "/tmp/application-release");
+    const committedVersion = createVersion(store, project.id, "committed", "/tmp/application-release-committed");
+    const revertedVersion = createVersion(store, project.id, "reverted", "/tmp/application-release-reverted");
+    const committed = store.createRequirement(requirementInput(project.id, committedVersion.id, "Committed"));
+    const reverted = store.createRequirement(requirementInput(project.id, revertedVersion.id, "Reverted"));
+    for (const requirement of [committed, reverted]) {
+      store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    }
+    for (const [version, requirement, suffix] of [
+      [committedVersion, committed, "committed"], [revertedVersion, reverted, "reverted"]
+    ] as const) {
+      store.beginVersionApplication({
+        versionId: version.id, requirementId: requirement.id, run: applicationRun(version, suffix)
+      });
+      store.completeVersionApplicationApply({
+        runId: `run-${suffix}`, sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
+        status: "awaiting_local_resolution"
+      });
+    }
+
+    expect(() => store.releaseVersionApplication({
+      versionId: committedVersion.id, runId: "wrong-run", resolution: "committed", resolutionCommit: "e".repeat(40)
+    })).toThrow("PROJECT_VERSION_APPLICATION_MISMATCH");
+    expect(store.getProjectVersion(committedVersion.id)?.pendingIntegrationRunId).toBe("run-committed");
+    expect(store.getIntegrationRun("run-committed")?.resolutionStatus).toBeUndefined();
+
+    expect(store.releaseVersionApplication({
+      versionId: committedVersion.id, runId: "run-committed", resolution: "committed",
+      resolutionCommit: "e".repeat(40)
+    })).toMatchObject({ resolutionStatus: "committed", resolutionCommit: "e".repeat(40) });
+    expect(store.getRequirement(committed.id)?.status).toBe("completed");
+    expect(store.getProjectVersion(committedVersion.id)).toMatchObject({
+      pendingRequirementId: undefined, pendingIntegrationRunId: undefined
+    });
+
+    expect(store.releaseVersionApplication({
+      versionId: revertedVersion.id, runId: "run-reverted", resolution: "reverted"
+    })).toMatchObject({ resolutionStatus: "reverted", resolutionCommit: undefined });
+    expect(store.getRequirement(reverted.id)?.status).toBe("awaiting_merge");
+    expect(store.getProjectVersion(revertedVersion.id)?.pendingRequirementId).toBeUndefined();
+  });
+
+  it("does not resolve a lease before its application has completed", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Premature resolution", "/tmp/premature-resolution");
+    const version = createVersion(store, project.id, "premature", "/tmp/premature-resolution-v1");
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Premature"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "premature")
+    });
+
+    expect(() => store.releaseVersionApplication({
+      versionId: version.id, runId: "run-premature", resolution: "committed",
+      resolutionCommit: "e".repeat(40)
+    })).toThrow("PROJECT_VERSION_APPLICATION_MISMATCH");
+    expect(() => store.markVersionResolutionAmbiguous({
+      versionId: version.id, runId: "run-premature", currentHead: "f".repeat(40)
+    })).toThrow("PROJECT_VERSION_APPLICATION_MISMATCH");
+    expect(store.getIntegrationRun("run-premature")?.status).toBe("running");
+    expect(store.getRequirement(requirement.id)?.status).toBe("awaiting_merge");
+    expect(store.getProjectVersion(version.id)).toMatchObject({
+      pendingRequirementId: requirement.id, pendingIntegrationRunId: "run-premature"
+    });
+  });
+
+  it("marks an ambiguous resolution without releasing the lease", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Ambiguous resolution", "/tmp/ambiguous-resolution");
+    const version = createVersion(store, project.id, "ambiguous", "/tmp/ambiguous-resolution-v1");
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Ambiguous"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "ambiguous")
+    });
+    store.completeVersionApplicationApply({
+      runId: "run-ambiguous", sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
+      status: "awaiting_local_resolution"
+    });
+
+    const run = store.markVersionResolutionAmbiguous({
+      versionId: version.id, runId: "run-ambiguous", currentHead: "f".repeat(40)
+    });
+    expect(run).toMatchObject({ resolutionStatus: "ambiguous", resolutionCommit: "f".repeat(40) });
+    expect(store.getRequirement(requirement.id)?.status).toBe("manual_resolution_required");
+    expect(store.getProjectVersion(version.id)).toMatchObject({
+      pendingRequirementId: requirement.id, pendingIntegrationRunId: "run-ambiguous"
+    });
+    expect(store.listPendingVersionApplications()).toEqual([
+      expect.objectContaining({
+        version: expect.objectContaining({ id: version.id }),
+        requirement: expect.objectContaining({ id: requirement.id, status: "manual_resolution_required" }),
+        run: expect.objectContaining({ id: "run-ambiguous", preApplyHead: "d".repeat(40), resolutionStatus: "ambiguous" })
+      })
+    ]);
+  });
+
+  it("lists the owner first and eligible active waiters by updated time and code without duplicates", () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const database = new DatabaseSync(path); databases.push(database);
+    const project = createProject(store, "Application queue", join(path, "..", "application-queue"));
+    const version = createVersion(store, project.id, "1.0.0", join(path, "..", "application-queue-v1"));
+    const otherVersion = createVersion(store, project.id, "2.0.0", join(path, "..", "application-queue-v2"));
+    const firstWaiter = store.createRequirement(requirementInput(project.id, version.id, "First waiter"));
+    const secondWaiter = store.createRequirement(requirementInput(project.id, version.id, "Second waiter"));
+    const owner = store.createRequirement(requirementInput(project.id, version.id, "Owner"));
+    const wrongVersion = store.createRequirement(requirementInput(project.id, otherVersion.id, "Wrong version"));
+    for (const requirement of [firstWaiter, secondWaiter, owner, wrongVersion]) {
+      store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    }
+    database.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?")
+      .run("2026-01-02T00:00:00.000Z", firstWaiter.id);
+    database.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?")
+      .run("2026-01-01T00:00:00.000Z", secondWaiter.id);
+    store.replaceRequirementProjects(firstWaiter.id, [{
+      projectId: project.id, projectVersionId: otherVersion.id, role: "primary", usage: "delivery",
+      deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0
+    }]);
+    store.replaceRequirementProjects(firstWaiter.id, [{
+      projectId: project.id, projectVersionId: version.id, role: "primary", usage: "delivery",
+      deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0
+    }]);
+    database.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?")
+      .run("2026-01-02T00:00:00.000Z", firstWaiter.id);
+    store.beginVersionApplication({
+      versionId: version.id, requirementId: owner.id, run: applicationRun(version, "queue-owner")
+    });
+    store.completeVersionApplicationApply({
+      runId: "run-queue-owner", sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
+      status: "awaiting_local_resolution"
+    });
+
+    const queue = store.listVersionApplicationQueue(version.id);
+    expect(queue.map(({ requirementId, owner, position }) => ({ requirementId, owner, position }))).toEqual([
+      { requirementId: owner.id, owner: true, position: 1 },
+      { requirementId: secondWaiter.id, owner: false, position: 2 },
+      { requirementId: firstWaiter.id, owner: false, position: 3 }
+    ]);
+    expect(new Set(queue.map(({ requirementId }) => requirementId)).size).toBe(3);
   });
 });
 
