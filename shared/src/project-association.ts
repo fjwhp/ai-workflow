@@ -20,6 +20,7 @@ export interface RequirementProject {
   moduleIds: string[];
   position: number;
   status: RequirementProjectStatus;
+  projectStatus: "active" | "archived";
   createdAt: string;
   updatedAt: string;
 }

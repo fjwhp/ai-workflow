@@ -88,6 +88,7 @@ describe("WorkflowStore", () => {
     expect(store.listProjects({ activeOnly: true })).toEqual([]);
     expect(store.listProjects()).toHaveLength(1);
     expect(store.getProject(project.id)?.status).toBe("archived");
+    expect(store.listRequirementProjects(requirement.id)[0]).toMatchObject({ status: "active", projectStatus: "archived" });
     expect(store.setRequirementProject(requirement.id, project.id)).toBeNull();
     expect(() => createRequirement(store, { title: "New association", businessProblem: "Archived project cannot be selected", expectedOutcome: "Selection rejected", priority: "medium", primaryProjectId: project.id })).toThrow("PROJECT_NOT_ACTIVE");
     expect(store.archiveProject("missing")).toBeNull();

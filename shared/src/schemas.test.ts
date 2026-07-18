@@ -54,6 +54,7 @@ describe("requirementProjectsInputSchema", () => {
 
     const records: RequirementProject[] = input.map((item, index) => ({
       ...item, id: `association-${index}`, requirementId: "requirement-1", status: "active" as const,
+      projectStatus: "active" as const,
       createdAt: "2026-07-18T00:00:00.000Z", updatedAt: "2026-07-18T00:00:00.000Z"
     }));
     records.push(

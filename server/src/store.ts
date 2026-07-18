@@ -726,6 +726,7 @@ function mapRequirementProject(row: any): RequirementProject {
     id: row.id, requirementId: row.requirement_id, projectId: row.project_id, projectName: row.project_name,
     role: row.role, usage: row.usage, deliveryRequired: Boolean(row.delivery_required), moduleMode: row.module_mode,
     moduleIds: JSON.parse(row.module_ids_json || "[]"), position: row.position, status: row.status,
+    projectStatus: row.project_status,
     createdAt: row.created_at, updatedAt: row.updated_at
   };
 }

@@ -39,14 +39,30 @@ describe("requirement project domain", () => {
     expect(validateRequirementProjects([selected], { projects, modulesByProject: new Map([["web", ["src/orders"]]]) })[0]!.moduleIds).toEqual(["src/orders"]);
     expect(() => validateRequirementProjects([{ ...selected, moduleIds: ["src/missing"] }], { projects, modulesByProject: new Map([["web", ["src/orders"]]]) })).toThrow("MODULE_NOT_FOUND");
     expect(() => validateRequirementProjects([selected], { projects })).toThrow("MODULE_INDEX_REQUIRED");
+    try {
+      validateRequirementProjects([{ ...selected, moduleIds: ["src/orders", "./src/orders"] }], { projects, modulesByProject: new Map([["web", ["src/orders"]]]) });
+      throw new Error("expected duplicate rejection");
+    } catch (error) {
+      expect(error).toMatchObject({ message: "DUPLICATE_MODULE_ID", path: ["moduleIds", 1] });
+    }
+    expect(() => validateRequirementProjects([{ ...selected, moduleIds: [" ./ "] }], { projects, modulesByProject: new Map([["web", ["src/orders"]]]) })).toThrow("MODULE_ID_INVALID");
+    expect(() => validateRequirementProjects([{ ...selected, moduleIds: ["../orders"] }], { projects })).toThrow("MODULE_ID_INVALID");
+  });
+
+  it("accepts auto and all modes without a module index", () => {
+    expect(validateRequirementProjects([primary], { projects })).toEqual([primary]);
+    expect(validateRequirementProjects([{ ...primary, moduleMode: "all" }], { projects })).toEqual([{ ...primary, moduleMode: "all" }]);
   });
 
   it("detects only material association changes", () => {
     const before = [{ ...delivery, moduleMode: "selected" as const, moduleIds: ["b", "a"], id: "old", createdAt: "old" }];
     expect(hasMaterialAssociationChange(before, [{ ...before[0]!, position: 9, id: "new", createdAt: "new", moduleIds: ["a", "b"] }])).toBe(false);
     for (const after of [
+      [{ ...before[0]!, projectId: "worker" }],
       [{ ...before[0]!, role: "primary" as const }],
       [{ ...before[0]!, usage: "context" as const }],
+      [{ ...before[0]!, deliveryRequired: false }],
+      [{ ...before[0]!, moduleMode: "all" as const, moduleIds: [] }],
       [{ ...before[0]!, moduleIds: ["c"] }]
     ]) expect(hasMaterialAssociationChange(before, after)).toBe(true);
   });

@@ -12,7 +12,13 @@ export interface RequirementProjectValidationContext {
 }
 
 export function normalizeModuleId(value: string): string {
-  return value.trim().replaceAll("\\", "/").replace(/\/{2,}/g, "/").replace(/^\.\//, "").replace(/\/$/, "");
+  return value.trim().replaceAll("\\", "/").replace(/\/{2,}/g, "/").replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
+}
+
+function moduleValidationError(code: string, index: number) {
+  const error = new Error(code) as Error & { path: Array<string | number> };
+  error.path = ["moduleIds", index];
+  return error;
 }
 
 export function validateRequirementProjects(
@@ -24,10 +30,18 @@ export function validateRequirementProjects(
   return parsed.map((item) => {
     if (projects.get(item.projectId)?.status !== "active") throw new Error("PROJECT_NOT_ACTIVE");
     if (item.moduleMode !== "selected") return item;
+    const moduleIds = item.moduleIds.map(normalizeModuleId);
+    const seen = new Set<string>();
+    for (const [index, moduleId] of moduleIds.entries()) {
+      if (!moduleId || moduleId.startsWith("/") || moduleId.split("/").some((part) => part === "." || part === "..")) {
+        throw moduleValidationError("MODULE_ID_INVALID", index);
+      }
+      if (seen.has(moduleId)) throw moduleValidationError("DUPLICATE_MODULE_ID", index);
+      seen.add(moduleId);
+    }
     const indexed = context.modulesByProject?.get(item.projectId);
     if (!indexed) throw new Error("MODULE_INDEX_REQUIRED");
     const available = new Set(Array.from(indexed, normalizeModuleId));
-    const moduleIds = item.moduleIds.map(normalizeModuleId);
     if (moduleIds.some((moduleId) => !available.has(moduleId))) throw new Error("MODULE_NOT_FOUND");
     return { ...item, moduleIds };
   });
