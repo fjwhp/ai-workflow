@@ -588,7 +588,7 @@ git commit -m "feat: manage requirement project associations"
 **Files:**
 - Modify: `README.md`
 - Modify: `docs/getting-started.md`
-- Test: `server/src/app.test.ts`
+- Test: `server/src/startup-acceptance.test.ts`
 
 - [x] **Step 1: Add the reset and usage documentation**
 
@@ -615,16 +615,16 @@ npm test
 
 Expected: all commands exit 0 and Vitest reports no failed files or tests.
 
-- [x] **Step 3: Verify clean reset with a copied database**
+- [x] **Step 3: Verify clean reset through the real server entrypoint**
 
-Copy the current local database to a temporary directory, start the server against that temporary data directory, and verify:
+Create a synthetic incompatible database in a temporary `DATA_DIR`, launch `server/src/index.ts` as a child process on an ephemeral localhost port, and verify:
 
 - a timestamped backup exists;
 - `GET /api/projects` returns `[]`;
 - `GET /api/requirements` returns `[]`;
 - the schema marker equals `multi-project-v1`.
 
-Do not run the destructive reset against the user's live database until the user explicitly starts phase-1 acceptance.
+The automated test must stop and await the child process in cleanup. Do not run the destructive reset against the user's live database until the user explicitly starts phase-1 acceptance.
 
 - [ ] **Step 4: Verify the browser workflow**
 

@@ -2,14 +2,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { buildApp, resolveReusableSourceCommit } from "./app.js";
 import { WorkflowStore } from "./store.js";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { publishRequirementKnowledge } from "./project-memory-service.js";
 import { buildAgentPrompt } from "./ai.js";
-import { prepareCleanDatabase, writeDatabaseVersionMarker } from "./database-reset.js";
 
 const execFileAsync=promisify(execFile);const tempDirs:string[]=[];
 
@@ -39,22 +37,6 @@ async function projectRepo(name="workflow-api-project-") {
 const projectPayload=(repoPath:string,extra:any={})=>({name:"API project",repoPath,defaultBranch:"main",allowedCommands:[],sensitivePatterns:[],...extra});
 
 describe("project and requirement association APIs",()=>{
-  it("starts multi-project-v1 empty after backing up a synthetic legacy DATA_DIR",async()=>{
-    const dataDir=await mkdtemp(join(tmpdir(),"workflow-legacy-data-"));tempDirs.push(dataDir);const databasePath=join(dataDir,"workflow.db");
-    const legacy=new DatabaseSync(databasePath);legacy.exec("CREATE TABLE projects (id TEXT PRIMARY KEY); CREATE TABLE requirements (id TEXT PRIMARY KEY, project_id TEXT); INSERT INTO projects VALUES ('legacy-project'); INSERT INTO requirements VALUES ('legacy-requirement', 'legacy-project')");legacy.close();
-    await writeFile(`${databasePath}.schema-version`,"single-project-v1");
-
-    const reset=await prepareCleanDatabase(databasePath,"multi-project-v1",{now:()=>new Date("2026-07-18T10:11:12.345Z")});
-    const store=new WorkflowStore(databasePath);stores.push(store);await writeDatabaseVersionMarker(databasePath,"multi-project-v1");const app=await buildApp(store);
-
-    expect(reset).toMatchObject({reset:true,backupPath:`${databasePath}.backup-2026-07-18T10-11-12-345Z`});
-    const backup=new DatabaseSync(reset.backupPath!);expect(backup.prepare("SELECT id FROM projects").all()).toEqual([{id:"legacy-project"}]);backup.close();
-    expect((await app.inject({method:"GET",url:"/api/projects"})).json()).toEqual([]);
-    expect((await app.inject({method:"GET",url:"/api/requirements"})).json()).toEqual([]);
-    await expect(readFile(`${databasePath}.schema-version`,"utf8")).resolves.toBe("multi-project-v1");
-    await app.close();
-  });
-
   it("returns a stable budget error before creating a run",async()=>{
     process.env.AI_PROJECT_CONTEXT_MAX_CHARS="4000";
     const store=new WorkflowStore(":memory:");stores.push(store);
