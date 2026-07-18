@@ -620,6 +620,59 @@ describe("project version application leases", () => {
     }
   );
 
+  it("atomically records a failed application and releases its lease", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Failed application", "/tmp/failed-application");
+    const version = createVersion(store, project.id, "failed", "/tmp/failed-application-v1");
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Failed application"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "failed")
+    });
+
+    expect(() => store.releaseFailedVersionApplication({
+      versionId: version.id, runId: "wrong-run", sourceCommit: "c".repeat(40), error: "conflict"
+    })).toThrow("PROJECT_VERSION_APPLICATION_MISMATCH");
+    expect(store.getIntegrationRun("run-failed")?.status).toBe("running");
+    expect(store.getProjectVersion(version.id)?.pendingIntegrationRunId).toBe("run-failed");
+
+    const run = store.releaseFailedVersionApplication({
+      versionId: version.id, runId: "run-failed", sourceCommit: "c".repeat(40),
+      conflictFiles: ["value.txt"], error: "CONFLICT (content): value.txt"
+    });
+
+    expect(run).toMatchObject({
+      status: "conflict", sourceCommit: "c".repeat(40),
+      preflight: { conflictFiles: ["value.txt"] }, error: "CONFLICT (content): value.txt"
+    });
+    expect(run.completedAt).toBeTruthy();
+    expect(store.getRequirement(requirement.id)).toMatchObject({
+      stage: "integration", status: "awaiting_merge"
+    });
+    expect(store.getProjectVersion(version.id)).toMatchObject({
+      pendingRequirementId: undefined, pendingIntegrationRunId: undefined
+    });
+  });
+
+  it("does not release a failed application after the requirement state has moved", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Late failed application", "/tmp/late-failed-application");
+    const version = createVersion(store, project.id, "late-failed", "/tmp/late-failed-application-v1");
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Late failed application"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "late-failed")
+    });
+    store.updateRequirementState(requirement.id, "integration", "cancelled");
+
+    expect(() => store.releaseFailedVersionApplication({
+      versionId: version.id, runId: "run-late-failed", sourceCommit: "c".repeat(40), error: "conflict"
+    })).toThrow("PROJECT_VERSION_APPLICATION_MISMATCH");
+    expect(store.getIntegrationRun("run-late-failed")?.status).toBe("running");
+    expect(store.getRequirement(requirement.id)?.status).toBe("cancelled");
+    expect(store.getProjectVersion(version.id)?.pendingIntegrationRunId).toBe("run-late-failed");
+  });
+
   it("rolls back a late apply completion after the requirement state has moved", () => {
     const path = databasePath();
     const store = new WorkflowStore(path); stores.push(store);

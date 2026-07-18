@@ -12,6 +12,8 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { publishRequirementKnowledge } from "./project-memory-service.js";
 import { buildAgentPrompt } from "./ai.js";
+import { getWorktreeSnapshot } from "./repository.js";
+import { hashDiff } from "./coding-evidence.js";
 
 const execFileAsync=promisify(execFile);const tempDirs:string[]=[];
 const codingResult={runId:crypto.randomUUID(),branch:"ai/REQ-0001",worktreePath:"/tmp/requirements/REQ-0001",baseCommit:"version-head",reused:false,diff:"diff --git a/a.ts b/a.ts\n+change",files:["a.ts"],additions:1,deletions:0,codexThreadId:"thread-1",events:[],diagnostics:[],summary:"implemented"};
@@ -43,6 +45,57 @@ async function projectRepo(name="workflow-api-project-") {
   await writeFile(join(dir,"package.json"),JSON.stringify({dependencies:{fastify:"latest"}}));
   await execFileAsync("git",["-C",dir,"add","--all"]);await execFileAsync("git",["-C",dir,"commit","-m","base"]);
   return dir;
+}
+
+async function versionApplicationFixture(store: WorkflowStore, options: { failingTests?: boolean; conflict?: boolean } = {}) {
+  const repoPath = await projectRepo("workflow-api-version-application-");
+  const root = join(repoPath, "..");
+  const targetWorktreePath = join(root, `version-${crypto.randomUUID()}`);
+  const sourceWorktreePath = join(root, `requirement-${crypto.randomUUID()}`);
+  tempDirs.push(targetWorktreePath, sourceWorktreePath);
+  const targetBranch = `release/${crypto.randomUUID()}`;
+  const sourceBranch = `ai/${crypto.randomUUID()}`;
+  await writeFile(join(repoPath, "value.txt"), "base\n");
+  await execFileAsync("git", ["-C", repoPath, "add", "--all"]);
+  await execFileAsync("git", ["-C", repoPath, "commit", "-m", "application base"]);
+  await execFileAsync("git", ["-C", repoPath, "worktree", "add", "-b", targetBranch, targetWorktreePath, "main"]);
+  await execFileAsync("git", ["-C", repoPath, "worktree", "add", "-b", sourceBranch, sourceWorktreePath, "main"]);
+  if (options.conflict) {
+    await writeFile(join(sourceWorktreePath, "value.txt"), "source\n");
+    await writeFile(join(targetWorktreePath, "value.txt"), "target\n");
+    await execFileAsync("git", ["-C", targetWorktreePath, "add", "--all"]);
+    await execFileAsync("git", ["-C", targetWorktreePath, "commit", "-m", "target conflict"]);
+  } else {
+    await writeFile(join(sourceWorktreePath, "feature.txt"), "implemented\n");
+  }
+  const snapshot = await getWorktreeSnapshot(sourceWorktreePath);
+  const targetHead = (await execFileAsync("git", ["-C", targetWorktreePath, "rev-parse", "HEAD"])).stdout.trim();
+  const project = store.createProject(projectPayload(repoPath, {
+    allowedCommands: [{
+      command: "npm",
+      argsPrefix: options.failingTests ? ["run", "missing-verification-script"] : ["--version"]
+    }]
+  }));
+  const version = store.createProjectVersion({
+    projectId: project.id, name: "1.0.0", branch: targetBranch, baseBranch: "main",
+    worktreePath: targetWorktreePath, headCommit: targetHead
+  });
+  const requirement = createRequirement(store, {
+    title: "版本应用", businessProblem: "需要应用证据", expectedOutcome: "保留人工处理", priority: "medium",
+    primaryProjectId: project.id, primaryProjectVersionId: version.id
+  });
+  const execution = store.addExecution({
+    requirementId: requirement.id, stage: "coding", projectId: project.id, branch: sourceBranch,
+    worktreePath: sourceWorktreePath, status: "completed", diff: snapshot.diff, events: []
+  });
+  store.addCodingEvidence({
+    executionId: execution.id, requirementId: requirement.id, projectId: project.id,
+    branch: sourceBranch, worktreePath: sourceWorktreePath, diffHash: hashDiff(snapshot.diff), diff: snapshot.diff,
+    originalChars: snapshot.diff.length, truncated: false, files: snapshot.files, additions: 1, deletions: 0,
+    diagnostics: ""
+  });
+  store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+  return { repoPath, targetWorktreePath, sourceWorktreePath, project, version, requirement, targetHead };
 }
 
 const projectPayload=(repoPath:string,extra:any={})=>({name:"API project",repoPath,defaultBranch:"main",allowedCommands:[],sensitivePatterns:[],...extra});
@@ -400,7 +453,7 @@ describe("stage run API", () => {
     expect(detail.json().humanOverride).toMatchObject({ visible: true, allowed: true, targetStage: target, returnCount: 0 });
     const response = await app.inject({ method: "POST", url: `/api/requirements/${req.id}/human-override`, payload: { comment: "人工已核查并接受风险" } });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode, JSON.stringify(response.json())).toBe(200);
     expect(response.json().requirement).toMatchObject({ stage: target, status: "ai_ready" });
     expect(response.json().approval.actor_type).toBe("human_override");
     await app.close();
@@ -444,33 +497,79 @@ describe("stage run API", () => {
     await app.close();
   });
 
-  it("lists and saves a requirement-local integration target branch",async()=>{
-    const repo=await branchRepo(),store=new WorkflowStore(":memory:");stores.push(store);
-    const project=store.createProject({name:"Repo",repoPath:repo,defaultBranch:"prod",allowedCommands:[],sensitivePatterns:[]});
-    const req=createRequirement(store, {title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"增加接口",priority:"medium",primaryProjectId:project.id});store.updateRequirementState(req.id,"integration","awaiting_merge");
-    const app=await buildApp(store);
-    const list=await app.inject({method:"GET",url:`/api/requirements/${req.id}/integration-branches`});
-    expect(list.json()).toMatchObject({currentBranch:"feature/0710-test",selectedTarget:"feature/0710-test"});
-    const saved=await app.inject({method:"PATCH",url:`/api/requirements/${req.id}/integration-target`,payload:{branch:"feature/0710-test"}});
-    expect(saved.statusCode).toBe(200);expect(saved.json().integrationTargetBranch).toBe("feature/0710-test");
-    expect((await app.inject({method:"PATCH",url:`/api/requirements/${req.id}/integration-target`,payload:{branch:"missing"}})).statusCode).toBe(400);
-    store.updateRequirementState(req.id,"coding","ai_ready");
-    expect((await app.inject({method:"PATCH",url:`/api/requirements/${req.id}/integration-target`,payload:{branch:"feature/0710-test"}})).statusCode).toBe(409);
+  it("applies to the frozen version worktree and blocks its queue until local resolution", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store);
+    const app = await buildApp(store);
+    const mainHead = (await execFileAsync("git", ["-C", fixture.repoPath, "rev-parse", "HEAD"])).stdout.trim();
+
+    const response = await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} });
+
+    expect(response.statusCode, JSON.stringify(response.json())).toBe(200);
+    expect(response.json()).toMatchObject({
+      status: "awaiting_local_resolution", projectVersionId: fixture.version.id,
+      preApplyHead: fixture.targetHead
+    });
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("awaiting_local_resolution");
+    expect(store.getProjectVersion(fixture.version.id)).toMatchObject({
+      pendingRequirementId: fixture.requirement.id,
+      pendingIntegrationRunId: response.json().id
+    });
+    expect((await execFileAsync("git", ["-C", fixture.targetWorktreePath, "status", "--porcelain"])).stdout).toContain("A  feature.txt");
+    expect((await execFileAsync("git", ["-C", fixture.repoPath, "rev-parse", "HEAD"])).stdout.trim()).toBe(mainHead);
+    expect((await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} })).statusCode).toBe(409);
     await app.close();
   });
 
-  it("requires exact confirmation before integrating into a protected branch",async()=>{
-    const repo=await branchRepo(),store=new WorkflowStore(":memory:");stores.push(store);
-    const project=store.createProject({name:"Repo",repoPath:repo,defaultBranch:"prod",allowedCommands:[],sensitivePatterns:[]});
-    const req=createRequirement(store, {title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"增加接口",priority:"medium",primaryProjectId:project.id});
-    const execution=store.addExecution({requirementId:req.id,stage:"coding",projectId:project.id,branch:"ai/req",worktreePath:repo,status:"completed",diff:"diff",events:[]});
-    store.addCodingEvidence({executionId:execution.id,requirementId:req.id,projectId:project.id,branch:"ai/req",worktreePath:repo,diffHash:"abc",diff:"diff",originalChars:4,truncated:false,files:["README.md"],additions:1,deletions:0,diagnostics:""});
-    store.updateRequirementState(req.id,"integration","awaiting_merge");store.setIntegrationTarget(req.id,"main");
-    const app=await buildApp(store);
-    const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/integrate`,payload:{}});
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error).toBe("PROTECTED_BRANCH_CONFIRMATION_REQUIRED");
-    expect(store.getLatestIntegrationRun(req.id)).toBeNull();
+  it("retains the version lease and dirty target when verification fails", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store, { failingTests: true });
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().status).toBe("merge_test_failed");
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("merge_test_failed");
+    expect(store.getProjectVersion(fixture.version.id)?.pendingRequirementId).toBe(fixture.requirement.id);
+    expect((await execFileAsync("git", ["-C", fixture.targetWorktreePath, "status", "--porcelain"])).stdout).not.toBe("");
+    store.updateProject(fixture.project.id, {
+      allowedCommands: [{ command: "npm", argsPrefix: ["--version"] }]
+    });
+
+    const rerun = await app.inject({
+      method: "POST", url: `/api/requirements/${fixture.requirement.id}/integration-test`, payload: {}
+    });
+
+    expect(rerun.statusCode, JSON.stringify(rerun.json())).toBe(200);
+    expect(rerun.json()).toMatchObject({
+      id: response.json().id, status: "awaiting_local_resolution", projectVersionId: fixture.version.id
+    });
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("awaiting_local_resolution");
+    expect(store.getProjectVersion(fixture.version.id)?.pendingIntegrationRunId).toBe(response.json().id);
+    await app.close();
+  });
+
+  it("releases a conflict lease and retries with the same source commit", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store, { conflict: true });
+    const app = await buildApp(store);
+
+    const conflicted = await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} });
+
+    expect(conflicted.statusCode, JSON.stringify(conflicted.json())).toBe(200);
+    expect(conflicted.json()).toMatchObject({ status: "conflict", sourceCommit: expect.stringMatching(/^[0-9a-f]{40}$/) });
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("awaiting_merge");
+    expect(store.getProjectVersion(fixture.version.id)?.pendingRequirementId).toBeUndefined();
+    expect((await execFileAsync("git", ["-C", fixture.targetWorktreePath, "status", "--porcelain"])).stdout).toBe("");
+    const sourceHead = (await execFileAsync("git", ["-C", fixture.sourceWorktreePath, "rev-parse", "HEAD"])).stdout.trim();
+    await execFileAsync("git", ["-C", fixture.targetWorktreePath, "reset", "--hard", "main"]);
+
+    const retried = await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} });
+
+    expect(retried.statusCode).toBe(200);
+    expect(retried.json()).toMatchObject({ status: "awaiting_local_resolution", sourceCommit: sourceHead });
+    expect((await execFileAsync("git", ["-C", fixture.sourceWorktreePath, "rev-parse", "HEAD"])).stdout.trim()).toBe(sourceHead);
     await app.close();
   });
 });

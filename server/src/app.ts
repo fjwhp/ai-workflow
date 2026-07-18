@@ -3,7 +3,6 @@ import cors from "@fastify/cors";
 import { approvalInputSchema, evaluateGate, projectInputSchema, projectUpdateSchema, requirementInputSchema, requirementProjectsInputSchema, returnStage, workflowStages } from "@ai-workflow/shared";
 import { WorkflowStore } from "./store.js";
 import { runAgent } from "./ai.js";
-import { getLocalBranches, isProtectedBranch } from "./repository.js";
 import { createBackup } from "./backup.js";
 import { runCodexCoding } from "./codex-runner.js";
 import { redactSensitive } from "./redaction.js";
@@ -19,7 +18,7 @@ import { publishRequirementKnowledge, refreshRequirementKnowledge } from "./proj
 import { inspectProjectRepository } from "./project-service.js";
 import { hasMaterialAssociationChange, normalizeModuleId, resolveSoleDeliveryProject } from "./requirement-projects.js";
 import { buildRequirementProjectContext, ProjectContextError, resolveProjectContextBudget } from "./project-context.js";
-import { registerProjectVersionRoutes } from "./project-version-routes.js";
+import { recheckVersionApplication, registerProjectVersionRoutes } from "./project-version-routes.js";
 
 const requirementRevisionSchema = requirementInputSchema.extend({
   clarifications: requirementInputSchema.shape.businessProblem,
@@ -28,6 +27,10 @@ const requirementRevisionSchema = requirementInputSchema.extend({
 
 export async function buildApp(store: WorkflowStore) {
   const app = Fastify({ logger: true });
+  for (const pending of store.listPendingVersionApplications()) {
+    try { await recheckVersionApplication(store, pending.version.id, { allowInterruptedRun: true }); }
+    catch (error) { app.log.error({ err: error, versionId: pending.version.id }, "Version application recovery failed"); }
+  }
   for(const item of store.listRequirements())if(item.status==="completed"&&item.projectId&&!store.getKnowledgeChangeSet(item.id).id){try{publishRequirementKnowledge(store,item.id)}catch{/* Existing completed data remains usable if backfill fails. */}}
   await app.register(cors, { origin: /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/ });
   await registerProjectVersionRoutes(app, { store });
@@ -237,31 +240,6 @@ export async function buildApp(store: WorkflowStore) {
     try{const result=store.applyHumanOverride(item.id,stage,comment);refreshRequirementKnowledge(store,item.id);return result;}
     catch(error){return reply.code(409).send({error:"HUMAN_OVERRIDE_NOT_ALLOWED",message:error instanceof Error?error.message:"当前状态已变化，请刷新后重试"});}
   });
-  app.get("/api/requirements/:id/integration-branches",async(req:any,reply)=>{
-    const item=store.getRequirement(req.params.id);
-    if(!item)return reply.code(404).send({error:"NOT_FOUND"});
-    if(item.stage!=="integration")return reply.code(409).send({error:"INTEGRATION_TARGET_NOT_ALLOWED",message:"只有代码合并阶段可以选择目标分支"});
-    const project=item.projectId?store.getProject(item.projectId):null;
-    if(!project)return reply.code(409).send({error:"PROJECT_NOT_FOUND",message:"需求尚未关联有效项目"});
-    try{
-      const result=await getLocalBranches(project.repoPath);
-      return {...result,selectedTarget:item.integrationTargetBranch||result.currentBranch};
-    }catch(error){return reply.code(409).send({error:"BRANCH_DISCOVERY_FAILED",message:error instanceof Error?error.message:"无法读取本地分支"});}
-  });
-  app.patch("/api/requirements/:id/integration-target",async(req:any,reply)=>{
-    const item=store.getRequirement(req.params.id);
-    if(!item)return reply.code(404).send({error:"NOT_FOUND"});
-    if(item.stage!=="integration")return reply.code(409).send({error:"INTEGRATION_TARGET_NOT_ALLOWED",message:"只有代码合并阶段可以选择目标分支"});
-    const branch=typeof req.body?.branch==="string"?req.body.branch.trim():"";
-    if(!branch)return reply.code(400).send({error:"VALIDATION_ERROR",message:"请选择目标分支"});
-    const project=item.projectId?store.getProject(item.projectId):null;
-    if(!project)return reply.code(409).send({error:"PROJECT_NOT_FOUND",message:"需求尚未关联有效项目"});
-    try{
-      const {branches}=await getLocalBranches(project.repoPath);
-      if(!branches.some(entry=>entry.name===branch))return reply.code(400).send({error:"BRANCH_NOT_FOUND",message:"目标分支不是仓库中的本地分支"});
-      return store.setIntegrationTarget(item.id,branch);
-    }catch(error){return reply.code(409).send({error:"BRANCH_DISCOVERY_FAILED",message:error instanceof Error?error.message:"无法读取本地分支"});}
-  });
   app.get("/api/requirements/:id/integration-check",async(req:any,reply)=>{
     const context=integrationContext(store,req.params.id);
     if(!context.item)return reply.code(404).send({error:"NOT_FOUND"});
@@ -272,32 +250,31 @@ export async function buildApp(store: WorkflowStore) {
     const context=integrationContext(store,req.params.id);
     if(!context.item)return reply.code(404).send({error:"NOT_FOUND"});
     if(!context.allowed)return reply.code(409).send({error:context.error??"INTEGRATION_NOT_ALLOWED",message:context.reason});
-    const targetBranch=context.item.integrationTargetBranch;
-    if(isProtectedBranch(targetBranch)&&req.body?.protectedBranchConfirmation!==targetBranch)return reply.code(409).send({error:"PROTECTED_BRANCH_CONFIRMATION_REQUIRED",message:`请输入目标分支名称 ${targetBranch} 以确认应用改动`});
     const preflight=await preflightLocalIntegration(context.input!);
     if(!preflight.allowed)return reply.code(409).send({error:"INTEGRATION_PREFLIGHT_FAILED",...preflight});
-    const project=context.project!,evidence=context.evidence!;
+    const project=context.project!,version=context.version!,evidence=context.evidence!;
     let run:any;
-    try{run=store.createIntegrationRun({requirementId:context.item.id,projectId:project.id,executionId:evidence.executionId,evidenceId:evidence.id,sourceBranch:evidence.branch,worktreePath:evidence.worktreePath,targetBranch,preflight:{...preflight,applicationMode:"worktree"}});}
-    catch{return reply.code(409).send({error:"INTEGRATION_ALREADY_ACTIVE",message:"当前需求已有本地应用操作正在执行"});}
+    try{({run}=store.beginVersionApplication({versionId:version.id,requirementId:context.item.id,run:{projectId:project.id,executionId:evidence.executionId,evidenceId:evidence.id,sourceBranch:evidence.branch,worktreePath:evidence.worktreePath,targetBranch:version.branch,preflight:{...preflight,applicationMode:"version_worktree"}}}));}
+    catch(error){return sendDomainError(reply,error);}
     const result=await executeLocalIntegration({...context.input!,commitMessage:`${context.item.code} ${context.item.title}`,commands:project.allowedCommands||[]});
-    const completed=store.completeIntegrationRun(run.id,result);
-    store.updateRequirementState(context.item.id,"integration",result.status==="completed"?"completed":result.status==="test_failed"?"merge_test_failed":"awaiting_merge");
-    if(result.status==="completed")publishRequirementKnowledge(store,context.item.id);
-    return completed;
+    if(result.status==="completed")return store.completeVersionApplicationApply({runId:run.id,sourceCommit:result.sourceCommit!,preApplyHead:result.preApplyHead,status:"awaiting_local_resolution"});
+    if(result.status==="test_failed")return store.completeVersionApplicationApply({runId:run.id,sourceCommit:result.sourceCommit!,preApplyHead:result.preApplyHead,status:"merge_test_failed"});
+    if(result.status==="conflict")return store.releaseFailedVersionApplication({versionId:version.id,runId:run.id,sourceCommit:result.sourceCommit!,conflictFiles:result.conflictFiles,error:result.error});
+    return store.releaseFailedVersionApplication({versionId:version.id,runId:run.id,sourceCommit:result.sourceCommit??"",error:result.error});
   });
   app.post("/api/requirements/:id/integration-test",async(req:any,reply)=>{
     const item=store.getRequirement(req.params.id);if(!item)return reply.code(404).send({error:"NOT_FOUND"});
     if(item.stage!=="integration"||item.status!=="merge_test_failed")return reply.code(409).send({error:"INTEGRATION_TEST_NOT_ALLOWED",message:"只有本地应用后测试失败时才能重新运行"});
-    const project=item.projectId?store.getProject(item.projectId):null,previous=store.getLatestIntegrationRun(item.id),evidence:any=store.getLatestCodingEvidence(item.id);
+    let deliveryProject:any,version:any;
+    try{deliveryProject=resolveSoleDeliveryProject(item.projects);version=resolveDeliveryVersion(store,deliveryProject);}
+    catch(error){return sendDomainError(reply,error);}
+    const project=store.getProject(deliveryProject.projectId),previous=store.getLatestIntegrationRun(item.id),evidence:any=store.getLatestCodingEvidence(item.id);
     if(project?.status==="archived")return reply.code(409).send({error:"PROJECT_ARCHIVED",message:"归档项目不能启动新的集成操作"});
-    if(!project||!previous||!evidence)return reply.code(409).send({error:"INTEGRATION_CONTEXT_MISSING"});
-    const plan=await buildVerificationPlan({repoPath:project.repoPath,changedFiles:evidence.files||[],fallbackCommands:project.allowedCommands||[]});
+    if(!project||!previous||!evidence||previous.id!==version.pendingIntegrationRunId)return reply.code(409).send({error:"INTEGRATION_CONTEXT_MISSING"});
+    const plan=await buildVerificationPlan({repoPath:version.worktreePath,changedFiles:evidence.files||[],fallbackCommands:project.allowedCommands||[]});
     if(!plan.plannedCommands.length)return reply.code(409).send({error:"VERIFICATION_PLAN_UNAVAILABLE",message:"未识别到安全测试命令"});
-    const run=store.createIntegrationRun({requirementId:item.id,projectId:project.id,executionId:previous.executionId,evidenceId:previous.evidenceId,sourceBranch:previous.sourceBranch,worktreePath:previous.worktreePath,targetBranch:previous.targetBranch,preflight:{rerun:true,...plan}});
-    const result=await rerunIntegrationTests(project.repoPath,plan.plannedCommands);
-    const completed=store.completeIntegrationRun(run!.id,{...result,sourceCommit:previous.sourceCommit,targetCommit:previous.targetCommit,error:result.status==="completed"?null:"本地应用后测试失败"});
-    store.updateRequirementState(item.id,"integration",result.status==="completed"?"completed":"merge_test_failed");if(result.status==="completed")publishRequirementKnowledge(store,item.id);return completed;
+    const result=await rerunIntegrationTests(version.worktreePath,plan.plannedCommands);
+    return store.completeVersionApplicationRetest({versionId:version.id,runId:previous.id,status:result.status==="completed"?"awaiting_local_resolution":"merge_test_failed",commandResults:result.commandResults,error:result.status==="completed"?undefined:"本地应用后测试失败"});
   });
   app.get("/api/projects", async (req:any,reply) => {
     const status=req.query?.status??"all";
@@ -369,7 +346,7 @@ function applyRequirementProjects(store:WorkflowStore,requirementId:string,input
   const technicalDesignInvalidated=materialChange&&store.invalidateTechnicalDesignForProjectChange(requirementId);
   return {requirement:store.getRequirement(requirementId),projects,snapshot:store.getRequirementProjectSnapshot(requirementId),materialChange,technicalDesignInvalidated:Boolean(technicalDesignInvalidated)};
 }
-function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});if(["RUN_ALREADY_ACTIVE","REQUIREMENT_CHANGED_DURING_RUN_PREPARATION","PROJECT_CHANGED_DURING_RUN_PREPARATION","PROJECT_IN_ACTIVE_EXECUTION","REQUIREMENT_VERSION_REQUIRED","REQUIREMENT_VERSION_PROJECT_MISMATCH","PROJECT_VERSION_NOT_ACTIVE","PROJECT_ARCHIVED"].includes(message))return reply.code(409).send({error:message,message});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
+function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});if(["RUN_ALREADY_ACTIVE","REQUIREMENT_CHANGED_DURING_RUN_PREPARATION","PROJECT_CHANGED_DURING_RUN_PREPARATION","PROJECT_IN_ACTIVE_EXECUTION","REQUIREMENT_VERSION_REQUIRED","REQUIREMENT_VERSION_PROJECT_MISMATCH","PROJECT_VERSION_NOT_ACTIVE","PROJECT_ARCHIVED","PROJECT_VERSION_APPLICATION_BUSY","VERSION_APPLICATION_NOT_ALLOWED","PROJECT_VERSION_APPLICATION_FAILED"].includes(message))return reply.code(409).send({error:message,message});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
 
 export function resolveDeliveryVersion(store:WorkflowStore,deliveryProject:any){
   if(!deliveryProject?.projectVersionId)throw new Error("REQUIREMENT_VERSION_REQUIRED");
@@ -393,13 +370,16 @@ function integrationContext(store:WorkflowStore,id:string){
   const item:any=store.getRequirement(id);
   if(!item)return {item:null,allowed:false,reason:"需求不存在"};
   if(item.stage!=="integration"||item.status!=="awaiting_merge")return {item,allowed:false,reason:"需求当前不处于待应用状态"};
-  const project=item.projectId?store.getProject(item.projectId):null,evidence:any=store.getLatestCodingEvidence(item.id);
+  let deliveryProject:any,version:any;
+  try{deliveryProject=resolveSoleDeliveryProject(item.projects);version=resolveDeliveryVersion(store,deliveryProject);}
+  catch(error){return {item,allowed:false,error:error instanceof Error?error.message:"INTEGRATION_NOT_ALLOWED",reason:"需求缺少唯一有效的交付版本"};}
+  const project=store.getProject(deliveryProject.projectId),evidence:any=store.getLatestCodingEvidence(item.id);
   if(!project)return {item,allowed:false,reason:"需求尚未关联有效项目"};
   if(project.status==="archived")return {item,project,allowed:false,error:"PROJECT_ARCHIVED",reason:"归档项目不能启动新的集成操作"};
   if(!evidence)return {item,project,allowed:false,reason:"缺少编码证据"};
-  if(!item.integrationTargetBranch)return {item,project,evidence,allowed:false,reason:"尚未选择本次需求的目标分支"};
+  if(version.pendingRequirementId)return {item,project,version,evidence,allowed:false,error:"PROJECT_VERSION_APPLICATION_BUSY",reason:"目标版本正在等待本地提交或撤销"};
   const latestRun=store.getLatestIntegrationRun(item.id);
   if(latestRun?.status==="running")return {item,project,evidence,allowed:false,reason:"已有本地应用操作正在执行"};
-  const sourceCommit=resolveReusableSourceCommit(latestRun,evidence,item.integrationTargetBranch);
-  return {item,project,evidence,allowed:true,input:{repoPath:project.repoPath,defaultBranch:item.integrationTargetBranch,worktreePath:evidence.worktreePath,sourceBranch:evidence.branch,evidenceDiffHash:evidence.diffHash,sourceCommit,changedFiles:evidence.files,fallbackCommands:project.allowedCommands||[]}};
+  const sourceCommit=resolveReusableSourceCommit(latestRun,evidence,version.branch);
+  return {item,project,version,evidence,allowed:true,input:{targetWorktreePath:version.worktreePath,targetBranch:version.branch,sourceWorktreePath:evidence.worktreePath,sourceBranch:evidence.branch,evidenceDiffHash:evidence.diffHash,sourceCommit,changedFiles:evidence.files,fallbackCommands:project.allowedCommands||[]}};
 }

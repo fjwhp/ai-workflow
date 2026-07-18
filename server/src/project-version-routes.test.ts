@@ -92,6 +92,33 @@ async function createVersion(app: FastifyInstance, projectId: string, input: Rec
   return response.json();
 }
 
+async function pendingApplication(store: WorkflowStore, app: FastifyInstance, projectId: string, suffix: string, complete = true) {
+  const version = await createVersion(app, projectId, {
+    name: `pending-${suffix}`, branch: `feature/pending-${suffix}`, baseBranch: "prod"
+  });
+  const requirement = store.createRequirement({
+    title: `Pending ${suffix}`, businessProblem: "Await local resolution", expectedOutcome: "Resolve lease",
+    priority: "medium", primaryProjectId: projectId, primaryProjectVersionId: version.id
+  });
+  store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+  const runId = `pending-run-${suffix}`;
+  store.beginVersionApplication({
+    versionId: version.id, requirementId: requirement.id,
+    run: {
+      id: runId, projectId, executionId: `execution-${suffix}`, evidenceId: `evidence-${suffix}`,
+      sourceBranch: `ai/${suffix}`, worktreePath: `/tmp/requirement-${suffix}`,
+      targetBranch: version.branch, preflight: { allowed: true }
+    }
+  });
+  if (complete) {
+    store.completeVersionApplicationApply({
+      runId, sourceCommit: "c".repeat(40), preApplyHead: version.headCommit,
+      status: "awaiting_local_resolution"
+    });
+  }
+  return { version, requirement, runId };
+}
+
 afterEach(async () => {
   await Promise.all(apps.splice(0).map((app) => app.close()));
   databases.splice(0).forEach((database) => database.close());
@@ -526,6 +553,111 @@ describe("project version item routes", () => {
     expect(invalid.statusCode).toBe(409);
     expect(invalid.json()).toMatchObject({ error: "PROJECT_VERSION_WORKTREE_INVALID", details: { status: "branch_mismatch" } });
     expect(store.getProjectVersion(version.id)?.headCommit).toBe(actualHead);
+  });
+
+  it("keeps a dirty pending application leased until a human commits it", async () => {
+    const { repoPath } = await setupRepository();
+    const store = createStore();
+    const project = createProject(store, repoPath);
+    const app = await routeApp(store);
+    const pending = await pendingApplication(store, app, project.id, "human-commit");
+    await writeFile(join(pending.version.worktreePath, "applied.txt"), "pending\n");
+    await git(pending.version.worktreePath, "add", "--all");
+
+    const dirty = await app.inject({ method: "POST", url: `/api/project-versions/${pending.version.id}/recheck` });
+
+    expect(dirty.statusCode).toBe(200);
+    expect(dirty.json()).toMatchObject({ status: "pending" });
+    expect(store.getProjectVersion(pending.version.id)?.pendingIntegrationRunId).toBe(pending.runId);
+    expect(store.getRequirement(pending.requirement.id)?.status).toBe("awaiting_local_resolution");
+
+    await git(pending.version.worktreePath, "commit", "-m", "REQ local review");
+    const committedHead = await git(pending.version.worktreePath, "rev-parse", "HEAD");
+    const committed = await app.inject({ method: "POST", url: `/api/project-versions/${pending.version.id}/recheck` });
+
+    expect(committed.json()).toMatchObject({ status: "committed", commit: committedHead });
+    expect(store.getRequirement(pending.requirement.id)?.status).toBe("completed");
+    expect(store.getProjectVersion(pending.version.id)).toMatchObject({
+      headCommit: committedHead, pendingRequirementId: undefined, pendingIntegrationRunId: undefined
+    });
+  });
+
+  it("returns a clean manual revert to awaiting application", async () => {
+    const { repoPath } = await setupRepository();
+    const store = createStore();
+    const project = createProject(store, repoPath);
+    const app = await routeApp(store);
+    const pending = await pendingApplication(store, app, project.id, "human-revert");
+    await writeFile(join(pending.version.worktreePath, "applied.txt"), "pending\n");
+    await git(pending.version.worktreePath, "add", "--all");
+    await git(pending.version.worktreePath, "reset", "--hard", pending.version.headCommit);
+
+    const reverted = await app.inject({ method: "POST", url: `/api/project-versions/${pending.version.id}/recheck` });
+
+    expect(reverted.json()).toMatchObject({ status: "reverted" });
+    expect(store.getRequirement(pending.requirement.id)?.status).toBe("awaiting_merge");
+    expect(store.getProjectVersion(pending.version.id)?.pendingRequirementId).toBeUndefined();
+  });
+
+  it("marks a clean non-descendant head ambiguous and retains the lease", async () => {
+    const { repoPath } = await setupRepository();
+    const store = createStore();
+    const project = createProject(store, repoPath);
+    const app = await routeApp(store);
+    const pending = await pendingApplication(store, app, project.id, "non-descendant");
+    await git(pending.version.worktreePath, "checkout", "--orphan", "divergent");
+    await git(pending.version.worktreePath, "rm", "-rf", ".");
+    await git(pending.version.worktreePath, "commit", "--allow-empty", "-m", "divergent history");
+    await git(pending.version.worktreePath, "branch", "-D", pending.version.branch);
+    await git(pending.version.worktreePath, "branch", "-m", pending.version.branch);
+    const divergentHead = await git(pending.version.worktreePath, "rev-parse", "HEAD");
+
+    const response = await app.inject({ method: "POST", url: `/api/project-versions/${pending.version.id}/recheck` });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ status: "ambiguous", currentHead: divergentHead });
+    expect(store.getRequirement(pending.requirement.id)?.status).toBe("manual_resolution_required");
+    expect(store.getProjectVersion(pending.version.id)?.pendingIntegrationRunId).toBe(pending.runId);
+
+    await git(pending.version.worktreePath, "reset", "--hard", pending.version.headCommit);
+    const repaired = await app.inject({
+      method: "POST", url: `/api/project-versions/${pending.version.id}/recheck`
+    });
+
+    expect(repaired.json()).toMatchObject({ status: "reverted" });
+    expect(store.getRequirement(pending.requirement.id)?.status).toBe("awaiting_merge");
+    expect(store.getProjectVersion(pending.version.id)?.pendingIntegrationRunId).toBeUndefined();
+  });
+
+  it("recovers every pending application on startup without releasing inaccessible ownership", async () => {
+    const { repoPath } = await setupRepository();
+    const store = createStore();
+    const project = createProject(store, repoPath);
+    const setupApp = await routeApp(store);
+    const inaccessible = await pendingApplication(store, setupApp, project.id, "startup-missing");
+    const wrongBranch = await pendingApplication(store, setupApp, project.id, "startup-wrong-branch");
+    const interrupted = await pendingApplication(store, setupApp, project.id, "startup-interrupted", false);
+    const committed = await pendingApplication(store, setupApp, project.id, "startup-committed");
+    await git(committed.version.worktreePath, "commit", "--allow-empty", "-m", "human commit");
+    await git(repoPath, "worktree", "remove", "--force", inaccessible.version.worktreePath);
+    await git(wrongBranch.version.worktreePath, "checkout", "--detach");
+    await git(repoPath, "worktree", "remove", "--force", interrupted.version.worktreePath);
+    await setupApp.close();
+    apps.splice(apps.indexOf(setupApp), 1);
+
+    const app = await fullApp(store);
+
+    expect(store.getRequirement(inaccessible.requirement.id)?.status).toBe("manual_resolution_required");
+    expect(store.getProjectVersion(inaccessible.version.id)?.pendingIntegrationRunId).toBe(inaccessible.runId);
+    expect(store.getRequirement(wrongBranch.requirement.id)?.status).toBe("manual_resolution_required");
+    expect(store.getProjectVersion(wrongBranch.version.id)?.pendingIntegrationRunId).toBe(wrongBranch.runId);
+    expect(store.getRequirement(interrupted.requirement.id)?.status).toBe("manual_resolution_required");
+    expect(store.getProjectVersion(interrupted.version.id)?.pendingIntegrationRunId).toBe(interrupted.runId);
+    expect(store.getIntegrationRun(interrupted.runId)).toMatchObject({ status: "failed", resolutionStatus: "ambiguous" });
+    expect(store.getRequirement(committed.requirement.id)?.status).toBe("completed");
+    expect(store.getProjectVersion(committed.version.id)?.pendingRequirementId).toBeUndefined();
+    await app.close();
+    apps.splice(apps.indexOf(app), 1);
   });
 
   it("revalidates project activity after Git inspection before recheck or close writes", async () => {
