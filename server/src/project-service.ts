@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { readFile, readdir, realpath } from "node:fs/promises";
+import { open, opendir, realpath, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -25,15 +25,23 @@ function invalid(repoPath: string, defaultBranch: string, warning: string): Proj
   return { valid: false, repoPath, defaultBranch, category: "other", technology: [], packageManager: null, modules: [{ id: "root", name: "root", path: "." }], warnings: [warning] };
 }
 
-async function readBounded(path: string) {
+export async function readBoundedFile(path: string, maxBytes = MAX_METADATA_BYTES, onRead?: (bytesRead: number) => void) {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const content = await readFile(path);
-    if (content.byteLength > MAX_METADATA_BYTES) return null;
-    return content.toString("utf8");
+    const before = await stat(path);
+    if (!before.isFile() || before.size > maxBytes) return null;
+    handle = await open(path, "r");
+    const buffer = Buffer.alloc(maxBytes);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    onRead?.(bytesRead);
+    const after = await handle.stat();
+    if (after.size > maxBytes || bytesRead < after.size) return null;
+    return buffer.subarray(0, bytesRead).toString("utf8");
   } catch { return null; }
+  finally { await handle?.close().catch(() => undefined); }
 }
 
-async function exists(path: string) { return (await readBounded(path)) !== null; }
+async function exists(path: string) { return (await readBoundedFile(path)) !== null; }
 
 function moduleFromPath(path: string, name?: string): ProjectModule {
   const normalized = path.replace(/^\.\//, "").replace(/\/$/, "") || ".";
@@ -44,15 +52,31 @@ async function detectWorkspaceModules(repoPath: string, packageJson: any): Promi
   const patterns = Array.isArray(packageJson?.workspaces) ? packageJson.workspaces : packageJson?.workspaces?.packages;
   if (!Array.isArray(patterns)) return [];
   const modules: ProjectModule[] = [];
-  for (const pattern of patterns.slice(0, 20)) {
+  const seen = new Set<string>();
+  for (const pattern of patterns.filter((item: unknown): item is string => typeof item === "string").sort()) {
+    if (modules.length >= MAX_WORKSPACE_ENTRIES - 1) break;
     if (typeof pattern !== "string") continue;
-    if (!pattern.includes("*")) { modules.push(moduleFromPath(pattern)); continue; }
+    if (!pattern.includes("*")) {
+      const module = moduleFromPath(pattern);
+      if (!seen.has(module.id)) { seen.add(module.id); modules.push(module); }
+      continue;
+    }
     if (!pattern.endsWith("/*") || pattern.slice(0, -2).includes("*")) continue;
     const parent = pattern.slice(0, -2);
+    const entries: string[] = [];
+    let directory: Awaited<ReturnType<typeof opendir>> | undefined;
     try {
-      const entries = await readdir(resolve(repoPath, parent), { withFileTypes: true });
-      for (const entry of entries.slice(0, MAX_WORKSPACE_ENTRIES)) if (entry.isDirectory()) modules.push(moduleFromPath(`${parent}/${entry.name}`));
+      directory = await opendir(resolve(repoPath, parent));
+      for await (const entry of directory) {
+        if (entry.isDirectory()) entries.push(entry.name);
+        if (entries.length >= MAX_WORKSPACE_ENTRIES - 1 - modules.length) break;
+      }
     } catch { /* optional workspace hint */ }
+    finally { await directory?.close().catch(() => undefined); }
+    for (const name of entries.sort()) {
+      const module = moduleFromPath(`${parent}/${name}`);
+      if (!seen.has(module.id)) { seen.add(module.id); modules.push(module); }
+    }
   }
   return modules;
 }
@@ -73,7 +97,7 @@ export async function inspectProjectRepository(repoPath: string, defaultBranch: 
   catch { return invalid(normalizedPath, defaultBranch, "Default branch does not exist locally"); }
 
   const [packageText, hasNpmLock, hasPnpmLock, hasYarnLock, hasPom, hasGradle, hasGradleKts] = await Promise.all([
-    readBounded(resolve(normalizedPath, "package.json")), exists(resolve(normalizedPath, "package-lock.json")),
+    readBoundedFile(resolve(normalizedPath, "package.json")), exists(resolve(normalizedPath, "package-lock.json")),
     exists(resolve(normalizedPath, "pnpm-lock.yaml")), exists(resolve(normalizedPath, "yarn.lock")),
     exists(resolve(normalizedPath, "pom.xml")), exists(resolve(normalizedPath, "build.gradle")), exists(resolve(normalizedPath, "build.gradle.kts"))
   ]);
@@ -90,8 +114,8 @@ export async function inspectProjectRepository(repoPath: string, defaultBranch: 
   const category = frontend && !backend ? "frontend" : backend && !frontend ? "backend" : "other";
   const declaredManager = typeof packageJson?.packageManager === "string" ? packageJson.packageManager.split("@")[0] : null;
   const packageManager = hasPnpmLock ? "pnpm" : hasYarnLock ? "yarn" : hasNpmLock ? "npm" : hasPom ? "maven" : (hasGradle || hasGradleKts) ? "gradle" : (["npm", "pnpm", "yarn"].includes(declaredManager) ? declaredManager : null);
-  const knowledgeModules = knowledgeEntries.filter((entry) => entry.kind === "module").slice(0, MAX_WORKSPACE_ENTRIES).map((entry) => moduleFromPath(entry.path, entry.title));
+  const knowledgeModules = knowledgeEntries.filter((entry) => entry.kind === "module").slice(0, MAX_WORKSPACE_ENTRIES - 1).map((entry) => moduleFromPath(entry.path, entry.title));
   const detectedModules = knowledgeModules.length ? knowledgeModules : await detectWorkspaceModules(normalizedPath, packageJson);
-  const modules = [...new Map([{ id: "root", name: "root", path: "." }, ...detectedModules].map((item) => [item.id, item])).values()];
+  const modules = [...new Map([{ id: "root", name: "root", path: "." }, ...detectedModules].map((item) => [item.id, item])).values()].slice(0, MAX_WORKSPACE_ENTRIES);
   return { valid: true, repoPath: normalizedPath, defaultBranch, category, technology: [...new Set(technology)], packageManager: packageManager as ProjectInspection["packageManager"], modules, warnings };
 }

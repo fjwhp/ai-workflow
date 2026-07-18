@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { inspectProjectRepository } from "./project-service.js";
+import { inspectProjectRepository, readBoundedFile } from "./project-service.js";
 
 const exec = promisify(execFile);
 const directories: string[] = [];
@@ -30,6 +30,17 @@ afterEach(async () => {
 });
 
 describe("inspectProjectRepository", () => {
+  it("rejects oversized metadata after reading only the bounded prefix", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bounded-read-"));
+    directories.push(directory);
+    const path = join(directory, "large.json");
+    await writeFile(path, Buffer.alloc(1024 * 1024, 65));
+    const reads: number[] = [];
+    const result = await readBoundedFile(path, 1024, (bytesRead) => reads.push(bytesRead));
+    expect(result).toBeNull();
+    expect(reads).toEqual([]);
+  });
+
   it.each([
     ["package-lock.json", "npm"],
     ["pnpm-lock.yaml", "pnpm"],
@@ -67,6 +78,20 @@ describe("inspectProjectRepository", () => {
       { id: "root", name: "root", path: "." },
       { id: "services/api", name: "API service", path: "services/api" }
     ]);
+  });
+
+  it("enforces one global deterministic module limit across workspace patterns", async () => {
+    const workspaces = Array.from({ length: 12 }, (_, index) => `group-${index}/*`);
+    const files: Record<string, string> = { "package.json": JSON.stringify({ workspaces }) };
+    for (let group = 0; group < 12; group++) {
+      for (let child = 0; child < 20; child++) files[`group-${group}/module-${String(child).padStart(2, "0")}/package.json`] = "{}";
+    }
+    const repo = await createRepo(files);
+    const result = await inspectProjectRepository(repo, "main");
+    expect(result.modules).toHaveLength(100);
+    expect(result.modules[0]).toEqual({ id: "root", name: "root", path: "." });
+    expect(new Set(result.modules.map((item) => item.id)).size).toBe(result.modules.length);
+    expect(result.modules.slice(1).map((item) => item.path)).toEqual([...result.modules.slice(1).map((item) => item.path)].sort());
   });
 
   it("returns structured invalid results for missing, nested, and branchless paths", async () => {
