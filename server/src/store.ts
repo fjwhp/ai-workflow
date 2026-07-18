@@ -727,7 +727,7 @@ export class WorkflowStore {
   }
 
   updateProjectVersionHead(id: string, headCommit: string): ProjectVersion | null {
-    const result = this.db.prepare("UPDATE project_versions SET head_commit = ?, updated_at = ? WHERE id = ?")
+    const result = this.db.prepare("UPDATE project_versions SET head_commit = ?, updated_at = ? WHERE id = ? AND status = 'active'")
       .run(headCommit, new Date().toISOString(), id);
     return result.changes ? this.getProjectVersion(id) : null;
   }

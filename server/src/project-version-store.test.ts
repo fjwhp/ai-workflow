@@ -223,6 +223,16 @@ describe("project version persistence", () => {
     expect(store.updateProjectVersionHead("missing", "noop")).toBeNull();
   });
 
+  it("does not update a closed version head", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Closed head", "/tmp/project-version-closed-head");
+    const version = createVersion(store, project.id, "closed-head", "/tmp/version-closed-head");
+    store.closeProjectVersion(version.id);
+
+    expect(store.updateProjectVersionHead(version.id, "unexpected-head")).toBeNull();
+    expect(store.getProjectVersion(version.id)).toMatchObject({ status: "closed", headCommit: version.headCommit });
+  });
+
   it("maps unique conflicts to stable errors while scoping name and branch per project", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const first = createProject(store, "First", "/tmp/version-first");

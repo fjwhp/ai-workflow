@@ -1,7 +1,7 @@
 import { execFile, execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { writeFileSync } from "node:fs";
-import { chmod, lstat, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
@@ -282,6 +282,16 @@ class AdvancingFailingVersionStore extends WorkflowStore {
   }
 }
 
+class DirtyFailingVersionStore extends WorkflowStore {
+  createdWorktreePath?: string;
+
+  override createProjectVersion(input: Parameters<WorkflowStore["createProjectVersion"]>[0]): never {
+    this.createdWorktreePath = input.worktreePath;
+    writeFileSync(join(input.worktreePath, "dirty-recovery.txt"), "preserve this recovery work\n");
+    throw new Error("SQLITE_BUSY");
+  }
+}
+
 class ArchivingVersionStore extends WorkflowStore {
   override createProjectVersion(input: Parameters<WorkflowStore["createProjectVersion"]>[0]) {
     this.archiveProject(input.projectId);
@@ -305,6 +315,22 @@ class ArchivingReadStore extends WorkflowStore {
   }
 }
 
+class ClosingVersionReadStore extends WorkflowStore {
+  private versionId?: string;
+  private projectReads = 0;
+
+  armCloseRace(versionId: string) {
+    this.versionId = versionId;
+    this.projectReads = 0;
+  }
+
+  override getProject(id: string) {
+    const project = super.getProject(id);
+    if (this.versionId && ++this.projectReads === 2) super.closeProjectVersion(this.versionId);
+    return project;
+  }
+}
+
 describe("project version persistence rollback", () => {
   it("removes only the managed worktree and branch created by the failed request", async () => {
     const { repoPath } = await setupRepository();
@@ -323,6 +349,27 @@ describe("project version persistence rollback", () => {
     expect(JSON.stringify(response.json())).not.toContain("git -C");
     expect(await branchExists(repoPath, "feature/rollback-new")).toBe(false);
     expect((await git(repoPath, "worktree", "list", "--porcelain"))).not.toContain("feature/rollback-new");
+  });
+
+  it("preserves a dirty created worktree and branch when persistence fails", async () => {
+    const { repoPath } = await setupRepository();
+    const store = new DirtyFailingVersionStore(":memory:"); stores.push(store);
+    const project = createProject(store, repoPath);
+    const app = await routeApp(store);
+
+    const response = await app.inject({
+      method: "POST", url: `/api/projects/${project.id}/versions`,
+      payload: { name: "rollback-dirty", branch: "feature/rollback-dirty", baseBranch: "prod" }
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("PROJECT_VERSION_PERSISTENCE_FAILED");
+    expect(store.listProjectVersions(project.id, "all")).toEqual([]);
+    expect(await pathExists(store.createdWorktreePath!)).toBe(true);
+    expect(await readFile(join(store.createdWorktreePath!, "dirty-recovery.txt"), "utf8"))
+      .toBe("preserve this recovery work\n");
+    expect(await branchExists(repoPath, "feature/rollback-dirty")).toBe(true);
+    expect((await git(repoPath, "worktree", "list", "--porcelain"))).toContain("feature/rollback-dirty");
   });
 
   it("returns the archived-project error and cleans Git when archival races persistence", async () => {
@@ -491,6 +538,26 @@ describe("project version item routes", () => {
       expect(response.json().error).toBe("PROJECT_ARCHIVED");
       expect(store.getProjectVersion(version.id)).toMatchObject({ status: "active", headCommit: version.headCommit });
     }
+  });
+
+  it("does not update a version closed while recheck inspects its worktree", async () => {
+    const { repoPath } = await setupRepository();
+    const store = new ClosingVersionReadStore(":memory:"); stores.push(store);
+    const project = createProject(store, repoPath);
+    const app = await routeApp(store);
+    const version = await createVersion(app, project.id, {
+      name: "close-race-recheck", branch: "feature/close-race-recheck", baseBranch: "prod"
+    });
+    await writeFile(join(version.worktreePath, "advanced.txt"), "advanced\n");
+    await git(version.worktreePath, "add", "--all");
+    await git(version.worktreePath, "commit", "-m", "advance before close race");
+    store.armCloseRace(version.id);
+
+    const response = await app.inject({ method: "POST", url: `/api/project-versions/${version.id}/recheck` });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("PROJECT_VERSION_NOT_ACTIVE");
+    expect(store.getProjectVersion(version.id)).toMatchObject({ status: "closed", headCommit: version.headCommit });
   });
 
   it("closes a clean valid version idempotently without deleting Git state", async () => {
