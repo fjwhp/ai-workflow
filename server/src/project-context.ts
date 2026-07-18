@@ -10,7 +10,7 @@ const ENTRY_CAP = 24;
 const EXECUTION_STAGES = new Set<WorkflowStage>(["coding", "code_review", "testing", "acceptance", "integration"]);
 
 export class ProjectContextError extends Error {
-  constructor(public readonly code: string, public readonly projects: Array<{ projectId: string; name: string }> = []) {
+  constructor(public readonly code: string, public readonly projects: Array<{ projectId: string; name: string }> = [], public readonly details?: { maxChars: number; minimumRequiredChars: number; projectCount: number }) {
     super(code);
   }
 }
@@ -82,6 +82,9 @@ export async function buildRequirementProjectContext(store: WorkflowStore, requi
     }, fairCap);
   });
   const totalChars = JSON.stringify(projects).length;
+  if (totalChars > appliedBudget.maxChars) {
+    throw new ProjectContextError("PROJECT_CONTEXT_BUDGET_TOO_SMALL", [], { maxChars: appliedBudget.maxChars, minimumRequiredChars: totalChars, projectCount: projects.length });
+  }
   return { projects, budgetMaxChars: appliedBudget.maxChars, totalChars, truncated: projects.some((project) => project.truncated) };
 }
 

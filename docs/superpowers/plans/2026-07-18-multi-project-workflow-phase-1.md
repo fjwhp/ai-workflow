@@ -441,7 +441,7 @@ Expected: FAIL because context assembly does not exist.
 
 - [ ] **Step 3: Implement role-aware bounded retrieval**
 
-`buildRequirementProjectContext(store, requirementId, stage, budget)` loads all active associations in position order. Retrieve at most 24 entries per project and allocate the configurable aggregate serialized-JSON character budget fairly across active projects. `AI_PROJECT_CONTEXT_MAX_CHARS` defaults to 200,000, rejects unsafe low/invalid values, and has a 1,000,000-character hard ceiling. The exact serialized project array must fit the applied budget; this character count is not a model-token estimate. Each project block contains identity, role, usage, module scope, knowledge version, source head, summary, and bounded entries.
+`buildRequirementProjectContext(store, requirementId, stage, budget)` loads all active associations in position order. Retrieve at most 24 entries per project and allocate the configurable aggregate serialized-JSON character budget fairly across active projects. `AI_PROJECT_CONTEXT_MAX_CHARS` defaults to 200,000, rejects unsafe low/invalid values, and has a 1,000,000-character hard ceiling. The exact serialized project array must fit the applied budget; this character count is not a model-token estimate. If irreducible identity metadata cannot fit, return `PROJECT_CONTEXT_BUDGET_TOO_SMALL`; raise the environment budget or reduce associations. Each project block contains identity, role, usage, module scope, knowledge version, source head, summary, and bounded entries.
 
 For coding and later project-execution stages in phase 1, call `resolveSoleDeliveryProject`; inject only that project's knowledge and module scope. Do not let the coding runner write outside that repository worktree.
 

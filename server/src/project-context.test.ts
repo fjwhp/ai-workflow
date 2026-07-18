@@ -139,4 +139,23 @@ describe("buildRequirementProjectContext", () => {
     expect(JSON.stringify(context.projects).length).toBeLessThanOrEqual(20_000);
     expect(context.totalChars).toBe(JSON.stringify(context.projects).length);
   });
+
+  it("rejects an infeasible budget and succeeds at the reported minimum boundary", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const paths = ["server", "web", "shared", "docs", "server/src", "web/src", "shared/src", "docs/superpowers", "docs/superpowers/specs", "docs/superpowers/plans", "web/node_modules", "web/node_modules/lucide-react", "web/node_modules/lucide-react/dist", "web/node_modules/lucide-react/dist/esm", "web/node_modules/lucide-react/dist/esm/shared", "web/node_modules/lucide-react/dist/esm/icons"];
+    const projects = paths.map((path, index) => store.createProject({ name: `Context ${index}`, repoPath: join(process.cwd(), path), defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] }));
+    const requirement = store.createRequirement({ title: "Many contexts", businessProblem: "Fit identity metadata", expectedOutcome: "Stable budget failure", priority: "medium", primaryProjectId: projects[0]!.id });
+    store.replaceRequirementProjects(requirement.id, projects.map((project, position) => ({ projectId: project.id, role: position === 0 ? "primary" : "collaborator", usage: "context", deliveryRequired: false, moduleMode: "all", moduleIds: [], position })));
+    for (const project of projects) ready(store, project.id, "", []);
+
+    let minimumRequiredChars = 0;
+    try { await buildRequirementProjectContext(store, requirement.id, "technical_design", { maxChars: 4_000 }); }
+    catch (error: any) {
+      expect(error).toMatchObject({ code: "PROJECT_CONTEXT_BUDGET_TOO_SMALL", details: { maxChars: 4_000, projectCount: projects.length } });
+      minimumRequiredChars = error.details.minimumRequiredChars;
+    }
+    expect(minimumRequiredChars).toBeGreaterThan(4_000);
+    const context = await buildRequirementProjectContext(store, requirement.id, "technical_design", { maxChars: minimumRequiredChars });
+    expect(context.totalChars).toBe(minimumRequiredChars);
+  });
 });
