@@ -271,6 +271,7 @@ export async function buildApp(store: WorkflowStore) {
     const item=store.getRequirement(req.params.id);if(!item)return reply.code(404).send({error:"NOT_FOUND"});
     if(item.stage!=="integration"||item.status!=="merge_test_failed")return reply.code(409).send({error:"INTEGRATION_TEST_NOT_ALLOWED",message:"只有本地应用后测试失败时才能重新运行"});
     const project=item.projectId?store.getProject(item.projectId):null,previous=store.getLatestIntegrationRun(item.id),evidence:any=store.getLatestCodingEvidence(item.id);
+    if(project?.status==="archived")return reply.code(409).send({error:"PROJECT_ARCHIVED",message:"归档项目不能启动新的集成操作"});
     if(!project||!previous||!evidence)return reply.code(409).send({error:"INTEGRATION_CONTEXT_MISSING"});
     const plan=await buildVerificationPlan({repoPath:project.repoPath,changedFiles:evidence.files||[],fallbackCommands:project.allowedCommands||[]});
     if(!plan.plannedCommands.length)return reply.code(409).send({error:"VERIFICATION_PLAN_UNAVAILABLE",message:"未识别到安全测试命令"});
@@ -322,7 +323,7 @@ export async function buildApp(store: WorkflowStore) {
     const parsed=projectUpdateSchema.safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:"VALIDATION_ERROR",issues:parsed.error.issues});
     let update:any={...parsed.data};
     if(parsed.data.repoPath!==undefined||parsed.data.defaultBranch!==undefined){const inspection=await inspectProjectRepository(parsed.data.repoPath??current.repoPath,parsed.data.defaultBranch??current.defaultBranch);if(!inspection.valid)return invalidRepository(reply,inspection);update={...update,repoPath:inspection.repoPath,technology:inspection.technology,category:parsed.data.category===undefined?inspection.category:parsed.data.category};}
-    try{if(parsed.data.repoPath!==undefined||parsed.data.defaultBranch!==undefined)store.cancelBuildingProjectKnowledge(current.id,"项目仓库配置已变更");const project=store.updateProject(current.id,update);if(parsed.data.repoPath!==undefined||parsed.data.defaultBranch!==undefined)void ensureProjectKnowledge(store,project!,"project_updated",true).catch(()=>{});return project;}
+    try{const identityChanged=parsed.data.repoPath!==undefined||parsed.data.defaultBranch!==undefined,project=store.updateProject(current.id,update);if(identityChanged){store.cancelBuildingProjectKnowledge(current.id,"项目仓库配置已变更");void ensureProjectKnowledge(store,project!,"project_updated",true).catch(()=>{});}return project;}
     catch(error){return sendDomainError(reply,error);}
   });
   app.post("/api/projects/:id/archive",async(req:any,reply)=>{const project=store.getProject(req.params.id);if(!project)return reply.code(404).send({error:"NOT_FOUND"});if(store.projectHasActiveDelivery(project.id))return reply.code(409).send({error:"PROJECT_IN_ACTIVE_DELIVERY",message:"项目正在用于活动交付"});return store.archiveProject(project.id);});

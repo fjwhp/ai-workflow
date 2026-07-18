@@ -60,6 +60,11 @@ describe("project and requirement association APIs",()=>{
     await app.close();
   });
 
+  it("preserves the project and active knowledge build when an identity update conflicts",async()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const first=await projectRepo(),second=await projectRepo();const project=store.createProject(projectPayload(first)),duplicate=store.createProject(projectPayload(second,{name:"Duplicate"}));const building=store.beginProjectKnowledge(project.id,"old-head","manual");const app=await buildApp(store);
+    const response=await app.inject({method:"PATCH",url:`/api/projects/${project.id}`,payload:{repoPath:`${second}/.`}});expect(response.statusCode).toBe(409);expect(response.json().error).toBe("PROJECT_REPO_PATH_EXISTS");expect(store.getProject(project.id)?.repoPath).toBe(await realpath(first));expect(store.getProjectKnowledgeVersion(building.id)).toMatchObject({status:"building"});expect(store.getProject(duplicate.id)?.repoPath).toBe(await realpath(second));await app.close();
+  });
+
   it("filters and archives projects while blocking active delivery",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const repo=await projectRepo();const other=await projectRepo();
     const project=store.createProject(projectPayload(repo));store.createProject(projectPayload(other,{name:"Other"}));
@@ -83,6 +88,11 @@ describe("project and requirement association APIs",()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject(projectPayload(await projectRepo()));const req=store.createRequirement({title:"归档保护",businessProblem:"归档项目不能启动新执行",expectedOutcome:"稳定拒绝",priority:"medium",primaryProjectId:project.id});store.archiveProject(project.id);const app=await buildApp(store);
     const run=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});expect(run.statusCode).toBe(409);expect(run.json().error).toBe("PROJECT_ARCHIVED");
     store.updateRequirementState(req.id,"integration","awaiting_merge");for(const [method,url] of [["GET",`/api/requirements/${req.id}/integration-check`],["POST",`/api/requirements/${req.id}/integrate`]] as const){const response=await app.inject({method,url,payload:method==="POST"?{}:undefined});expect(response.statusCode).toBe(409);expect(response.json().error).toBe("PROJECT_ARCHIVED");}await app.close();
+  });
+
+  it("rejects integration test reruns for archived projects before creating a run",async()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject(projectPayload(await projectRepo()));const req=store.createRequirement({title:"归档重测",businessProblem:"归档项目不能重新执行测试命令",expectedOutcome:"不创建执行记录",priority:"medium",primaryProjectId:project.id});store.updateRequirementState(req.id,"integration","merge_test_failed");store.archiveProject(project.id);const app=await buildApp(store);
+    expect(store.getLatestIntegrationRun(req.id)).toBeNull();const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/integration-test`,payload:{}});expect(response.statusCode).toBe(409);expect(response.json().error).toBe("PROJECT_ARCHIVED");expect(store.getLatestIntegrationRun(req.id)).toBeNull();await app.close();
   });
 
   it("cancels an old knowledge build before rebuilding after project identity edits",async()=>{
