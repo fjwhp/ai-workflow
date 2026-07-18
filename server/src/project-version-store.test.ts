@@ -516,32 +516,81 @@ describe("project version application leases", () => {
     });
   });
 
-  it("lets only one of two store connections acquire the same version", async () => {
+  it("lets only one of two independent processes acquire the same version", { timeout: 15_000 }, async () => {
     const path = databasePath();
-    const firstStore = new WorkflowStore(path);
-    const secondStore = new WorkflowStore(path);
-    stores.push(firstStore, secondStore);
-    const project = createProject(firstStore, "Application race", join(path, "..", "application-race"));
-    const version = createVersion(firstStore, project.id, "1.0.0", join(path, "..", "application-race-v1"));
-    const firstRequirement = firstStore.createRequirement(requirementInput(project.id, version.id, "Race first"));
-    const secondRequirement = firstStore.createRequirement(requirementInput(project.id, version.id, "Race second"));
-    firstStore.updateRequirementState(firstRequirement.id, "integration", "awaiting_merge");
-    firstStore.updateRequirementState(secondRequirement.id, "integration", "awaiting_merge");
-
-    const outcomes = await Promise.allSettled([
-      Promise.resolve().then(() => firstStore.beginVersionApplication({
+    const store = new WorkflowStore(path); stores.push(store);
+    const project = createProject(store, "Application race", join(path, "..", "application-race"));
+    const version = createVersion(store, project.id, "1.0.0", join(path, "..", "application-race-v1"));
+    const firstRequirement = store.createRequirement(requirementInput(project.id, version.id, "Race first"));
+    const secondRequirement = store.createRequirement(requirementInput(project.id, version.id, "Race second"));
+    store.updateRequirementState(firstRequirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(secondRequirement.id, "integration", "awaiting_merge");
+    const first = spawnVersionApplicationWorker(path, {
+      mode: "begin", begin: {
         versionId: version.id, requirementId: firstRequirement.id, run: applicationRun(version, "race-first")
-      })),
-      Promise.resolve().then(() => secondStore.beginVersionApplication({
+      }
+    });
+    const second = spawnVersionApplicationWorker(path, {
+      mode: "begin", begin: {
         versionId: version.id, requirementId: secondRequirement.id, run: applicationRun(version, "race-second")
-      }))
-    ]);
+      }
+    });
+    await Promise.all([first.waitFor("ready"), second.waitFor("ready")]);
+    const locker = new DatabaseSync(path); databases.push(locker);
+    locker.exec("BEGIN IMMEDIATE");
+    const firstStarting = first.waitFor("starting");
+    const secondStarting = second.waitFor("starting");
+    first.child.send("go");
+    second.child.send("go");
+    await Promise.all([firstStarting, secondStarting]);
+    locker.exec("COMMIT");
 
-    expect(outcomes.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
-    expect(outcomes.filter(({ status }) => status === "rejected")).toHaveLength(1);
-    expect((outcomes.find(({ status }) => status === "rejected") as PromiseRejectedResult).reason)
-      .toMatchObject({ message: "PROJECT_VERSION_APPLICATION_BUSY" });
-    expect(firstStore.listPendingVersionApplications()).toHaveLength(1);
+    const outcomes = await Promise.all([first.waitForOutcome(), second.waitForOutcome()]);
+    expect(outcomes.filter(({ type }) => type === "result")).toHaveLength(1);
+    expect(outcomes.filter(({ type }) => type === "error")).toEqual([
+      expect.objectContaining({ type: "error", message: "PROJECT_VERSION_APPLICATION_BUSY" })
+    ]);
+    expect(store.listPendingVersionApplications()).toHaveLength(1);
+    await Promise.all([waitForExit(first.child), waitForExit(second.child)]);
+  });
+
+  it("allows independent processes to acquire different versions", { timeout: 15_000 }, async () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const project = createProject(store, "Independent applications", join(path, "..", "independent-applications"));
+    const firstVersion = createVersion(store, project.id, "1.0.0", join(path, "..", "independent-applications-v1"));
+    const secondVersion = createVersion(store, project.id, "2.0.0", join(path, "..", "independent-applications-v2"));
+    const firstRequirement = store.createRequirement(requirementInput(project.id, firstVersion.id, "Independent first"));
+    const secondRequirement = store.createRequirement(requirementInput(project.id, secondVersion.id, "Independent second"));
+    store.updateRequirementState(firstRequirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(secondRequirement.id, "integration", "awaiting_merge");
+    const first = spawnVersionApplicationWorker(path, {
+      mode: "begin", begin: {
+        versionId: firstVersion.id, requirementId: firstRequirement.id,
+        run: applicationRun(firstVersion, "independent-first")
+      }
+    });
+    const second = spawnVersionApplicationWorker(path, {
+      mode: "begin", begin: {
+        versionId: secondVersion.id, requirementId: secondRequirement.id,
+        run: applicationRun(secondVersion, "independent-second")
+      }
+    });
+    await Promise.all([first.waitFor("ready"), second.waitFor("ready")]);
+    const locker = new DatabaseSync(path); databases.push(locker);
+    locker.exec("BEGIN IMMEDIATE");
+    const firstStarting = first.waitFor("starting");
+    const secondStarting = second.waitFor("starting");
+    first.child.send("go");
+    second.child.send("go");
+    await Promise.all([firstStarting, secondStarting]);
+    locker.exec("COMMIT");
+
+    expect(await Promise.all([first.waitForOutcome(), second.waitForOutcome()])).toEqual([
+      expect.objectContaining({ type: "result" }), expect.objectContaining({ type: "result" })
+    ]);
+    expect(store.listPendingVersionApplications()).toHaveLength(2);
+    await Promise.all([waitForExit(first.child), waitForExit(second.child)]);
   });
 
   it.each(["awaiting_local_resolution", "merge_test_failed"] as const)(
@@ -570,6 +619,35 @@ describe("project version application leases", () => {
       });
     }
   );
+
+  it("rolls back a late apply completion after the requirement state has moved", () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const database = new DatabaseSync(path); databases.push(database);
+    const project = createProject(store, "Late completion", join(path, "..", "late-completion"));
+    const version = createVersion(store, project.id, "1.0.0", join(path, "..", "late-completion-v1"));
+    const requirement = store.createRequirement(requirementInput(project.id, version.id, "Late completion"));
+    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.beginVersionApplication({
+      versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "late-completion")
+    });
+    database.prepare("UPDATE requirements SET status = 'cancelled', updated_at = ? WHERE id = ?")
+      .run("2000-01-01T00:00:00.000Z", requirement.id);
+
+    expect(() => store.completeVersionApplicationApply({
+      runId: "run-late-completion", sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
+      status: "awaiting_local_resolution"
+    })).toThrow("PROJECT_VERSION_APPLICATION_MISMATCH");
+    expect(store.getIntegrationRun("run-late-completion")).toMatchObject({
+      status: "running", sourceCommit: undefined, preApplyHead: undefined
+    });
+    expect(store.getProjectVersion(version.id)).toMatchObject({
+      pendingRequirementId: requirement.id, pendingIntegrationRunId: "run-late-completion"
+    });
+    expect(store.getRequirement(requirement.id)).toMatchObject({
+      stage: "integration", status: "cancelled", updatedAt: "2000-01-01T00:00:00.000Z"
+    });
+  });
 
   it("atomically releases committed and reverted applications only for the matching run", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
@@ -739,10 +817,83 @@ describe("project version application leases", () => {
       requirementId, owner, position
     }))).toEqual([{ requirementId: owner.id, owner: true, position: 1 }]);
   });
+
+  it("returns observable queue snapshots while another process acquires and releases", { timeout: 15_000 }, async () => {
+    const path = databasePath();
+    const store = new WorkflowStore(path); stores.push(store);
+    const project = createProject(store, "Queue snapshots", join(path, "..", "queue-snapshots"));
+    const version = createVersion(store, project.id, "1.0.0", join(path, "..", "queue-snapshots-v1"));
+    const owner = store.createRequirement(requirementInput(project.id, version.id, "Snapshot owner"));
+    const waiter = store.createRequirement(requirementInput(project.id, version.id, "Snapshot waiter"));
+    store.updateRequirementState(owner.id, "integration", "awaiting_merge");
+    store.updateRequirementState(waiter.id, "integration", "awaiting_merge");
+    const worker = spawnVersionApplicationWorker(path, {
+      mode: "lifecycle",
+      begin: {
+        versionId: version.id, requirementId: owner.id, run: applicationRun(version, "snapshot-owner")
+      },
+      complete: {
+        runId: "run-snapshot-owner", sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
+        status: "awaiting_local_resolution"
+      },
+      release: {
+        versionId: version.id, runId: "run-snapshot-owner", resolution: "committed",
+        resolutionCommit: "e".repeat(40)
+      }
+    });
+    await worker.waitFor("ready");
+
+    const snapshots: Array<Array<{ requirementId: string; status: string; owner: boolean }>> = [];
+    const readQueue = () => store.listVersionApplicationQueue(version.id)
+      .map(({ requirementId, status, owner: isOwner }) => ({ requirementId, status, owner: isOwner }));
+    snapshots.push(readQueue());
+    const acquiredMessage = worker.waitFor("acquired");
+    worker.child.send("go");
+    let acquired = false;
+    const acquiredDone = acquiredMessage.then(() => { acquired = true; });
+    while (!acquired) {
+      snapshots.push(readQueue());
+      await new Promise<void>((resolveTick) => setImmediate(resolveTick));
+    }
+    await acquiredDone;
+    snapshots.push(readQueue());
+
+    const releasedMessage = worker.waitFor("released");
+    worker.child.send("release");
+    let released = false;
+    const releasedDone = releasedMessage.then(() => { released = true; });
+    while (!released) {
+      snapshots.push(readQueue());
+      await new Promise<void>((resolveTick) => setImmediate(resolveTick));
+    }
+    await releasedDone;
+    snapshots.push(readQueue());
+    await waitForExit(worker.child);
+
+    const validSnapshots = [
+      [
+        { requirementId: owner.id, status: "awaiting_merge", owner: false },
+        { requirementId: waiter.id, status: "awaiting_merge", owner: false }
+      ],
+      [
+        { requirementId: owner.id, status: "awaiting_merge", owner: true },
+        { requirementId: waiter.id, status: "awaiting_merge", owner: false }
+      ],
+      [
+        { requirementId: owner.id, status: "awaiting_local_resolution", owner: true },
+        { requirementId: waiter.id, status: "awaiting_merge", owner: false }
+      ],
+      [{ requirementId: waiter.id, status: "awaiting_merge", owner: false }]
+    ].map((snapshot) => JSON.stringify(snapshot));
+    const serializedSnapshots = snapshots.map((snapshot) => JSON.stringify(snapshot));
+    expect(serializedSnapshots)
+      .toEqual(expect.arrayContaining([validSnapshots[0], validSnapshots[1], validSnapshots[3]]));
+    expect(serializedSnapshots.filter((snapshot) => !validSnapshots.includes(snapshot))).toEqual([]);
+  });
 });
 
 type ChildMessage =
-  | { type: "ready" | "starting" }
+  | { type: "ready" | "starting" | "acquired" | "released" }
   | { type: "result"; code: string }
   | { type: "error"; message: string; code?: string };
 
@@ -774,14 +925,83 @@ const creatorScript = `
 });
 `;
 
+const versionApplicationScript = `
+(async () => {
+  const { WorkflowStore } = await import(process.env.STORE_MODULE_URL);
+  const store = new WorkflowStore(process.env.DATABASE_PATH);
+  const input = JSON.parse(process.env.VERSION_APPLICATION_INPUT);
+  const finish = (message, exitCode) => process.send(message, () => {
+    store.close();
+    process.exit(exitCode);
+  });
+  const fail = (error) => finish({
+    type: "error",
+    message: error instanceof Error ? error.message : String(error),
+    code: error && typeof error === "object" ? error.code : undefined
+  }, 1);
+  process.on("message", (message) => {
+    if (message === "go") {
+      process.send({ type: "starting" });
+      try {
+        store.beginVersionApplication(input.begin);
+        if (input.mode === "begin") finish({ type: "result", code: "ACQUIRED" }, 0);
+        else process.send({ type: "acquired" });
+      } catch (error) { fail(error); }
+      return;
+    }
+    if (message === "release" && input.mode === "lifecycle") {
+      try {
+        store.completeVersionApplicationApply(input.complete);
+        store.releaseVersionApplication(input.release);
+        finish({ type: "released" }, 0);
+      } catch (error) { fail(error); }
+    }
+  });
+  process.send({ type: "ready" });
+})().catch((error) => {
+  process.send({ type: "error", message: error instanceof Error ? error.message : String(error) }, () => process.exit(1));
+});
+`;
+
+type VersionApplicationWorkerInput = {
+  mode: "begin" | "lifecycle";
+  begin: {
+    versionId: string;
+    requirementId: string;
+    run: ReturnType<typeof applicationRun>;
+  };
+  complete?: {
+    runId: string;
+    sourceCommit: string;
+    preApplyHead: string;
+    status: "awaiting_local_resolution" | "merge_test_failed";
+  };
+  release?: {
+    versionId: string;
+    runId: string;
+    resolution: "committed" | "reverted";
+    resolutionCommit?: string;
+  };
+};
+
 function spawnCreator(path: string, input: ReturnType<typeof requirementInput>) {
-  const child = spawn(process.execPath, [resolve("node_modules/tsx/dist/cli.mjs"), "--eval", creatorScript], {
+  return spawnStoreWorker(path, creatorScript, { REQUIREMENT_INPUT: JSON.stringify(input) });
+}
+
+function spawnVersionApplicationWorker(path: string, input: VersionApplicationWorkerInput) {
+  return spawnStoreWorker(path, versionApplicationScript, {
+    VERSION_APPLICATION_INPUT: JSON.stringify(input)
+  });
+}
+
+function spawnStoreWorker(path: string, script: string, extraEnv: Record<string, string>) {
+  const child = spawn(process.execPath, [resolve("node_modules/tsx/dist/cli.mjs"), "--eval", script], {
     cwd: resolve("."),
     env: {
       ...process.env,
       DATABASE_PATH: path,
-      REQUIREMENT_INPUT: JSON.stringify(input),
-      STORE_MODULE_URL: pathToFileURL(resolve("server/src/store.ts")).href
+      STORE_MODULE_URL: pathToFileURL(resolve("server/src/store.ts")).href,
+      ...extraEnv
     },
     stdio: ["ignore", "pipe", "pipe", "ipc"]
   });

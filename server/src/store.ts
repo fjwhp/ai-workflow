@@ -973,11 +973,14 @@ export class WorkflowStore {
          AND pv.id = ir.project_version_id
         WHERE ir.id = ? AND ir.status = 'running'`).get(input.runId) as any;
       if (!run) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
+      const requirementUpdated = this.db.prepare(`UPDATE requirements
+        SET status = ?, updated_at = ?
+        WHERE id = ? AND stage = 'integration' AND status = 'awaiting_merge'`)
+        .run(input.status, now, run.requirement_id);
+      if (requirementUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       this.db.prepare(`UPDATE integration_runs
         SET status = ?, source_commit = ?, pre_apply_head = ?, completed_at = ? WHERE id = ?`)
         .run(input.status, input.sourceCommit, input.preApplyHead, now, input.runId);
-      this.db.prepare("UPDATE requirements SET stage = 'integration', status = ?, updated_at = ? WHERE id = ?")
-        .run(input.status, now, run.requirement_id);
       this.db.exec("COMMIT");
       return this.getIntegrationRun(input.runId)!;
     } catch (error) {
@@ -1064,32 +1067,37 @@ export class WorkflowStore {
   }
 
   listVersionApplicationQueue(versionId: string): VersionApplicationQueueEntry[] {
-    const version = this.getProjectVersion(versionId);
-    if (!version) return [];
-    const rows = this.db.prepare(`SELECT DISTINCT r.id, r.code, r.title, r.status, r.updated_at
-      FROM requirements r JOIN requirement_projects rp ON rp.requirement_id = r.id
-      JOIN project_versions pv ON pv.id = rp.project_version_id AND pv.project_id = rp.project_id
-      JOIN projects p ON p.id = pv.project_id
-      WHERE rp.project_version_id = ? AND rp.project_id = ?
-        AND pv.status = 'active' AND p.status = 'active'
-        AND rp.usage = 'delivery' AND rp.status = 'active'
-        AND (SELECT COUNT(*) FROM requirement_projects active_delivery
-          WHERE active_delivery.requirement_id = r.id
-            AND active_delivery.usage = 'delivery' AND active_delivery.status = 'active') = 1
-        AND r.stage = 'integration' AND r.status = 'awaiting_merge'
-        AND r.id != COALESCE(?, '')
-      ORDER BY r.updated_at, r.code`).all(versionId, version.projectId, version.pendingRequirementId ?? null) as any[];
-    const entries = version.pendingRequirementId
-      ? [this.db.prepare("SELECT id, code, title, status, updated_at FROM requirements WHERE id = ?")
-          .get(version.pendingRequirementId) as any, ...rows]
-      : rows;
-    return entries.filter(Boolean).map((row, index) => ({
+    const rows = this.db.prepare(`WITH target_version AS (
+        SELECT pv.id, pv.project_id, pv.status AS version_status, pv.pending_requirement_id,
+          p.status AS project_status
+        FROM project_versions pv JOIN projects p ON p.id = pv.project_id
+        WHERE pv.id = ?
+      ), queue_entries AS (
+        SELECT r.id, r.code, r.title, r.status, r.updated_at, 1 AS owner, 0 AS sort_group
+        FROM target_version tv JOIN requirements r ON r.id = tv.pending_requirement_id
+        UNION ALL
+        SELECT DISTINCT r.id, r.code, r.title, r.status, r.updated_at, 0 AS owner, 1 AS sort_group
+        FROM target_version tv
+        JOIN requirement_projects rp
+          ON rp.project_version_id = tv.id AND rp.project_id = tv.project_id
+        JOIN requirements r ON r.id = rp.requirement_id
+        WHERE tv.version_status = 'active' AND tv.project_status = 'active'
+          AND rp.usage = 'delivery' AND rp.status = 'active'
+          AND (SELECT COUNT(*) FROM requirement_projects active_delivery
+            WHERE active_delivery.requirement_id = r.id
+              AND active_delivery.usage = 'delivery' AND active_delivery.status = 'active') = 1
+          AND r.stage = 'integration' AND r.status = 'awaiting_merge'
+          AND r.id != COALESCE(tv.pending_requirement_id, '')
+      )
+      SELECT id, code, title, status, updated_at, owner
+      FROM queue_entries ORDER BY sort_group, updated_at, code`).all(versionId) as any[];
+    return rows.map((row, index) => ({
       requirementId: row.id,
       code: row.code,
       title: row.title,
       status: row.status,
       updatedAt: row.updated_at,
-      owner: row.id === version.pendingRequirementId,
+      owner: Boolean(row.owner),
       position: index + 1
     }));
   }
