@@ -22,9 +22,33 @@ export class WorkflowStore {
       CREATE TABLE IF NOT EXISTS requirements (
         id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
         business_problem TEXT NOT NULL, expected_outcome TEXT NOT NULL, priority TEXT NOT NULL,
-        project_id TEXT, stage TEXT NOT NULL, status TEXT NOT NULL,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        stage TEXT NOT NULL, status TEXT NOT NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS requirement_projects (
+        id TEXT PRIMARY KEY,
+        requirement_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('primary', 'collaborator')),
+        usage TEXT NOT NULL CHECK(usage IN ('context', 'delivery')),
+        delivery_required INTEGER NOT NULL,
+        module_mode TEXT NOT NULL CHECK(module_mode IN ('auto', 'all', 'selected')),
+        module_ids_json TEXT NOT NULL DEFAULT '[]',
+        position INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(requirement_id, project_id),
+        FOREIGN KEY(requirement_id) REFERENCES requirements(id),
         FOREIGN KEY(project_id) REFERENCES projects(id)
+      );
+      CREATE TABLE IF NOT EXISTS requirement_project_snapshots (
+        id TEXT PRIMARY KEY,
+        requirement_id TEXT NOT NULL UNIQUE,
+        version INTEGER NOT NULL,
+        associations_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
       );
       CREATE TABLE IF NOT EXISTS stage_runs (
         id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL,
@@ -126,10 +150,10 @@ export class WorkflowStore {
     this.ensureColumn("approvals", "reasons_json", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("approvals", "override_json", "TEXT");
     this.ensureColumn("approvals", "return_count", "INTEGER");
-    this.ensureColumn("requirements", "integration_target_branch", "TEXT");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_ai_gate_artifact ON approvals(artifact_id) WHERE actor_type = 'ai_gate' AND artifact_id IS NOT NULL");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_runs_active ON integration_runs(requirement_id) WHERE status = 'running'");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_project_knowledge_active ON project_knowledge_versions(project_id) WHERE status = 'building'");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_projects_active_primary ON requirement_projects(requirement_id) WHERE role = 'primary' AND status = 'active'");
   }
 
   private ensureColumn(table: string, column: string, definition: string) {
@@ -137,38 +161,36 @@ export class WorkflowStore {
     if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
-  createRequirement(input: RequirementInput) {
+  createRequirement(input: RequirementInput | (Omit<RequirementInput, "primaryProjectId"> & { primaryProjectId?: string; projectId?: string })) {
     const now = new Date().toISOString();
     const id = randomUUID();
     const row = this.db.prepare("SELECT COUNT(*) AS count FROM requirements").get() as { count: number };
     const code = `REQ-${String(row.count + 1).padStart(4, "0")}`;
     this.db.prepare(`INSERT INTO requirements
-      (id, code, title, business_problem, expected_outcome, priority, project_id, stage, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'prd', 'ai_ready', ?, ?)`)
-      .run(id, code, input.title, input.businessProblem, input.expectedOutcome, input.priority, input.projectId ?? null, now, now);
+      (id, code, title, business_problem, expected_outcome, priority, stage, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'prd', 'ai_ready', ?, ?)`)
+      .run(id, code, input.title, input.businessProblem, input.expectedOutcome, input.priority, now, now);
     this.insertRequirementRevision(id, 1, { ...input, clarifications: "" }, "创建需求", now);
     return this.getRequirement(id)!;
   }
 
   listRequirements() {
-    return this.db.prepare("SELECT r.*, p.name AS project_name FROM requirements r LEFT JOIN projects p ON p.id = r.project_id ORDER BY r.created_at DESC").all().map(mapRequirement);
+    return this.db.prepare("SELECT * FROM requirements ORDER BY created_at DESC").all().map(mapRequirement);
   }
 
   getRequirement(id: string) {
-    const row = this.db.prepare("SELECT r.*, p.name AS project_name FROM requirements r LEFT JOIN projects p ON p.id = r.project_id WHERE r.id = ?").get(id);
+    const row = this.db.prepare("SELECT * FROM requirements WHERE id = ?").get(id);
     return row ? mapRequirement(row as Record<string, unknown>) : null;
   }
 
-  setRequirementProject(id: string, projectId: string | null) {
-    if (projectId && !this.db.prepare("SELECT id FROM projects WHERE id = ?").get(projectId)) return null;
-    const result = this.db.prepare("UPDATE requirements SET project_id = ?, updated_at = ? WHERE id = ?")
-      .run(projectId, new Date().toISOString(), id);
-    return result.changes ? this.getRequirement(id) : null;
+  setRequirementProject(id: string, projectId: string | null): any {
+    void id; void projectId;
+    throw new Error("REQUIREMENT_PROJECT_ASSOCIATIONS_NOT_IMPLEMENTED");
   }
 
-  setIntegrationTarget(id:string,branch:string){
-    const result=this.db.prepare("UPDATE requirements SET integration_target_branch=?,updated_at=? WHERE id=? AND stage='integration'").run(branch,new Date().toISOString(),id);
-    return result.changes?this.getRequirement(id):null;
+  setIntegrationTarget(id:string,branch:string): any {
+    void id; void branch;
+    throw new Error("REQUIREMENT_PROJECT_ASSOCIATIONS_NOT_IMPLEMENTED");
   }
 
   reviseRequirement(id: string, input: any) {
@@ -429,15 +451,15 @@ export class WorkflowStore {
   listKnowledgeCandidates(requirementId:string){return (this.db.prepare("SELECT * FROM knowledge_candidates WHERE requirement_id=? ORDER BY created_at").all(requirementId) as any[]).map(row=>({...JSON.parse(row.payload_json),id:row.id,status:row.status,publishDecision:row.publish_decision,createdAt:row.created_at,updatedAt:row.updated_at}));}
 
   publishKnowledgeCandidates(requirementId:string){
-    const candidates=this.listKnowledgeCandidates(requirementId).filter((item:any)=>item.status==="candidate");const requirement:any=this.getRequirement(requirementId);if(!requirement?.projectId)throw new Error("PROJECT_REQUIRED");
+    const candidates=this.listKnowledgeCandidates(requirementId).filter((item:any)=>item.status==="candidate");const projectId=candidates[0]?.projectId;if(!projectId)throw new Error("PROJECT_REQUIRED");
     const now=new Date().toISOString();let publishedCount=0,reviewCount=0,conflictCount=0;this.db.exec("BEGIN");
     try{for(const candidate of candidates){if(candidate.publishDecision==="human_review"||candidate.riskLevel==="high"){this.db.prepare("UPDATE knowledge_candidates SET status='review',updated_at=? WHERE id=?").run(now,candidate.id);reviewCount++;continue;}
-        const record:any=this.db.prepare("SELECT * FROM knowledge_records WHERE project_id=? AND subject_key=?").get(requirement.projectId,candidate.subjectKey);
+        const record:any=this.db.prepare("SELECT * FROM knowledge_records WHERE project_id=? AND subject_key=?").get(projectId,candidate.subjectKey);
         if(record){const active:any=this.db.prepare("SELECT content FROM knowledge_record_versions WHERE record_id=? AND version=?").get(record.id,record.current_version);if(active?.content!==candidate.content){this.db.prepare("UPDATE knowledge_candidates SET status='conflict',updated_at=? WHERE id=?").run(now,candidate.id);conflictCount++;}else this.db.prepare("UPDATE knowledge_candidates SET status='published',updated_at=? WHERE id=?").run(now,candidate.id);continue;}
-        const recordId=randomUUID();this.db.prepare("INSERT INTO knowledge_records VALUES (?,?,?,?,?,'active',1,?,?)").run(recordId,requirement.projectId,candidate.subjectKey,candidate.layer,candidate.type,now,now);
+        const recordId=randomUUID();this.db.prepare("INSERT INTO knowledge_records VALUES (?,?,?,?,?,'active',1,?,?)").run(recordId,projectId,candidate.subjectKey,candidate.layer,candidate.type,now,now);
         this.db.prepare("INSERT INTO knowledge_record_versions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(randomUUID(),recordId,1,candidate.title,candidate.content,JSON.stringify(candidate.modules||[]),JSON.stringify(candidate.tags||[]),JSON.stringify(candidate.evidence||[]),requirementId,candidate.sourceStage,candidate.confidence,candidate.riskLevel,now);
         this.db.prepare("UPDATE knowledge_candidates SET status='published',updated_at=? WHERE id=?").run(now,candidate.id);publishedCount++;}
-      const status=conflictCount?"conflict":reviewCount?"review":"published";this.db.prepare("INSERT INTO knowledge_change_sets VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(requirement_id) DO UPDATE SET status=excluded.status,published_count=excluded.published_count,review_count=excluded.review_count,conflict_count=excluded.conflict_count,completed_at=excluded.completed_at").run(randomUUID(),requirementId,requirement.projectId,status,publishedCount,reviewCount,conflictCount,now,now);
+      const status=conflictCount?"conflict":reviewCount?"review":"published";this.db.prepare("INSERT INTO knowledge_change_sets VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(requirement_id) DO UPDATE SET status=excluded.status,published_count=excluded.published_count,review_count=excluded.review_count,conflict_count=excluded.conflict_count,completed_at=excluded.completed_at").run(randomUUID(),requirementId,projectId,status,publishedCount,reviewCount,conflictCount,now,now);
       this.db.exec("COMMIT");return {status,publishedCount,reviewCount,conflictCount,candidates:this.listKnowledgeCandidates(requirementId)};
     }catch(error){this.db.exec("ROLLBACK");throw error;}
   }

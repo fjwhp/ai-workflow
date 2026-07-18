@@ -1,10 +1,55 @@
+import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { WorkflowStore } from "./store.js";
 
 const stores: WorkflowStore[] = [];
-afterEach(() => stores.splice(0).forEach((store) => store.close()));
+const directories: string[] = [];
+afterEach(() => {
+  stores.splice(0).forEach((store) => store.close());
+  directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true }));
+});
 
 describe("WorkflowStore", () => {
+  it("opens with an empty fresh schema", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    expect(store.listRequirements()).toEqual([]);
+    expect(store.listProjects()).toEqual([]);
+  });
+
+  it("creates the multi-project tables without legacy requirement columns", () => {
+    const directory = mkdtempSync(join(tmpdir(), "workflow-store-")); directories.push(directory);
+    const path = join(directory, "workflow.db");
+    const store = new WorkflowStore(path); store.close();
+    const db = new DatabaseSync(path);
+    const requirementColumns = (db.prepare("PRAGMA table_info(requirements)").all() as { name: string }[]).map(({ name }) => name);
+    expect(requirementColumns).not.toContain("project_id");
+    expect(requirementColumns).not.toContain("integration_target_branch");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'requirement_projects'").get()).toBeTruthy();
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'requirement_project_snapshots'").get()).toBeTruthy();
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_requirement_projects_active_primary'").get()).toBeTruthy();
+    db.close();
+  });
+
+  it("rejects a second active primary project for one requirement", () => {
+    const directory = mkdtempSync(join(tmpdir(), "workflow-store-")); directories.push(directory);
+    const path = join(directory, "workflow.db");
+    const store = new WorkflowStore(path); store.close();
+    const db = new DatabaseSync(path);
+    const now = new Date().toISOString();
+    const insertProject = db.prepare("INSERT INTO projects (id,name,repo_path,default_branch,created_at) VALUES (?,?,?,?,?)");
+    insertProject.run("p1", "One", "/tmp/one", "main", now);
+    insertProject.run("p2", "Two", "/tmp/two", "main", now);
+    db.prepare("INSERT INTO requirements (id,code,title,business_problem,expected_outcome,priority,stage,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+      .run("r1", "REQ-0001", "Title", "Business problem", "Outcome", "medium", "prd", "ai_ready", now, now);
+    const insertAssociation = db.prepare("INSERT INTO requirement_projects (id,requirement_id,project_id,role,usage,delivery_required,module_mode,module_ids_json,position,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+    insertAssociation.run("rp1", "r1", "p1", "primary", "delivery", 1, "all", "[]", 0, "active", now, now);
+    expect(() => insertAssociation.run("rp2", "r1", "p2", "primary", "delivery", 1, "all", "[]", 1, "active", now, now)).toThrow(/UNIQUE constraint failed/);
+    db.close();
+  });
+
   it("persists candidates and publishes only safe non-conflicting knowledge",()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Memory Repo",repoPath:"/tmp/repo-memory",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
@@ -46,7 +91,7 @@ describe("WorkflowStore", () => {
     expect(store.listArtifacts(req.id)).toHaveLength(2);
   });
 
-  it("associates an existing requirement with a registered project", () => {
+  it("rejects the legacy single-project mutator until association methods are implemented", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = store.createProject({
       name: "Soto Dine", repoPath: "/tmp/soto-dine", defaultBranch: "prod",
@@ -56,9 +101,7 @@ describe("WorkflowStore", () => {
       title: "订单备注规则统一", businessProblem: "三个入口的备注规则存在不一致风险",
       expectedOutcome: "所有下单入口行为一致", priority: "medium"
     });
-    const updated = store.setRequirementProject(req.id, project.id);
-    expect(updated?.projectId).toBe(project.id);
-    expect(updated?.projectName).toBe("Soto Dine");
+    expect(() => store.setRequirementProject(req.id, project.id)).toThrow("REQUIREMENT_PROJECT_ASSOCIATIONS_NOT_IMPLEMENTED");
   });
 
   it("creates an immutable revision when a returned requirement is clarified", () => {
@@ -184,13 +227,12 @@ describe("WorkflowStore", () => {
     expect(store.getLatestIntegrationRun(req.id)?.id).toBe(run!.id);
   });
 
-  it("stores an integration target on the requirement without changing the project default",()=>{
+  it("rejects the legacy requirement-level integration target",()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Repo",repoPath:"/tmp/repo-target",defaultBranch:"prod",allowedCommands:[],sensitivePatterns:[]});
     const req=store.createRequirement({title:"接口",businessProblem:"缺少接口能力",expectedOutcome:"新增接口",priority:"medium",projectId:project.id});
     store.updateRequirementState(req.id,"integration","awaiting_merge");
-    const updated=store.setIntegrationTarget(req.id,"feature/0710-test");
-    expect(updated?.integrationTargetBranch).toBe("feature/0710-test");
+    expect(()=>store.setIntegrationTarget(req.id,"feature/0710-test")).toThrow("REQUIREMENT_PROJECT_ASSOCIATIONS_NOT_IMPLEMENTED");
     expect(store.getProject(project.id)?.defaultBranch).toBe("prod");
   });
 });

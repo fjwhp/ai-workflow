@@ -2,12 +2,17 @@ import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { WorkflowStore } from "./store.js";
 import { buildApp } from "./app.js";
+import { prepareCleanDatabase, writeDatabaseVersionMarker } from "./database-reset.js";
+
+const schemaVersion = "multi-project-v1";
 
 const dataDir = resolve(process.env.DATA_DIR || "data");
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 const databasePath = resolve(dataDir, "workflow.db");
 process.env.DATABASE_PATH = databasePath;
+await prepareCleanDatabase(databasePath, schemaVersion);
 const store = new WorkflowStore(databasePath);
+await writeDatabaseVersionMarker(databasePath, schemaVersion);
 store.interruptActiveStageRuns();
 store.interruptActiveIntegrationRuns();
 store.interruptActiveProjectKnowledge();
