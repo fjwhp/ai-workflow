@@ -51,8 +51,12 @@ export const requirementProjectInputSchema = z.object({
   if (value.usage === "delivery" && !value.projectVersionId) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["projectVersionId"], message: "Delivery projects must select a version" });
   }
-  if (value.usage === "context" && value.projectVersionId) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["projectVersionId"], message: "Context projects cannot select a version" });
+  if (value.usage === "context") {
+    for (const field of ["projectVersionId", "projectVersionName", "projectVersionBranch", "projectVersionStatus"] as const) {
+      if (value[field] !== undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: "Context projects cannot select a version" });
+      }
+    }
   }
   if (value.usage === "context" && value.deliveryRequired) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["deliveryRequired"], message: "Context projects cannot require delivery" });

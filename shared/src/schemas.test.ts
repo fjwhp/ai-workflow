@@ -144,6 +144,24 @@ describe("requirementProjectsInputSchema", () => {
     }
   });
 
+  it.each([
+    ["projectVersionName", "Release 1"],
+    ["projectVersionBranch", "feature/release-1"],
+    ["projectVersionStatus", "active"]
+  ] as const)("rejects %s on context associations", (field, value) => {
+    const result = requirementProjectsInputSchema.safeParse([
+      association({ [field]: value })
+    ]);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(expect.objectContaining({
+        path: [0, field],
+        message: "Context projects cannot select a version"
+      }));
+    }
+  });
+
   it("preserves optional project version display fields", () => {
     const input = requirementProjectsInputSchema.parse([
       association({
