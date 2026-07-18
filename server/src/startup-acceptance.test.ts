@@ -13,13 +13,13 @@ afterEach(async () => {
 });
 
 describe("real server startup acceptance", () => {
-  it("backs up incompatible data and serves an empty multi-project-v1 database", { timeout: 15_000 }, async () => {
+  it("backs up incompatible data and serves an empty project-versions-v1 database", { timeout: 15_000 }, async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "workflow-startup-acceptance-"));
     tempDirectories.push(dataDir);
     const databasePath = join(dataDir, "workflow.db");
     const oldBytes = Buffer.from("synthetic incompatible workflow database\n");
     await writeFile(databasePath, oldBytes);
-    await writeFile(`${databasePath}.schema-version`, "single-project-v1");
+    await writeFile(`${databasePath}.schema-version`, "multi-project-v1");
     const stdout = boundedLogs();
     const allLogs = boundedLogs();
     const child = spawn(process.execPath, [resolve("node_modules/tsx/dist/cli.mjs"), resolve("server/src/index.ts")], {
@@ -39,7 +39,7 @@ describe("real server startup acceptance", () => {
       const backupNames = (await readdir(dataDir)).filter((name) => /^workflow\.db\.backup-\d{4}-\d{2}-\d{2}T/.test(name) && !name.endsWith("-wal") && !name.endsWith("-shm"));
       expect(backupNames).toHaveLength(1);
       await expect(readFile(join(dataDir, backupNames[0]!))).resolves.toEqual(oldBytes);
-      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("multi-project-v1");
+      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("project-versions-v1");
     } finally {
       await stopChild(child);
     }

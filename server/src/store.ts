@@ -24,6 +24,30 @@ export class WorkflowStore {
         status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'archived')),
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS project_versions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        base_branch TEXT NOT NULL,
+        worktree_path TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL CHECK(status IN ('active','closed')),
+        head_commit TEXT NOT NULL,
+        pending_requirement_id TEXT,
+        pending_integration_run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        closed_at TEXT,
+        UNIQUE(project_id,name),
+        UNIQUE(project_id,branch),
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+      );
+      CREATE TABLE IF NOT EXISTS counters (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+      );
+      INSERT INTO counters (key,value)
+        SELECT 'requirement',0 WHERE NOT EXISTS (SELECT 1 FROM counters WHERE key = 'requirement');
       CREATE TABLE IF NOT EXISTS requirements (
         id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
         business_problem TEXT NOT NULL, expected_outcome TEXT NOT NULL, priority TEXT NOT NULL,
@@ -34,6 +58,7 @@ export class WorkflowStore {
         id TEXT PRIMARY KEY,
         requirement_id TEXT NOT NULL,
         project_id TEXT NOT NULL,
+        project_version_id TEXT,
         role TEXT NOT NULL CHECK(role IN ('primary', 'collaborator')),
         usage TEXT NOT NULL CHECK(usage IN ('context', 'delivery')),
         delivery_required INTEGER NOT NULL,
@@ -45,7 +70,8 @@ export class WorkflowStore {
         updated_at TEXT NOT NULL,
         UNIQUE(requirement_id, project_id),
         FOREIGN KEY(requirement_id) REFERENCES requirements(id),
-        FOREIGN KEY(project_id) REFERENCES projects(id)
+        FOREIGN KEY(project_id) REFERENCES projects(id),
+        FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
       );
       CREATE TABLE IF NOT EXISTS requirement_project_snapshots (
         id TEXT PRIMARY KEY,
@@ -56,12 +82,6 @@ export class WorkflowStore {
         superseded_at TEXT,
         created_at TEXT NOT NULL,
         UNIQUE(requirement_id, version),
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
-      );
-      CREATE TABLE IF NOT EXISTS requirement_integration_targets (
-        requirement_id TEXT PRIMARY KEY,
-        target_branch TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
         FOREIGN KEY(requirement_id) REFERENCES requirements(id)
       );
       CREATE TABLE IF NOT EXISTS stage_runs (
@@ -89,11 +109,13 @@ export class WorkflowStore {
       );
       CREATE TABLE IF NOT EXISTS executions (
         id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL,
-        project_id TEXT NOT NULL, branch TEXT NOT NULL, worktree_path TEXT NOT NULL,
+        project_id TEXT NOT NULL, project_version_id TEXT, branch TEXT NOT NULL, worktree_path TEXT NOT NULL,
+        base_commit TEXT,
         status TEXT NOT NULL, commands_json TEXT NOT NULL, diff_text TEXT NOT NULL,
         error TEXT, created_at TEXT NOT NULL, completed_at TEXT,
         FOREIGN KEY(requirement_id) REFERENCES requirements(id),
-        FOREIGN KEY(project_id) REFERENCES projects(id)
+        FOREIGN KEY(project_id) REFERENCES projects(id),
+        FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
       );
       CREATE TABLE IF NOT EXISTS requirement_revisions (
         id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, version INTEGER NOT NULL,
@@ -119,12 +141,14 @@ export class WorkflowStore {
         FOREIGN KEY(requirement_id) REFERENCES requirements(id)
       );
       CREATE TABLE IF NOT EXISTS integration_runs (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, project_id TEXT NOT NULL,
+        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, project_id TEXT NOT NULL, project_version_id TEXT,
         execution_id TEXT, evidence_id TEXT, status TEXT NOT NULL,
         source_branch TEXT NOT NULL, worktree_path TEXT NOT NULL, target_branch TEXT NOT NULL,
-        source_commit TEXT, target_commit TEXT, preflight_json TEXT NOT NULL,
+        source_commit TEXT, target_commit TEXT, pre_apply_head TEXT,
+        resolution_status TEXT, resolution_commit TEXT, preflight_json TEXT NOT NULL,
         commands_json TEXT NOT NULL DEFAULT '[]', error TEXT, created_at TEXT NOT NULL, completed_at TEXT,
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
+        FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+        FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
       );
       CREATE TABLE IF NOT EXISTS project_knowledge_versions (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL, version INTEGER NOT NULL, status TEXT NOT NULL,
@@ -201,14 +225,14 @@ export class WorkflowStore {
   createRequirement(input: RequirementInput) {
     const now = new Date().toISOString();
     const id = randomUUID();
-    const row = this.db.prepare("SELECT COUNT(*) AS count FROM requirements").get() as { count: number };
-    const code = `REQ-${String(row.count + 1).padStart(4, "0")}`;
     const association = validateRequirementProjects([{
-      projectId: input.primaryProjectId, role: "primary", usage: "delivery", deliveryRequired: true,
+      projectId: input.primaryProjectId, projectVersionId: input.primaryProjectVersionId,
+      role: "primary", usage: "delivery", deliveryRequired: true,
       moduleMode: "auto", moduleIds: [], position: 0
     }], { projects: this.projectValidationRows([input.primaryProjectId]) })[0]!;
     this.db.exec("BEGIN");
     try {
+      const code = this.nextRequirementCode();
       this.db.prepare(`INSERT INTO requirements
         (id, code, title, business_problem, expected_outcome, priority, stage, status, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, 'prd', 'ai_ready', ?, ?)`)
@@ -220,18 +244,20 @@ export class WorkflowStore {
     return this.getRequirement(id)!;
   }
 
+  private nextRequirementCode() {
+    const row = this.db.prepare(
+      "UPDATE counters SET value = value + 1 WHERE key = 'requirement' RETURNING value"
+    ).get() as { value: number };
+    return `REQ-${String(row.value).padStart(4, "0")}`;
+  }
+
   listRequirements() {
-    return this.db.prepare(`SELECT r.*, rit.target_branch AS integration_target_branch
-      FROM requirements r
-      LEFT JOIN requirement_integration_targets rit ON rit.requirement_id = r.id
-      ORDER BY r.created_at DESC`).all().map((row) => this.mapRequirementWithProjects(row as any));
+    return this.db.prepare("SELECT r.* FROM requirements r ORDER BY r.created_at DESC").all()
+      .map((row) => this.mapRequirementWithProjects(row as any));
   }
 
   getRequirement(id: string) {
-    const row = this.db.prepare(`SELECT r.*, rit.target_branch AS integration_target_branch
-      FROM requirements r
-      LEFT JOIN requirement_integration_targets rit ON rit.requirement_id = r.id
-      WHERE r.id = ?`).get(id);
+    const row = this.db.prepare("SELECT r.* FROM requirements r WHERE r.id = ?").get(id);
     return row ? this.mapRequirementWithProjects(row as any) : null;
   }
 
@@ -239,14 +265,6 @@ export class WorkflowStore {
     if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(id)) return null;
     if (!projectId || !this.db.prepare("SELECT id FROM projects WHERE id = ? AND status = 'active'").get(projectId)) return null;
     this.replaceRequirementProjects(id, [{ projectId, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0 }]);
-    return this.getRequirement(id);
-  }
-
-  setIntegrationTarget(id:string,branch:string): any {
-    if (!this.db.prepare("SELECT id FROM requirements WHERE id = ? AND stage = 'integration'").get(id)) return null;
-    const now = new Date().toISOString();
-    this.db.prepare(`INSERT INTO requirement_integration_targets (requirement_id, target_branch, updated_at) VALUES (?, ?, ?)
-      ON CONFLICT(requirement_id) DO UPDATE SET target_branch = excluded.target_branch, updated_at = excluded.updated_at`).run(id, branch, now);
     return this.getRequirement(id);
   }
 
@@ -749,7 +767,7 @@ function mapRequirement(row: any) {
   return {
     id: row.id, code: row.code, title: row.title, businessProblem: row.business_problem,
     expectedOutcome: row.expected_outcome, priority: row.priority, projectId: row.project_id ?? undefined,
-    projectName: row.project_name ?? undefined, version: row.version ?? 1, clarifications: row.clarifications ?? "", integrationTargetBranch:row.integration_target_branch??undefined,
+    projectName: row.project_name ?? undefined, version: row.version ?? 1, clarifications: row.clarifications ?? "",
     stage: row.stage, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at
   };
 }
