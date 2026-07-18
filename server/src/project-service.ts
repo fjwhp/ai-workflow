@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const MAX_METADATA_BYTES = 256 * 1024;
 const MAX_WORKSPACE_ENTRIES = 100;
+export const MAX_SCANNED_ENTRIES = 1000;
 
 export interface ProjectModule { id: string; name: string; path: string }
 export interface ProjectInspection {
@@ -53,8 +54,9 @@ async function detectWorkspaceModules(repoPath: string, packageJson: any): Promi
   if (!Array.isArray(patterns)) return [];
   const modules: ProjectModule[] = [];
   const seen = new Set<string>();
+  let scannedEntries = 0;
   for (const pattern of patterns.filter((item: unknown): item is string => typeof item === "string").sort()) {
-    if (modules.length >= MAX_WORKSPACE_ENTRIES - 1) break;
+    if (modules.length >= MAX_WORKSPACE_ENTRIES - 1 || scannedEntries >= MAX_SCANNED_ENTRIES) break;
     if (typeof pattern !== "string") continue;
     if (!pattern.includes("*")) {
       const module = moduleFromPath(pattern);
@@ -68,8 +70,9 @@ async function detectWorkspaceModules(repoPath: string, packageJson: any): Promi
     try {
       directory = await opendir(resolve(repoPath, parent));
       for await (const entry of directory) {
+        scannedEntries++;
         if (entry.isDirectory()) entries.push(entry.name);
-        if (entries.length >= MAX_WORKSPACE_ENTRIES - 1 - modules.length) break;
+        if (entries.length >= MAX_WORKSPACE_ENTRIES - 1 - modules.length || scannedEntries >= MAX_SCANNED_ENTRIES) break;
       }
     } catch { /* optional workspace hint */ }
     finally { await directory?.close().catch(() => undefined); }

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { inspectProjectRepository, readBoundedFile } from "./project-service.js";
+import { inspectProjectRepository, MAX_SCANNED_ENTRIES, readBoundedFile } from "./project-service.js";
 
 const exec = promisify(execFile);
 const directories: string[] = [];
@@ -92,6 +92,15 @@ describe("inspectProjectRepository", () => {
     expect(result.modules[0]).toEqual({ id: "root", name: "root", path: "." });
     expect(new Set(result.modules.map((item) => item.id)).size).toBe(result.modules.length);
     expect(result.modules.slice(1).map((item) => item.path)).toEqual([...result.modules.slice(1).map((item) => item.path)].sort());
+  });
+
+  it("stops workspace scanning after a global budget that counts regular files", async () => {
+    const files: Record<string, string> = { "package.json": JSON.stringify({ workspaces: ["first/*", "second/*"] }) };
+    for (let index = 0; index < MAX_SCANNED_ENTRIES; index++) files[`first/file-${String(index).padStart(4, "0")}.txt`] = "x";
+    files["second/late-module/package.json"] = "{}";
+    const repo = await createRepo(files);
+    const result = await inspectProjectRepository(repo, "main");
+    expect(result.modules).toEqual([{ id: "root", name: "root", path: "." }]);
   });
 
   it("returns structured invalid results for missing, nested, and branchless paths", async () => {
