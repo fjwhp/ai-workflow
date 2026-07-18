@@ -118,7 +118,9 @@ export async function buildApp(store: WorkflowStore) {
       if (runItem.stage === "coding") {
         if (!runItem.projectId) throw new Error("编码阶段必须先关联本地项目");
         if (!runProject) throw new Error("关联项目不存在");
-        const coding = await runCodexCoding({ requirement: runItem, artifacts: store.listArtifacts(runItem.id), project: runProject, reworkContext: runContext.reworkContext, onEvent: emit });
+        const projectContext = runContext.projectContext?.projects?.[0];
+        if (!projectContext) throw new Error("编码阶段缺少交付项目上下文");
+        const coding = await runCodexCoding({ requirement: runItem, artifacts: store.listArtifacts(runItem.id), project: runProject, projectContext, reworkContext: runContext.reworkContext, onEvent: emit });
         const conclusion = coding.diff ? "pass" : "return";
         const execution = store.addExecution({ requirementId: runItem.id, stage: runItem.stage, projectId: runProject.id, branch: coding.branch, worktreePath: coding.worktreePath, status: conclusion === "pass" ? "completed" : "needs_review", commands: [], diff: coding.diff, codexThreadId: coding.codexThreadId, events: coding.events, diagnostics: coding.diagnostics.join("\n"), completedAt: new Date().toISOString() });
         const snapshot = buildCodingEvidence({ diff: coding.diff, files: coding.files, additions: coding.additions, deletions: coding.deletions });

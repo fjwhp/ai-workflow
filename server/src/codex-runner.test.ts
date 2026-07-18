@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildCodexArgs, closeCodexInput, parseCodexEventLine, summarizeCodexEvents, type CodexEvent } from "./codex-runner.js";
+import { buildCodexArgs, buildCodingPrompt, closeCodexInput, parseCodexEventLine, summarizeCodexEvents, type CodexEvent } from "./codex-runner.js";
 
 describe("Codex JSONL events", () => {
   it("parses thread and agent message events", () => {
@@ -26,5 +26,15 @@ describe("Codex JSONL events", () => {
     let ended = false;
     closeCodexInput({ stdin: { end: () => { ended = true; } } } as any);
     expect(ended).toBe(true);
+  });
+
+  it("includes only the delivery project scope and knowledge in the coding prompt", () => {
+    const prompt = buildCodingPrompt({
+      requirement: { code: "REQ-1", title: "Orders" }, artifacts: [],
+      projectContext: { projectId: "orders", name: "Orders API", role: "collaborator", usage: "delivery", deliveryRequired: true, moduleMode: "selected", moduleIds: ["src/orders"], version: 4, sourceHead: "abc123", summary: "DELIVERY_FACT", entries: [{ path: "src/orders/service.ts", title: "Order service", content: "handles creation", tags: ["orders"] }], totalAvailable: 1, totalChars: 500, truncated: false, status: "ready" },
+      reworkContext: { note: "delivery only" }
+    });
+    expect(prompt).toContain("PROJECT_CONTEXT_JSON_BEGIN"); expect(prompt).toContain("src/orders"); expect(prompt).toContain("DELIVERY_FACT"); expect(prompt).toContain("abc123");
+    expect(prompt).not.toContain("SECOND_PROJECT_SENTINEL"); expect(prompt).not.toContain("repoPath");
   });
 });

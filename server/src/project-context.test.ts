@@ -62,6 +62,7 @@ describe("buildRequirementProjectContext", () => {
     expect(context.projects.every((project) => project.truncated && project.totalAvailable === 30)).toBe(true);
     expect(context.totalChars).toBeLessThanOrEqual(60_000);
     expect(context.projects.reduce((sum, project) => sum + JSON.stringify(project).length, 0)).toBeLessThanOrEqual(60_000);
+    expect(JSON.stringify(context.projects).length).toBeLessThanOrEqual(60_000);
     expect(context.truncated).toBe(true);
   });
 
@@ -104,5 +105,21 @@ describe("buildRequirementProjectContext", () => {
     await expect(buildRequirementProjectContext(store, requirement.id, "technical_design")).rejects.toMatchObject({ code: "PROJECT_KNOWLEDGE_BUILDING", projects: [{ projectId: primary.id, name: "Primary" }, { projectId: delivery.id, name: "Delivery" }] });
     for (let attempt = 0; attempt < 20 && !store.getLatestProjectKnowledge(primary.id); attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
     expect(store.getLatestProjectKnowledge(primary.id)).not.toBeNull();
+  });
+
+  it("strictly bounds metadata-heavy blocks using their actual serialized size", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject({ name: "Project".repeat(8_000), repoPath: process.cwd(), defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+    const requirement = store.createRequirement({ title: "Metadata", businessProblem: "Bound all project metadata", expectedOutcome: "Safe prompt", priority: "medium", primaryProjectId: project.id });
+    const moduleIds = Array.from({ length: 400 }, (_, index) => `src/${index}-${"m".repeat(120)}`);
+    ready(store, project.id, "summary".repeat(8_000), moduleIds.map((path, index) => ({ path, kind: "module", title: `Title-${index}-${"t".repeat(1_000)}`, content: "content".repeat(1_000), tags: Array.from({ length: 50 }, (_, tag) => `tag-${tag}-${"z".repeat(100)}`) })));
+    store.replaceRequirementProjects(requirement.id, [{ projectId: project.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "selected", moduleIds, position: 0 }]);
+
+    const context = await buildRequirementProjectContext(store, requirement.id, "coding");
+    const block = context.projects[0]!;
+    expect(block.projectId).toBe(project.id); expect(block.name.length).toBeGreaterThan(0); expect(block.truncated).toBe(true);
+    expect(JSON.stringify(block).length).toBeLessThanOrEqual(20_000);
+    expect(JSON.stringify(context.projects).length).toBeLessThanOrEqual(60_000);
+    expect(context.totalChars).toBe(JSON.stringify(block).length);
   });
 });
