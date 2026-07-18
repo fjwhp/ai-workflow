@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
+import { ApiError } from "./api.js";
 import {
+  archiveErrorMessage,
   filterProjects,
   initialSubmissionState,
   normalizeAllowedCommands,
   parseAllowedCommands,
   projectActions,
   projectHealth,
+  projectFieldErrors,
   projectValidationLabel,
   submissionReducer,
   validationAfterChange,
@@ -54,5 +57,16 @@ describe("project management helpers", () => {
     const form = { name: "Orders", repoPath: "/repo" };
     const busy = submissionReducer(initialSubmissionState(form), { type: "submit" });
     expect(submissionReducer(busy, { type: "failure", error: "重复仓库" })).toEqual({ form, submitting: false, error: "重复仓库" });
+  });
+
+  it("maps structured project API errors to repository fields", () => {
+    expect(projectFieldErrors(new ApiError("PROJECT_REPOSITORY_INVALID", "invalid", { defaultBranch: "missing" }, 400))).toEqual({ repoPath: "invalid", defaultBranch: "invalid", general: "" });
+    expect(projectFieldErrors(new ApiError("PROJECT_REPO_PATH_EXISTS", "duplicate", null, 409))).toEqual({ repoPath: "duplicate", defaultBranch: "", general: "" });
+    expect(projectFieldErrors(new ApiError("UNKNOWN", "unknown", null, 400))).toEqual({ repoPath: "", defaultBranch: "", general: "unknown" });
+  });
+
+  it("uses structured archive conflicts without localized message matching", () => {
+    expect(archiveErrorMessage(new ApiError("PROJECT_IN_ACTIVE_DELIVERY", "localized text can change", null, 409), "Orders")).toBe("无法归档“Orders”：项目正在用于活动交付，请先完成或停止相关需求。");
+    expect(archiveErrorMessage(new ApiError("UNKNOWN", "archive failed", null, 500), "Orders")).toBe("archive failed");
   });
 });
