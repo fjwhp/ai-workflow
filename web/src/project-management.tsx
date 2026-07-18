@@ -30,6 +30,18 @@ export function parseAllowedCommands(value: string): { commands: AllowedCommand[
   }
   return { commands, error: "" };
 }
+export function buildProjectMutationPayload(form: Form, commands: AllowedCommand[], validation: Validation, existingProject?: Pick<Project, "repoPath" | "defaultBranch">) {
+  const payload: Record<string, unknown> = {
+    name: form.name.trim(),
+    allowedCommands: commands,
+    sensitivePatterns: form.sensitivePatterns.split(/\r?\n/).map(item => item.trim()).filter(Boolean),
+  };
+  if (existingProject) payload.category = form.category || null;
+  else if (form.category) payload.category = form.category;
+  if (!existingProject || form.repoPath !== existingProject.repoPath) payload.repoPath = validation.result.repoPath;
+  if (!existingProject || form.defaultBranch !== existingProject.defaultBranch) payload.defaultBranch = form.defaultBranch.trim();
+  return payload;
+}
 export function filterProjects<T extends { status: ProjectStatus }>(projects: readonly T[], status: ProjectStatus) {
   const active = projects.filter(item => item.status === "active").length, archived = projects.length - active;
   return { list: projects.filter(item => item.status === status), active, archived, total: projects.length };
@@ -128,7 +140,7 @@ function ProjectEditor({ project, readOnly, validateOnOpen, onClose, onSaved }: 
   const change = (field: keyof Form, value: string) => { dispatch({ type: "change", form: { ...state.form, [field]: value } }); setValidation(current => validationAfterChange(current, field, value)); setErrors(current => ({ ...current, [field]: "", general: "" })); };
   const validate = async () => { const snapshot = { ...state.form }; setValidating(true); setErrors({ repoPath: "", defaultBranch: "", general: "" }); try { const result = await post<Inspection>("/projects/validate", { repoPath: snapshot.repoPath, defaultBranch: snapshot.defaultBranch }); setValidation({ repoPath: snapshot.repoPath, defaultBranch: snapshot.defaultBranch, result }); } catch (e: unknown) { setValidation(null); setErrors(projectFieldErrors(e)); } finally { setValidating(false); } };
   useEffect(() => { if (validateOnOpen && !readOnly && !initialValidationStarted.current) { initialValidationStarted.current = true; void validate(); } }, [validateOnOpen, readOnly]);
-  const save = async (event: React.FormEvent) => { event.preventDefault(); if (!shouldStartSubmission(state) || submittingRef.current) return; const snapshot = { ...state.form }, parsed = parseAllowedCommands(snapshot.allowedCommands); if (parsed.error) { setErrors({ repoPath: "", defaultBranch: "", general: parsed.error }); return; } if (!validation || validation.repoPath !== snapshot.repoPath || validation.defaultBranch !== snapshot.defaultBranch) { setErrors({ repoPath: "", defaultBranch: "", general: "请先验证当前仓库路径和默认分支" }); return; } submittingRef.current = true; dispatch({ type: "submit" }); try { const body: Record<string, unknown> = { name: snapshot.name.trim(), category: snapshot.category || null, allowedCommands: parsed.commands, sensitivePatterns: snapshot.sensitivePatterns.split(/\r?\n/).map(item => item.trim()).filter(Boolean) }; if (!project || snapshot.repoPath !== project.repoPath) body.repoPath = validation.result.repoPath; if (!project || snapshot.defaultBranch !== project.defaultBranch) body.defaultBranch = snapshot.defaultBranch.trim(); if (project) await patch(`/projects/${project.id}`, body); else await post("/projects", body); await onSaved(); } catch (e: unknown) { submittingRef.current = false; const next = projectFieldErrors(e); setErrors(next); dispatch({ type: "failure", error: next.general }); } };
+  const save = async (event: React.FormEvent) => { event.preventDefault(); if (!shouldStartSubmission(state) || submittingRef.current) return; const snapshot = { ...state.form }, parsed = parseAllowedCommands(snapshot.allowedCommands); if (parsed.error) { setErrors({ repoPath: "", defaultBranch: "", general: parsed.error }); return; } if (!validation || validation.repoPath !== snapshot.repoPath || validation.defaultBranch !== snapshot.defaultBranch) { setErrors({ repoPath: "", defaultBranch: "", general: "请先验证当前仓库路径和默认分支" }); return; } submittingRef.current = true; dispatch({ type: "submit" }); try { const body = buildProjectMutationPayload(snapshot, parsed.commands, validation, project || undefined); if (project) await patch(`/projects/${project.id}`, body); else await post("/projects", body); await onSaved(); } catch (e: unknown) { submittingRef.current = false; const next = projectFieldErrors(e); setErrors(next); dispatch({ type: "failure", error: next.general }); } };
   const busy = validating || state.submitting;
   return <AccessibleDialog className="project-editor" title={readOnly ? "项目详情" : project ? "编辑项目" : "新建项目"} subtitle={readOnly ? "归档项目为只读，历史和知识记录仍会保留" : "验证仓库后才能保存路径和分支配置"} titleId="project-editor-title" busy={busy} onClose={onClose}><form onSubmit={save}><fieldset disabled={readOnly || busy}>
     <div className="project-form-grid"><Field label="项目名称"><input required data-autofocus value={state.form.name} onChange={e => change("name", e.target.value)}/></Field><Field label="项目分类"><select value={state.form.category} onChange={e => change("category", e.target.value)}><option value="">未设置（使用检测结果）</option><option value="frontend">前端</option><option value="backend">后端</option><option value="fullstack">全栈</option><option value="library">类库</option><option value="other">其他</option></select></Field></div>

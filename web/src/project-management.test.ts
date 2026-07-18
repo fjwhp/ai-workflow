@@ -4,6 +4,7 @@ import {
   archiveErrorMessage,
   addBusyOperation,
   beginProjectDetails,
+  buildProjectMutationPayload,
   canCloseDialog,
   filterProjects,
   initialSubmissionState,
@@ -125,5 +126,28 @@ describe("project management helpers", () => {
   it("uses structured archive conflicts without localized message matching", () => {
     expect(archiveErrorMessage(new ApiError("PROJECT_IN_ACTIVE_DELIVERY", "localized text can change", null, 409), "Orders")).toBe("无法归档“Orders”：项目正在用于活动交付，请先完成或停止相关需求。");
     expect(archiveErrorMessage(new ApiError("UNKNOWN", "archive failed", null, 500), "Orders")).toBe("archive failed");
+  });
+
+  it("omits an unset category when creating and includes validated identity", () => {
+    const form = { name: " Orders ", repoPath: "/typed", defaultBranch: " main ", category: "", allowedCommands: "pnpm test", sensitivePatterns: ".env" };
+    const validation = { repoPath: "/typed", defaultBranch: " main ", result: { repoPath: "/canonical" } } as any;
+    expect(buildProjectMutationPayload(form, [{ command: "pnpm", argsPrefix: ["test"] }], validation)).toEqual({ name: "Orders", repoPath: "/canonical", defaultBranch: "main", allowedCommands: [{ command: "pnpm", argsPrefix: ["test"] }], sensitivePatterns: [".env"] });
+  });
+
+  it("sends an explicit category when creating", () => {
+    const form = { name: "Web", repoPath: "/repo", defaultBranch: "main", category: "frontend", allowedCommands: "", sensitivePatterns: "" };
+    expect(buildProjectMutationPayload(form, [], { repoPath: "/repo", defaultBranch: "main", result: { repoPath: "/repo" } } as any)).toMatchObject({ category: "frontend", repoPath: "/repo", defaultBranch: "main" });
+  });
+
+  it("clears category on update while omitting unchanged repository identity", () => {
+    const form = { name: "API", repoPath: "/repo", defaultBranch: "main", category: "", allowedCommands: "", sensitivePatterns: "" };
+    const existing = { repoPath: "/repo", defaultBranch: "main" } as any;
+    expect(buildProjectMutationPayload(form, [], { repoPath: "/repo", defaultBranch: "main", result: { repoPath: "/repo" } } as any, existing)).toEqual({ name: "API", category: null, allowedCommands: [], sensitivePatterns: [] });
+  });
+
+  it("includes only changed repository identity fields on update", () => {
+    const form = { name: "API", repoPath: "/new", defaultBranch: "dev", category: "backend", allowedCommands: "", sensitivePatterns: "" };
+    const payload = buildProjectMutationPayload(form, [], { repoPath: "/new", defaultBranch: "dev", result: { repoPath: "/canonical-new" } } as any, { repoPath: "/old", defaultBranch: "main" } as any);
+    expect(payload).toMatchObject({ repoPath: "/canonical-new", defaultBranch: "dev", category: "backend" });
   });
 });
