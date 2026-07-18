@@ -42,6 +42,16 @@ async function mainState(repoPath: string) {
   };
 }
 
+async function replaceWithForeignRepository(path: string, branch: string) {
+  await rm(path, { recursive: true, force: true });
+  await exec("git", ["init", "-b", branch, path]);
+  await git(path, "config", "user.email", "foreign@example.com");
+  await git(path, "config", "user.name", "Foreign");
+  await writeFile(join(path, "FOREIGN.md"), "foreign\n");
+  await git(path, "add", "--all");
+  await git(path, "commit", "-m", "foreign");
+}
+
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
@@ -50,16 +60,19 @@ describe("project version worktree lifecycle", () => {
   it("creates a missing branch from the base branch in its deterministic worktree", async () => {
     const { repoPath } = await setupRepository();
     const before = await mainState(repoPath);
+    const baseHead = await git(repoPath, "rev-parse", "prod");
     const inspected = await inspectProjectVersion({ repoPath, name: "2.3", branch: "feature/2.3", baseBranch: "prod" });
-    expect(inspected).toMatchObject({ mode: "create_branch" });
+    expect(inspected).toEqual({
+      valid: true, branch: "feature/2.3", baseBranch: "prod", mode: "create_branch", headCommit: baseHead
+    });
 
     const created = await createProjectVersionWorktree({
       repoPath, versionId: "version-23", branch: "feature/2.3", baseBranch: "prod", mode: "create_branch"
     });
 
     expect(created).toEqual({
-      worktreePath: resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "versions", "version-23"),
-      headCommit: await git(repoPath, "rev-parse", "prod"),
+      worktreePath: resolve(await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "versions", "version-23"),
+      headCommit: baseHead,
       createdBranch: true,
       createdWorktree: true
     });
@@ -70,8 +83,11 @@ describe("project version worktree lifecycle", () => {
   it("attaches an existing unmounted branch", async () => {
     const { repoPath } = await setupRepository();
     const before = await mainState(repoPath);
+    const branchHead = await git(repoPath, "rev-parse", "feature/2.2.1");
     expect(await inspectProjectVersion({ repoPath, name: "2.2.1", branch: "feature/2.2.1", baseBranch: "prod" }))
-      .toMatchObject({ mode: "attach_branch" });
+      .toEqual({
+        valid: true, branch: "feature/2.2.1", baseBranch: "prod", mode: "attach_branch", headCommit: branchHead
+      });
 
     const created = await createProjectVersionWorktree({
       repoPath, versionId: "version-221", branch: "feature/2.2.1", baseBranch: "prod", mode: "attach_branch"
@@ -85,8 +101,12 @@ describe("project version worktree lifecycle", () => {
   it("requires explicit confirmation before reusing an occupied external worktree", async () => {
     const { repoPath, externalWorktreePath } = await setupRepository();
     const before = await mainState(repoPath);
+    const branchHead = await git(externalWorktreePath, "rev-parse", "HEAD");
     const inspected = await inspectProjectVersion({ repoPath, name: "3.0", branch: "occupied/3.0", baseBranch: "prod" });
-    expect(inspected).toMatchObject({ mode: "reuse_worktree", existingWorktreePath: await realpath(externalWorktreePath) });
+    expect(inspected).toEqual({
+      valid: true, branch: "occupied/3.0", baseBranch: "prod", mode: "reuse_worktree",
+      headCommit: branchHead, existingWorktreePath: await realpath(externalWorktreePath)
+    });
 
     await expect(createProjectVersionWorktree({
       repoPath, versionId: "version-30", branch: "occupied/3.0", baseBranch: "prod",
@@ -163,6 +183,43 @@ describe("project version worktree lifecycle", () => {
     expect(await inspectVersionWorktree({ repoPath, worktreePath: created.worktreePath, branch: "feature/2.2.1" }))
       .toMatchObject({ valid: true, clean: false, status: "dirty" });
     expect(await inspectVersionWorktree({ repoPath, worktreePath: created.worktreePath, branch: "wrong/branch" }))
-      .toMatchObject({ valid: false, clean: false, status: "branch_mismatch" });
+      .toEqual({ valid: false, clean: false, headCommit: "", status: "branch_mismatch" });
+  });
+
+  it("rejects a foreign repository replacing a stale registered version worktree", async () => {
+    const { repoPath } = await setupRepository();
+    const before = await mainState(repoPath);
+    const created = await createProjectVersionWorktree({
+      repoPath, versionId: "stale", branch: "feature/2.2.1", baseBranch: "prod", mode: "attach_branch"
+    });
+    await replaceWithForeignRepository(created.worktreePath, "feature/2.2.1");
+
+    expect(await inspectVersionWorktree({ repoPath, worktreePath: created.worktreePath, branch: "feature/2.2.1" }))
+      .toEqual({ valid: false, clean: false, headCommit: "", status: "repository_mismatch" });
+    await expect(inspectProjectVersion({ repoPath, name: "2.2.1", branch: "feature/2.2.1", baseBranch: "prod" }))
+      .rejects.toThrow("PROJECT_VERSION_WORKTREE_IDENTITY_MISMATCH");
+    await expect(createProjectVersionWorktree({
+      repoPath, versionId: "stale", branch: "feature/2.2.1", baseBranch: "prod", mode: "reuse_worktree",
+      existingWorktreePath: created.worktreePath, reuseExistingWorktree: true
+    })).rejects.toThrow("PROJECT_VERSION_WORKTREE_IDENTITY_MISMATCH");
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("anchors managed version paths beside the canonical repo when invoked through a symlink", async () => {
+    const { root, repoPath } = await setupRepository();
+    const before = await mainState(repoPath);
+    const aliasParent = join(root, "aliases");
+    const aliasPath = join(aliasParent, "alias");
+    await mkdir(aliasParent);
+    await symlink(repoPath, aliasPath);
+
+    const created = await createProjectVersionWorktree({
+      repoPath: aliasPath, versionId: "alias-version", branch: "feature/2.2.1", baseBranch: "prod", mode: "attach_branch"
+    });
+    expect(created.worktreePath).toBe(resolve(
+      await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "versions", "alias-version"
+    ));
+    expect((await readdir(aliasParent)).sort()).toEqual(["alias"]);
+    expect(await mainState(repoPath)).toEqual(before);
   });
 });

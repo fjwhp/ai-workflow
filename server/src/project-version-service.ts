@@ -2,13 +2,10 @@ import { execFile } from "node:child_process";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { basename, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import type { ProjectVersionValidation } from "@ai-workflow/shared";
+import { inspectActualWorktreeIdentity } from "./repository.js";
 
 const execFileAsync = promisify(execFile);
-
-export interface ProjectVersionValidation {
-  mode: "create_branch" | "attach_branch" | "reuse_worktree";
-  existingWorktreePath?: string;
-}
 
 interface RegisteredWorktree {
   path: string;
@@ -60,7 +57,7 @@ async function validateRepo(repoPath: string) {
     if (error instanceof Error && error.message === "PROJECT_VERSION_REPOSITORY_INVALID") throw error;
     fail("PROJECT_VERSION_REPOSITORY_INVALID");
   }
-  return requested;
+  return canonical;
 }
 
 async function validateBranch(repoPath: string, branch: string, code: string) {
@@ -110,14 +107,25 @@ async function inspectCanonical(repoPath: string, branch: string, baseBranch: st
   if (!await localBranchExists(repoPath, baseBranch)) fail("PROJECT_VERSION_BASE_BRANCH_NOT_FOUND");
 
   const branchExists = await localBranchExists(repoPath, branch);
-  if (!branchExists) return { mode: "create_branch" };
+  if (!branchExists) {
+    const { stdout } = await git(repoPath, ["rev-parse", baseBranch]);
+    return { valid: true, branch, baseBranch, mode: "create_branch", headCommit: stdout.trim() };
+  }
   const wantedRef = `refs/heads/${branch}`;
   const occupied = await Promise.all((await registeredWorktrees(repoPath)).filter((item) => item.branch === wantedRef).map(canonicalWorktree));
-  if (!occupied.length) return { mode: "attach_branch" };
+  if (!occupied.length) {
+    const { stdout } = await git(repoPath, ["rev-parse", branch]);
+    return { valid: true, branch, baseBranch, mode: "attach_branch", headCommit: stdout.trim() };
+  }
   const projectRoot = await realpath(repoPath);
   if (occupied.some((item) => item.path === projectRoot)) fail("PROJECT_VERSION_BRANCH_IN_USE");
   if (occupied.length !== 1) fail("PROJECT_VERSION_BRANCH_IN_USE");
-  return { mode: "reuse_worktree", existingWorktreePath: occupied[0]!.path };
+  const identity = await inspectActualWorktreeIdentity(repoPath, occupied[0]!.path, branch);
+  if (!identity.valid) fail("PROJECT_VERSION_WORKTREE_IDENTITY_MISMATCH");
+  return {
+    valid: true, branch, baseBranch, mode: "reuse_worktree",
+    headCommit: identity.headCommit, existingWorktreePath: identity.path
+  };
 }
 
 export async function inspectProjectVersion(input: {
@@ -173,8 +181,9 @@ export async function createProjectVersionWorktree(input: {
     try { requested = await realpath(input.existingWorktreePath); }
     catch { fail("PROJECT_VERSION_WORKTREE_MISMATCH"); }
     if (requested !== inspected.existingWorktreePath) fail("PROJECT_VERSION_WORKTREE_MISMATCH");
-    const { stdout } = await git(requested, ["rev-parse", "HEAD"]);
-    return { worktreePath: requested, headCommit: stdout.trim(), createdBranch: false, createdWorktree: false };
+    const identity = await inspectActualWorktreeIdentity(repoPath, requested, input.branch);
+    if (!identity.valid) fail("PROJECT_VERSION_WORKTREE_IDENTITY_MISMATCH");
+    return { worktreePath: requested, headCommit: identity.headCommit, createdBranch: false, createdWorktree: false };
   }
 
   const worktreePath = await prepareManagedTarget(repoPath, input.versionId, await registeredWorktrees(repoPath));
@@ -208,15 +217,16 @@ export async function inspectVersionWorktree(input: {
   const found = registered.find((item) => item.path === worktreePath);
   if (!found) return { valid: false, clean: false, headCommit: "", status: "not_registered" };
   if (found.branch !== `refs/heads/${input.branch}`) {
-    return { valid: false, clean: false, headCommit: found.headCommit, status: "branch_mismatch" };
+    return { valid: false, clean: false, headCommit: "", status: "branch_mismatch" };
+  }
+  const identity = await inspectActualWorktreeIdentity(repoPath, worktreePath, input.branch);
+  if (identity.valid === false) {
+    return { valid: false, clean: false, headCommit: "", status: identity.status };
   }
   try {
-    const [{ stdout: head }, { stdout: status }] = await Promise.all([
-      git(worktreePath, ["rev-parse", "HEAD"]),
-      git(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"])
-    ]);
+    const { stdout: status } = await git(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]);
     const clean = status.length === 0;
-    return { valid: true, clean, headCommit: head.trim(), status: clean ? "ok" : "dirty" };
+    return { valid: true, clean, headCommit: identity.headCommit, status: clean ? "ok" : "dirty" };
   } catch {
     return { valid: false, clean: false, headCommit: "", status: "not_accessible" };
   }

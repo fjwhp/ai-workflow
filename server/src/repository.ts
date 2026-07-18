@@ -6,6 +6,10 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const protectedBranches=new Set(["prod","production","main","master"]);
 
+export type ActualWorktreeIdentity =
+  | { valid: true; path: string; branch: string; headCommit: string }
+  | { valid: false; status: "not_accessible" | "repository_mismatch" | "branch_mismatch" };
+
 export function isProtectedBranch(branch:string){return protectedBranches.has(branch.toLowerCase());}
 
 export async function getLocalBranches(repoPath:string){
@@ -27,6 +31,41 @@ export async function validateRepository(repoPath: string) {
     return await realpath(stdout.trim()) === actualPath;
   } catch {
     return false;
+  }
+}
+
+async function canonicalGitCommonDir(repoOrWorktreePath: string) {
+  const { stdout } = await execFileAsync("git", ["-C", repoOrWorktreePath, "rev-parse", "--git-common-dir"]);
+  return realpath(resolve(repoOrWorktreePath, stdout.trim()));
+}
+
+export async function inspectActualWorktreeIdentity(
+  repoPath: string,
+  candidatePath: string,
+  expectedBranch: string
+): Promise<ActualWorktreeIdentity> {
+  let canonicalCandidate: string;
+  try { canonicalCandidate = await realpath(resolve(candidatePath)); }
+  catch { return { valid: false, status: "not_accessible" }; }
+  try {
+    const [{ stdout: topLevel }, repoCommonDir, candidateCommonDir] = await Promise.all([
+      execFileAsync("git", ["-C", canonicalCandidate, "rev-parse", "--show-toplevel"]),
+      canonicalGitCommonDir(repoPath),
+      canonicalGitCommonDir(canonicalCandidate)
+    ]);
+    if (await realpath(resolve(canonicalCandidate, topLevel.trim())) !== canonicalCandidate) {
+      return { valid: false, status: "repository_mismatch" };
+    }
+    if (candidateCommonDir !== repoCommonDir) return { valid: false, status: "repository_mismatch" };
+    const [{ stdout: branch }, { stdout: head }] = await Promise.all([
+      execFileAsync("git", ["-C", canonicalCandidate, "symbolic-ref", "--quiet", "HEAD"]),
+      execFileAsync("git", ["-C", canonicalCandidate, "rev-parse", "HEAD"])
+    ]);
+    const actualBranch = branch.trim();
+    if (actualBranch !== `refs/heads/${expectedBranch}`) return { valid: false, status: "branch_mismatch" };
+    return { valid: true, path: canonicalCandidate, branch: actualBranch, headCommit: head.trim() };
+  } catch {
+    return { valid: false, status: "not_accessible" };
   }
 }
 
@@ -63,7 +102,7 @@ async function requirementRepoPath(repoPath: string) {
     if (error instanceof Error && error.message === "REPOSITORY_INVALID") throw error;
     throw new Error("REPOSITORY_INVALID");
   }
-  return requested;
+  return canonical;
 }
 
 async function validateLocalBranch(repoPath: string, branch: string, invalidCode: string, missingCode: string) {
@@ -126,10 +165,12 @@ async function findRegisteredWorktree(repoPath: string, branch: string, managedR
     if (error instanceof Error && error.message === "REQUIREMENT_WORKTREE_PATH_ESCAPE") throw error;
   }
   if (!isInside(canonicalRoot, canonicalPath)) throw new Error("REQUIREMENT_WORKTREE_OUTSIDE_MANAGED_ROOT");
+  const identity = await inspectActualWorktreeIdentity(repoPath, canonicalPath, branch);
+  if (!identity.valid) throw new Error("REQUIREMENT_WORKTREE_IDENTITY_MISMATCH");
   const deterministicPath = resolve(managedRoot, branch.slice("ai/".length));
   let returnedPath = canonicalPath;
   try { if (await realpath(deterministicPath) === canonicalPath) returnedPath = deterministicPath; } catch { /* use registered path */ }
-  return { ...matches[0]!, path: returnedPath };
+  return { ...matches[0]!, path: returnedPath, baseCommit: identity.headCommit };
 }
 
 export async function createOrReuseRequirementWorktree(repoPath: string, baseBranch: string, requirementCode: string) {

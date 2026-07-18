@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -40,6 +40,13 @@ describe("local integration branches",()=>{
 
 async function git(path: string, ...args: string[]) { return (await exec("git", ["-C", path, ...args])).stdout.trim(); }
 
+async function replaceWithForeignRepository(path: string, branch: string) {
+  await rm(path, { recursive: true, force: true });
+  await exec("git", ["init", "-b", branch, path]);
+  await git(path, "config", "user.email", "foreign@example.com"); await git(path, "config", "user.name", "Foreign");
+  await writeFile(join(path, "FOREIGN.md"), "foreign\n"); await git(path, "add", "--all"); await git(path, "commit", "-m", "foreign");
+}
+
 async function setupVersionRepository() {
   const root = await mkdtemp(join(tmpdir(), "workflow-requirements-")); dirs.push(root);
   const repoPath = join(root, "project");
@@ -66,7 +73,7 @@ describe("requirement worktree lifecycle", () => {
     const first = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0001");
     expect(first).toEqual({
       branch: "ai/REQ-0001",
-      worktreePath: resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "requirements", "REQ-0001"),
+      worktreePath: resolve(await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "requirements", "REQ-0001"),
       baseCommit: versionHead,
       reused: false
     });
@@ -122,5 +129,32 @@ describe("requirement worktree lifecycle", () => {
     await expect(createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0005"))
       .rejects.toThrow("REQUIREMENT_WORKTREE_PATH_ESCAPE");
     expect(await readdir(outside)).toEqual([]);
+  });
+
+  it("rejects a foreign repository replacing a stale registered requirement worktree", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const before = await mainState(repoPath);
+    const created = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0006");
+    await replaceWithForeignRepository(created.worktreePath, "ai/REQ-0006");
+
+    await expect(createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0006"))
+      .rejects.toThrow("REQUIREMENT_WORKTREE_IDENTITY_MISMATCH");
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("anchors managed requirement paths beside the canonical repo when invoked through a symlink", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const before = await mainState(repoPath);
+    const aliasParent = join(root, "aliases");
+    const aliasPath = join(aliasParent, "alias");
+    await mkdir(aliasParent);
+    await symlink(repoPath, aliasPath);
+
+    const created = await createOrReuseRequirementWorktree(aliasPath, "feature/2.2.1", "REQ-0007");
+    expect(created.worktreePath).toBe(resolve(
+      await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "requirements", "REQ-0007"
+    ));
+    expect((await readdir(aliasParent)).sort()).toEqual(["alias"]);
+    expect(await mainState(repoPath)).toEqual(before);
   });
 });
