@@ -2,12 +2,66 @@ import { z } from "zod";
 import { workflowStages, workflowStatuses } from "./domain.js";
 
 export const prioritySchema = z.enum(["low", "medium", "high", "urgent"]);
+
+const nonEmptyIdSchema = z.string().trim().min(1);
+const allowedCommandSchema = z.object({
+  command: z.string().trim().min(1),
+  argsPrefix: z.array(z.string()).optional()
+});
+
+export const projectInputSchema = z.object({
+  name: z.string().trim().min(1),
+  repoPath: z.string().trim().min(1),
+  defaultBranch: z.string().trim().min(1),
+  allowedCommands: z.array(allowedCommandSchema),
+  sensitivePatterns: z.array(z.string()),
+  category: z.string().trim().min(1).optional()
+});
+
+export const projectUpdateSchema = projectInputSchema.partial().refine(
+  (value) => Object.values(value).some((field) => field !== undefined),
+  { message: "Project update must include at least one field" }
+);
+
+export const requirementProjectInputSchema = z.object({
+  projectId: nonEmptyIdSchema,
+  role: z.enum(["primary", "collaborator"]),
+  usage: z.enum(["context", "delivery"]),
+  deliveryRequired: z.boolean(),
+  moduleMode: z.enum(["auto", "all", "selected"]),
+  moduleIds: z.array(nonEmptyIdSchema),
+  position: z.number().int().nonnegative()
+}).superRefine((value, ctx) => {
+  if (value.usage === "context" && value.deliveryRequired) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["deliveryRequired"], message: "Context projects cannot require delivery" });
+  }
+  if (value.moduleMode === "selected" && value.moduleIds.length === 0) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["moduleIds"], message: "Selected mode requires modules" });
+  }
+  if (value.moduleMode !== "selected" && value.moduleIds.length > 0) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["moduleIds"], message: "Only selected mode can specify modules" });
+  }
+  if (new Set(value.moduleIds).size !== value.moduleIds.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["moduleIds"], message: "Module IDs must be unique" });
+  }
+});
+
+export const requirementProjectsInputSchema = z.array(requirementProjectInputSchema).superRefine((items, ctx) => {
+  if (items.filter((item) => item.role === "primary").length !== 1) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Exactly one primary project is required" });
+  }
+  const projectIds = items.map((item) => item.projectId);
+  if (new Set(projectIds).size !== projectIds.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Project IDs must be unique" });
+  }
+});
+
 export const requirementInputSchema = z.object({
   title: z.string().trim().min(2).max(120),
   businessProblem: z.string().trim().min(10),
   expectedOutcome: z.string().trim().min(4),
   priority: prioritySchema.default("medium"),
-  projectId: z.string().optional()
+  primaryProjectId: nonEmptyIdSchema
 });
 
 export const findingSchema = z.object({
@@ -50,5 +104,8 @@ export const requirementSchema = requirementInputSchema.extend({
 
 export type Requirement = z.infer<typeof requirementSchema>;
 export type RequirementInput = z.infer<typeof requirementInputSchema>;
+export type ProjectInput = z.infer<typeof projectInputSchema>;
+export type ProjectUpdate = z.infer<typeof projectUpdateSchema>;
+export type RequirementProjectInput = z.infer<typeof requirementProjectInputSchema>;
 export type AiArtifact = z.infer<typeof aiArtifactSchema>;
 export type ProductArtifact = z.infer<typeof productArtifactSchema>;

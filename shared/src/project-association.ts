@@ -1,0 +1,29 @@
+export type ProjectRole = "primary" | "collaborator";
+export type ProjectUsage = "context" | "delivery";
+export type ModuleMode = "auto" | "all" | "selected";
+
+export interface RequirementProject {
+  id: string;
+  requirementId: string;
+  projectId: string;
+  projectName?: string;
+  role: ProjectRole;
+  usage: ProjectUsage;
+  deliveryRequired: boolean;
+  moduleMode: ModuleMode;
+  moduleIds: string[];
+  position: number;
+  status: "active" | "archived";
+  createdAt: string;
+  updatedAt: string;
+}
+
+export function selectPrimaryProject(items: RequirementProject[]): RequirementProject | undefined {
+  return items.find((item) => item.status === "active" && item.role === "primary");
+}
+
+export function selectDeliveryProjects(items: RequirementProject[]): RequirementProject[] {
+  return items
+    .filter((item) => item.status === "active" && item.usage === "delivery")
+    .sort((left, right) => left.position - right.position);
+}
