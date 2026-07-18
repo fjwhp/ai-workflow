@@ -39,7 +39,7 @@ export async function buildApp(store: WorkflowStore) {
   app.post("/api/requirements", async (req, reply) => {
     const parsed = requirementInputSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "VALIDATION_ERROR", issues: parsed.error.issues });
-    return reply.code(201).send(store.createRequirement(parsed.data));
+    try{return reply.code(201).send(store.createRequirement(parsed.data));}catch(error){return sendDomainError(reply,error);}
   });
   app.get("/api/requirements/:id", async (req: any, reply) => {
     const item = store.getRequirement(req.params.id);
@@ -74,8 +74,7 @@ export async function buildApp(store: WorkflowStore) {
     if (!store.getRequirement(req.params.id)) return reply.code(404).send({ error: "NOT_FOUND" });
     if (!projectId) return reply.code(400).send({ error: "VALIDATION_ERROR", message: "必须选择项目" });
     try {
-      store.replaceRequirementProjects(req.params.id, [{projectId,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]);
-      return store.getRequirement(req.params.id);
+      return applyRequirementProjects(store,req.params.id,[{projectId,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]);
     } catch (error) { return sendDomainError(reply,error); }
   });
   app.get("/api/requirements/:id/projects",async(req:any,reply)=>{
@@ -85,12 +84,8 @@ export async function buildApp(store: WorkflowStore) {
   app.put("/api/requirements/:id/projects",async(req:any,reply)=>{
     if(!store.getRequirement(req.params.id))return reply.code(404).send({error:"NOT_FOUND"});
     const parsed=requirementProjectsInputSchema.safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:"VALIDATION_ERROR",issues:parsed.error.issues});
-    const before=store.listRequirementProjects(req.params.id);
     try{
-      const projects=store.replaceRequirementProjects(req.params.id,parsed.data);
-      const material=hasMaterialAssociationChange(before,projects);
-      const invalidated=material&&store.invalidateTechnicalDesignForProjectChange(req.params.id);
-      return {projects,snapshot:store.getRequirementProjectSnapshot(req.params.id),materialChange:material,technicalDesignInvalidated:Boolean(invalidated)};
+      return applyRequirementProjects(store,req.params.id,parsed.data);
     }catch(error){return sendDomainError(reply,error);}
   });
   app.post("/api/requirements/:id/run", async (req: any, reply) => {
@@ -341,6 +336,12 @@ export async function buildApp(store: WorkflowStore) {
 function stageLabel(stage: string) { return stage.replaceAll("_", " "); }
 
 function invalidRepository(reply:any,details:any){return reply.code(400).send({error:"PROJECT_REPOSITORY_INVALID",message:details.warnings?.[0]||"项目仓库无效",details});}
+function applyRequirementProjects(store:WorkflowStore,requirementId:string,inputs:any[]){
+  const before=store.listRequirementProjects(requirementId),projects=store.replaceRequirementProjects(requirementId,inputs);
+  const materialChange=hasMaterialAssociationChange(before,projects);
+  const technicalDesignInvalidated=materialChange&&store.invalidateTechnicalDesignForProjectChange(requirementId);
+  return {requirement:store.getRequirement(requirementId),projects,snapshot:store.getRequirementProjectSnapshot(requirementId),materialChange,technicalDesignInvalidated:Boolean(technicalDesignInvalidated)};
+}
 function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
 
 export function resolveReusableSourceCommit(run:any,evidence:any,targetBranch:string){

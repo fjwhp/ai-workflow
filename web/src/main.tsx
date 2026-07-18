@@ -18,7 +18,7 @@ import { productArtifactView } from "./product-artifact-view.js";
 import { projectKnowledgeView } from "./project-knowledge-view.js";
 import { filterRequirements, navigationTarget, type QueueFilter } from "./navigation-view.js";
 
-type Detail = Requirement & { projectName?: string; version?: number; clarifications?: string; artifacts: any[]; approvals: any[]; executions?: any[]; revisions?: any[]; runs?: StageRun[]; codingEvidence?: any; reworkContext?: any; humanOverride?: any; integrationRun?: any;knowledgeChanges?:any };
+type Detail = Requirement & { projectId?: string; projectName?: string; version?: number; clarifications?: string; artifacts: any[]; approvals: any[]; executions?: any[]; revisions?: any[]; runs?: StageRun[]; codingEvidence?: any; reworkContext?: any; humanOverride?: any; integrationRun?: any;knowledgeChanges?:any };
 type Page = "dashboard" | "requirements" | "projects" | "settings";
 
 function App() {
