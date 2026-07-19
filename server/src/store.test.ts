@@ -342,6 +342,7 @@ describe("WorkflowStore", () => {
     expect(first.associations[0]!.projectVersionHead).toBe("fixture-head");
     expect(first.associations[0]!.projectVersionWorktreePath).toBe(`/tmp/requirement-version-${project.id}`);
     store.updateProjectVersionHead(version.id, "new-head");
+    store.supersedeRequirementProjectSnapshot(req.id);
     store.replaceRequirementProjects(req.id, [{ projectId: project.id, role: "primary", usage: "context", deliveryRequired: false, moduleMode: "auto", moduleIds: [], position: 4 }]);
     const second = store.createRequirementProjectSnapshot(req.id);
     expect(first).toMatchObject({ version: 1, status: "active" });
@@ -443,7 +444,7 @@ describe("WorkflowStore", () => {
 
   it("persists gate configuration with defaults", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
-    expect(store.getGateConfig()).toEqual({ autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: ["implementation"] });
+    expect(store.getGateConfig()).toEqual({ autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: [] });
     store.updateGateConfig({ autoTransitionEnabled: false, confidenceThreshold: 0.9, mandatoryHumanStages: ["implementation"] });
     expect(store.getGateConfig().confidenceThreshold).toBe(0.9);
     expect(store.getGateConfig().autoTransitionEnabled).toBe(false);

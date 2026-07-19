@@ -7,10 +7,12 @@ export type GateResult = { decision: GateDecision; reasons: string[] };
 export const defaultGateConfig: GateConfig = {
   autoTransitionEnabled: true,
   confidenceThreshold: 0.85,
-  mandatoryHumanStages: ["implementation"]
+  mandatoryHumanStages: []
 };
 
 export function evaluateGate(stage: WorkflowStage, artifact: any, config: GateConfig): GateResult {
+  // Overall acceptance is a separate server workflow; acceptance_delivery is only a delivery-unit phase.
+  if (stage === "solution_design") return { decision: "human_review", reasons: ["solution_design 是不可配置的人工阶段"] };
   if (!config.autoTransitionEnabled) return { decision: "human_review", reasons: ["自动流转已关闭"] };
   if (config.mandatoryHumanStages.includes(stage)) return { decision: "human_review", reasons: [`${stage} 是强制人工阶段`] };
   const findings = Array.isArray(artifact?.findings) ? artifact.findings : [];

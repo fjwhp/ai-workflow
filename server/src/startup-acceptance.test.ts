@@ -44,7 +44,7 @@ describe("real server startup acceptance", () => {
       await expect(getJson(baseUrl, "/api/projects")).resolves.toEqual([]);
       await expect(getJson(baseUrl, "/api/requirements")).resolves.toEqual([]);
       await expect(getJson(baseUrl, "/api/settings/gates")).resolves.toMatchObject({
-        mandatoryHumanStages: ["implementation"]
+        mandatoryHumanStages: []
       });
       const backupNames = (await readdir(dataDir)).filter((name) => /^workflow\.db\.backup-\d{4}-\d{2}-\d{2}T/.test(name) && !name.endsWith("-wal") && !name.endsWith("-shm"));
       expect(backupNames).toHaveLength(1);

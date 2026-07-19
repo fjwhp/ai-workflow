@@ -10,12 +10,12 @@ describe("version application view", () => {
   const currentVersion = { projectId: "api", usage: "delivery", status: "active", projectVersionId: "current-version" };
   const frozenVersion = { projectId: "api", usage: "delivery", status: "active", projectVersionId: "frozen-version", projectVersionName: "2.2.1" };
 
-  it("keeps a requirement without a snapshot on the legacy path when current projects have no version", () => {
-    expect(requirementApplicationContext({ projects: [{ projectId: "api", usage: "delivery", status: "active" }] })).toEqual({ mode: "legacy", target: null });
+  it("requires a frozen snapshot when current projects have no version", () => {
+    expect(requirementApplicationContext({ projects: [{ projectId: "api", usage: "delivery", status: "active" }] })).toEqual({ mode: "versioned", target: null });
   });
 
-  it("keeps a requirement without a snapshot on the legacy path even when current projects have a version", () => {
-    expect(requirementApplicationContext({ projects: [currentVersion] })).toEqual({ mode: "legacy", target: null });
+  it("does not fall back to mutable projects when a snapshot is missing", () => {
+    expect(requirementApplicationContext({ projects: [currentVersion] })).toEqual({ mode: "versioned", target: null });
   });
 
   it("uses only the active snapshot association as the frozen version target", () => {

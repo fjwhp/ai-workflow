@@ -323,6 +323,7 @@ describe("project version persistence", () => {
     const requirement = store.createRequirement(requirementInput(project.id, firstVersion.id, "Version history"));
     const snapshot = store.createRequirementProjectSnapshot(requirement.id);
 
+    store.supersedeRequirementProjectSnapshot(requirement.id);
     store.replaceRequirementProjects(requirement.id, [{
       projectId: project.id, projectVersionId: secondVersion.id, role: "primary", usage: "delivery",
       deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0
@@ -340,7 +341,8 @@ describe("project version persistence", () => {
     expect(store.listVersionRequirements(firstVersion.id).map((item) => item.id)).toEqual([requirement.id]);
     expect(store.listVersionRequirements(secondVersion.id).map((item) => item.id)).toEqual([requirement.id]);
     expect(snapshot.associations[0]).toMatchObject({ projectVersionId: firstVersion.id, projectVersionHead: "head-1.0.0" });
-    expect(store.getRequirementProjectSnapshot(requirement.id)?.associations[0]).toMatchObject({
+    expect(store.getRequirementProjectSnapshot(requirement.id)).toBeNull();
+    expect(store.listRequirementProjectSnapshots(requirement.id)[0]?.associations[0]).toMatchObject({
       projectVersionId: firstVersion.id, projectVersionHead: "head-1.0.0"
     });
   });

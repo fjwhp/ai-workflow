@@ -169,14 +169,11 @@ type VersionProject = {
 
 const terminalRequirementStatuses = new Set(["completed", "closed", "cancelled"]);
 const stageLabels: Record<string, string> = {
-  discovery: "发现",
-  product: "产品",
-  design: "设计",
-  coding: "编码",
-  code_review: "评审",
-  testing: "测试",
-  acceptance: "验收",
-  integration: "集成",
+  definition: "需求定义",
+  solution_design: "方案设计",
+  implementation: "实现",
+  quality_verification: "质量验证",
+  acceptance_delivery: "验收交付",
 };
 
 function versionIdentity(values: VersionFormState["values"]) {

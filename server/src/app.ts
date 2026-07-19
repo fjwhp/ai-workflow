@@ -110,6 +110,7 @@ export async function buildApp(store: WorkflowStore) {
     if(store.hasPendingVersionApplication(item.id))return sendDomainError(reply,new Error("PROJECT_VERSION_APPLICATION_PENDING"));
     const existing = store.listStageRuns(item.id, item.stage).find((run: any) => run.status === "running");
     if (existing) return reply.code(409).send({ error: "RUN_ALREADY_ACTIVE", message: "当前阶段已有 AI 正在执行" });
+    if(item.status!=="ai_ready")return reply.code(409).send({error:"REQUIREMENT_RUN_NOT_READY",message:"当前需求状态不能启动 AI"});
     const associatedProjects=(item.projects??[]).map((association:any)=>store.getProject(association.projectId)).filter(Boolean);
     const sensitivePatterns=[...new Set(associatedProjects.flatMap((associated:any)=>associated.sensitivePatterns??[]))] as string[];
     const reworkContext=item.status==="returned"?store.getLatestReworkContext(item.id):null;
@@ -128,10 +129,9 @@ export async function buildApp(store: WorkflowStore) {
     }
     const model = process.env.OPENAI_MODEL || "gpt-5.5";
     let run:any;
-    try{run=store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: context });}
+    try{run=store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: context, expectedRequirementUpdatedAt:item.updatedAt, expectedRequirementStatus:item.status, expectedRequirementProjectIds:(item.projects??[]).map((project:any)=>project.id) });}
     catch(error){return sendDomainError(reply,error);}
     for(const block of context.projectContext?.projects??[])store.appendStageRunEvent(run.id,"knowledge.retrieved",{projectId:block.projectId,version:block.version,sourceHead:block.sourceHead,paths:block.entries.map((entry:any)=>entry.path),totalAvailable:block.totalAvailable,budgetMaxChars:context.projectContext.budgetMaxChars,totalChars:block.totalChars,contextTotalChars:context.projectContext.totalChars,truncated:block.truncated});
-    store.updateRequirementState(item.id, item.stage, "ai_running");
     void executeRun(run.id, item, context, sensitivePatterns);
     return reply.code(202).send(run);
 
@@ -161,7 +161,6 @@ export async function buildApp(store: WorkflowStore) {
     } catch (error) {
       const message = error instanceof Error ? error.message : "AI 执行失败";
       store.failStageRun(runId, redactSensitive(message,patterns));
-      store.updateRequirementState(runItem.id, runItem.stage, "ai_ready");
     }
     }
   });
@@ -342,7 +341,7 @@ function applyRequirementProjects(store:WorkflowStore,requirementId:string,input
   const result=store.replaceRequirementProjectsAndInvalidate(requirementId,inputs);
   return {requirement:store.getRequirement(requirementId),...result,snapshot:store.getRequirementProjectSnapshot(requirementId)};
 }
-function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_VERSION_APPLICATION_PENDING")return reply.code(409).send({error:message,message:"版本应用处理中，不能修改需求或项目关联"});if(message==="PROJECT_VERSION_APPLICATION_NOT_NEXT")return reply.code(409).send({error:message,message:"当前需求尚未轮到应用"});if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});if(["RUN_ALREADY_ACTIVE","REQUIREMENT_CHANGED_DURING_RUN_PREPARATION","PROJECT_CHANGED_DURING_RUN_PREPARATION","PROJECT_IN_ACTIVE_EXECUTION","REQUIREMENT_VERSION_REQUIRED","REQUIREMENT_VERSION_PROJECT_MISMATCH","PROJECT_VERSION_NOT_ACTIVE","PROJECT_ARCHIVED","PROJECT_VERSION_APPLICATION_BUSY","VERSION_APPLICATION_NOT_ALLOWED","PROJECT_VERSION_APPLICATION_FAILED","VERSION_APPLICATION_RETEST_BUSY","PROJECT_VERSION_APPLICATION_MISMATCH","REQUIREMENT_APPROVAL_STATE_CHANGED","REQUIREMENT_APPROVAL_NOT_READY"].includes(message))return reply.code(409).send({error:message,message});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
+function sendDomainError(reply:any,error:unknown){const message=error instanceof Error?error.message:"VALIDATION_ERROR";if(message==="PROJECT_VERSION_APPLICATION_PENDING")return reply.code(409).send({error:message,message:"版本应用处理中，不能修改需求或项目关联"});if(message==="PROJECT_VERSION_APPLICATION_NOT_NEXT")return reply.code(409).send({error:message,message:"当前需求尚未轮到应用"});if(message==="PROJECT_REPO_PATH_EXISTS")return reply.code(409).send({error:message,message:"仓库路径已被其他项目使用"});if(message==="REQUIREMENT_NOT_FOUND")return reply.code(404).send({error:"NOT_FOUND"});if(["PROJECT_NOT_FOUND","PROJECT_NOT_ACTIVE","MODULE_NOT_FOUND","MODULE_INDEX_REQUIRED","MODULE_ID_INVALID"].includes(message))return reply.code(400).send({error:"VALIDATION_ERROR",message});if(message==="MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED")return reply.code(409).send({error:message,message:"多项目交付执行将在第二阶段提供"});if(message==="REQUIREMENT_DELIVERY_PLAN_FROZEN")return reply.code(409).send({error:message,message:"交付计划已冻结，不能修改项目、版本或模块范围"});if(["RUN_ALREADY_ACTIVE","REQUIREMENT_RUN_NOT_READY","REQUIREMENT_AI_STAGE_UNSUPPORTED","REQUIREMENT_CHANGED_DURING_RUN_PREPARATION","PROJECT_CHANGED_DURING_RUN_PREPARATION","PROJECT_IN_ACTIVE_EXECUTION","REQUIREMENT_VERSION_REQUIRED","REQUIREMENT_VERSION_PROJECT_MISMATCH","PROJECT_VERSION_NOT_ACTIVE","PROJECT_ARCHIVED","PROJECT_VERSION_APPLICATION_BUSY","VERSION_APPLICATION_NOT_ALLOWED","PROJECT_VERSION_APPLICATION_FAILED","VERSION_APPLICATION_RETEST_BUSY","PROJECT_VERSION_APPLICATION_MISMATCH","REQUIREMENT_APPROVAL_STATE_CHANGED","REQUIREMENT_APPROVAL_NOT_READY"].includes(message))return reply.code(409).send({error:message,message});return reply.code(400).send({error:"VALIDATION_ERROR",message});}
 
 export function resolveDeliveryVersion(store:WorkflowStore,deliveryProject:any){
   if(!deliveryProject?.projectVersionId)throw new Error("REQUIREMENT_VERSION_REQUIRED");

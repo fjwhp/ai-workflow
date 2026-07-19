@@ -64,6 +64,8 @@ export interface StageRunInput {
   projectId?: string;
   projectVersionId?: string;
   expectedRequirementUpdatedAt?: string;
+  expectedRequirementStatus?: string;
+  expectedRequirementProjectIds?: string[];
   expectedProjectUpdatedAt?: string;
 }
 
@@ -315,6 +317,12 @@ export class WorkflowStore {
     now: string
   ): RequirementProject[] {
     if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
+    if (
+      this.db.prepare("SELECT id FROM requirement_project_snapshots WHERE requirement_id = ? AND status = 'active' LIMIT 1").get(requirementId)
+      || this.db.prepare("SELECT id FROM delivery_units WHERE requirement_id = ? LIMIT 1").get(requirementId)
+    ) {
+      throw new Error("REQUIREMENT_DELIVERY_PLAN_FROZEN");
+    }
     if (this.db.prepare("SELECT id FROM stage_runs WHERE requirement_id = ? AND status = 'running'").get(requirementId)) throw new Error("RUN_ALREADY_ACTIVE");
     const projectIds = [...new Set(inputs.map((item) => item.projectId))];
     const versionIds = [...new Set(inputs.flatMap((item) => item.projectVersionId ? [item.projectVersionId] : []))];
@@ -575,19 +583,37 @@ export class WorkflowStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.assertNoPendingVersionApplication(input.requirementId);
-      const requirement = this.db.prepare("SELECT stage, updated_at FROM requirements WHERE id = ?").get(input.requirementId) as { stage: string; updated_at: string } | undefined;
+      const requirement = this.db.prepare("SELECT stage, status, updated_at FROM requirements WHERE id = ?").get(input.requirementId) as { stage: string; status: string; updated_at: string } | undefined;
       if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
       if (this.db.prepare("SELECT id FROM stage_runs WHERE requirement_id = ? AND stage = ? AND status = 'running'").get(input.requirementId, input.stage)) {
         throw new Error("RUN_ALREADY_ACTIVE");
       }
-      if (input.expectedRequirementUpdatedAt !== undefined && (requirement.updated_at !== input.expectedRequirementUpdatedAt || requirement.stage !== input.stage)) {
+      if (input.expectedRequirementUpdatedAt !== undefined && (
+        requirement.updated_at !== input.expectedRequirementUpdatedAt
+        || requirement.stage !== input.stage
+        || (input.expectedRequirementStatus !== undefined && requirement.status !== input.expectedRequirementStatus)
+      )) {
         throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
       }
-      const item = { id: randomUUID(), ...input, status: "running", createdAt: new Date().toISOString(), completedAt: null };
+      if (input.expectedRequirementProjectIds !== undefined) {
+        const currentProjectIds = (this.db.prepare(`SELECT id FROM requirement_projects
+          WHERE requirement_id = ? AND status = 'active' ORDER BY position, created_at, rowid`).all(input.requirementId) as { id: string }[]).map((row) => row.id);
+        if (JSON.stringify(currentProjectIds) !== JSON.stringify(input.expectedRequirementProjectIds)) {
+          throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
+        }
+      }
+      if (!(requirement.stage === "definition" || requirement.stage === "solution_design")) throw new Error("REQUIREMENT_AI_STAGE_UNSUPPORTED");
+      if (requirement.status !== "ai_ready") throw new Error("REQUIREMENT_RUN_NOT_READY");
+      const now = new Date().toISOString();
+      const item = { id: randomUUID(), ...input, status: "running", createdAt: now, completedAt: null };
       this.db.prepare(`INSERT INTO stage_runs
         (id, requirement_id, owner_type, owner_id, stage, status, model, input_json, created_at)
         VALUES (?, ?, 'requirement', ?, ?, ?, ?, ?, ?)`)
         .run(item.id, item.requirementId, item.requirementId, item.stage, item.status, item.model, JSON.stringify(item.input), item.createdAt);
+      const claimed = this.db.prepare(`UPDATE requirements SET status = 'ai_running', updated_at = ?
+        WHERE id = ? AND stage = ? AND status = 'ai_ready' AND updated_at = ?`)
+        .run(now, input.requirementId, input.stage, requirement.updated_at);
+      if (claimed.changes !== 1) throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
       this.appendStageRunEvent(item.id, "run.started", { stage: item.stage, model: item.model });
       this.db.exec("COMMIT");
       return item;
@@ -629,9 +655,20 @@ export class WorkflowStore {
 
   failStageRun(id: string, error: string, status = "failed") {
     const now = new Date().toISOString();
-    this.db.prepare("UPDATE stage_runs SET status = ?, error = ?, completed_at = ? WHERE id = ?").run(status, error, now, id);
-    this.appendStageRunEvent(id, status === "interrupted" ? "run.interrupted" : "run.failed", { error });
-    return this.getStageRun(id);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const run = this.db.prepare("SELECT requirement_id, stage, status, created_at FROM stage_runs WHERE id = ?").get(id) as { requirement_id: string; stage: string; status: string; created_at: string } | undefined;
+      if (!run) throw new Error("RUN_NOT_FOUND");
+      if (run.status === "running") {
+        this.db.prepare("UPDATE stage_runs SET status = ?, error = ?, completed_at = ? WHERE id = ? AND status = 'running'").run(status, error, now, id);
+        this.appendStageRunEvent(id, status === "interrupted" ? "run.interrupted" : "run.failed", { error });
+        this.db.prepare(`UPDATE requirements SET status = 'ai_ready', updated_at = ?
+          WHERE id = ? AND stage = ? AND status = 'ai_running' AND updated_at = ?`)
+          .run(now, run.requirement_id, run.stage, run.created_at);
+      }
+      this.db.exec("COMMIT");
+      return this.getStageRun(id);
+    } catch (cause) { this.db.exec("ROLLBACK"); throw cause; }
   }
 
   interruptActiveStageRuns() {
@@ -702,7 +739,7 @@ export class WorkflowStore {
   }
 
   listApprovals(requirementId: string) {
-    return this.db.prepare("SELECT * FROM approvals WHERE requirement_id = ? ORDER BY created_at DESC").all(requirementId).map((row: any) => ({
+    return this.db.prepare("SELECT * FROM approvals WHERE requirement_id = ? ORDER BY created_at DESC, rowid DESC").all(requirementId).map((row: any) => ({
       ...row, override: row.override_json ? JSON.parse(row.override_json) : null
     }));
   }

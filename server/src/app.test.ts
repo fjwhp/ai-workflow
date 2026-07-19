@@ -136,6 +136,14 @@ class NotNextApplicationStore extends WorkflowStore {
   }
 }
 
+class RunPreparationRacingStore extends WorkflowStore {
+  beforeRunCreate: (() => void) | undefined;
+  override createStageRun(input: Parameters<WorkflowStore["createStageRun"]>[0]) {
+    const race=this.beforeRunCreate;this.beforeRunCreate=undefined;race?.();
+    return super.createStageRun(input);
+  }
+}
+
 type PendingMutationRunStatus = "running" | "awaiting_local_resolution" | "merge_test_failed" | "retesting";
 
 function pendingMutationFixture(store: WorkflowStore, suffix: string) {
@@ -219,7 +227,33 @@ describe("project and requirement association APIs",()=>{
     const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});
 
     expect(response.statusCode).toBe(202);for(let attempt=0;attempt<50&&store.getStageRun(response.json().id)?.status==="running";attempt++)await new Promise(resolve=>setTimeout(resolve,10));
-    expect(store.getRequirement(req.id)).toMatchObject({stage:"definition",status:"awaiting_approval"});expect(store.getStageRun(response.json().id)?.events.find((event:any)=>event.type==="gate.decided")?.payload).toMatchObject({decision:"human_review"});await app.close();
+    expect(store.getRequirement(req.id)).toMatchObject({stage:"definition",status:"awaiting_approval"});expect(store.getStageRun(response.json().id)?.events.find((event:any)=>event.type==="gate.decided")?.payload).toMatchObject({decision:"human_review"});agent.run.mockClear();
+    const repeated=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});expect(repeated.statusCode).toBe(409);expect(repeated.json()).toMatchObject({error:"REQUIREMENT_RUN_NOT_READY"});expect(store.listStageRuns(req.id)).toHaveLength(1);expect(runAgent).not.toHaveBeenCalled();await app.close();
+  });
+
+  it.each(["state","association"] as const)("rejects a %s race after run context preparation without starting the agent",async(race)=>{
+    const store=new RunPreparationRacingStore(":memory:");stores.push(store);const repo=await projectRepo();const project=store.createProject(projectPayload(repo));const replacement=store.createProject(projectPayload(await projectRepo(),{name:"Race replacement"}));const req=createRequirement(store,{title:"运行准备竞争",businessProblem:"上下文准备期间状态或关联可能变化",expectedOutcome:"拒绝过期上下文",priority:"high",primaryProjectId:project.id});
+    const knowledge=store.beginProjectKnowledge(project.id,(await execFileAsync("git",["-C",repo,"rev-parse","HEAD"])).stdout.trim(),"test");store.completeProjectKnowledge(knowledge.id,{summary:"ready",entries:[]});store.updateRequirementState(req.id,"definition","ai_ready");
+    const expectedUpdatedAt=store.getRequirement(req.id)!.updatedAt;store.beforeRunCreate=()=>{if(race==="state")store.updateRequirementState(req.id,"definition","awaiting_approval");else{store.replaceRequirementProjects(req.id,[{projectId:replacement.id,projectVersionId:ensureProjectVersion(store,replacement.id).id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]);(store as any).db.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?").run(expectedUpdatedAt,req.id);}};const app=await buildApp(store);
+
+    const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});
+
+    expect(response.statusCode).toBe(409);expect(response.json()).toMatchObject({error:"REQUIREMENT_CHANGED_DURING_RUN_PREPARATION"});expect(store.listStageRuns(req.id)).toEqual([]);expect(runAgent).not.toHaveBeenCalled();await app.close();
+  });
+
+  it("atomically admits only one of two concurrent requirement runs",async()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const repo=await projectRepo();const project=store.createProject(projectPayload(repo));const req=createRequirement(store,{title:"并发启动",businessProblem:"重复请求不能启动两个模型",expectedOutcome:"单一运行 claim",priority:"high",primaryProjectId:project.id});const knowledge=store.beginProjectKnowledge(project.id,(await execFileAsync("git",["-C",repo,"rev-parse","HEAD"])).stdout.trim(),"test");store.completeProjectKnowledge(knowledge.id,{summary:"ready",entries:[]});store.updateRequirementState(req.id,"definition","ai_ready");let resolveAgent!:(value:any)=>void;agent.run.mockImplementation(()=>new Promise(resolve=>{resolveAgent=resolve}));const app=await buildApp(store);
+
+    const responses=await Promise.all([app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}}),app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}})]);
+
+    expect(responses.map(response=>response.statusCode).sort()).toEqual([202,409]);expect(responses.find(response=>response.statusCode===409)?.json()).toMatchObject({error:"RUN_ALREADY_ACTIVE"});expect(store.listStageRuns(req.id)).toHaveLength(1);expect(runAgent).toHaveBeenCalledTimes(1);resolveAgent(definitionResult);await app.close();
+  });
+
+  it("does not let a stale failed run restore an obsolete requirement state",async()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const repo=await projectRepo();const project=store.createProject(projectPayload(repo));const req=createRequirement(store,{title:"过期失败恢复",businessProblem:"旧运行失败不能覆盖新状态",expectedOutcome:"CAS 保留新状态",priority:"high",primaryProjectId:project.id});const knowledge=store.beginProjectKnowledge(project.id,(await execFileAsync("git",["-C",repo,"rev-parse","HEAD"])).stdout.trim(),"test");store.completeProjectKnowledge(knowledge.id,{summary:"ready",entries:[]});store.updateRequirementState(req.id,"definition","ai_ready");let rejectAgent!:(reason:Error)=>void;agent.run.mockImplementation(()=>new Promise((_resolve,reject)=>{rejectAgent=reject}));const app=await buildApp(store);
+    const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});expect(response.statusCode).toBe(202);store.updateRequirementState(req.id,"solution_design","ai_ready");rejectAgent(new Error("stale failure"));for(let attempt=0;attempt<50&&store.getStageRun(response.json().id)?.status==="running";attempt++)await new Promise(resolve=>setTimeout(resolve,10));
+
+    expect(store.getStageRun(response.json().id)?.status).toBe("failed");expect(store.getRequirement(req.id)).toMatchObject({stage:"solution_design",status:"ai_ready"});await app.close();
   });
 
   it("binds the generated definition artifact before passing it to solution design",async()=>{
@@ -253,6 +287,15 @@ describe("project and requirement association APIs",()=>{
     expect(context.approvedDefinition).toMatchObject({artifactId:approved.id,content:{summary:"current approved definition"}});
     expect(context.priorArtifacts).toEqual([expect.objectContaining({id:priorSolution.id,stage:"solution_design",content:{summary:"retain prior solution context"}})]);
     expect(JSON.stringify(context)).not.toContain("unapproved definition secret");await app.close();
+  });
+
+  it("uses the later positive approval when two definition approvals share one timestamp",async()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const repo=await projectRepo();const project=store.createProject(projectPayload(repo));const req=createRequirement(store,{title:"稳定审批顺序",businessProblem:"同一时钟刻度可能写入两次审批",expectedOutcome:"后写审批获胜",priority:"high",primaryProjectId:project.id});const knowledge=store.beginProjectKnowledge(project.id,(await execFileAsync("git",["-C",repo,"rev-parse","HEAD"])).stdout.trim(),"test");store.completeProjectKnowledge(knowledge.id,{summary:"ready",entries:[]});const first=store.addArtifact(req.id,"definition","First definition",{...definitionResult,summary:"first approved definition"}),second=store.addArtifact(req.id,"definition","Second definition",{...definitionResult,summary:"later approved definition"}),now="2026-07-20T00:00:00.000Z";
+    store.withImmediateTransaction(()=>{store.insertApprovalInTransaction(req.id,"definition",{decision:"approve",comment:"first",artifactId:first.id},now);store.insertApprovalInTransaction(req.id,"definition",{decision:"conditional",comment:"later",condition:"track",artifactId:second.id},now);});store.updateRequirementState(req.id,"solution_design","ai_ready");agent.run.mockResolvedValue(solutionResult([project.id]));const app=await buildApp(store);
+
+    const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});
+
+    expect(response.statusCode).toBe(202);expect(store.listApprovals(req.id).filter((approval:any)=>approval.stage==="definition").map((approval:any)=>approval.artifact_id)).toEqual([second.id,first.id]);expect(vi.mocked(runAgent).mock.calls[0]![1]).toMatchObject({approvedDefinition:{artifactId:second.id,content:{summary:"later approved definition"}}});await app.close();
   });
 
   it("returns a stable budget error before creating a run",async()=>{
@@ -401,29 +444,46 @@ describe("project and requirement association APIs",()=>{
     const response=await app.inject({method:"GET",url:`/api/projects/${project.id}/modules?include=module-300%2Cunknown&include=..%2Fbad`}),body=response.json();expect(body).toMatchObject({total:401,truncated:true});expect(body.modules).toHaveLength(257);expect(body.modules).toContainEqual({id:"module-300",name:"Module 300",path:"src/300"});expect(body.modules.some((item:any)=>item.id==="unknown"||item.id==="../bad")).toBe(false);const search=(await app.inject({method:"GET",url:`/api/projects/${project.id}/modules?q=Module%20400`})).json();expect(search).toMatchObject({total:1,truncated:false,modules:[{id:"module-400"}]});await app.close();
   });
 
-  it("invalidates approved solution design and supersedes its project snapshot on material change",async()=>{
+  it("rejects project replacement while a solution-design snapshot is active",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const a=store.createProject(projectPayload(await projectRepo()));const b=store.createProject(projectPayload(await projectRepo(),{name:"B"}));
     const req=createRequirement(store,{title:"设计需求",businessProblem:"需要冻结项目设计上下文",expectedOutcome:"设计可追溯",priority:"medium",primaryProjectId:a.id});store.updateRequirementState(req.id,"solution_design","awaiting_approval");
     store.addArtifact(req.id,"solution_design","技术设计",{summary:"approved"});store.addApproval(req.id,"solution_design",{decision:"approve",comment:"通过"});store.createRequirementProjectSnapshot(req.id);const app=await buildApp(store);
     const payload=[{projectId:b.id,projectVersionId:ensureProjectVersion(store,b.id).id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}];
-    const response=await app.inject({method:"PUT",url:`/api/requirements/${req.id}/projects`,payload});expect(response.statusCode).toBe(200);expect(response.json().requirement).toMatchObject({stage:"solution_design",status:"ai_ready",projects:[{projectId:b.id}]});expect(store.getRequirement(req.id)).toMatchObject({stage:"solution_design",status:"ai_ready"});
-    expect(store.listApprovals(req.id)[0]).toMatchObject({actor_type:"system",comment:"项目关联或模块范围发生变化"});expect(store.listRequirementProjectSnapshots(req.id)).toMatchObject([{status:"superseded"}]);await app.close();
+    const response=await app.inject({method:"PUT",url:`/api/requirements/${req.id}/projects`,payload});expect(response.statusCode).toBe(409);expect(response.json()).toMatchObject({error:"REQUIREMENT_DELIVERY_PLAN_FROZEN"});expect(store.getRequirement(req.id)).toMatchObject({stage:"solution_design",status:"awaiting_approval",projects:[{projectId:a.id}]});
+    expect(store.listApprovals(req.id)).toHaveLength(1);expect(store.listRequirementProjectSnapshots(req.id)).toMatchObject([{status:"active"}]);await app.close();
   });
 
-  it("invalidates solution design when the selected delivery version changes",async()=>{
+  it("rejects delivery-version changes while a solution-design snapshot is active",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject(projectPayload(await projectRepo()));const first=ensureProjectVersion(store,project.id);const next=store.createProjectVersion({projectId:project.id,name:"next",branch:"release/next",baseBranch:"main",worktreePath:`/tmp/api-project-version-next-${project.id}`,headCommit:"next-head"});
     const req=createRequirement(store,{title:"旧接口变更",businessProblem:"旧接口也必须保持设计不变量",expectedOutcome:"统一失效行为",priority:"medium",primaryProjectId:project.id,primaryProjectVersionId:first.id});store.updateRequirementState(req.id,"solution_design","awaiting_approval");
     store.addArtifact(req.id,"solution_design","技术设计",{summary:"approved"});store.addApproval(req.id,"solution_design",{decision:"approve",comment:"通过"});store.createRequirementProjectSnapshot(req.id);const app=await buildApp(store);
-    const response=await app.inject({method:"PUT",url:`/api/requirements/${req.id}/projects`,payload:[{projectId:project.id,projectVersionId:next.id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]});expect(response.statusCode).toBe(200);expect(response.json().requirement).toMatchObject({stage:"solution_design",status:"ai_ready",projects:[{projectId:project.id,projectVersionId:next.id}]});
-    expect(store.listApprovals(req.id)[0]).toMatchObject({actor_type:"system",comment:"项目关联或模块范围发生变化"});expect(store.listRequirementProjectSnapshots(req.id)[0]).toMatchObject({status:"superseded"});await app.close();
+    const response=await app.inject({method:"PUT",url:`/api/requirements/${req.id}/projects`,payload:[{projectId:project.id,projectVersionId:next.id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]});expect(response.statusCode).toBe(409);expect(response.json()).toMatchObject({error:"REQUIREMENT_DELIVERY_PLAN_FROZEN"});expect(store.getRequirement(req.id)).toMatchObject({stage:"solution_design",status:"awaiting_approval",projects:[{projectId:project.id,projectVersionId:first.id}]});
+    expect(store.listApprovals(req.id)).toHaveLength(1);expect(store.listRequirementProjectSnapshots(req.id)[0]).toMatchObject({status:"active"});await app.close();
   });
 
-  it("does not invalidate solution design when only the selected version HEAD advances",async()=>{
+  it("keeps frozen scope unchanged when the selected version HEAD advances",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject(projectPayload(await projectRepo()));const version=ensureProjectVersion(store,project.id);const req=createRequirement(store,{title:"版本推进",businessProblem:"同一版本会持续接收新的提交",expectedOutcome:"设计关联保持有效",priority:"medium",primaryProjectId:project.id});store.updateRequirementState(req.id,"solution_design","awaiting_approval");store.addArtifact(req.id,"solution_design","技术设计",{summary:"approved"});store.addApproval(req.id,"solution_design",{decision:"approve",comment:"通过"});const snapshot=store.createRequirementProjectSnapshot(req.id);store.updateProjectVersionHead(version.id,"advanced-head");const app=await buildApp(store);
 
     const response=await app.inject({method:"PUT",url:`/api/requirements/${req.id}/projects`,payload:[{projectId:project.id,projectVersionId:version.id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]});
 
-    expect(response.statusCode).toBe(200);expect(response.json()).toMatchObject({materialChange:false,solutionDesignInvalidated:false});expect(store.getRequirementProjectSnapshot(req.id)?.id).toBe(snapshot.id);expect(store.getRequirement(req.id)).toMatchObject({stage:"solution_design",status:"awaiting_approval"});await app.close();
+    expect(response.statusCode).toBe(409);expect(response.json()).toMatchObject({error:"REQUIREMENT_DELIVERY_PLAN_FROZEN"});expect(store.getRequirementProjectSnapshot(req.id)?.id).toBe(snapshot.id);expect(store.getRequirement(req.id)).toMatchObject({stage:"solution_design",status:"awaiting_approval",projects:[{projectVersionId:version.id}]});await app.close();
+  });
+
+  it.each(["approve","conditional"] as const)("freezes every requirement project scope write after a %s delivery-plan approval",async(decision)=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject(projectPayload(await projectRepo(),{name:"Frozen"}));const version=ensureProjectVersion(store,project.id);const nextVersion=store.createProjectVersion({projectId:project.id,name:"next",branch:"next",baseBranch:"main",worktreePath:`/tmp/frozen-next-${crypto.randomUUID()}`,headCommit:"next-head"});const replacement=store.createProject(projectPayload(await projectRepo(),{name:"Replacement"}));const replacementVersion=ensureProjectVersion(store,replacement.id);
+    const knowledge=store.beginProjectKnowledge(project.id,"frozen-head","test");store.completeProjectKnowledge(knowledge.id,{summary:"modules",entries:[{id:"module:orders",kind:"module",moduleId:"orders",name:"Orders",path:"src/orders"}]});
+    const req=createRequirement(store,{title:"冻结交付范围",businessProblem:"批准后不能改变项目版本或模块",expectedOutcome:"交付计划保持一致",priority:"high",primaryProjectId:project.id,primaryProjectVersionId:version.id});store.updateRequirementState(req.id,"solution_design","awaiting_approval");store.addArtifact(req.id,"solution_design","Solution design",solutionResult([project.id]));const app=await buildApp(store);
+    const approval=await app.inject({method:"POST",url:`/api/requirements/${req.id}/approve`,payload:{decision,comment:"freeze scope",...(decision==="conditional"?{condition:"track condition"}:{})}});expect(approval.statusCode).toBe(200);
+    const frozen=()=>structuredClone({requirement:store.getRequirement(req.id),projects:store.listRequirementProjects(req.id),snapshot:store.getRequirementProjectSnapshot(req.id),units:store.deliveryUnits.listForRequirement(req.id),dependencies:store.deliveryUnits.listDependencies(req.id)}),before=frozen();
+    const writes=[
+      {method:"PATCH",url:`/api/requirements/${req.id}/project`,payload:{projectId:replacement.id}},
+      {method:"PUT",url:`/api/requirements/${req.id}/projects`,payload:[{projectId:replacement.id,projectVersionId:replacementVersion.id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]},
+      {method:"PUT",url:`/api/requirements/${req.id}/projects`,payload:[{projectId:project.id,projectVersionId:nextVersion.id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}]},
+      {method:"PUT",url:`/api/requirements/${req.id}/projects`,payload:[{projectId:project.id,projectVersionId:version.id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"selected",moduleIds:["orders"],position:0}]}
+    ] as const;
+    for(const write of writes){const response=await app.inject(write);expect(response.statusCode).toBe(409);expect(response.json()).toMatchObject({error:"REQUIREMENT_DELIVERY_PLAN_FROZEN"});expect(frozen()).toEqual(before);}
+    expect(()=>store.replaceRequirementProjects(req.id,[{projectId:project.id,projectVersionId:nextVersion.id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}])).toThrow("REQUIREMENT_DELIVERY_PLAN_FROZEN");expect(frozen()).toEqual(before);
+    store.supersedeRequirementProjectSnapshot(req.id);const planOnly=structuredClone({requirement:store.getRequirement(req.id),projects:store.listRequirementProjects(req.id),units:store.deliveryUnits.listForRequirement(req.id)});expect(()=>store.replaceRequirementProjects(req.id,[{projectId:project.id,projectVersionId:nextVersion.id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0}])).toThrow("REQUIREMENT_DELIVERY_PLAN_FROZEN");expect({requirement:store.getRequirement(req.id),projects:store.listRequirementProjects(req.id),units:store.deliveryUnits.listForRequirement(req.id)}).toEqual(planOnly);await app.close();
   });
 
   it("maps invalid requirement primary projects without creating orphan requirements",async()=>{

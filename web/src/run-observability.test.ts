@@ -4,11 +4,11 @@ import { displayRunEvents, eventLabel, isTerminalRun, latestRunForStage, mergeRu
 describe("run observability helpers", () => {
   it("selects the latest run for the viewed stage", () => {
     const runs = [
-      { id: "old", stage: "prd", createdAt: "2026-01-01" },
-      { id: "coding", stage: "coding", createdAt: "2026-01-03" },
-      { id: "new", stage: "prd", createdAt: "2026-01-02" }
+      { id: "old", stage: "definition", createdAt: "2026-01-01" },
+      { id: "implementation", stage: "implementation", createdAt: "2026-01-03" },
+      { id: "new", stage: "definition", createdAt: "2026-01-02" }
     ] as any;
-    expect(latestRunForStage(runs, "prd")?.id).toBe("new");
+    expect(latestRunForStage(runs, "definition")?.id).toBe("new");
   });
 
   it("merges replayed and live events by sequence", () => {

@@ -82,11 +82,11 @@ describe("requirement project helpers", () => {
     expect(validateAssociations([{ ...primary, role: "collaborator" }], {}).rows[0]?.role).toBeTruthy();
     expect(validateAssociations([primary, { ...delivery, role: "primary" }], {}).rows[1]?.role).toBeTruthy();
   });
-  it("warns on material edits at or after a frozen technical design", () => {
-    expect(hasMaterialAssociationEdit([primary], [{ ...primary, moduleMode: "all" }], "technical_design", { version: 1 })).toBe(true);
-    expect(hasMaterialAssociationEdit([primary], [{ ...primary, position: 4 }], "coding", { version: 1 })).toBe(false);
-    expect(hasMaterialAssociationEdit([primary], [{ ...primary, moduleMode: "all" }], "prd", { version: 1 })).toBe(false);
-    expect(hasMaterialAssociationEdit([{ ...delivery, projectVersionId: "v1" }], [{ ...delivery, projectVersionId: "v2" }], "technical_design", { version: 1 })).toBe(true);
+  it("warns on material edits whenever an active scope snapshot is frozen", () => {
+    expect(hasMaterialAssociationEdit([primary], [{ ...primary, moduleMode: "all" }], "solution_design", { version: 1 })).toBe(true);
+    expect(hasMaterialAssociationEdit([primary], [{ ...primary, position: 4 }], "implementation", { version: 1 })).toBe(false);
+    expect(hasMaterialAssociationEdit([primary], [{ ...primary, moduleMode: "all" }], "definition", null)).toBe(false);
+    expect(hasMaterialAssociationEdit([{ ...delivery, projectVersionId: "v1" }], [{ ...delivery, projectVersionId: "v2" }], "acceptance_delivery", { version: 1 })).toBe(true);
   });
   it("maps API row issues and general errors", () => {
     expect(associationApiErrors(new ApiError("VALIDATION_ERROR", "invalid", { issues: [{ path: [1, "moduleIds"], message: "bad module" }] })).rows[1]?.moduleIds).toBe("bad module");

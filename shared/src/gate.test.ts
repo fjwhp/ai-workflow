@@ -34,15 +34,15 @@ describe("evaluateGate", () => {
     [{ ...pass, risks: ["兼容风险"] }, "风险"],
     [{ ...pass, openQuestions: ["范围是什么"] }, "待确认"]
   ])("requires a human for ambiguous evidence", (artifact, reason) => {
-    const result = evaluateGate("solution_design", artifact, defaultGateConfig);
+    const result = evaluateGate("quality_verification", artifact, defaultGateConfig);
     expect(result.decision).toBe("human_review");
     expect(result.reasons.join(" ")).toContain(reason);
   });
 
-  it("defaults mandatory human review to implementation", () => {
-    expect(defaultGateConfig.mandatoryHumanStages).toEqual(["implementation"]);
-    expect(evaluateGate("implementation", pass, defaultGateConfig).decision).toBe("human_review");
-    expect(evaluateGate("acceptance_delivery", pass, defaultGateConfig).decision).toBe("auto_approve");
+  it("keeps solution design human-only without making implementation mandatory", () => {
+    expect(defaultGateConfig.mandatoryHumanStages).toEqual([]);
+    expect(evaluateGate("implementation", pass, defaultGateConfig).decision).toBe("auto_approve");
+    expect(evaluateGate("solution_design", pass, { ...defaultGateConfig, mandatoryHumanStages: [] }).decision).toBe("human_review");
   });
 
   it("requires humans when automation is disabled", () => {

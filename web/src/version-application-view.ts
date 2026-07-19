@@ -22,7 +22,7 @@ export function requirementApplicationContext(item: {
   projectSnapshot?: { associations?: VersionAssociation[] } | null;
   projects?: VersionAssociation[];
 }) {
-  if (!item.projectSnapshot) return { mode: "legacy" as const, target: null };
+  if (!item.projectSnapshot) return { mode: "versioned" as const, target: null };
   const associations = Array.isArray(item.projectSnapshot.associations) ? item.projectSnapshot.associations : [];
   const delivery = associations.filter((entry) => entry.status !== "archived" && entry.usage === "delivery");
   const target = delivery.length === 1 && delivery[0]?.projectVersionId ? delivery[0] : null;

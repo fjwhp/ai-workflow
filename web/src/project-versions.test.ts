@@ -197,7 +197,7 @@ describe("project version view model", () => {
       recheck: async () => ({ status: "pending" }),
       listVersions: async () => [latest],
       loadSnapshot: async () => ({
-        requirements: [{ id: "r-new", code: "REQ-NEW", stage: "coding", status: "ai_running" }],
+        requirements: [{ id: "r-new", code: "REQ-NEW", stage: "implementation", status: "ai_running" }],
         queue: [{ requirementId: "r-owner", code: "REQ-OWNER", title: "Owner", status: "awaiting_local_resolution", updatedAt: "1", owner: true, position: 1 }],
       }),
     });
@@ -211,7 +211,7 @@ describe("project version view model", () => {
   });
 
   it("preserves the previous close display when any authority refresh step fails", async () => {
-    const previous = { requirements: [{ id: "old", stage: "testing", status: "completed" }], queue: [] };
+    const previous = { requirements: [{ id: "old", stage: "quality_verification", status: "completed" }], queue: [] };
     const currentVersion = version();
     const authority = await loadCloseAuthority("project-1", currentVersion, previous, {
       recheck: async () => ({ version: currentVersion, inspection: { valid: true, clean: true } }),
@@ -241,16 +241,16 @@ describe("project version view model", () => {
 
   it("blocks closing while active requirements remain and counts requirement stages", () => {
     const requirements = [
-      { id: "r1", code: "REQ-1", stage: "coding", status: "ai_running" },
-      { id: "r2", code: "REQ-2", stage: "coding", status: "completed" },
-      { id: "r3", code: "REQ-3", stage: "integration", status: "closed" },
+      { id: "r1", code: "REQ-1", stage: "implementation", status: "ai_running" },
+      { id: "r2", code: "REQ-2", stage: "implementation", status: "completed" },
+      { id: "r3", code: "REQ-3", stage: "acceptance_delivery", status: "closed" },
     ];
     expect(projectVersionView(version(), [], requirements)).toMatchObject({
       canClose: false,
       closeReason: "REQ-1 等 1 个需求仍在进行中",
       requirementCount: 3,
       activeRequirementCount: 1,
-      stageCounts: { coding: 2, integration: 1 },
+      stageCounts: { implementation: 2, acceptance_delivery: 1 },
     });
   });
 
@@ -264,7 +264,7 @@ describe("project version view model", () => {
 
   it("retains the last successful snapshot across transient refresh failures", () => {
     const successful = mergeVersionSnapshot(undefined, { status: "fulfilled", value: {
-      requirements: [{ id: "r1", stage: "integration", status: "awaiting_merge" }],
+      requirements: [{ id: "r1", stage: "acceptance_delivery", status: "awaiting_merge" }],
       queue: [{ requirementId: "r1", code: "REQ-1", title: "Owner", status: "awaiting_merge", updatedAt: "1", owner: true, position: 1 }],
     } });
     const failed = mergeVersionSnapshot(successful, { status: "rejected", reason: "temporary unavailable" });
