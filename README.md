@@ -1,32 +1,43 @@
-# AI 主执行研发工作流
+# Flowgate 五阶段研发工作流
 
-这是一套面向 5-15 人产品研发团队的工作流规范。AI 执行需求分析、研发评审、技术设计、编码、自测、代码审查和自动化测试，人工在关键门禁审核 AI 的成果、证据与风险。
+Flowgate 是本地优先的 AI 研发工作台。当前 foundation 使用五个职责互斥的阶段：
 
-仓库现已包含本地 Web 应用。开发与启动方法见 [`docs/getting-started.md`](docs/getting-started.md)。
+| 阶段 | 唯一职责 |
+|---|---|
+| `definition` | 澄清业务目标、范围、约束和可验证验收标准 |
+| `solution_design` | 定义跨项目方案、交付单元、依赖、接口和风险 |
+| `implementation` | 按交付单元实现代码并保存实现证据 |
+| `quality_verification` | 对实现做独立 Review，并由另一条独立活动执行自动化测试 |
+| `acceptance_delivery` | 汇总交付成果，供总体业务验收与后续本地应用使用 |
 
-## 项目版本与并行需求
+阶段不得互相代办。尤其是 Review 与自动化测试必须独立记录、独立判定；测试通过不能替代 Review，Review 通过也不能替代测试。安全、确定、可审计的节点可以自动推进，但总体业务验收始终由人工负责。
 
-`project-versions-v1` 首次启动会为不兼容的 SQLite 主文件及现有 WAL/SHM 伴随文件创建同一时间戳的完整备份集，然后建立空数据库。旧项目和需求不会迁移；启动后需重新登记项目、等待项目知识库重建、创建或登记项目版本，再创建需求。具体备份格式、恢复步骤和上下文预算配置见 [`docs/getting-started.md`](docs/getting-started.md)。
+## 当前交付范围
 
-项目登记一个本地 Git 仓库；项目版本登记该仓库的一条长期本地分支和独立 worktree；需求通过交付项目关联选择一个使用中的版本。版本取代自由填写的集成 target。需求开始编码前不会创建 `ai/REQ-*` 分支或需求 worktree；开始编码后，每个需求使用独立分支和 `.ai-workflow-worktrees/<repo>/requirements/<REQ-code>`，同一需求返工复用原 worktree。长期版本 worktree 位于 `.ai-workflow-worktrees/<repo>/versions/<version-id>`。
+- **Phase 1（当前）**：批准方案后创建并展示状态为 `ready` 或 `waiting_dependency` 的交付单元。`implementation`、`quality_verification`、`acceptance_delivery` 的 `/run` 是只读查询，不启动 AI，不创建自动化队列，不运行 Git 任务，也不修改目标 worktree。
+- **Phase 2**：激活交付单元队列、worker、独立 Review 和自动化测试。Phase 1 不预实现这些执行器。
+- **Phase 3**：提供总体业务验收，以及按依赖顺序执行的 no-commit 本地应用。应用 owner 是交付单元，不是需求记录。
 
-同一版本可并行编码多个需求，但一次只允许一个需求向版本 worktree 执行无提交应用。应用不会自动提交版本 target，不会 push 或创建 PR，也不会切换或修改项目主 worktree。人工在版本 worktree 提交或撤销后，通过“重新检测本地处理结果”释放队列；服务重启会恢复未处理租约，无法明确归因的 HEAD 变化会保留现场并要求人工处理。完整操作和临时双需求 runbook 见 [`docs/getting-started.md`](docs/getting-started.md)。
+任何阶段都不得在目标项目自动执行 commit、push、tag 或创建 PR。Phase 3 的本地应用也只允许留下未提交改动，必须由人工检查和决定后续处理。
 
-登记、验证和重建知识库只读取本地 Git 仓库，不会修改源码、创建提交或分支，也不会推送。当前阶段可为需求配置多个上下文项目，但真实编码和后续应用必须恰好只有一个交付项目和该项目的一个使用中版本；两个或更多交付项目会在编码前停止并提示等待第二阶段。
+## 数据基线
 
-## 使用顺序
+当前 schema marker 是 `phase-2-five-stage-v2`。首次用本版本打开 v1 或其他旧 live 数据库时，服务先完整备份 SQLite 主文件及现存 WAL/SHM，再创建空的 v2 数据库。Phase 1 历史只存在于备份中；不做 row migration、dual read/write 或 fallback，也没有旧新数据库并行入口。用户已授权旧数据以新跑为准。
 
-1. 阅读 [`docs/workflow-sop.md`](docs/workflow-sop.md)，确定角色和流程实例负责人。
-2. 按 [`docs/states-and-gates.md`](docs/states-and-gates.md) 创建阶段、状态和门禁。
-3. 从 [`docs/forms.md`](docs/forms.md) 复制对应阶段表单。
-4. 使用 [`docs/ai-prompts.md`](docs/ai-prompts.md) 中的提示词驱动各 AI 角色。
-5. 人工审批人使用 [`docs/human-review-checklists.md`](docs/human-review-checklists.md) 审核 AI 成果。
-6. 按 [`docs/pilot-runbook.md`](docs/pilot-runbook.md) 选择一个低风险真实需求完成试运行，再发布团队 SOP 1.0。
+详细操作见：
 
-## 核心原则
+- [开始使用](docs/getting-started.md)
+- [状态与门禁](docs/states-and-gates.md)
+- [工作流 SOP](docs/workflow-sop.md)
 
-- AI 主执行，人工负最终责任。
-- 每个 AI 结论必须有引用依据、证据、风险和置信度。
-- 编码 AI 与 Review AI 使用隔离上下文。
-- 输入缺失、材料冲突、高风险或低置信度时停止流转。
-- 所有变更、打回、代码和测试结果均可追溯到需求版本。
+## 开发命令
+
+```bash
+npm install
+npm test
+npm run typecheck
+npm run build
+npm run dev
+```
+
+Web 默认监听 `http://127.0.0.1:5173`，API 默认监听 `http://127.0.0.1:3210`。
