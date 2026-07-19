@@ -565,6 +565,31 @@ describe("stage run API", () => {
     await app.close();
   });
 
+  it("rejects a stale approval after technical design has advanced to coding", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const req = createRequirement(store, { title: "接口", businessProblem: "缺少接口能力", expectedOutcome: "增加接口", priority: "medium" });
+    store.updateRequirementState(req.id, "technical_design", "awaiting_approval");
+    const app = await buildApp(store);
+
+    const designApproval = await app.inject({
+      method: "POST", url: `/api/requirements/${req.id}/approve`,
+      payload: { decision: "approve", comment: "设计通过" }
+    });
+    expect(designApproval.statusCode).toBe(200);
+    expect(designApproval.json()).toMatchObject({ stage: "coding", status: "ai_ready" });
+
+    const staleApproval = await app.inject({
+      method: "POST", url: `/api/requirements/${req.id}/approve`,
+      payload: { decision: "approve", comment: "旧弹窗重复提交" }
+    });
+
+    expect(staleApproval.statusCode).toBe(409);
+    expect(staleApproval.json().error).toBe("REQUIREMENT_APPROVAL_NOT_READY");
+    expect(store.getRequirement(req.id)).toMatchObject({ stage: "coding", status: "ai_ready" });
+    expect(store.listApprovals(req.id).map((approval) => approval.stage)).toEqual(["technical_design"]);
+    await app.close();
+  });
+
   it("rejects integration outside the awaiting-merge state", async () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const req = createRequirement(store, { title: "接口", businessProblem: "缺少接口能力", expectedOutcome: "增加接口", priority: "medium" });

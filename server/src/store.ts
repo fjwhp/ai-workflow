@@ -807,9 +807,10 @@ export class WorkflowStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.assertNoPendingVersionApplication(input.requirementId);
-      const requirement = this.db.prepare("SELECT stage FROM requirements WHERE id = ?").get(input.requirementId) as { stage: WorkflowStage } | undefined;
+      const requirement = this.db.prepare("SELECT stage, status FROM requirements WHERE id = ?").get(input.requirementId) as { stage: WorkflowStage; status: string } | undefined;
       if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
       if (requirement.stage !== input.expectedStage) throw new Error("REQUIREMENT_APPROVAL_STATE_CHANGED");
+      if (requirement.status !== "awaiting_approval") throw new Error("REQUIREMENT_APPROVAL_NOT_READY");
       const approval = input.approval.decision === "return"
         ? { ...input.approval, targetStage: input.approval.targetStage ?? returnStage(requirement.stage) }
         : input.approval;
