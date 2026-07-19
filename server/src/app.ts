@@ -405,7 +405,7 @@ function sendProjectContextError(reply:any,error:unknown){
 }
 
 export function resolveReusableSourceCommit(run:any,evidence:any,targetBranch:string){
-  if(!run||run.status!=="conflict"||!run.sourceCommit)return undefined;
+  if(!run||(run.status!=="conflict"&&run.resolutionStatus!=="reverted")||!run.sourceCommit)return undefined;
   return run.evidenceId===evidence.id&&run.executionId===evidence.executionId&&run.sourceBranch===evidence.branch&&run.worktreePath===evidence.worktreePath&&run.targetBranch===targetBranch?run.sourceCommit:undefined;
 }
 

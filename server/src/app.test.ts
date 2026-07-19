@@ -474,13 +474,18 @@ describe("stage run API", () => {
     await app.close();
   });
 
-  it("reuses only a matching conflict source commit", () => {
+  it("reuses only a matching source commit from a retryable prior application", () => {
     const evidence = { id: "evidence-1", executionId: "execution-1", branch: "ai/req-1", worktreePath: "/tmp/worktree" };
     const run = { status: "conflict", evidenceId: "evidence-1", executionId: "execution-1", sourceBranch: "ai/req-1", worktreePath: "/tmp/worktree", targetBranch: "feature/target", sourceCommit: "abc123" };
     expect(resolveReusableSourceCommit(run, evidence, "feature/target")).toBe("abc123");
-    expect(resolveReusableSourceCommit({ ...run, targetBranch: "main" }, evidence, "feature/target")).toBeUndefined();
-    expect(resolveReusableSourceCommit({ ...run, evidenceId: "other" }, evidence, "feature/target")).toBeUndefined();
+    expect(resolveReusableSourceCommit({ ...run, status: "merge_test_failed", resolutionStatus: "reverted" }, evidence, "feature/target")).toBe("abc123");
+    expect(resolveReusableSourceCommit({ ...run, status: "awaiting_local_resolution", resolutionStatus: "reverted" }, evidence, "feature/target")).toBe("abc123");
+    for (const mismatch of [
+      { targetBranch: "main" }, { evidenceId: "other" }, { executionId: "other" },
+      { sourceBranch: "ai/other" }, { worktreePath: "/tmp/other" }
+    ]) expect(resolveReusableSourceCommit({ ...run, ...mismatch }, evidence, "feature/target")).toBeUndefined();
     expect(resolveReusableSourceCommit({ ...run, status: "completed" }, evidence, "feature/target")).toBeUndefined();
+    expect(resolveReusableSourceCommit({ ...run, status: "merge_test_failed" }, evidence, "feature/target")).toBeUndefined();
   });
 
   it("lists runs by stage and returns a run snapshot", async () => {
@@ -703,6 +708,34 @@ describe("stage run API", () => {
     });
     expect(store.getRequirement(fixture.requirement.id)?.status).toBe("awaiting_local_resolution");
     expect(store.getProjectVersion(fixture.version.id)?.pendingIntegrationRunId).toBe(response.json().id);
+    await app.close();
+  });
+
+  it("reuses the verified source commit after a failed application is manually reverted", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store, { failingTests: true });
+    const app = await buildApp(store);
+
+    const failed = await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} });
+    expect(failed.statusCode, JSON.stringify(failed.json())).toBe(200);
+    expect(failed.json()).toMatchObject({ status: "merge_test_failed", sourceCommit: expect.stringMatching(/^[0-9a-f]{40}$/) });
+    const sourceHead = (await execFileAsync("git", ["-C", fixture.sourceWorktreePath, "rev-parse", "HEAD"])).stdout.trim();
+    expect(sourceHead).toBe(failed.json().sourceCommit);
+    expect((await execFileAsync("git", ["-C", fixture.sourceWorktreePath, "status", "--porcelain"])).stdout).toBe("");
+
+    await execFileAsync("git", ["-C", fixture.targetWorktreePath, "reset", "--hard", fixture.targetHead]);
+    const reverted = await app.inject({ method: "POST", url: `/api/project-versions/${fixture.version.id}/recheck` });
+    expect(reverted.statusCode, JSON.stringify(reverted.json())).toBe(200);
+    expect(reverted.json()).toMatchObject({ status: "reverted" });
+    expect(store.getRequirement(fixture.requirement.id)?.status).toBe("awaiting_merge");
+    store.updateProject(fixture.project.id, { allowedCommands: [{ command: "npm", argsPrefix: ["--version"] }] });
+
+    const retried = await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} });
+
+    expect(retried.statusCode, JSON.stringify(retried.json())).toBe(200);
+    expect(retried.json()).toMatchObject({ status: "awaiting_local_resolution", sourceCommit: sourceHead });
+    expect((await execFileAsync("git", ["-C", fixture.sourceWorktreePath, "rev-parse", "HEAD"])).stdout.trim()).toBe(sourceHead);
+    expect((await execFileAsync("git", ["-C", fixture.sourceWorktreePath, "status", "--porcelain"])).stdout).toBe("");
     await app.close();
   });
 
