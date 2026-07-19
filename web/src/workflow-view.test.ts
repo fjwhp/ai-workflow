@@ -32,7 +32,7 @@ describe("RequirementDetail", () => {
         projectStatus: "active" as const
       }],
       deliveryUnits: [{
-        id: "unit-frontend", projectId: "frontend", projectVersionId: "frontend-v1",
+        id: "unit-frontend", projectId: "frontend", projectVersionId: "frontend-v1", required: true,
         phase: "implementation" as const, status: "ready" as const, evidenceVersion: 1
       }],
       deliveryDependencies: []

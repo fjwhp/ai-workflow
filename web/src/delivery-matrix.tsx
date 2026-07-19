@@ -4,6 +4,7 @@ export type DeliveryUnitView = {
   id: string;
   projectId: string;
   projectVersionId: string;
+  required: boolean;
   phase: "implementation" | "quality_verification" | "acceptance_delivery";
   status: "waiting_dependency" | "ready" | "running" | "awaiting_gate" | "returned" |
     "potentially_stale" | "ready_for_acceptance" | "applying" | "applied" |
@@ -64,25 +65,25 @@ export function deliveryRowView(
     dependency.downstreamUnitId === unit.id && dependency.releasedAt === null
   );
   const released = dependencies.filter((dependency) => dependency.downstreamUnitId === unit.id);
-  const testingEvidence = dependencies.find((dependency) =>
-    dependency.upstreamUnitId === unit.id && dependency.releasedAt !== null &&
-    dependency.releasedByEvidenceVersion !== null && dependency.releasedByEvidenceVersion !== undefined
-  );
-  const dependencyLabel = pending
-    ? `等待 ${pending.upstreamProjectName ?? pending.upstreamUnitId} 自动化测试`
-    : released.length > 0 ? "依赖已释放" : "无等待依赖";
+  const dependencyLabel = unit.status === "skipped"
+    ? "无需等待 · 已跳过"
+    : pending ? `等待 ${pending.upstreamProjectName ?? pending.upstreamUnitId} 自动化测试`
+      : released.length > 0 ? "依赖已释放" : "无等待依赖";
+  const quality = qualityLabels(unit);
 
   return {
     dependencyLabel,
-    implementationLabel: unit.phase === "implementation"
+    implementationLabel: unit.status === "skipped"
+      ? "已跳过"
+      : unit.phase === "implementation"
       ? implementationStatusLabels[unit.status]
       : "已完成",
-    reviewLabel: "尚无证据",
-    automatedTestingLabel: testingEvidence
-      ? `已通过 · 证据 v${testingEvidence.releasedByEvidenceVersion}`
-      : "尚无证据",
+    reviewLabel: quality.review,
+    automatedTestingLabel: quality.testing,
     applicationLabel: applicationLabel(unit),
-    blocker: pending ? dependencyLabel : blockedStatusLabels[unit.status] ?? null,
+    blocker: unit.status === "skipped"
+      ? `${unit.required ? "必需" : "可选"}交付已跳过`
+      : pending ? dependencyLabel : blockedStatusLabels[unit.status] ?? null,
     nextAction: null
   };
 }
@@ -115,13 +116,13 @@ export function DeliveryMatrix({ units, dependencies, projects }: DeliveryMatrix
         const version = project?.projectVersionName ?? unit.projectVersionId;
         const branch = project?.projectVersionBranch;
         return <article className="delivery-row-grid delivery-row-stack" data-delivery-row={unit.id} key={unit.id}>
-          <div className="delivery-project"><span className="delivery-field-label">项目 / 版本</span><b>{project?.projectName ?? unit.projectId}</b><small>{version}{branch ? ` · ${branch}` : ""}</small></div>
+          <div className="delivery-project"><span className="delivery-field-label">项目 / 版本</span><b>{project?.projectName ?? unit.projectId}<span className="delivery-requirement">{unit.required ? "必需" : "可选"}</span></b><small>{version}{branch ? ` · ${branch}` : ""}</small></div>
           <DeliveryField label="依赖" value={view.dependencyLabel}/>
           <DeliveryField label="实现" value={view.implementationLabel}/>
           <DeliveryField label="Code Review" field="code-review" value={view.reviewLabel}/>
           <DeliveryField label="自动化测试" field="automated-testing" value={view.automatedTestingLabel}/>
           <DeliveryField label="应用" value={view.applicationLabel}/>
-          <DeliveryField label="Blocker" value={view.blocker ?? "无"} blocker={Boolean(view.blocker)}/>
+          <DeliveryField label="Blocker" value={view.blocker ?? "无"} blocker={unit.status !== "skipped" && Boolean(view.blocker)}/>
           <DeliveryField label="下一步" field="next-action" value={view.nextAction ?? "—"}/>
         </article>;
       })}
@@ -142,9 +143,25 @@ function DeliveryField({ label, value, field, blocker = false }: {
 }
 
 function applicationLabel(unit: DeliveryUnitView): string {
+  if (unit.status === "skipped") return "已跳过";
   if (unit.status === "applied") return "已应用";
   if (unit.status === "applying") return "应用中";
   if (unit.status === "conflicted") return "存在冲突";
   if (unit.status === "failed" && unit.phase === "acceptance_delivery") return "应用失败";
   return unit.phase === "acceptance_delivery" ? "待应用" : "尚未开始";
+}
+
+function qualityLabels(unit: DeliveryUnitView): { review: string; testing: string } {
+  if (unit.status === "skipped") return { review: "已跳过", testing: "已跳过" };
+  if (
+    unit.phase === "acceptance_delivery" ||
+    ["ready_for_acceptance", "applying", "applied"].includes(unit.status)
+  ) return { review: "已通过", testing: "已通过" };
+  if (unit.phase !== "quality_verification") return { review: "待开始", testing: "待开始" };
+  if (unit.status === "running") return { review: "进行中", testing: "待开始" };
+  if (unit.status === "awaiting_gate") return { review: "已通过", testing: "进行中" };
+  if (["returned", "potentially_stale", "failed"].includes(unit.status)) {
+    return { review: "需要检查", testing: "需要检查" };
+  }
+  return { review: "待开始", testing: "待开始" };
 }

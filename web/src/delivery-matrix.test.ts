@@ -10,6 +10,7 @@ describe("deliveryRowView", () => {
       id: "unit-frontend",
       projectId: "frontend",
       projectVersionId: "frontend-v1",
+      required: true,
       phase: "implementation" as const,
       status: "waiting_dependency" as const,
       evidenceVersion: 1
@@ -27,10 +28,10 @@ describe("deliveryRowView", () => {
     });
   });
 
-  it("uses released evidence for automated testing without treating it as code review", () => {
+  it("does not treat a released dependency edge as unit quality evidence", () => {
     const backend = {
-      id: "unit-backend", projectId: "backend", projectVersionId: "backend-v1",
-      phase: "quality_verification" as const, status: "awaiting_gate" as const, evidenceVersion: 2
+      id: "unit-backend", projectId: "backend", projectVersionId: "backend-v1", required: true,
+      phase: "quality_verification" as const, status: "ready" as const, evidenceVersion: 2
     };
 
     expect(deliveryRowView(backend, [{
@@ -38,19 +39,59 @@ describe("deliveryRowView", () => {
       releaseCondition: "automated_testing_passed", releasedByEvidenceVersion: 2,
       releasedAt: "2026-07-20T01:00:00.000Z"
     }])).toMatchObject({
-      reviewLabel: "尚无证据",
-      automatedTestingLabel: "已通过 · 证据 v2"
+      reviewLabel: "待开始",
+      automatedTestingLabel: "待开始"
     });
+  });
+
+  it.each([
+    ["reviewing", "quality_verification", "running", "进行中", "待开始"],
+    ["automated testing", "quality_verification", "awaiting_gate", "已通过", "进行中"],
+    ["leaf ready for acceptance", "quality_verification", "ready_for_acceptance", "已通过", "已通过"],
+    ["leaf applied", "acceptance_delivery", "applied", "已通过", "已通过"]
+  ] as const)("keeps review and testing independent while %s", (_case, phase, status, reviewLabel, automatedTestingLabel) => {
+    const leaf = {
+      id: "unit-leaf", projectId: "leaf", projectVersionId: "leaf-v1", required: true,
+      phase, status, evidenceVersion: 3
+    };
+
+    expect(deliveryRowView(leaf, [])).toMatchObject({ reviewLabel, automatedTestingLabel });
+  });
+
+  it("keeps an optional skipped unit explicit and non-actionable in every delivery column", () => {
+    const skipped = {
+      id: "unit-optional", projectId: "docs", projectVersionId: "docs-v1", required: false,
+      phase: "acceptance_delivery" as const, status: "skipped" as const, evidenceVersion: 1
+    };
+
+    expect(deliveryRowView(skipped, [])).toMatchObject({
+      dependencyLabel: "无需等待 · 已跳过",
+      implementationLabel: "已跳过",
+      reviewLabel: "已跳过",
+      automatedTestingLabel: "已跳过",
+      applicationLabel: "已跳过",
+      blocker: "可选交付已跳过",
+      nextAction: null
+    });
+
+    const markup = renderToStaticMarkup(React.createElement(DeliveryMatrix, {
+      units: [skipped], dependencies: [], projects: [{
+        projectId: "docs", projectName: "Docs", projectVersionId: "docs-v1",
+        projectVersionName: "1.0.0", projectVersionBranch: "release/1.0"
+      }]
+    }));
+    expect(markup).toContain("可选");
+    expect(markup).not.toContain("delivery-blocker");
   });
 });
 
 describe("DeliveryMatrix", () => {
   it("renders one read-only delivery row per unit with independent review and testing fields", () => {
     const units = [{
-      id: "unit-backend", projectId: "backend", projectVersionId: "backend-v1",
+      id: "unit-backend", projectId: "backend", projectVersionId: "backend-v1", required: true,
       phase: "quality_verification" as const, status: "awaiting_gate" as const, evidenceVersion: 2
     }, {
-      id: "unit-frontend", projectId: "frontend", projectVersionId: "frontend-v1",
+      id: "unit-frontend", projectId: "frontend", projectVersionId: "frontend-v1", required: true,
       phase: "implementation" as const, status: "waiting_dependency" as const, evidenceVersion: 1
     }];
     const dependencies = [{
@@ -87,7 +128,7 @@ describe("DeliveryMatrix", () => {
     expect(markup).not.toMatch(/<button|<form|<input|<select/);
   });
 
-  it("keeps delivery rows and actions inside a 390px viewport", () => {
+  it("stacks the actual delivery row classes across the 901-937px gap and at 390px", () => {
     const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
 
     expect(css).toMatch(/\.delivery-row-grid\{[^}]*display:grid[^}]*grid-template-columns:/);
@@ -96,6 +137,10 @@ describe("DeliveryMatrix", () => {
     expect(css).toMatch(/\.delivery-project[^}]*overflow-wrap:anywhere/);
     expect(css).toMatch(/\.delivery-field[^}]*overflow-wrap:anywhere/);
     expect(css).toMatch(/\[data-field="next-action"\]\{[^}]*max-width:100%/);
-    expect(css).toMatch(/@media\(max-width:620px\)\{[^@]*\.delivery-row-stack\{[^}]*grid-template-columns:1fr/);
+    const stackRule = css.match(/@media\(max-width:(\d+)px\)\{[^@]*\.delivery-matrix-header\{display:none\}[^@]*\.delivery-row-stack\{grid-template-columns:1fr/);
+    expect(stackRule).not.toBeNull();
+    const stackBreakpoint = Number(stackRule![1]);
+    expect(stackBreakpoint).toBeGreaterThanOrEqual(937);
+    expect(390).toBeLessThanOrEqual(stackBreakpoint);
   });
 });
