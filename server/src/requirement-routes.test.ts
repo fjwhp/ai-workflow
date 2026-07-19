@@ -167,6 +167,35 @@ describe("requirement approval routes", () => {
     await app.close();
   });
 
+  it.each([
+    ["archived delivery project", "PROJECT_NOT_ACTIVE", (fixture: ReturnType<typeof createFixture>) => {
+      fixture.store.archiveProject(fixture.frontend.id);
+    }],
+    ["closed delivery version", "PROJECT_VERSION_NOT_ACTIVE", (fixture: ReturnType<typeof createFixture>) => {
+      const database = new DatabaseSync(fixture.databasePath);
+      database.prepare("UPDATE project_versions SET status = 'closed', closed_at = ? WHERE project_id = ?")
+        .run("2026-07-20T08:00:00.000Z", fixture.frontend.id);
+      database.close();
+    }]
+  ])("maps %s to stable approval conflict %s and rolls back", async (_case, error, mutate) => {
+    const fixture = createFixture();
+    mutate(fixture);
+    const app = await buildApp(fixture.store);
+
+    const response = await app.inject({
+      method: "POST", url: `/api/requirements/${fixture.requirement.id}/approve`,
+      payload: { decision: "approve", comment: "Validate delivery state" }
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error });
+    expect(fixture.store.getRequirement(fixture.requirement.id)).toMatchObject({
+      stage: "solution_design", status: "awaiting_approval"
+    });
+    expectNoApprovalWrites(fixture);
+    await app.close();
+  });
+
   it("maps missing, not-ready, missing-artifact, and invalid-latest states to stable responses", async () => {
     const missingArtifact = createFixture({ artifact: false });
     const missingArtifactApp = await buildApp(missingArtifact.store);

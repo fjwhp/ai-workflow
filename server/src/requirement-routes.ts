@@ -15,8 +15,14 @@ const approvalConflictCodes = new Set([
   "SOLUTION_DESIGN_APPROVAL_DECISION_INVALID",
   "SOLUTION_DESIGN_ARTIFACT_NOT_FOUND",
   "SOLUTION_DESIGN_ARTIFACT_INVALID",
-  "PROJECT_VERSION_APPLICATION_PENDING"
+  "PROJECT_VERSION_APPLICATION_PENDING",
+  "PROJECT_NOT_ACTIVE",
+  "PROJECT_VERSION_NOT_ACTIVE",
+  "REQUIREMENT_VERSION_REQUIRED",
+  "REQUIREMENT_VERSION_PROJECT_MISMATCH"
 ]);
+
+const approvalConflictPrefixes = ["DELIVERY_", "REQUIREMENT_PROJECT_SNAPSHOT_"];
 
 export async function registerRequirementRoutes(
   app: FastifyInstance,
@@ -72,7 +78,7 @@ function sendRequirementApprovalError(reply: any, error: unknown) {
   if (code === "PROJECT_VERSION_APPLICATION_PENDING") {
     return reply.code(409).send({ error: code, message: "版本应用处理中，不能修改需求或项目关联" });
   }
-  if (code.startsWith("DELIVERY_") || approvalConflictCodes.has(code)) {
+  if (approvalConflictCodes.has(code) || approvalConflictPrefixes.some((prefix) => code.startsWith(prefix))) {
     return reply.code(409).send({ error: code });
   }
   return reply.code(500).send({ error: "INTERNAL_ERROR" });

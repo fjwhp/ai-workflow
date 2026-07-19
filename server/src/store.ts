@@ -557,7 +557,10 @@ export class WorkflowStore {
 
   getLatestArtifact(requirementId: string, stage: WorkflowStage): RequirementArtifact | null {
     const row = this.db.prepare(`SELECT * FROM artifacts
-      WHERE requirement_id = ? AND stage = ?
+      WHERE requirement_id = ? AND stage = ? AND (
+        (owner_type IS NULL AND owner_id IS NULL)
+        OR (owner_type = 'requirement' AND owner_id = requirement_id)
+      )
       ORDER BY version DESC, created_at DESC, rowid DESC LIMIT 1`).get(requirementId, stage) as any;
     return row ? {
       id: row.id,

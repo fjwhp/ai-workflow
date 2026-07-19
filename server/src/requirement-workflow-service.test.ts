@@ -104,6 +104,47 @@ function count(databasePath: string, table: string, requirementId: string) {
 }
 
 describe("RequirementWorkflowService", () => {
+  it("selects only requirement-owned solution artifacts across explicit and transitional ownership", () => {
+    const fixture = createFixture();
+    const snapshot = fixture.store.createRequirementProjectSnapshot(fixture.requirement.id);
+    const plan = fixture.store.deliveryUnits.createPlan({
+      requirementId: fixture.requirement.id,
+      snapshot,
+      plan: solutionDesignArtifact(fixture.backend.id, fixture.frontend.id).deliveryPlan
+    });
+    const explicitArtifact = solutionDesignArtifact(fixture.backend.id, fixture.frontend.id);
+    explicitArtifact.summary = "Explicit requirement owner";
+    const deliveryUnitArtifact = solutionDesignArtifact(fixture.backend.id, fixture.frontend.id);
+    deliveryUnitArtifact.summary = "Delivery unit owner must be excluded";
+    const database = new DatabaseSync(fixture.databasePath);
+    database.prepare(`INSERT INTO artifacts
+      (id, requirement_id, owner_type, owner_id, stage, version, title, content_json, created_at)
+      VALUES (?, ?, 'requirement', ?, 'solution_design', 2, ?, ?, ?)`)
+      .run(crypto.randomUUID(), fixture.requirement.id, fixture.requirement.id, "Explicit requirement design",
+        JSON.stringify(explicitArtifact), "2026-07-20T08:00:01.000Z");
+    database.prepare(`INSERT INTO artifacts
+      (id, requirement_id, owner_type, owner_id, stage, version, title, content_json, created_at)
+      VALUES (?, ?, 'delivery_unit', ?, 'solution_design', 99, ?, ?, ?)`)
+      .run(crypto.randomUUID(), fixture.requirement.id, plan.units[0]!.id, "Delivery unit design",
+        JSON.stringify(deliveryUnitArtifact), "2026-07-20T08:00:02.000Z");
+    database.close();
+
+    expect(fixture.store.getLatestArtifact(fixture.requirement.id, "solution_design")).toMatchObject({
+      version: 2,
+      title: "Explicit requirement design",
+      content: { summary: "Explicit requirement owner" }
+    });
+
+    const cleanup = new DatabaseSync(fixture.databasePath);
+    cleanup.prepare("DELETE FROM artifacts WHERE owner_type = 'requirement' AND owner_id = ?")
+      .run(fixture.requirement.id);
+    cleanup.close();
+    expect(fixture.store.getLatestArtifact(fixture.requirement.id, "solution_design")).toMatchObject({
+      version: 1,
+      title: "Solution design"
+    });
+  });
+
   it("approves persisted solution design and creates the frozen delivery plan atomically", () => {
     const fixture = createFixture();
 
