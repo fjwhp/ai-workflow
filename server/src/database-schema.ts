@@ -140,7 +140,11 @@ export function createPhase2Schema(db: DatabaseSync) {
     CREATE TABLE IF NOT EXISTS artifacts (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, owner_type TEXT, owner_id TEXT, stage TEXT NOT NULL,
       version INTEGER NOT NULL, title TEXT NOT NULL, content_json TEXT NOT NULL,
-      created_at TEXT NOT NULL, UNIQUE(requirement_id, stage, version),
+      created_at TEXT NOT NULL,
+      CHECK(
+        (owner_type IS NULL AND owner_id IS NULL)
+        OR (owner_type IS NOT NULL AND owner_id IS NOT NULL AND owner_type IN ('requirement', 'delivery_unit'))
+      ),
       FOREIGN KEY(requirement_id) REFERENCES requirements(id)
     );
     CREATE TABLE IF NOT EXISTS approvals (
@@ -255,6 +259,12 @@ export function createPhase2Schema(db: DatabaseSync) {
       ON delivery_dependencies(requirement_id, upstream_unit_id, downstream_unit_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_unit_active_run
       ON stage_runs(owner_type, owner_id, stage) WHERE status = 'running';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_owner_version
+      ON artifacts(owner_type, owner_id, stage, version)
+      WHERE owner_type IS NOT NULL AND owner_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_requirement_version
+      ON artifacts(requirement_id, stage, version)
+      WHERE owner_type IS NULL AND owner_id IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_automation_job_dedupe
       ON automation_jobs(dedupe_key);
   `);
