@@ -1,10 +1,69 @@
 import React from "react";
+import { deliveryUnitStatuses } from "@ai-workflow/shared";
 import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { DeliveryMatrix, deliveryRowView } from "./delivery-matrix.js";
+import {
+  DeliveryMatrix,
+  deliveryMatrixRowViews,
+  deliveryRowView,
+  deliveryStatusViews
+} from "./delivery-matrix.js";
+
+type NativeRole = "table" | "row" | "columnheader" | "cell";
+
+function renderedRoleQueries(markup: string) {
+  const tagsByRole: Record<NativeRole, string> = {
+    table: "table",
+    row: "tr",
+    columnheader: "th",
+    cell: "td"
+  };
+  const textById = new Map([...markup.matchAll(/<([a-z][\w-]*)\b[^>]*\bid="([^"]+)"[^>]*>([\s\S]*?)<\/\1>/gi)]
+    .map((match) => [match[2], accessibleText(match[3])]));
+
+  function allByRole(role: NativeRole) {
+    const tag = tagsByRole[role];
+    return [...markup.matchAll(new RegExp(`<${tag}\\b([^>]*)>([\\s\\S]*?)<\\/${tag}>`, "gi"))].map((match) => {
+      const labelledBy = match[1].match(/\baria-labelledby="([^"]+)"/i)?.[1];
+      return {
+        markup: match[0],
+        name: labelledBy ? textById.get(labelledBy) ?? "" : accessibleText(match[2])
+      };
+    });
+  }
+
+  return {
+    getByRole(role: NativeRole, options: { name: string | RegExp }) {
+      const matches = allByRole(role).filter((entry) => typeof options.name === "string"
+        ? entry.name === options.name
+        : options.name.test(entry.name));
+      if (matches.length !== 1) throw new Error(`Expected one ${role} named ${String(options.name)}, found ${matches.length}`);
+      return matches[0];
+    },
+    getAllByRole: allByRole
+  };
+}
+
+function accessibleText(markup: string): string {
+  return markup
+    .replace(/<([a-z][\w-]*)\b[^>]*\baria-hidden="true"[^>]*>[\s\S]*?<\/\1>/gi, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+type MatrixUnits = React.ComponentProps<typeof DeliveryMatrix>["units"];
+type MatrixDependencies = React.ComponentProps<typeof DeliveryMatrix>["dependencies"];
 
 describe("deliveryRowView", () => {
+  it("defines a presentation for every shared delivery status", () => {
+    expect(Object.keys(deliveryStatusViews)).toEqual([...deliveryUnitStatuses]);
+  });
+
   it("waits for the upstream project's automated testing without inventing an action", () => {
     const frontend = {
       id: "unit-frontend",
@@ -61,6 +120,21 @@ describe("deliveryRowView", () => {
     expect(deliveryRowView(leaf, [])).toMatchObject({ reviewLabel, automatedTestingLabel });
   });
 
+  it.each([
+    ["acceptance ready", "acceptance_delivery", "ready", "待应用"],
+    ["acceptance applying", "acceptance_delivery", "applying", "应用中"],
+    ["acceptance applied", "acceptance_delivery", "applied", "已应用"],
+    ["acceptance skipped", "acceptance_delivery", "skipped", "已跳过"],
+    ["non-acceptance neutral", "quality_verification", "ready", "尚未开始"]
+  ] as const)("shows the application state for %s", (_case, phase, status, applicationLabel) => {
+    const unit = {
+      id: "unit-application", projectId: "application", projectVersionId: "application-v1",
+      required: status !== "skipped", phase, status, evidenceVersion: 1
+    };
+
+    expect(deliveryRowView(unit, [])).toMatchObject({ applicationLabel });
+  });
+
   it("keeps an optional skipped unit explicit and non-actionable in every delivery column", () => {
     const skipped = {
       id: "unit-optional", projectId: "docs", projectVersionId: "docs-v1", required: false,
@@ -108,6 +182,55 @@ describe("deliveryRowView", () => {
   });
 });
 
+describe("deliveryMatrixRowViews", () => {
+  const unit = {
+    id: "unit-api", projectId: "api", projectVersionId: "api-v1", required: true,
+    phase: "implementation" as const, status: "waiting_dependency" as const, evidenceVersion: 1
+  };
+
+  it.each([
+    ["unknown upstream", { upstreamUnitId: "unit-missing", downstreamUnitId: unit.id }],
+    ["unknown downstream", { upstreamUnitId: unit.id, downstreamUnitId: "unit-missing" }]
+  ])("marks a known unit incident to an %s endpoint as invalid", (_case, endpoint) => {
+    const dependencies = [{
+      ...endpoint,
+      releaseCondition: "automated_testing_passed" as const,
+      releasedAt: null
+    }];
+
+    expect(deliveryMatrixRowViews([unit], dependencies).get(unit.id)).toMatchObject({
+      dependencyLabel: "交付依赖数据异常",
+      blocker: "交付依赖数据异常",
+      nextAction: null
+    });
+  });
+
+  it("marks every unit participating in a dependency cycle as invalid", () => {
+    const peer = { ...unit, id: "unit-web", projectId: "web", projectVersionId: "web-v1" };
+    const dependencies = [{
+      upstreamUnitId: unit.id, downstreamUnitId: peer.id,
+      releaseCondition: "automated_testing_passed" as const, releasedAt: null
+    }, {
+      upstreamUnitId: peer.id, downstreamUnitId: unit.id,
+      releaseCondition: "automated_testing_passed" as const, releasedAt: null
+    }];
+    const views = deliveryMatrixRowViews([unit, peer], dependencies);
+
+    expect([...views.values()]).toHaveLength(2);
+    for (const view of views.values()) expect(view).toMatchObject({
+      dependencyLabel: "交付依赖数据异常",
+      blocker: "交付依赖数据异常",
+      nextAction: null
+    });
+
+    const markup = renderToStaticMarkup(React.createElement(DeliveryMatrix, {
+      units: [unit, peer], dependencies, projects: []
+    }));
+    expect(renderedRoleQueries(markup).getAllByRole("cell")
+      .filter((cell) => cell.name === "交付依赖数据异常")).toHaveLength(4);
+  });
+});
+
 describe("DeliveryMatrix", () => {
   it("renders one read-only delivery row per unit with independent review and testing fields", () => {
     const units = [{
@@ -133,6 +256,7 @@ describe("DeliveryMatrix", () => {
     const markup = renderToStaticMarkup(React.createElement(DeliveryMatrix, {
       units, dependencies, projects
     }));
+    const screen = renderedRoleQueries(markup);
 
     expect(markup.match(/data-delivery-row=/g)).toHaveLength(2);
     expect(markup).toContain("Backend");
@@ -149,6 +273,12 @@ describe("DeliveryMatrix", () => {
     expect(markup.match(/data-field="automated-testing"/g)).toHaveLength(2);
     expect(markup.match(/data-field="next-action"/g)).toHaveLength(2);
     expect(markup).not.toMatch(/<button|<form|<input|<select/);
+    expect(screen.getByRole("table", { name: "项目交付矩阵" })).toBeDefined();
+    expect(screen.getAllByRole("columnheader").map((entry) => entry.name)).toEqual([
+      "项目 / 版本", "依赖", "实现", "Code Review", "自动化测试", "应用", "Blocker", "下一步"
+    ]);
+    expect(screen.getAllByRole("row")).toHaveLength(3);
+    expect(screen.getByRole("cell", { name: /^Backend必需2\.4\.0/ })).toBeDefined();
   });
 
   it("stacks the actual delivery row classes across the 901-937px gap and at 390px", () => {
@@ -160,8 +290,9 @@ describe("DeliveryMatrix", () => {
     expect(css).toMatch(/\.delivery-project[^}]*overflow-wrap:anywhere/);
     expect(css).toMatch(/\.delivery-field[^}]*overflow-wrap:anywhere/);
     expect(css).toMatch(/\[data-field="next-action"\]\{[^}]*max-width:100%/);
-    const stackRule = css.match(/@media\(max-width:(\d+)px\)\{[^@]*\.delivery-matrix-header\{display:none\}[^@]*\.delivery-row-stack\{grid-template-columns:1fr/);
+    const stackRule = css.match(/@media\(max-width:(\d+)px\)\{[^@]*\.delivery-matrix-header\{(?=[^}]*position:absolute)(?=[^}]*clip:)[^}]*\}[^@]*\.delivery-row-stack\{grid-template-columns:1fr/);
     expect(stackRule).not.toBeNull();
+    expect(stackRule![0]).not.toContain("display:none");
     const stackBreakpoint = Number(stackRule![1]);
     expect(stackBreakpoint).toBeGreaterThanOrEqual(937);
     expect(390).toBeLessThanOrEqual(stackBreakpoint);
