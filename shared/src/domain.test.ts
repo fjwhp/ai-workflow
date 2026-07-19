@@ -1,39 +1,40 @@
 import { describe, expect, it } from "vitest";
-import { canTransition, previousStage, returnStage, requirementInputSchema, stageLabels, statusLabels, workflowStages } from "./index.js";
+import { canTransition, previousStage, returnStage, requirementInputSchema, stageLabels, statusLabels, workflowStages, workflowStatuses } from "./index.js";
 
 describe("workflow transitions", () => {
+  it("uses five non-overlapping workflow stages", () => {
+    expect(workflowStages).toEqual([
+      "definition", "solution_design", "implementation",
+      "quality_verification", "acceptance_delivery"
+    ]);
+  });
+
+  it("keeps requirement statuses limited to generic workflow states", () => {
+    expect(workflowStatuses).toEqual([
+      "ai_ready", "ai_running", "awaiting_approval", "returned",
+      "blocked", "completed", "closed", "cancelled"
+    ]);
+  });
+
   it("requires a manual approval between an AI run and the next stage", () => {
     expect(canTransition("ai_running", "awaiting_approval")).toBe(true);
-    expect(canTransition("ai_running", "approved")).toBe(false);
-    expect(canTransition("approved", "ai_ready")).toBe(true);
+    expect(canTransition("ai_running", "ai_ready")).toBe(false);
+    expect(canTransition("awaiting_approval", "ai_ready")).toBe(true);
   });
 
   it("does not allow a closed requirement to transition", () => {
-    expect(canTransition("closed", "draft")).toBe(false);
+    expect(canTransition("closed", "ai_ready")).toBe(false);
   });
 
-  it("awaits local resolution when an applied change creates no commit", () => {
-    expect(canTransition("awaiting_merge", "awaiting_local_resolution")).toBe(true);
-    expect(canTransition("merge_test_failed", "awaiting_local_resolution")).toBe(true);
-    expect(canTransition("awaiting_merge", "completed")).toBe(false);
-  });
-
-  it("supports resolution and manual escalation after a no-commit application", () => {
-    expect(canTransition("awaiting_local_resolution", "completed")).toBe(true);
-    expect(canTransition("awaiting_local_resolution", "awaiting_merge")).toBe(true);
-    expect(canTransition("awaiting_local_resolution", "manual_resolution_required")).toBe(true);
-    expect(canTransition("awaiting_local_resolution", "cancelled")).toBe(true);
-    expect(canTransition("manual_resolution_required", "completed")).toBe(true);
-    expect(canTransition("manual_resolution_required", "awaiting_merge")).toBe(true);
-    expect(canTransition("manual_resolution_required", "cancelled")).toBe(true);
-  });
-
-  it("places local code integration after acceptance", () => {
-    expect(workflowStages.at(-1)).toBe("integration");
-    expect(stageLabels.integration).toBe("本地应用");
-    expect(statusLabels.awaiting_merge).toBe("待应用");
-    expect(statusLabels.merge_test_failed).toBe("应用后测试失败");
-    expect(returnStage("integration")).toBe("acceptance");
+  it("labels the five workflow stages", () => {
+    expect(stageLabels).toEqual({
+      definition: "需求定义",
+      solution_design: "方案设计",
+      implementation: "实现",
+      quality_verification: "质量验证",
+      acceptance_delivery: "验收交付"
+    });
+    expect(statusLabels.completed).toBe("已完成");
   });
 });
 
@@ -52,24 +53,27 @@ describe("requirement input", () => {
 
 describe("previousStage", () => {
   it("returns the immediately preceding workflow stage", () => {
-    expect(previousStage("prd")).toBe("intake");
-    expect(previousStage("technical_design")).toBe("requirement_review");
-    expect(previousStage("testing")).toBe("code_review");
+    expect(previousStage("solution_design")).toBe("definition");
+    expect(previousStage("implementation")).toBe("solution_design");
+    expect(previousStage("acceptance_delivery")).toBe("quality_verification");
   });
 
-  it("keeps intake at intake because it has no previous stage", () => {
-    expect(previousStage("intake")).toBe("intake");
+  it("keeps definition at definition because it has no previous stage", () => {
+    expect(previousStage("definition")).toBe("definition");
   });
 });
 
 describe("returnStage", () => {
-  it("routes failed testing back to coding so fixes are reviewed again", () => {
-    expect(returnStage("testing")).toBe("coding");
+  it.each([
+    ["solution_design", "definition"],
+    ["implementation", "solution_design"],
+    ["quality_verification", "implementation"],
+    ["acceptance_delivery", "quality_verification"]
+  ] as const)("routes %s findings to %s", (stage, target) => {
+    expect(returnStage(stage)).toBe(target);
   });
 
-  it("routes other gates to their responsible prior stage", () => {
-    expect(returnStage("code_review")).toBe("coding");
-    expect(returnStage("technical_design")).toBe("requirement_review");
-    expect(returnStage("acceptance")).toBe("testing");
+  it("keeps definition findings in definition", () => {
+    expect(returnStage("definition")).toBe("definition");
   });
 });
