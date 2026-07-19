@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { approvalInputSchema, evaluateGate, projectInputSchema, projectUpdateSchema, requirementInputSchema, requirementProjectsInputSchema, returnStage, workflowStages } from "@ai-workflow/shared";
+import { evaluateGate, projectInputSchema, projectUpdateSchema, requirementInputSchema, requirementProjectsInputSchema, workflowStages } from "@ai-workflow/shared";
 import { WorkflowStore } from "./store.js";
 import { runAgent } from "./ai.js";
 import { createBackup } from "./backup.js";
@@ -20,6 +20,7 @@ import { normalizeModuleId, resolveSoleDeliveryProject } from "./requirement-pro
 import { buildRequirementProjectContext, ProjectContextError, resolveProjectContextBudget } from "./project-context.js";
 import { recheckVersionApplication, registerProjectVersionRoutes } from "./project-version-routes.js";
 import { inspectVersionWorktree } from "./project-version-service.js";
+import { registerRequirementRoutes } from "./requirement-routes.js";
 
 const requirementRevisionSchema = requirementInputSchema.extend({
   clarifications: requirementInputSchema.shape.businessProblem,
@@ -36,6 +37,10 @@ export async function buildApp(store: WorkflowStore) {
   for(const item of store.listRequirements())if(item.status==="completed"&&item.projectId&&!store.getKnowledgeChangeSet(item.id).id){try{publishRequirementKnowledge(store,item.id)}catch{/* Existing completed data remains usable if backfill fails. */}}
   await app.register(cors, { origin: /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/ });
   await registerProjectVersionRoutes(app, { store });
+  await registerRequirementRoutes(app, {
+    store,
+    onApproved: (requirementId) => { refreshRequirementKnowledge(store, requirementId); }
+  });
   app.get("/api/health", async () => ({
     ok: true,
     openAiConfigured: Boolean(process.env.OPENAI_API_KEY),
@@ -68,7 +73,7 @@ export async function buildApp(store: WorkflowStore) {
     const humanOverride={visible:["code_review","testing"].includes(item.stage),...overrideEligibility,
       targetStage:item.stage==="code_review"?"testing":item.stage==="testing"?"acceptance":null,
       returnCount:approvals.filter((entry:any)=>entry.stage===item.stage&&entry.decision==="return").length};
-    return { ...item, artifacts, approvals, executions: store.listExecutions(item.id), revisions: store.listRequirementRevisions(item.id), runs: store.listStageRuns(item.id), codingEvidence, reworkContext, humanOverride, integrationRun:store.getLatestIntegrationRun(item.id),knowledgeChanges:store.getKnowledgeChangeSet(item.id) };
+    return { ...item, artifacts, approvals, executions: store.listExecutions(item.id), revisions: store.listRequirementRevisions(item.id), runs: store.listStageRuns(item.id), codingEvidence, reworkContext, humanOverride, integrationRun:store.getLatestIntegrationRun(item.id),knowledgeChanges:store.getKnowledgeChangeSet(item.id),deliveryUnits:store.deliveryUnits.listForRequirement(item.id),deliveryDependencies:store.deliveryUnits.listDependencies(item.id) };
   });
   app.patch("/api/requirements/:id", async (req: any, reply) => {
     const input = requirementRevisionSchema.safeParse(req.body);
@@ -217,18 +222,6 @@ export async function buildApp(store: WorkflowStore) {
     };
     const timer = setInterval(flush, 500); flush();
     req.raw.on("close", () => clearInterval(timer));
-  });
-  app.post("/api/requirements/:id/approve", async (req: any, reply) => {
-    const input = approvalInputSchema.safeParse(req.body);
-    const item = store.getRequirement(req.params.id);
-    if (!input.success) return reply.code(400).send({ error: "VALIDATION_ERROR", issues: input.error.issues });
-    if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
-    const approval = input.data.decision === "return" ? { ...input.data, targetStage: returnStage(item.stage) } : input.data;
-    try {
-      const result = store.applyRequirementApproval({ requirementId: item.id, expectedStage: item.stage, approval });
-      refreshRequirementKnowledge(store,item.id);
-      return result;
-    } catch (error) { return sendDomainError(reply, error); }
   });
   app.post("/api/requirements/:id/human-override", async (req: any, reply) => {
     const comment=typeof req.body?.comment==="string"?req.body.comment.trim():"";

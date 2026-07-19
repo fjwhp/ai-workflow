@@ -29,6 +29,16 @@ export interface RequirementProjectSnapshot {
   createdAt: string;
 }
 
+export interface RequirementArtifact {
+  id: string;
+  requirementId: string;
+  stage: WorkflowStage;
+  version: number;
+  title: string;
+  content: unknown;
+  createdAt: string;
+}
+
 export interface ExecutionInput {
   requirementId: string;
   stage: WorkflowStage;
@@ -116,6 +126,33 @@ export interface VersionApplicationQueueEntry {
 }
 
 const executionStages = new Set<WorkflowStage>(["coding", "code_review", "testing", "acceptance", "integration"]);
+
+const legacyApprovalTransitions: Record<string, { stage: string; status: string }> = {
+  intake: { stage: "prd", status: "ai_ready" },
+  prd: { stage: "requirement_review", status: "ai_ready" },
+  requirement_review: { stage: "technical_design", status: "ai_ready" },
+  technical_design: { stage: "coding", status: "ai_ready" },
+  coding: { stage: "code_review", status: "ai_ready" },
+  code_review: { stage: "testing", status: "ai_ready" },
+  testing: { stage: "acceptance", status: "ai_ready" },
+  acceptance: { stage: "integration", status: "awaiting_merge" }
+};
+
+const legacyReturnStages: Record<string, string> = {
+  intake: "intake",
+  prd: "intake",
+  requirement_review: "prd",
+  technical_design: "requirement_review",
+  coding: "technical_design",
+  code_review: "coding",
+  testing: "coding",
+  acceptance: "testing",
+  integration: "acceptance"
+};
+
+function approvalReturnStage(stage: WorkflowStage): string {
+  return legacyReturnStages[stage as string] ?? returnStage(stage);
+}
 
 const versionApplicationQueueSql = `WITH target_version AS (
     SELECT pv.id, pv.project_id, pv.status AS version_status, pv.pending_requirement_id,
@@ -333,7 +370,7 @@ export class WorkflowStore {
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
-  private createRequirementProjectSnapshotInTransaction(requirementId: string, now: string): RequirementProjectSnapshot {
+  createRequirementProjectSnapshotInTransaction(requirementId: string, now: string): RequirementProjectSnapshot {
     if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(requirementId)) throw new Error("REQUIREMENT_NOT_FOUND");
     const associations = this.listRequirementProjects(requirementId);
     const version = (this.db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM requirement_project_snapshots WHERE requirement_id = ?").get(requirementId) as { version: number }).version;
@@ -392,7 +429,7 @@ export class WorkflowStore {
     const artifact = this.db.prepare("SELECT id FROM artifacts WHERE requirement_id = ? AND stage = 'technical_design' LIMIT 1").get(requirementId);
     if (!approved || !artifact || !this.getRequirementProjectSnapshot(requirementId)) return false;
     const reason = "项目关联或模块范围发生变化";
-    this.insertApproval(requirementId, "technical_design", { decision: "return", comment: reason, targetStage: "technical_design", actorType: "system", reasons: [reason] }, now);
+    this.insertApprovalInTransaction(requirementId, "technical_design", { decision: "return", comment: reason, targetStage: "technical_design", actorType: "system", reasons: [reason] }, now);
     this.supersedeRequirementProjectSnapshotInTransaction(requirementId, now);
     this.db.prepare("UPDATE requirements SET stage = 'technical_design', status = 'ai_ready', updated_at = ? WHERE id = ?")
       .run(now, requirementId);
@@ -497,6 +534,38 @@ export class WorkflowStore {
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
+  getRequirementStateInTransaction(id: string): { stage: WorkflowStage; status: string } | null {
+    return (this.db.prepare("SELECT stage, status FROM requirements WHERE id = ?").get(id) as {
+      stage: WorkflowStage;
+      status: string;
+    } | undefined) ?? null;
+  }
+
+  updateRequirementInTransaction(
+    id: string,
+    stage: WorkflowStage,
+    status: string,
+    now: string,
+    expectedStage?: WorkflowStage,
+    expectedStatus?: string
+  ) {
+    const clauses = ["id = ?"];
+    const parameters: any[] = [stage, status, now, id];
+    if (expectedStage !== undefined) {
+      clauses.push("stage = ?");
+      parameters.push(expectedStage);
+    }
+    if (expectedStatus !== undefined) {
+      clauses.push("status = ?");
+      parameters.push(expectedStatus);
+    }
+    const result = this.db.prepare(
+      `UPDATE requirements SET stage = ?, status = ?, updated_at = ? WHERE ${clauses.join(" AND ")}`
+    ).run(...parameters);
+    if (result.changes !== 1) throw new Error("REQUIREMENT_APPROVAL_STATE_CHANGED");
+    return this.getRequirement(id)!;
+  }
+
   addArtifact(requirementId: string, stage: WorkflowStage, title: string, content: unknown) {
     const versionRow = this.db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM artifacts WHERE requirement_id = ? AND stage = ?")
       .get(requirementId, stage) as { version: number };
@@ -511,6 +580,21 @@ export class WorkflowStore {
       id: row.id, requirementId: row.requirement_id, stage: row.stage, version: row.version,
       title: row.title, content: JSON.parse(row.content_json), createdAt: row.created_at
     }));
+  }
+
+  getLatestArtifact(requirementId: string, stage: WorkflowStage): RequirementArtifact | null {
+    const row = this.db.prepare(`SELECT * FROM artifacts
+      WHERE requirement_id = ? AND stage = ?
+      ORDER BY version DESC, created_at DESC, rowid DESC LIMIT 1`).get(requirementId, stage) as any;
+    return row ? {
+      id: row.id,
+      requirementId: row.requirement_id,
+      stage: row.stage,
+      version: row.version,
+      title: row.title,
+      content: JSON.parse(row.content_json),
+      createdAt: row.created_at
+    } : null;
   }
 
   createStageRun(input: StageRunInput) {
@@ -611,13 +695,13 @@ export class WorkflowStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.assertNoPendingVersionApplication(requirementId);
-      const approval = this.insertApproval(requirementId, stage, input, now);
+      const approval = this.insertApprovalInTransaction(requirementId, stage, input, now);
       this.db.exec("COMMIT");
       return approval;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
-  private insertApproval(requirementId: string, stage: WorkflowStage, input: any, now: string) {
+  insertApprovalInTransaction(requirementId: string, stage: WorkflowStage, input: any, now: string) {
     const id = randomUUID();
     this.db.prepare(`INSERT INTO approvals
       (id, requirement_id, stage, decision, comment, condition_text, target_stage, created_at, actor_type, artifact_id, reasons_json, override_json, return_count)
@@ -637,10 +721,10 @@ export class WorkflowStore {
       if (requirement.stage !== input.expectedStage) throw new Error("REQUIREMENT_APPROVAL_STATE_CHANGED");
       if (requirement.status !== "awaiting_approval") throw new Error("REQUIREMENT_APPROVAL_NOT_READY");
       const approval = input.approval.decision === "return"
-        ? { ...input.approval, targetStage: input.approval.targetStage ?? returnStage(requirement.stage) }
+        ? { ...input.approval, targetStage: input.approval.targetStage ?? approvalReturnStage(requirement.stage) }
         : input.approval;
-      const approvalRecord = this.insertApproval(input.requirementId, requirement.stage, approval, now);
-      if (requirement.stage === "technical_design" && approval.decision !== "return" && !this.getRequirementProjectSnapshot(input.requirementId)) {
+      const approvalRecord = this.insertApprovalInTransaction(input.requirementId, requirement.stage, approval, now);
+      if ((requirement.stage as string) === "technical_design" && approval.decision !== "return" && !this.getRequirementProjectSnapshot(input.requirementId)) {
         this.createRequirementProjectSnapshotInTransaction(input.requirementId, now);
       }
       if (approval.decision === "return") {
@@ -649,10 +733,11 @@ export class WorkflowStore {
         this.db.prepare("UPDATE requirements SET stage = ?, status = 'returned', updated_at = ? WHERE id = ?")
           .run(approval.targetStage, now, input.requirementId);
       } else {
+        const legacyTransition = legacyApprovalTransitions[requirement.stage as string];
         const index = workflowStages.indexOf(requirement.stage);
         const nextStage = workflowStages[index + 1];
-        const targetStage = requirement.stage === "acceptance" ? "integration" : nextStage ?? requirement.stage;
-        const status = requirement.stage === "acceptance" ? "awaiting_merge" : nextStage ? "ai_ready" : "completed";
+        const targetStage = legacyTransition?.stage ?? nextStage ?? requirement.stage;
+        const status = legacyTransition?.status ?? (nextStage ? "ai_ready" : "completed");
         this.db.prepare("UPDATE requirements SET stage = ?, status = ?, updated_at = ? WHERE id = ?")
           .run(targetStage, status, now, input.requirementId);
       }
@@ -677,7 +762,7 @@ export class WorkflowStore {
       if (!requirement || requirement.stage !== stage || !eligibility.allowed) throw new Error(eligibility.reason || "HUMAN_OVERRIDE_NOT_ALLOWED");
       const countRow = this.db.prepare("SELECT COUNT(*) AS count FROM approvals WHERE requirement_id = ? AND stage = ? AND decision = 'return'").get(requirementId, stage) as { count: number };
       const snapshot = buildHumanOverrideSnapshot({ stage, comment, artifact, returnCount: countRow.count });
-      const approval = this.insertApproval(requirementId, stage, {
+      const approval = this.insertApprovalInTransaction(requirementId, stage, {
         decision: "approve", comment: snapshot.comment, targetStage: snapshot.targetStage,
         actorType: "human_override", artifactId: snapshot.artifactId, returnCount: snapshot.returnCount, override: snapshot
       }, new Date().toISOString());
@@ -735,7 +820,7 @@ export class WorkflowStore {
       }
       const approvalDecision = input.decision === "auto_approve" ? "approve" : input.decision === "auto_return" ? "return" : "review";
       const targetStage = input.decision === "auto_return" ? returnStage(input.stage) : null;
-      gateApproval = this.insertApproval(input.requirementId, input.stage, {
+      gateApproval = this.insertApprovalInTransaction(input.requirementId, input.stage, {
         decision: approvalDecision, comment: input.reasons.join("；"), targetStage,
         actorType: "ai_gate", artifactId: input.artifactId, reasons: input.reasons
       }, now);
