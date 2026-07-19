@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { createIsolatedWorktree, getWorktreeSnapshot } from "./repository.js";
+import { createOrReuseRequirementWorktree, getWorktreeSnapshot } from "./repository.js";
 import type { ProjectContextBlock } from "./project-context.js";
+import type { CodingVersion } from "./coding-agent.js";
 
 export type CodexEvent = Record<string, any>;
 
@@ -37,6 +38,12 @@ export function buildCodexArgs(input: { model: string; baseUrl: string; cwd: str
 
 type CodexProject = { id: string; repoPath: string; defaultBranch: string };
 
+export async function prepareCodexCodingWorktree(project: CodexProject, version: CodingVersion, requirementCode: string) {
+  if (version.projectId !== project.id) throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
+  if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
+  return createOrReuseRequirementWorktree(project.repoPath, version.branch, requirementCode);
+}
+
 export function buildCodingPrompt(input: { requirement: any; artifacts: any[]; projectContext: ProjectContextBlock; reworkContext?: any }) {
   return `你是独立需求 ${input.requirement.code} 的编码代理。只在当前 worktree 工作。
 根据需求、已批准产物和交付项目上下文完成最小范围实现，遵守仓库 AGENTS.md。必须先检查现有代码，再修改文件并运行与变更模块匹配的测试。
@@ -55,12 +62,12 @@ ${JSON.stringify(input.projectContext)}
 PROJECT_CONTEXT_JSON_END`;
 }
 
-export async function runCodexCoding(input: { requirement: any; artifacts: any[]; project: CodexProject; projectContext: ProjectContextBlock; reworkContext?: any; onEvent?: (type: string, payload: unknown) => void }) {
+export async function runCodexCoding(input: { requirement: any; artifacts: any[]; project: CodexProject; version: CodingVersion; projectContext: ProjectContextBlock; reworkContext?: any; onEvent?: (type: string, payload: unknown) => void }) {
+  if (!process.env.OPENAI_API_KEY || !process.env.OPENAI_BASE_URL) throw new Error("Codex 中转执行需要 OPENAI_API_KEY 和 OPENAI_BASE_URL");
   const runId = crypto.randomUUID();
-  const worktree = await createIsolatedWorktree(input.project.repoPath, input.project.defaultBranch, input.requirement.code, runId);
+  const worktree = await prepareCodexCodingWorktree(input.project, input.version, input.requirement.code);
   const prompt = buildCodingPrompt(input);
   const model = process.env.CODEX_MODEL || process.env.OPENAI_CODING_MODEL || "gpt-5.5";
-  if (!process.env.OPENAI_API_KEY || !process.env.OPENAI_BASE_URL) throw new Error("Codex 中转执行需要 OPENAI_API_KEY 和 OPENAI_BASE_URL");
   const args = buildCodexArgs({ model, baseUrl: process.env.OPENAI_BASE_URL, cwd: worktree.worktreePath, prompt });
   const events: CodexEvent[] = [], diagnostics: string[] = [];
   const emit = input.onEvent ?? (() => {});

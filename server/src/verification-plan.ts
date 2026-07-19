@@ -7,7 +7,12 @@ export type VerificationPlan={changedModules:string[];plannedCommands:Verificati
 const safeExecutables=new Set(["mvn","mvnw","./mvnw","npm","gradle","./gradlew"]);
 
 function safeFallback(commands:VerificationCommand[]){
-  return commands.filter(item=>safeExecutables.has(item.command)&&item.argsPrefix.every(arg=>!/[;&|`$<>\n\r]/.test(arg)));
+  return commands.flatMap(item=>{
+    const args=item.argsPrefix??[];
+    const safeExecutable=safeExecutables.has(item.command)&&args.every(arg=>!/[;&|`$<>\n\r]/.test(arg));
+    const safeGitDiff=item.command==="git"&&args.length===3&&args[0]==="diff"&&args[1]==="--cached"&&args[2]==="--check";
+    return safeExecutable||safeGitDiff?[{command:item.command,argsPrefix:args}]:[];
+  });
 }
 
 async function exists(path:string){try{await access(path);return true}catch{return false}}

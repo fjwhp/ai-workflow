@@ -4,11 +4,15 @@
 
 仓库现已包含本地 Web 应用。开发与启动方法见 [`docs/getting-started.md`](docs/getting-started.md)。
 
-## 多项目第一阶段
+## 项目版本与并行需求
 
-`multi-project-v1` 首次启动会为旧 SQLite 主文件及现有 WAL/SHM 伴随文件创建同一时间戳的完整备份集，然后建立空数据库。旧项目和需求不会迁移；启动后需重新登记项目、等待项目知识库重建，再创建需求。具体备份格式、恢复步骤和上下文预算配置见 [`docs/getting-started.md`](docs/getting-started.md)。
+`project-versions-v1` 首次启动会为不兼容的 SQLite 主文件及现有 WAL/SHM 伴随文件创建同一时间戳的完整备份集，然后建立空数据库。旧项目和需求不会迁移；启动后需重新登记项目、等待项目知识库重建、创建或登记项目版本，再创建需求。具体备份格式、恢复步骤和上下文预算配置见 [`docs/getting-started.md`](docs/getting-started.md)。
 
-登记或重建知识库只读取本地 Git 仓库，不会修改源码、创建提交或分支，也不会推送。第一阶段可为需求配置多个上下文项目，但真实编码和后续集成必须恰好只有一个交付项目；两个或更多交付项目会在编码前停止并提示等待第二阶段。
+项目登记一个本地 Git 仓库；项目版本登记该仓库的一条长期本地分支和独立 worktree；需求通过交付项目关联选择一个使用中的版本。版本取代自由填写的集成 target。需求开始编码前不会创建 `ai/REQ-*` 分支或需求 worktree；开始编码后，每个需求使用独立分支和 `.ai-workflow-worktrees/<repo>/requirements/<REQ-code>`，同一需求返工复用原 worktree。长期版本 worktree 位于 `.ai-workflow-worktrees/<repo>/versions/<version-id>`。
+
+同一版本可并行编码多个需求，但一次只允许一个需求向版本 worktree 执行无提交应用。应用不会自动提交版本 target，不会 push 或创建 PR，也不会切换或修改项目主 worktree。人工在版本 worktree 提交或撤销后，通过“重新检测本地处理结果”释放队列；服务重启会恢复未处理租约，无法明确归因的 HEAD 变化会保留现场并要求人工处理。完整操作和临时双需求 runbook 见 [`docs/getting-started.md`](docs/getting-started.md)。
+
+登记、验证和重建知识库只读取本地 Git 仓库，不会修改源码、创建提交或分支，也不会推送。当前阶段可为需求配置多个上下文项目，但真实编码和后续应用必须恰好只有一个交付项目和该项目的一个使用中版本；两个或更多交付项目会在编码前停止并提示等待第二阶段。
 
 ## 使用顺序
 

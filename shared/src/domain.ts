@@ -5,7 +5,8 @@ export const workflowStages = [
 
 export const workflowStatuses = [
   "draft", "ai_ready", "ai_running", "awaiting_approval", "approved",
-  "returned", "blocked", "awaiting_merge", "merge_test_failed", "completed", "closed", "cancelled"
+  "returned", "blocked", "awaiting_merge", "merge_test_failed", "awaiting_local_resolution",
+  "manual_resolution_required", "completed", "closed", "cancelled"
 ] as const;
 
 export type WorkflowStage = typeof workflowStages[number];
@@ -19,8 +20,10 @@ const transitions: Record<WorkflowStatus, readonly WorkflowStatus[]> = {
   approved: ["ai_ready", "completed"],
   returned: ["ai_ready", "cancelled"],
   blocked: ["ai_ready", "cancelled"],
-  awaiting_merge: ["merge_test_failed", "completed", "cancelled"],
-  merge_test_failed: ["completed", "cancelled"],
+  awaiting_merge: ["merge_test_failed", "awaiting_local_resolution", "cancelled"],
+  merge_test_failed: ["awaiting_local_resolution", "cancelled"],
+  awaiting_local_resolution: ["completed", "awaiting_merge", "manual_resolution_required", "cancelled"],
+  manual_resolution_required: ["completed", "awaiting_merge", "cancelled"],
   completed: ["closed"],
   closed: [],
   cancelled: []
@@ -60,5 +63,6 @@ export const statusLabels: Record<WorkflowStatus, string> = {
   draft: "草稿", ai_ready: "AI 待启动", ai_running: "AI 处理中",
   awaiting_approval: "待人工审批", approved: "已批准", returned: "已打回",
   blocked: "已阻塞", awaiting_merge: "待应用", merge_test_failed: "应用后测试失败",
+  awaiting_local_resolution: "待处理本地变更", manual_resolution_required: "需手动处理",
   completed: "已完成", closed: "已关闭", cancelled: "已取消"
 };

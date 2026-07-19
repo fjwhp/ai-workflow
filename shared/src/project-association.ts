@@ -1,3 +1,5 @@
+import type { ProjectVersionStatus } from "./project-version.js";
+
 export const projectRoles = ["primary", "collaborator"] as const;
 export const projectUsages = ["context", "delivery"] as const;
 export const moduleModes = ["auto", "all", "selected"] as const;
@@ -13,6 +15,10 @@ export interface RequirementProject {
   requirementId: string;
   projectId: string;
   projectName?: string;
+  projectVersionId?: string;
+  projectVersionName?: string;
+  projectVersionBranch?: string;
+  projectVersionStatus?: ProjectVersionStatus;
   role: ProjectRole;
   usage: ProjectUsage;
   deliveryRequired: boolean;

@@ -1,3 +1,5 @@
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./api.js";
 import {
@@ -14,6 +16,7 @@ import {
   projectHealth,
   projectFieldErrors,
   projectValidationLabel,
+  ProjectBand,
   mergeProjectDetails,
   nextFocusIndex,
   shouldStartSubmission,
@@ -24,6 +27,23 @@ import {
 } from "./project-management.js";
 
 describe("project management helpers", () => {
+  it("mounts version management below a project's knowledge and memory area", () => {
+    const markup = renderToStaticMarkup(React.createElement(ProjectBand, {
+      project: { id: "p1", name: "Orders", repoPath: "/repo", defaultBranch: "main", category: null, technology: [], status: "active" },
+      knowledge: null,
+      memory: null,
+      detailErrors: null,
+      rebuildBusy: false,
+      archiveBusy: false,
+      onEdit: () => undefined,
+      onValidate: () => undefined,
+      onRebuild: () => undefined,
+      onArchive: () => undefined,
+    }));
+    expect(markup).toContain("项目持续记忆");
+    expect(markup).toContain("项目版本");
+  });
+
   it("exposes maintenance actions only for active projects", () => {
     expect(projectActions("active")).toEqual(["edit", "validate", "rebuild", "archive"]);
     expect(projectActions("archived")).toEqual(["view"]);
