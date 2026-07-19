@@ -39,17 +39,20 @@ describe("deliveryRowView", () => {
       releaseCondition: "automated_testing_passed", releasedByEvidenceVersion: 2,
       releasedAt: "2026-07-20T01:00:00.000Z"
     }])).toMatchObject({
-      reviewLabel: "待开始",
-      automatedTestingLabel: "待开始"
+      reviewLabel: "等待独立审查证据",
+      automatedTestingLabel: "等待自动化测试证据"
     });
   });
 
   it.each([
-    ["reviewing", "quality_verification", "running", "进行中", "待开始"],
-    ["automated testing", "quality_verification", "awaiting_gate", "已通过", "进行中"],
+    ["implementation ready", "implementation", "ready", "等待独立审查证据", "等待自动化测试证据"],
+    ["quality aggregate running", "quality_verification", "running", "等待独立审查证据", "等待自动化测试证据"],
+    ["implementation aggregate awaiting gate", "quality_verification", "awaiting_gate", "等待独立审查证据", "等待自动化测试证据"],
+    ["aggregate returned", "quality_verification", "returned", "等待独立审查证据", "等待自动化测试证据"],
+    ["aggregate failed", "quality_verification", "failed", "等待独立审查证据", "等待自动化测试证据"],
     ["leaf ready for acceptance", "quality_verification", "ready_for_acceptance", "已通过", "已通过"],
     ["leaf applied", "acceptance_delivery", "applied", "已通过", "已通过"]
-  ] as const)("keeps review and testing independent while %s", (_case, phase, status, reviewLabel, automatedTestingLabel) => {
+  ] as const)("does not invent per-check conclusions while %s", (_case, phase, status, reviewLabel, automatedTestingLabel) => {
     const leaf = {
       id: "unit-leaf", projectId: "leaf", projectVersionId: "leaf-v1", required: true,
       phase, status, evidenceVersion: 3
@@ -82,6 +85,26 @@ describe("deliveryRowView", () => {
     }));
     expect(markup).toContain("可选");
     expect(markup).not.toContain("delivery-blocker");
+  });
+
+  it("renders a required skipped unit as an invalid blocking state", () => {
+    const skipped = {
+      id: "unit-required", projectId: "api", projectVersionId: "api-v1", required: true,
+      phase: "acceptance_delivery" as const, status: "skipped" as const, evidenceVersion: 1
+    };
+
+    expect(deliveryRowView(skipped, [])).toMatchObject({
+      blocker: "必需交付已跳过",
+      nextAction: null
+    });
+    const markup = renderToStaticMarkup(React.createElement(DeliveryMatrix, {
+      units: [skipped], dependencies: [], projects: [{
+        projectId: "api", projectName: "API", projectVersionId: "api-v1",
+        projectVersionName: "2.0.0", projectVersionBranch: "release/2.0"
+      }]
+    }));
+    expect(markup).toContain("必需交付已跳过");
+    expect(markup).toContain("delivery-blocker");
   });
 });
 

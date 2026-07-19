@@ -122,7 +122,7 @@ export function DeliveryMatrix({ units, dependencies, projects }: DeliveryMatrix
           <DeliveryField label="Code Review" field="code-review" value={view.reviewLabel}/>
           <DeliveryField label="自动化测试" field="automated-testing" value={view.automatedTestingLabel}/>
           <DeliveryField label="应用" value={view.applicationLabel}/>
-          <DeliveryField label="Blocker" value={view.blocker ?? "无"} blocker={unit.status !== "skipped" && Boolean(view.blocker)}/>
+          <DeliveryField label="Blocker" value={view.blocker ?? "无"} blocker={Boolean(view.blocker) && (unit.status !== "skipped" || unit.required)}/>
           <DeliveryField label="下一步" field="next-action" value={view.nextAction ?? "—"}/>
         </article>;
       })}
@@ -153,15 +153,8 @@ function applicationLabel(unit: DeliveryUnitView): string {
 
 function qualityLabels(unit: DeliveryUnitView): { review: string; testing: string } {
   if (unit.status === "skipped") return { review: "已跳过", testing: "已跳过" };
-  if (
-    unit.phase === "acceptance_delivery" ||
-    ["ready_for_acceptance", "applying", "applied"].includes(unit.status)
-  ) return { review: "已通过", testing: "已通过" };
-  if (unit.phase !== "quality_verification") return { review: "待开始", testing: "待开始" };
-  if (unit.status === "running") return { review: "进行中", testing: "待开始" };
-  if (unit.status === "awaiting_gate") return { review: "已通过", testing: "进行中" };
-  if (["returned", "potentially_stale", "failed"].includes(unit.status)) {
-    return { review: "需要检查", testing: "需要检查" };
+  if (["ready_for_acceptance", "applying", "applied"].includes(unit.status)) {
+    return { review: "已通过", testing: "已通过" };
   }
-  return { review: "待开始", testing: "待开始" };
+  return { review: "等待独立审查证据", testing: "等待自动化测试证据" };
 }
