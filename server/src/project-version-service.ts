@@ -84,6 +84,25 @@ async function localBranchExists(repoPath: string, branch: string) {
   }
 }
 
+async function exactBranchHead(repoPath: string, ref: string) {
+  try {
+    await git(repoPath, ["show-ref", "--verify", "--quiet", ref]);
+    const { stdout } = await git(repoPath, ["rev-parse", "--verify", `${ref}^{commit}`]);
+    return stdout.trim();
+  } catch (error) {
+    if (classifyGitFailure(error) === "not_found") return undefined;
+    throw new Error("PROJECT_VERSION_GIT_UNAVAILABLE", { cause: error });
+  }
+}
+
+async function resolveBaseBranchHead(repoPath: string, baseBranch: string) {
+  const local = await exactBranchHead(repoPath, `refs/heads/${baseBranch}`);
+  if (local) return local;
+  const remote = await exactBranchHead(repoPath, `refs/remotes/${baseBranch}`);
+  if (remote) return remote;
+  fail("PROJECT_VERSION_BASE_BRANCH_NOT_FOUND");
+}
+
 async function canonicalWorktree(worktree: RegisteredWorktree) {
   try { return { ...worktree, path: await realpath(worktree.path) }; }
   catch { return worktree; }
@@ -115,12 +134,11 @@ async function ensureManagedDirectory(parent: string, segments: string[]) {
 async function inspectCanonical(repoPath: string, branch: string, baseBranch: string): Promise<ProjectVersionValidation> {
   await validateBranch(repoPath, branch, "PROJECT_VERSION_BRANCH_INVALID");
   await validateBranch(repoPath, baseBranch, "PROJECT_VERSION_BASE_BRANCH_INVALID");
-  if (!await localBranchExists(repoPath, baseBranch)) fail("PROJECT_VERSION_BASE_BRANCH_NOT_FOUND");
+  const baseHead = await resolveBaseBranchHead(repoPath, baseBranch);
 
   const branchExists = await localBranchExists(repoPath, branch);
   if (!branchExists) {
-    const { stdout } = await git(repoPath, ["rev-parse", baseBranch]);
-    return { valid: true, branch, baseBranch, mode: "create_branch", headCommit: stdout.trim() };
+    return { valid: true, branch, baseBranch, mode: "create_branch", headCommit: baseHead };
   }
   const wantedRef = `refs/heads/${branch}`;
   const occupied = await Promise.all((await registeredWorktrees(repoPath)).filter((item) => item.branch === wantedRef).map(canonicalWorktree));
@@ -219,8 +237,8 @@ export async function createProjectVersionWorktree(input: {
     let worktreeAdded = false;
     try {
       if (input.mode === "create_branch") {
-        const { stdout } = await git(repoPath, ["rev-parse", input.baseBranch]);
-        const baseHead = stdout.trim();
+        const baseHead = inspected.headCommit;
+        if (!baseHead) fail("PROJECT_VERSION_BASE_BRANCH_NOT_FOUND");
         await git(repoPath, ["update-ref", `refs/heads/${input.branch}`, baseHead, ""]);
         ownedHead = baseHead;
       }

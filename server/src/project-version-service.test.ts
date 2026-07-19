@@ -108,6 +108,69 @@ describe("project version worktree lifecycle", () => {
     expect(await mainState(repoPath)).toEqual(before);
   });
 
+  it("creates a missing local branch from a remote-tracking base branch", async () => {
+    const { repoPath } = await setupRepository();
+    const before = await mainState(repoPath);
+    const remoteHead = await git(repoPath, "rev-parse", "prod");
+    await git(repoPath, "update-ref", "refs/remotes/origin/feature/2.4", remoteHead);
+
+    const inspected = await inspectProjectVersion({
+      repoPath, name: "2.4", branch: "feature/2.4", baseBranch: "origin/feature/2.4"
+    });
+    expect(inspected).toEqual({
+      valid: true, branch: "feature/2.4", baseBranch: "origin/feature/2.4",
+      mode: "create_branch", headCommit: remoteHead
+    });
+
+    const created = await createProjectVersionWorktree({
+      repoPath, versionId: "version-24", branch: "feature/2.4",
+      baseBranch: "origin/feature/2.4", mode: "create_branch"
+    });
+
+    expect(created).toMatchObject({
+      headCommit: remoteHead, createdBranchHead: remoteHead,
+      createdBranch: true, createdWorktree: true
+    });
+    expect(await git(created.worktreePath, "branch", "--show-current")).toBe("feature/2.4");
+    expect(await git(created.worktreePath, "rev-parse", "HEAD")).toBe(remoteHead);
+    expect(await mainState(repoPath)).toEqual(before);
+  });
+
+  it("prefers an exact local branch when a remote-tracking branch has the same name", async () => {
+    const { repoPath } = await setupRepository();
+    const remoteHead = await git(repoPath, "rev-parse", "prod");
+    await writeFile(join(repoPath, "local-base.txt"), "local branch wins\n");
+    await git(repoPath, "add", "local-base.txt");
+    await git(repoPath, "commit", "-m", "advance local base");
+    const localHead = await git(repoPath, "rev-parse", "prod");
+    await git(repoPath, "branch", "origin/shared", localHead);
+    await git(repoPath, "update-ref", "refs/remotes/origin/shared", remoteHead);
+
+    const inspected = await inspectProjectVersion({
+      repoPath, name: "local-priority", branch: "feature/local-priority", baseBranch: "origin/shared"
+    });
+
+    expect(inspected).toMatchObject({ mode: "create_branch", headCommit: localHead });
+    expect(inspected.headCommit).not.toBe(remoteHead);
+  });
+
+  it("rejects object ids, tags, and revision expressions as base branches", async () => {
+    const { repoPath } = await setupRepository();
+    const head = await git(repoPath, "rev-parse", "HEAD");
+    await git(repoPath, "tag", "release-candidate", head);
+
+    for (const [baseBranch, error] of [
+      [head, "PROJECT_VERSION_BASE_BRANCH_NOT_FOUND"],
+      ["release-candidate", "PROJECT_VERSION_BASE_BRANCH_NOT_FOUND"],
+      ["prod~1", "PROJECT_VERSION_BASE_BRANCH_INVALID"],
+      ["prod^{commit}", "PROJECT_VERSION_BASE_BRANCH_INVALID"]
+    ] as const) {
+      await expect(inspectProjectVersion({
+        repoPath, name: "invalid-base", branch: "feature/invalid-base", baseBranch
+      })).rejects.toThrow(error);
+    }
+  });
+
   it("returns the base head resolved inside creation after an earlier inspection becomes stale", async () => {
     const { repoPath } = await setupRepository();
     const inspected = await inspectProjectVersion({
