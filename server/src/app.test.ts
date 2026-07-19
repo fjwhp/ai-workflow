@@ -237,17 +237,22 @@ describe("project and requirement association APIs",()=>{
     expect(runAgent).toHaveBeenCalledWith("solution_design",expect.objectContaining({approvedDefinition:{artifactId:definition!.id,content:expect.objectContaining({summary:"approved generated definition"})}}),expect.any(Function));await app.close();
   });
 
-  it("binds solution design to the latest approved definition artifact",async()=>{
-    const store=new WorkflowStore(":memory:");stores.push(store);const repo=await projectRepo();const project=store.createProject(projectPayload(repo));
-    const req=createRequirement(store,{title:"方案输入",businessProblem:"定义返工后只能使用最新批准版本",expectedOutcome:"绑定批准定义",priority:"high",primaryProjectId:project.id});
-    const knowledge=store.beginProjectKnowledge(project.id,(await execFileAsync("git",["-C",repo,"rev-parse","HEAD"])).stdout.trim(),"test");store.completeProjectKnowledge(knowledge.id,{summary:"ready",entries:[]});
-    const stale=store.addArtifact(req.id,"definition","旧定义",{...definitionResult,summary:"stale definition"});store.addApproval(req.id,"definition",{decision:"approve",comment:"旧版本批准",artifactId:stale.id});await new Promise(resolve=>setTimeout(resolve,2));
-    const approved=store.addArtifact(req.id,"definition","新定义",{...definitionResult,summary:"approved definition"});store.addApproval(req.id,"definition",{decision:"approve",comment:"返工版本批准",artifactId:approved.id});store.updateRequirementState(req.id,"solution_design","ai_ready");agent.run.mockResolvedValue(solutionResult([project.id]));const app=await buildApp(store);
+  it("exposes approved definition only through the dedicated solution-design context",async()=>{
+    const store=new WorkflowStore(":memory:");stores.push(store);const repo=await projectRepo();const project=store.createProject(projectPayload(repo));const version=ensureProjectVersion(store,project.id);
+    const knowledge=store.beginProjectKnowledge(project.id,(await execFileAsync("git",["-C",repo,"rev-parse","HEAD"])).stdout.trim(),"test");store.completeProjectKnowledge(knowledge.id,{summary:"ready",entries:[]});const app=await buildApp(store);
+    const created=await app.inject({method:"POST",url:"/api/requirements",payload:{title:"方案输入隔离",businessProblem:"未批准定义不能进入方案上下文",expectedOutcome:"只暴露批准定义",priority:"high",primaryProjectId:project.id,primaryProjectVersionId:version.id}});const requirementId=created.json().id;
+    const approved=store.addArtifact(requirementId,"definition","Approved definition",{...definitionResult,summary:"current approved definition"});store.updateRequirementState(requirementId,"definition","awaiting_approval");
+    const approval=await app.inject({method:"POST",url:`/api/requirements/${requirementId}/approve`,payload:{decision:"approve",comment:"批准当前定义"}});expect(approval.statusCode).toBe(200);
+    store.addArtifact(requirementId,"definition","Unapproved definition",{summary:"unapproved definition secret"});
+    const priorSolution=store.addArtifact(requirementId,"solution_design","Prior solution attempt",{summary:"retain prior solution context"});agent.run.mockClear();agent.run.mockResolvedValue(solutionResult([project.id]));
 
-    const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});
+    const response=await app.inject({method:"POST",url:`/api/requirements/${requirementId}/run`,payload:{}});
 
     expect(response.statusCode).toBe(202);for(let attempt=0;attempt<50&&store.getStageRun(response.json().id)?.status==="running";attempt++)await new Promise(resolve=>setTimeout(resolve,10));
-    expect(runAgent).toHaveBeenCalledWith("solution_design",expect.objectContaining({approvedDefinition:expect.objectContaining({artifactId:approved.id,content:expect.objectContaining({summary:"approved definition"})})}),expect.any(Function));await app.close();
+    const context=vi.mocked(runAgent).mock.calls[0]![1] as any;
+    expect(context.approvedDefinition).toMatchObject({artifactId:approved.id,content:{summary:"current approved definition"}});
+    expect(context.priorArtifacts).toEqual([expect.objectContaining({id:priorSolution.id,stage:"solution_design",content:{summary:"retain prior solution context"}})]);
+    expect(JSON.stringify(context)).not.toContain("unapproved definition secret");await app.close();
   });
 
   it("returns a stable budget error before creating a run",async()=>{

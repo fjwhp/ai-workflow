@@ -117,8 +117,9 @@ export async function buildApp(store: WorkflowStore) {
     let projectContext:any;
     try{projectContext=await buildRequirementProjectContext(store,item.id,item.stage,projectContextBudget);}
     catch(error){return sendProjectContextError(reply,error);}
-    const priorArtifacts=store.listArtifacts(item.id),approvalHistory=store.listApprovals(item.id);
-    const approvedDefinition=item.stage==="solution_design"?approvedDefinitionFrom(priorArtifacts,approvalHistory):undefined;
+    const allPriorArtifacts=store.listArtifacts(item.id),approvalHistory=store.listApprovals(item.id);
+    const approvedDefinition=item.stage==="solution_design"?approvedDefinitionFrom(allPriorArtifacts,approvalHistory):undefined;
+    const priorArtifacts=item.stage==="solution_design"?allPriorArtifacts.filter((artifact:any)=>artifact.stage!=="definition"):allPriorArtifacts;
     const context = redactSensitive({ requirement: item, priorArtifacts, approvalHistory, approvedDefinition, projectContext, reworkRequired:Boolean(reworkContext), reworkContext, userContext: req.body?.context },sensitivePatterns);
     if(context.projectContext){
       for(const block of context.projectContext.projects){do{block.totalChars=JSON.stringify(block).length;}while(block.totalChars!==JSON.stringify(block).length);}
