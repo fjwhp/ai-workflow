@@ -271,7 +271,7 @@ describe("requirement approval routes", () => {
     await app.close();
   });
 
-  it("keeps generic approval behavior for other stages and ignores post-commit callback failures", async () => {
+  it("advances definition approval through the current five-stage generic flow", async () => {
     const fixture = createFixture();
     fixture.store.updateRequirementState(fixture.requirement.id, "definition", "awaiting_approval");
     const app = Fastify();
@@ -287,7 +287,9 @@ describe("requirement approval routes", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ stage: "solution_design", status: "ai_ready" });
-    expect(fixture.store.listApprovals(fixture.requirement.id)).toHaveLength(1);
+    expect(fixture.store.listApprovals(fixture.requirement.id)).toMatchObject([{
+      stage: "definition", decision: "conditional", condition_text: "Track the risk"
+    }]);
     await app.close();
   });
 });

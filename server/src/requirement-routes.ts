@@ -9,18 +9,6 @@ interface RequirementRouteDependencies {
   onApproved?: (requirementId: string) => void | Promise<void>;
 }
 
-const legacyReturnStages: Record<string, string> = {
-  intake: "intake",
-  prd: "intake",
-  requirement_review: "prd",
-  technical_design: "requirement_review",
-  coding: "technical_design",
-  code_review: "coding",
-  testing: "coding",
-  acceptance: "testing",
-  integration: "acceptance"
-};
-
 const approvalConflictCodes = new Set([
   "REQUIREMENT_APPROVAL_STATE_CHANGED",
   "REQUIREMENT_APPROVAL_NOT_READY",
@@ -58,7 +46,7 @@ export async function registerRequirementRoutes(
         }).requirement;
       } else {
         const approval = parsed.data.decision === "return"
-          ? { ...parsed.data, targetStage: legacyReturnStages[current.stage] ?? returnStage(current.stage) }
+          ? { ...parsed.data, targetStage: returnStage(current.stage) }
           : parsed.data;
         requirement = store.applyRequirementApproval({
           requirementId: current.id,

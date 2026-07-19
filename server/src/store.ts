@@ -127,33 +127,6 @@ export interface VersionApplicationQueueEntry {
 
 const executionStages = new Set<WorkflowStage>(["coding", "code_review", "testing", "acceptance", "integration"]);
 
-const legacyApprovalTransitions: Record<string, { stage: string; status: string }> = {
-  intake: { stage: "prd", status: "ai_ready" },
-  prd: { stage: "requirement_review", status: "ai_ready" },
-  requirement_review: { stage: "technical_design", status: "ai_ready" },
-  technical_design: { stage: "coding", status: "ai_ready" },
-  coding: { stage: "code_review", status: "ai_ready" },
-  code_review: { stage: "testing", status: "ai_ready" },
-  testing: { stage: "acceptance", status: "ai_ready" },
-  acceptance: { stage: "integration", status: "awaiting_merge" }
-};
-
-const legacyReturnStages: Record<string, string> = {
-  intake: "intake",
-  prd: "intake",
-  requirement_review: "prd",
-  technical_design: "requirement_review",
-  coding: "technical_design",
-  code_review: "coding",
-  testing: "coding",
-  acceptance: "testing",
-  integration: "acceptance"
-};
-
-function approvalReturnStage(stage: WorkflowStage): string {
-  return legacyReturnStages[stage as string] ?? returnStage(stage);
-}
-
 const versionApplicationQueueSql = `WITH target_version AS (
     SELECT pv.id, pv.project_id, pv.status AS version_status, pv.pending_requirement_id,
       p.status AS project_status
@@ -721,23 +694,19 @@ export class WorkflowStore {
       if (requirement.stage !== input.expectedStage) throw new Error("REQUIREMENT_APPROVAL_STATE_CHANGED");
       if (requirement.status !== "awaiting_approval") throw new Error("REQUIREMENT_APPROVAL_NOT_READY");
       const approval = input.approval.decision === "return"
-        ? { ...input.approval, targetStage: input.approval.targetStage ?? approvalReturnStage(requirement.stage) }
+        ? { ...input.approval, targetStage: returnStage(requirement.stage) }
         : input.approval;
       const approvalRecord = this.insertApprovalInTransaction(input.requirementId, requirement.stage, approval, now);
-      if ((requirement.stage as string) === "technical_design" && approval.decision !== "return" && !this.getRequirementProjectSnapshot(input.requirementId)) {
-        this.createRequirementProjectSnapshotInTransaction(input.requirementId, now);
-      }
       if (approval.decision === "return") {
         const artifact = this.listArtifacts(input.requirementId).find((entry: any) => entry.stage === requirement.stage);
         this.insertReworkContext(input.requirementId, buildReworkContext({ approval: approvalRecord, artifact }), now);
         this.db.prepare("UPDATE requirements SET stage = ?, status = 'returned', updated_at = ? WHERE id = ?")
           .run(approval.targetStage, now, input.requirementId);
       } else {
-        const legacyTransition = legacyApprovalTransitions[requirement.stage as string];
         const index = workflowStages.indexOf(requirement.stage);
         const nextStage = workflowStages[index + 1];
-        const targetStage = legacyTransition?.stage ?? nextStage ?? requirement.stage;
-        const status = legacyTransition?.status ?? (nextStage ? "ai_ready" : "completed");
+        const targetStage = nextStage ?? requirement.stage;
+        const status = nextStage ? "ai_ready" : "completed";
         this.db.prepare("UPDATE requirements SET stage = ?, status = ?, updated_at = ? WHERE id = ?")
           .run(targetStage, status, now, input.requirementId);
       }
