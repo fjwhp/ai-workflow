@@ -549,43 +549,66 @@ describe("project version application leases", () => {
     });
   });
 
-  it("lets only one of two independent processes acquire the same version", { timeout: 15_000 }, async () => {
-    const path = databasePath();
-    const store = new WorkflowStore(path); stores.push(store);
-    const project = createProject(store, "Application race", join(path, "..", "application-race"));
-    const version = createVersion(store, project.id, "1.0.0", join(path, "..", "application-race-v1"));
-    const firstRequirement = store.createRequirement(requirementInput(project.id, version.id, "Race first"));
-    const secondRequirement = store.createRequirement(requirementInput(project.id, version.id, "Race second"));
-    store.updateRequirementState(firstRequirement.id, "integration", "awaiting_merge");
-    store.updateRequirementState(secondRequirement.id, "integration", "awaiting_merge");
-    const first = spawnVersionApplicationWorker(path, {
-      mode: "begin", begin: {
-        versionId: version.id, requirementId: firstRequirement.id, run: applicationRun(version, "race-first")
-      }
-    });
-    const second = spawnVersionApplicationWorker(path, {
-      mode: "begin", begin: {
-        versionId: version.id, requirementId: secondRequirement.id, run: applicationRun(version, "race-second")
-      }
-    });
-    await Promise.all([first.waitFor("ready"), second.waitFor("ready")]);
-    const locker = new DatabaseSync(path); databases.push(locker);
-    locker.exec("BEGIN IMMEDIATE");
-    const firstStarting = first.waitFor("starting");
-    const secondStarting = second.waitFor("starting");
-    first.child.send("go");
-    second.child.send("go");
-    await Promise.all([firstStarting, secondStarting]);
-    locker.exec("COMMIT");
+  it.each([1, 2, 3, 4, 5])(
+    "stably distinguishes an idle non-next waiter from an occupied version across processes (round %i)",
+    { timeout: 15_000 },
+    async (round) => {
+      const path = databasePath();
+      const store = new WorkflowStore(path); stores.push(store);
+      const project = createProject(store, "Application race", join(path, "..", "application-race"));
+      const version = createVersion(store, project.id, "1.0.0", join(path, "..", "application-race-v1"));
+      const firstRequirement = store.createRequirement(requirementInput(project.id, version.id, "Race first"));
+      const secondRequirement = store.createRequirement(requirementInput(project.id, version.id, "Race second"));
+      store.updateRequirementState(firstRequirement.id, "integration", "awaiting_merge");
+      store.updateRequirementState(secondRequirement.id, "integration", "awaiting_merge");
 
-    const outcomes = await Promise.all([first.waitForOutcome(), second.waitForOutcome()]);
-    expect(outcomes.filter(({ type }) => type === "result")).toHaveLength(1);
-    expect(outcomes.filter(({ type }) => type === "error")).toEqual([
-      expect.objectContaining({ type: "error", message: "PROJECT_VERSION_APPLICATION_BUSY" })
-    ]);
-    expect(store.listPendingVersionApplications()).toHaveLength(1);
-    await Promise.all([waitForExit(first.child), waitForExit(second.child)]);
-  });
+      const idleWaiter = spawnVersionApplicationWorker(path, {
+        mode: "begin", begin: {
+          versionId: version.id, requirementId: secondRequirement.id,
+          run: applicationRun(version, `race-${round}-idle-waiter`)
+        }
+      });
+      await idleWaiter.waitFor("ready");
+      idleWaiter.child.send("go");
+      await expect(idleWaiter.waitForOutcome()).resolves.toMatchObject({
+        type: "error", message: "PROJECT_VERSION_APPLICATION_NOT_NEXT"
+      });
+      await waitForExit(idleWaiter.child);
+      expect(store.listPendingVersionApplications()).toEqual([]);
+      expect(store.getIntegrationRun(`run-race-${round}-idle-waiter`)).toBeNull();
+
+      const owner = spawnVersionApplicationWorker(path, {
+        mode: "begin", begin: {
+          versionId: version.id, requirementId: firstRequirement.id,
+          run: applicationRun(version, `race-${round}-owner`)
+        }
+      });
+      await owner.waitFor("ready");
+      owner.child.send("go");
+      await expect(owner.waitForOutcome()).resolves.toMatchObject({ type: "result", code: "ACQUIRED" });
+      await waitForExit(owner.child);
+
+      const occupiedWaiter = spawnVersionApplicationWorker(path, {
+        mode: "begin", begin: {
+          versionId: version.id, requirementId: secondRequirement.id,
+          run: applicationRun(version, `race-${round}-occupied-waiter`)
+        }
+      });
+      await occupiedWaiter.waitFor("ready");
+      occupiedWaiter.child.send("go");
+      await expect(occupiedWaiter.waitForOutcome()).resolves.toMatchObject({
+        type: "error", message: "PROJECT_VERSION_APPLICATION_BUSY"
+      });
+      await waitForExit(occupiedWaiter.child);
+
+      expect(store.listPendingVersionApplications()).toHaveLength(1);
+      expect(store.getProjectVersion(version.id)).toMatchObject({
+        pendingRequirementId: firstRequirement.id,
+        pendingIntegrationRunId: `run-race-${round}-owner`
+      });
+      expect(store.getIntegrationRun(`run-race-${round}-occupied-waiter`)).toBeNull();
+    }
+  );
 
   it("allows independent processes to acquire different versions", { timeout: 15_000 }, async () => {
     const path = databasePath();
