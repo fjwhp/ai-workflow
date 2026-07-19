@@ -4,6 +4,7 @@ import {
   deliveryReleaseConditions,
   deliveryUnitPhases,
   deliveryUnitStatuses,
+  requirementProjectsInputSchema,
   validateDeliveryGraph,
   type DeliveryDependencyInput
 } from "@ai-workflow/shared";
@@ -124,10 +125,10 @@ interface PreparedUnit {
   position: number;
 }
 
-export class DeliveryUnitRepository implements DeliveryUnitPersistence {
+export class DeliveryUnitRepository {
   constructor(private readonly db: DatabaseSync) {}
 
-  createPlan(input: CreateDeliveryPlanInput): DeliveryPlanResult {
+  createPlanInTransaction(input: CreateDeliveryPlanInput): DeliveryPlanResult {
     this.validateInputShape(input);
     if (!this.db.prepare("SELECT id FROM requirements WHERE id = ?").get(input.requirementId)) {
       throw new Error("REQUIREMENT_NOT_FOUND");
@@ -297,7 +298,17 @@ function parseAssociations(value: string): FrozenDeliveryAssociation[] {
   let parsed: unknown;
   try { parsed = JSON.parse(value); }
   catch { throw new Error("REQUIREMENT_PROJECT_SNAPSHOT_INVALID"); }
-  if (!Array.isArray(parsed)) throw new Error("REQUIREMENT_PROJECT_SNAPSHOT_INVALID");
+  const validated = requirementProjectsInputSchema.safeParse(parsed);
+  if (!validated.success || !Array.isArray(parsed)) throw new Error("REQUIREMENT_PROJECT_SNAPSHOT_INVALID");
+  for (const association of parsed) {
+    const frozen = association as Record<string, unknown>;
+    if (
+      (frozen.projectVersionWorktreePath !== undefined && typeof frozen.projectVersionWorktreePath !== "string")
+      || (frozen.projectVersionHead !== undefined && typeof frozen.projectVersionHead !== "string")
+    ) {
+      throw new Error("REQUIREMENT_PROJECT_SNAPSHOT_INVALID");
+    }
+  }
   return parsed as FrozenDeliveryAssociation[];
 }
 

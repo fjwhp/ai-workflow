@@ -171,6 +171,34 @@ describe("DeliveryUnitRepository", () => {
     expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)).toHaveLength(1);
   });
 
+  it("rolls back the public facade when a snapshot write fails and allows retry", () => {
+    const fixture = createFixture();
+    fixture.database.exec(`CREATE TRIGGER fail_delivery_unit_snapshot
+      BEFORE INSERT ON delivery_unit_snapshots
+      BEGIN SELECT RAISE(ABORT, 'forced snapshot failure'); END;`);
+
+    expect(() => fixture.store.deliveryUnits.createPlan(fixture.input)).toThrow("forced snapshot failure");
+    expectNoWrites(fixture);
+
+    fixture.database.exec("DROP TRIGGER fail_delivery_unit_snapshot");
+    const result = fixture.store.deliveryUnits.createPlan(fixture.input);
+    expect(result.units).toHaveLength(2);
+    expect(result.dependencies).toHaveLength(1);
+    expect(fixture.database.prepare("SELECT * FROM delivery_unit_snapshots WHERE requirement_id = ?")
+      .all(fixture.requirement.id)).toHaveLength(2);
+  });
+
+  it("supports raw delivery persistence inside an explicit store transaction", () => {
+    const fixture = createFixture();
+
+    const result = fixture.store.withImmediateTransaction(
+      () => fixture.store.createDeliveryPlanInTransaction(fixture.input)
+    );
+
+    expect(result.units).toHaveLength(2);
+    expect(result.dependencies).toHaveLength(1);
+  });
+
   it("rejects plan projects outside the frozen snapshot without writing", () => {
     const fixture = createFixture();
     const extra = fixture.store.createProject({
@@ -199,7 +227,7 @@ describe("DeliveryUnitRepository", () => {
     expectNoWrites(fixture);
   });
 
-  it("rejects a delivery association without a frozen version without writing", () => {
+  it("rejects a delivery association without a frozen version as an invalid snapshot", () => {
     const fixture = createFixture();
     const snapshot = replaceSnapshotAssociations(fixture, (associations) => associations.map((association) =>
       association.projectId === fixture.frontend.id
@@ -208,7 +236,7 @@ describe("DeliveryUnitRepository", () => {
     ));
 
     expect(() => fixture.store.deliveryUnits.createPlan({ ...fixture.input, snapshot }))
-      .toThrow("REQUIREMENT_VERSION_REQUIRED");
+      .toThrow("REQUIREMENT_PROJECT_SNAPSHOT_INVALID");
     expectNoWrites(fixture);
   });
 
@@ -330,6 +358,35 @@ describe("DeliveryUnitRepository", () => {
 
     expect(() => fixture.store.deliveryUnits.createPlan({ ...fixture.input, snapshot }))
       .toThrow("REQUIREMENT_PROJECT_SNAPSHOT_MISMATCH");
+    expectNoWrites(fixture);
+  });
+
+  it.each([
+    ["missing module scope", (associations: any[]) => associations.map((association) => {
+      if (association.usage !== "delivery") return association;
+      const { moduleMode: _moduleMode, moduleIds: _moduleIds, ...malformed } = association;
+      return malformed;
+    })],
+    ["invalid usage", (associations: any[]) => associations.map((association) =>
+      association.usage === "delivery" ? { ...association, usage: "invalid" } : association
+    )],
+    ["non-array module ids", (associations: any[]) => associations.map((association) =>
+      association.usage === "delivery" ? { ...association, moduleIds: "src/not-an-array" } : association
+    )],
+    ["non-string frozen worktree", (associations: any[]) => associations.map((association) =>
+      association.usage === "delivery" ? { ...association, projectVersionWorktreePath: 42 } : association
+    )],
+    ["non-string frozen head", (associations: any[]) => associations.map((association) =>
+      association.usage === "delivery" ? { ...association, projectVersionHead: ["not-a-string"] } : association
+    )]
+  ])("rejects %s snapshot associations with a stable error and no writes", (_case, mutate) => {
+    const fixture = createFixture();
+    const malformed = mutate(structuredClone(fixture.snapshot.associations));
+    fixture.database.prepare("UPDATE requirement_project_snapshots SET associations_json = ? WHERE id = ?")
+      .run(JSON.stringify(malformed), fixture.snapshot.id);
+
+    expect(() => fixture.store.deliveryUnits.createPlan(fixture.input))
+      .toThrow("REQUIREMENT_PROJECT_SNAPSHOT_INVALID");
     expectNoWrites(fixture);
   });
 

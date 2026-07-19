@@ -7,7 +7,12 @@ import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./hum
 import { hasMaterialAssociationChange, validateRequirementProjects } from "./requirement-projects.js";
 import { buildReworkContext } from "./rework-context.js";
 import { createPhase2Schema } from "./database-schema.js";
-import { DeliveryUnitRepository, type DeliveryUnitPersistence } from "./delivery-unit-repository.js";
+import {
+  DeliveryUnitRepository,
+  type CreateDeliveryPlanInput,
+  type DeliveryPlanResult,
+  type DeliveryUnitPersistence
+} from "./delivery-unit-repository.js";
 
 export type RequirementProjectWithVersionMetadata = RequirementProject & {
   projectVersionWorktreePath?: string;
@@ -139,13 +144,37 @@ const versionApplicationQueueSql = `WITH target_version AS (
 
 export class WorkflowStore {
   private db: DatabaseSync;
+  private readonly deliveryUnitRepository: DeliveryUnitRepository;
   public readonly deliveryUnits: DeliveryUnitPersistence;
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     createPhase2Schema(this.db);
-    this.deliveryUnits = new DeliveryUnitRepository(this.db);
+    this.deliveryUnitRepository = new DeliveryUnitRepository(this.db);
+    this.deliveryUnits = {
+      createPlan: (input) => this.withImmediateTransaction(
+        () => this.deliveryUnitRepository.createPlanInTransaction(input)
+      ),
+      listForRequirement: (requirementId) => this.deliveryUnitRepository.listForRequirement(requirementId),
+      listDependencies: (requirementId) => this.deliveryUnitRepository.listDependencies(requirementId)
+    };
+  }
+
+  withImmediateTransaction<T>(operation: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  createDeliveryPlanInTransaction(input: CreateDeliveryPlanInput): DeliveryPlanResult {
+    return this.deliveryUnitRepository.createPlanInTransaction(input);
   }
 
   private assertNoPendingVersionApplication(requirementId: string) {
