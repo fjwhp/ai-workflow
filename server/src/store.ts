@@ -7,6 +7,7 @@ import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./hum
 import { hasMaterialAssociationChange, validateRequirementProjects } from "./requirement-projects.js";
 import { buildReworkContext } from "./rework-context.js";
 import { createPhase2Schema } from "./database-schema.js";
+import { DeliveryUnitRepository, type DeliveryUnitPersistence } from "./delivery-unit-repository.js";
 
 export type RequirementProjectWithVersionMetadata = RequirementProject & {
   projectVersionWorktreePath?: string;
@@ -138,11 +139,13 @@ const versionApplicationQueueSql = `WITH target_version AS (
 
 export class WorkflowStore {
   private db: DatabaseSync;
+  public readonly deliveryUnits: DeliveryUnitPersistence;
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     createPhase2Schema(this.db);
+    this.deliveryUnits = new DeliveryUnitRepository(this.db);
   }
 
   private assertNoPendingVersionApplication(requirementId: string) {
