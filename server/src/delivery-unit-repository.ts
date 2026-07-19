@@ -7,6 +7,7 @@ import {
   validateDeliveryGraph,
   type DeliveryDependencyInput
 } from "@ai-workflow/shared";
+import { normalizeModuleId } from "./requirement-projects.js";
 
 export type DeliveryUnitPhase = typeof deliveryUnitPhases[number];
 export type DeliveryUnitStatus = typeof deliveryUnitStatuses[number];
@@ -26,6 +27,8 @@ export interface FrozenDeliveryAssociation {
   projectVersionHead?: string;
   usage: "context" | "delivery";
   deliveryRequired: boolean;
+  moduleMode: "auto" | "all" | "selected";
+  moduleIds: string[];
 }
 
 export interface DeliveryAssociationSnapshotInput {
@@ -87,6 +90,7 @@ interface SnapshotRow {
   requirement_id: string;
   version: number;
   associations_json: string;
+  status: "active" | "superseded";
 }
 
 interface ProjectRow {
@@ -115,6 +119,7 @@ interface PreparedUnit {
   project: ProjectRow;
   version: ProjectVersionRow;
   knowledgeVersionId: string | null;
+  required: boolean;
   status: "ready" | "waiting_dependency";
   position: number;
 }
@@ -134,6 +139,7 @@ export class DeliveryUnitRepository implements DeliveryUnitPersistence {
     const snapshotRow = this.db.prepare("SELECT * FROM requirement_project_snapshots WHERE id = ?")
       .get(input.snapshot.id) as SnapshotRow | undefined;
     if (!snapshotRow) throw new Error("REQUIREMENT_PROJECT_SNAPSHOT_NOT_FOUND");
+    if (snapshotRow.status !== "active") throw new Error("REQUIREMENT_PROJECT_SNAPSHOT_NOT_ACTIVE");
     const storedAssociations = parseAssociations(snapshotRow.associations_json);
     if (
       snapshotRow.requirement_id !== input.requirementId
@@ -157,7 +163,6 @@ export class DeliveryUnitRepository implements DeliveryUnitPersistence {
 
     const associationByProject = new Map<string, FrozenDeliveryAssociation>();
     for (const association of deliveryAssociations) {
-      if (!association.deliveryRequired) throw new Error("DELIVERY_ASSOCIATION_NOT_REQUIRED");
       if (!association.projectVersionId) throw new Error("REQUIREMENT_VERSION_REQUIRED");
       if (associationByProject.has(association.projectId)) throw new Error("DELIVERY_ASSOCIATION_DUPLICATE_PROJECT");
       associationByProject.set(association.projectId, association);
@@ -173,6 +178,13 @@ export class DeliveryUnitRepository implements DeliveryUnitPersistence {
     const downstreamProjectIds = new Set(input.plan.dependencies.map((dependency) => dependency.downstreamProjectId));
     const preparedUnits = input.plan.units.map((unit, position): PreparedUnit => {
       const association = associationByProject.get(unit.projectId)!;
+      const normalizedModuleIds = normalizeDeliveryUnitModuleIds(unit.moduleIds);
+      if (association.moduleMode === "selected") {
+        const frozenModuleIds = new Set(normalizeDeliveryUnitModuleIds(association.moduleIds));
+        if (normalizedModuleIds.some((moduleId) => !frozenModuleIds.has(moduleId))) {
+          throw new Error("DELIVERY_UNIT_MODULE_SCOPE_INVALID");
+        }
+      }
       const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(unit.projectId) as ProjectRow | undefined;
       if (!project || project.status !== "active") throw new Error("PROJECT_NOT_ACTIVE");
       const version = this.db.prepare("SELECT * FROM project_versions WHERE id = ?")
@@ -182,8 +194,9 @@ export class DeliveryUnitRepository implements DeliveryUnitPersistence {
       const knowledge = this.db.prepare(`SELECT id FROM project_knowledge_versions
         WHERE project_id = ? AND status = 'ready' ORDER BY version DESC LIMIT 1`).get(unit.projectId) as { id: string } | undefined;
       return {
-        id: randomUUID(), input: unit, association, project, version,
+        id: randomUUID(), input: { ...unit, moduleIds: normalizedModuleIds }, association, project, version,
         knowledgeVersionId: knowledge?.id ?? null,
+        required: association.deliveryRequired,
         status: downstreamProjectIds.has(unit.projectId) ? "waiting_dependency" : "ready",
         position
       };
@@ -201,7 +214,7 @@ export class DeliveryUnitRepository implements DeliveryUnitPersistence {
     const insertUnit = this.db.prepare(`INSERT INTO delivery_units
       (id, requirement_id, association_snapshot_id, project_id, project_version_id, required, position,
        phase, status, evidence_version, created_at, updated_at, completed_at)
-      VALUES (?, ?, ?, ?, ?, 1, ?, 'implementation', ?, 1, ?, ?, NULL)`);
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'implementation', ?, 1, ?, ?, NULL)`);
     const insertSnapshot = this.db.prepare(`INSERT INTO delivery_unit_snapshots
       (id, delivery_unit_id, requirement_id, project_id, project_version_id, repo_path, branch,
        base_branch, worktree_path, head_commit, module_ids_json, sensitive_patterns_json,
@@ -215,7 +228,7 @@ export class DeliveryUnitRepository implements DeliveryUnitPersistence {
     for (const unit of preparedUnits) {
       insertUnit.run(
         unit.id, input.requirementId, input.snapshot.id, unit.input.projectId,
-        unit.version.id, unit.position, unit.status, now, now
+        unit.version.id, unit.required ? 1 : 0, unit.position, unit.status, now, now
       );
       insertSnapshot.run(
         randomUUID(), unit.id, input.requirementId, unit.input.projectId, unit.version.id,
@@ -286,6 +299,25 @@ function parseAssociations(value: string): FrozenDeliveryAssociation[] {
   catch { throw new Error("REQUIREMENT_PROJECT_SNAPSHOT_INVALID"); }
   if (!Array.isArray(parsed)) throw new Error("REQUIREMENT_PROJECT_SNAPSHOT_INVALID");
   return parsed as FrozenDeliveryAssociation[];
+}
+
+function normalizeDeliveryUnitModuleIds(moduleIds: string[]): string[] {
+  const normalizedModuleIds = moduleIds.map(normalizeModuleId);
+  const seen = new Set<string>();
+  for (const moduleId of normalizedModuleIds) {
+    const segments = moduleId.split("/");
+    if (
+      !moduleId
+      || moduleId.startsWith("/")
+      || /^[a-zA-Z]:\//.test(moduleId)
+      || segments.some((segment) => segment === "." || segment === "..")
+      || seen.has(moduleId)
+    ) {
+      throw new Error("DELIVERY_UNIT_MODULE_SCOPE_INVALID");
+    }
+    seen.add(moduleId);
+  }
+  return normalizedModuleIds;
 }
 
 function canonicalJson(value: unknown): string {

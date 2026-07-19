@@ -212,7 +212,7 @@ describe("DeliveryUnitRepository", () => {
     expectNoWrites(fixture);
   });
 
-  it("rejects a delivery association that is not required without writing", () => {
+  it("persists optional delivery associations as non-required units", () => {
     const fixture = createFixture();
     const snapshot = replaceSnapshotAssociations(fixture, (associations) => associations.map((association) =>
       association.projectId === fixture.frontend.id
@@ -220,9 +220,16 @@ describe("DeliveryUnitRepository", () => {
         : association
     ));
 
-    expect(() => fixture.store.deliveryUnits.createPlan({ ...fixture.input, snapshot }))
-      .toThrow("DELIVERY_ASSOCIATION_NOT_REQUIRED");
-    expectNoWrites(fixture);
+    const result = fixture.store.deliveryUnits.createPlan({ ...fixture.input, snapshot });
+
+    expect(result.units.map((item) => [item.projectId, item.required])).toEqual([
+      [fixture.backend.id, true],
+      [fixture.frontend.id, false]
+    ]);
+    expect(result.units).toHaveLength(2);
+    expect(result.dependencies).toHaveLength(1);
+    expect(fixture.database.prepare("SELECT * FROM delivery_unit_snapshots WHERE requirement_id = ?")
+      .all(fixture.requirement.id)).toHaveLength(2);
   });
 
   it("rejects a closed frozen project version without writing", () => {
@@ -306,6 +313,17 @@ describe("DeliveryUnitRepository", () => {
     expectNoWrites(fixture);
   });
 
+  it("rejects a superseded association snapshot without writing", () => {
+    const fixture = createFixture();
+    fixture.database.prepare(`UPDATE requirement_project_snapshots
+      SET status = 'superseded', superseded_at = ? WHERE id = ?`)
+      .run("2026-07-20T00:00:00.000Z", fixture.snapshot.id);
+
+    expect(() => fixture.store.deliveryUnits.createPlan(fixture.input))
+      .toThrow("REQUIREMENT_PROJECT_SNAPSHOT_NOT_ACTIVE");
+    expectNoWrites(fixture);
+  });
+
   it("rejects snapshot metadata that differs from the stored frozen row without writing", () => {
     const fixture = createFixture();
     const snapshot = { ...fixture.snapshot, version: fixture.snapshot.version + 1 };
@@ -337,6 +355,115 @@ describe("DeliveryUnitRepository", () => {
     };
 
     expect(() => fixture.store.deliveryUnits.createPlan(input)).toThrow("DELIVERY_UNIT_PROJECT_SET_MISMATCH");
+    expectNoWrites(fixture);
+  });
+
+  it("rejects traversal outside a selected frozen module scope without writing", () => {
+    const fixture = createFixture();
+    const snapshot = replaceSnapshotAssociations(fixture, (associations) => associations.map((association) =>
+      association.projectId === fixture.backend.id
+        ? { ...association, moduleMode: "selected", moduleIds: ["src/allowed"] }
+        : association
+    ));
+    const input = {
+      ...fixture.input,
+      snapshot,
+      plan: {
+        ...fixture.input.plan,
+        units: [unit(fixture.backend.id, ["../outside"]), unit(fixture.frontend.id)]
+      }
+    };
+
+    expect(() => fixture.store.deliveryUnits.createPlan(input)).toThrow("DELIVERY_UNIT_MODULE_SCOPE_INVALID");
+    expectNoWrites(fixture);
+  });
+
+  it("normalizes and freezes a subset of the selected frozen module scope", () => {
+    const fixture = createFixture();
+    const snapshot = replaceSnapshotAssociations(fixture, (associations) => associations.map((association) =>
+      association.projectId === fixture.backend.id
+        ? { ...association, moduleMode: "selected", moduleIds: ["src/allowed", "src/other"] }
+        : association
+    ));
+    const input = {
+      ...fixture.input,
+      snapshot,
+      plan: {
+        ...fixture.input.plan,
+        units: [unit(fixture.backend.id, ["./src/allowed/"]), unit(fixture.frontend.id)]
+      }
+    };
+
+    const result = fixture.store.deliveryUnits.createPlan(input);
+
+    const backendUnit = result.units.find((item) => item.projectId === fixture.backend.id)!;
+    expect(fixture.database.prepare("SELECT module_ids_json FROM delivery_unit_snapshots WHERE delivery_unit_id = ?")
+      .get(backendUnit.id)).toEqual({ module_ids_json: JSON.stringify(["src/allowed"]) });
+  });
+
+  it("rejects a safe module outside the selected frozen scope without writing", () => {
+    const fixture = createFixture();
+    const snapshot = replaceSnapshotAssociations(fixture, (associations) => associations.map((association) =>
+      association.projectId === fixture.backend.id
+        ? { ...association, moduleMode: "selected", moduleIds: ["src/allowed"] }
+        : association
+    ));
+    const input = {
+      ...fixture.input,
+      snapshot,
+      plan: {
+        ...fixture.input.plan,
+        units: [unit(fixture.backend.id, ["src/not-frozen"]), unit(fixture.frontend.id)]
+      }
+    };
+
+    expect(() => fixture.store.deliveryUnits.createPlan(input)).toThrow("DELIVERY_UNIT_MODULE_SCOPE_INVALID");
+    expectNoWrites(fixture);
+  });
+
+  it("rejects module ids that collide after normalization without writing", () => {
+    const fixture = createFixture();
+    const input = {
+      ...fixture.input,
+      plan: {
+        ...fixture.input.plan,
+        units: [
+          unit(fixture.backend.id, ["src/allowed", "./src/allowed/"]),
+          unit(fixture.frontend.id)
+        ]
+      }
+    };
+
+    expect(() => fixture.store.deliveryUnits.createPlan(input)).toThrow("DELIVERY_UNIT_MODULE_SCOPE_INVALID");
+    expectNoWrites(fixture);
+  });
+
+  it.each([
+    ["all", "/absolute/path"],
+    ["all", "src/./allowed"],
+    ["all", "src/../outside"],
+    ["all", "./"],
+    ["auto", "/absolute/path"],
+    ["auto", "src/./allowed"],
+    ["auto", "src/../outside"],
+    ["auto", "./"]
+  ] as const)("rejects unsafe %s module scope %s without writing", (moduleMode, moduleId) => {
+    const fixture = createFixture();
+    const snapshot = replaceSnapshotAssociations(fixture, (associations) => associations.map((association) =>
+      association.projectId === fixture.backend.id
+        ? { ...association, moduleMode, moduleIds: [] }
+        : association
+    ));
+    const input = {
+      ...fixture.input,
+      snapshot,
+      plan: {
+        ...fixture.input.plan,
+        units: [unit(fixture.backend.id, [moduleId]), unit(fixture.frontend.id)]
+      }
+    };
+
+    expect(() => fixture.store.deliveryUnits.createPlan(input)).toThrow("DELIVERY_UNIT_MODULE_SCOPE_INVALID");
     expectNoWrites(fixture);
   });
 });
