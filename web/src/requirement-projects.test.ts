@@ -57,7 +57,18 @@ describe("requirement project helpers", () => {
   });
   it("enforces one primary and clears required delivery for context", () => {
     expect(setPrimary([primary, delivery], "api").map(item => item.role)).toEqual(["collaborator", "primary"]);
-    expect(setUsage([delivery], "api", "context")[0]).toMatchObject({ usage: "context", deliveryRequired: false });
+    expect(setUsage([{ ...delivery, projectVersionId: "v-api", projectVersionName: "2.2.1" }], "api", "context")[0]).toEqual({
+      ...delivery, usage: "context", deliveryRequired: false
+    });
+    const switched = setUsage([primary], "web", "delivery")[0]!;
+    expect(switched.usage).toBe("delivery");
+    expect(switched.projectVersionId).toBeUndefined();
+  });
+  it("requires an active version for delivery rows and includes it in the payload", () => {
+    expect(validateAssociations([delivery], {}).rows[0]?.projectVersionId).toContain("版本");
+    const versioned = { ...delivery, role: "primary" as const, projectVersionId: "v-api", projectVersionName: "2.2.1", projectVersionBranch: "feature/2.2.1" };
+    expect(validateAssociations([versioned], {}).valid).toBe(true);
+    expect(requirementProjectsPayload([versioned])).toEqual([{ projectId: "api", projectVersionId: "v-api", role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0 }]);
   });
   it("validates selected modules while accepting auto and all", () => {
     expect(validateAssociations([{ ...primary, moduleMode: "selected", moduleIds: [] }], { web: { status: "ready", modules: ["src"] } }).rows[0]?.moduleIds).toBeTruthy();
@@ -75,6 +86,7 @@ describe("requirement project helpers", () => {
     expect(hasMaterialAssociationEdit([primary], [{ ...primary, moduleMode: "all" }], "technical_design", { version: 1 })).toBe(true);
     expect(hasMaterialAssociationEdit([primary], [{ ...primary, position: 4 }], "coding", { version: 1 })).toBe(false);
     expect(hasMaterialAssociationEdit([primary], [{ ...primary, moduleMode: "all" }], "prd", { version: 1 })).toBe(false);
+    expect(hasMaterialAssociationEdit([{ ...delivery, projectVersionId: "v1" }], [{ ...delivery, projectVersionId: "v2" }], "technical_design", { version: 1 })).toBe(true);
   });
   it("maps API row issues and general errors", () => {
     expect(associationApiErrors(new ApiError("VALIDATION_ERROR", "invalid", { issues: [{ path: [1, "moduleIds"], message: "bad module" }] })).rows[1]?.moduleIds).toBe("bad module");
