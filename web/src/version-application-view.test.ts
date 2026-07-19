@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { requirementApplicationContext, versionApplicationView } from "./version-application-view.js";
+import {
+  initialVersionApplicationRequestState,
+  requirementApplicationContext,
+  versionApplicationRequestReducer,
+  versionApplicationView
+} from "./version-application-view.js";
 
 describe("version application view", () => {
   const currentVersion = { projectId: "api", usage: "delivery", status: "active", projectVersionId: "current-version" };
@@ -15,6 +20,16 @@ describe("version application view", () => {
 
   it("uses only the active snapshot association as the frozen version target", () => {
     expect(requirementApplicationContext({ projectSnapshot: { associations: [frozenVersion] }, projects: [currentVersion] })).toEqual({ mode: "versioned", target: frozenVersion });
+  });
+
+  it("ignores stale queue and check success or error after the requirement identity changes", () => {
+    const first = versionApplicationRequestReducer(initialVersionApplicationRequestState, { type: "start", generation: 1, identity: "REQ-1:v1:awaiting_merge" });
+    const second = versionApplicationRequestReducer(first, { type: "start", generation: 2, identity: "REQ-2:v2:awaiting_merge" });
+    expect(versionApplicationRequestReducer(second, { type: "patch", generation: 1, identity: "REQ-1:v1:awaiting_merge", patch: { queue: [{ requirementId: "REQ-1" }], check: { allowed: true }, loading: false } })).toBe(second);
+    expect(versionApplicationRequestReducer(second, { type: "patch", generation: 1, identity: "REQ-1:v1:awaiting_merge", patch: { error: "old failure", loading: false } })).toBe(second);
+    expect(versionApplicationRequestReducer(second, { type: "patch", generation: 2, identity: "REQ-2:v2:awaiting_merge", patch: { queue: [{ requirementId: "REQ-2" }], check: { allowed: false }, loading: false } })).toMatchObject({
+      generation: 2, identity: "REQ-2:v2:awaiting_merge", queue: [{ requirementId: "REQ-2" }], check: { allowed: false }, error: "", loading: false
+    });
   });
 
   it("blocks requirements behind the queue owner and shows their position", () => {

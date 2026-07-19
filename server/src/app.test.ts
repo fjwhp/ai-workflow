@@ -122,6 +122,12 @@ class ApplyCompletionFailingStore extends WorkflowStore {
   }
 }
 
+class NotNextApplicationStore extends WorkflowStore {
+  override beginVersionApplication(_input: Parameters<WorkflowStore["beginVersionApplication"]>[0]): never {
+    throw new Error("PROJECT_VERSION_APPLICATION_NOT_NEXT");
+  }
+}
+
 type PendingMutationRunStatus = "running" | "awaiting_local_resolution" | "merge_test_failed" | "retesting";
 
 function pendingMutationFixture(store: WorkflowStore, suffix: string) {
@@ -590,6 +596,59 @@ describe("stage run API", () => {
     expect((await execFileAsync("git", ["-C", fixture.targetWorktreePath, "status", "--porcelain"])).stdout).toContain("A  feature.txt");
     expect((await execFileAsync("git", ["-C", fixture.repoPath, "rev-parse", "HEAD"])).stdout.trim()).toBe(mainHead);
     expect((await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} })).statusCode).toBe(409);
+    await app.close();
+  });
+
+  it("rejects a later version waiter from preflight and integration without state changes", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store);
+    const second = createRequirement(store, {
+      title: "版本应用后排", businessProblem: "后排需求不能越过应用队列", expectedOutcome: "保持稳定顺序", priority: "medium",
+      primaryProjectId: fixture.project.id, primaryProjectVersionId: fixture.version.id
+    });
+    const firstEvidence = store.getLatestCodingEvidence(fixture.requirement.id)!;
+    const execution = store.addExecution({
+      requirementId: second.id, stage: "coding", projectId: fixture.project.id, branch: firstEvidence.branch,
+      worktreePath: firstEvidence.worktreePath, status: "completed", diff: firstEvidence.diff, events: []
+    });
+    store.addCodingEvidence({
+      executionId: execution.id, requirementId: second.id, projectId: fixture.project.id,
+      branch: firstEvidence.branch, worktreePath: firstEvidence.worktreePath, diffHash: firstEvidence.diffHash,
+      diff: firstEvidence.diff, originalChars: firstEvidence.originalChars, truncated: firstEvidence.truncated,
+      files: firstEvidence.files, additions: firstEvidence.additions, deletions: firstEvidence.deletions,
+      diagnostics: firstEvidence.diagnostics
+    });
+    store.updateRequirementState(second.id, "integration", "awaiting_merge");
+    const before = { version: store.getProjectVersion(fixture.version.id), second: store.getRequirement(second.id) };
+    const app = await buildApp(store);
+
+    for (const [method, url] of [
+      ["GET", `/api/requirements/${second.id}/integration-check`],
+      ["POST", `/api/requirements/${second.id}/integrate`]
+    ] as const) {
+      const response = await app.inject({ method, url, payload: method === "POST" ? {} : undefined });
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toMatchObject({ error: "PROJECT_VERSION_APPLICATION_NOT_NEXT", message: "当前需求尚未轮到应用" });
+    }
+    expect(store.getLatestIntegrationRun(second.id)).toBeNull();
+    expect({ version: store.getProjectVersion(fixture.version.id), second: store.getRequirement(second.id) }).toEqual(before);
+
+    const first = await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} });
+    expect(first.statusCode).toBe(200);
+    expect(store.getProjectVersion(fixture.version.id)?.pendingRequirementId).toBe(fixture.requirement.id);
+    await app.close();
+  });
+
+  it("maps an atomic not-next rejection after preflight to a stable Chinese conflict", async () => {
+    const store = new NotNextApplicationStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store);
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: "PROJECT_VERSION_APPLICATION_NOT_NEXT", message: "当前需求尚未轮到应用" });
+    expect(store.getLatestIntegrationRun(fixture.requirement.id)).toBeNull();
     await app.close();
   });
 

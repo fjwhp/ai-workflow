@@ -29,6 +29,32 @@ export function requirementApplicationContext(item: {
   return { mode: "versioned" as const, target };
 }
 
+export type VersionApplicationRequestState = {
+  generation: number;
+  identity: string;
+  queue: any[];
+  check: any;
+  loading: boolean;
+  error: string;
+};
+
+export const initialVersionApplicationRequestState: VersionApplicationRequestState = {
+  generation: 0, identity: "", queue: [], check: null, loading: false, error: ""
+};
+
+type VersionApplicationRequestAction =
+  | { type: "start"; generation: number; identity: string }
+  | { type: "patch"; generation: number; identity: string; patch: Partial<Omit<VersionApplicationRequestState, "generation" | "identity">> };
+
+export function versionApplicationRequestReducer(state: VersionApplicationRequestState, action: VersionApplicationRequestAction): VersionApplicationRequestState {
+  if (action.type === "start") {
+    if (action.generation <= state.generation) return state;
+    return { generation: action.generation, identity: action.identity, queue: [], check: null, loading: true, error: "" };
+  }
+  if (action.generation !== state.generation || action.identity !== state.identity) return state;
+  return { ...state, ...action.patch };
+}
+
 export function versionApplicationView(input: VersionApplicationViewInput) {
   const queuePosition = input.queuePosition || 0;
   const waitingBehindOwner = input.status === "awaiting_merge" && queuePosition > 1;

@@ -383,6 +383,39 @@ describe("project version persistence", () => {
 });
 
 describe("project version application leases", () => {
+  it("allows only the first eligible waiter to acquire an idle version", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = createProject(store, "Ordered application", "/tmp/ordered-application");
+    const version = createVersion(store, project.id, "1.0.0", "/tmp/ordered-application-v1");
+    const first = store.createRequirement(requirementInput(project.id, version.id, "First waiter"));
+    const second = store.createRequirement(requirementInput(project.id, version.id, "Second waiter"));
+    for (const requirement of [first, second]) store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    const before = {
+      version: store.getProjectVersion(version.id),
+      first: store.getRequirement(first.id),
+      second: store.getRequirement(second.id)
+    };
+
+    expect(() => store.beginVersionApplication({
+      versionId: version.id, requirementId: second.id, run: applicationRun(version, "second-before-first")
+    })).toThrow("PROJECT_VERSION_APPLICATION_NOT_NEXT");
+    expect(store.getIntegrationRun("run-second-before-first")).toBeNull();
+    expect({
+      version: store.getProjectVersion(version.id),
+      first: store.getRequirement(first.id),
+      second: store.getRequirement(second.id)
+    }).toEqual(before);
+
+    const acquired = store.beginVersionApplication({
+      versionId: version.id, requirementId: first.id, run: applicationRun(version, "first-waiter")
+    });
+    expect(acquired.version.pendingRequirementId).toBe(first.id);
+    expect(store.listVersionApplicationQueue(version.id)).toMatchObject([
+      { requirementId: first.id, owner: true, position: 1 },
+      { requirementId: second.id, owner: false, position: 2 }
+    ]);
+  });
+
   it("serializes one writer per version while allowing a different version", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = createProject(store, "Application leases", "/tmp/application-leases");
@@ -916,7 +949,7 @@ describe("project version application leases", () => {
     database.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?")
       .run("2026-01-02T00:00:00.000Z", firstWaiter.id);
     store.beginVersionApplication({
-      versionId: version.id, requirementId: owner.id, run: applicationRun(version, "queue-owner")
+      versionId: version.id, requirementId: secondWaiter.id, run: applicationRun(version, "queue-owner")
     });
     store.completeVersionApplicationApply({
       runId: "run-queue-owner", sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
@@ -925,9 +958,9 @@ describe("project version application leases", () => {
 
     const queue = store.listVersionApplicationQueue(version.id);
     expect(queue.map(({ requirementId, owner, position }) => ({ requirementId, owner, position }))).toEqual([
-      { requirementId: owner.id, owner: true, position: 1 },
-      { requirementId: secondWaiter.id, owner: false, position: 2 },
-      { requirementId: firstWaiter.id, owner: false, position: 3 }
+      { requirementId: secondWaiter.id, owner: true, position: 1 },
+      { requirementId: firstWaiter.id, owner: false, position: 2 },
+      { requirementId: owner.id, owner: false, position: 3 }
     ]);
     expect(new Set(queue.map(({ requirementId }) => requirementId)).size).toBe(3);
     expect(queue.some(({ requirementId }) => requirementId === multipleDeliveries.id)).toBe(false);
@@ -940,7 +973,7 @@ describe("project version application leases", () => {
     store.archiveProject(project.id);
     expect(store.listVersionApplicationQueue(version.id).map(({ requirementId, owner, position }) => ({
       requirementId, owner, position
-    }))).toEqual([{ requirementId: owner.id, owner: true, position: 1 }]);
+    }))).toEqual([{ requirementId: secondWaiter.id, owner: true, position: 1 }]);
   });
 
   it("returns observable queue snapshots while another process acquires and releases", { timeout: 15_000 }, async () => {

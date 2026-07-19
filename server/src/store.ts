@@ -110,6 +110,31 @@ export interface VersionApplicationQueueEntry {
 
 const executionStages = new Set<WorkflowStage>(["coding", "code_review", "testing", "acceptance", "integration"]);
 
+const versionApplicationQueueSql = `WITH target_version AS (
+    SELECT pv.id, pv.project_id, pv.status AS version_status, pv.pending_requirement_id,
+      p.status AS project_status
+    FROM project_versions pv JOIN projects p ON p.id = pv.project_id
+    WHERE pv.id = ?
+  ), queue_entries AS (
+    SELECT r.id, r.code, r.title, r.status, r.updated_at, 1 AS owner, 0 AS sort_group
+    FROM target_version tv JOIN requirements r ON r.id = tv.pending_requirement_id
+    UNION ALL
+    SELECT DISTINCT r.id, r.code, r.title, r.status, r.updated_at, 0 AS owner, 1 AS sort_group
+    FROM target_version tv
+    JOIN requirement_projects rp
+      ON rp.project_version_id = tv.id AND rp.project_id = tv.project_id
+    JOIN requirements r ON r.id = rp.requirement_id
+    WHERE tv.version_status = 'active' AND tv.project_status = 'active'
+      AND rp.usage = 'delivery' AND rp.status = 'active'
+      AND (SELECT COUNT(*) FROM requirement_projects active_delivery
+        WHERE active_delivery.requirement_id = r.id
+          AND active_delivery.usage = 'delivery' AND active_delivery.status = 'active') = 1
+      AND r.stage = 'integration' AND r.status = 'awaiting_merge'
+      AND r.id != COALESCE(tv.pending_requirement_id, '')
+  )
+  SELECT id, code, title, status, updated_at, owner
+  FROM queue_entries ORDER BY sort_group, updated_at, code`;
+
 export class WorkflowStore {
   private db: DatabaseSync;
 
@@ -1028,6 +1053,9 @@ export class WorkflowStore {
       if (!version) throw new Error("PROJECT_VERSION_NOT_FOUND");
       if (version.project_status !== "active") throw new Error("PROJECT_NOT_ACTIVE");
       if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
+      if (version.pending_requirement_id || version.pending_integration_run_id) {
+        throw new Error("PROJECT_VERSION_APPLICATION_BUSY");
+      }
 
       const requirement = this.db.prepare("SELECT stage, status FROM requirements WHERE id = ?")
         .get(input.requirementId) as { stage: string; status: string } | undefined;
@@ -1047,6 +1075,8 @@ export class WorkflowStore {
           delivery?.project_version_id !== input.versionId || input.run.projectId !== version.project_id) {
         throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
       }
+      const next = this.db.prepare(`${versionApplicationQueueSql} LIMIT 1`).get(input.versionId) as { id: string } | undefined;
+      if (next?.id !== input.requirementId) throw new Error("PROJECT_VERSION_APPLICATION_NOT_NEXT");
 
       const runId = input.run.id ?? randomUUID();
       const leased = this.db.prepare(`UPDATE project_versions
@@ -1323,30 +1353,7 @@ export class WorkflowStore {
   }
 
   listVersionApplicationQueue(versionId: string): VersionApplicationQueueEntry[] {
-    const rows = this.db.prepare(`WITH target_version AS (
-        SELECT pv.id, pv.project_id, pv.status AS version_status, pv.pending_requirement_id,
-          p.status AS project_status
-        FROM project_versions pv JOIN projects p ON p.id = pv.project_id
-        WHERE pv.id = ?
-      ), queue_entries AS (
-        SELECT r.id, r.code, r.title, r.status, r.updated_at, 1 AS owner, 0 AS sort_group
-        FROM target_version tv JOIN requirements r ON r.id = tv.pending_requirement_id
-        UNION ALL
-        SELECT DISTINCT r.id, r.code, r.title, r.status, r.updated_at, 0 AS owner, 1 AS sort_group
-        FROM target_version tv
-        JOIN requirement_projects rp
-          ON rp.project_version_id = tv.id AND rp.project_id = tv.project_id
-        JOIN requirements r ON r.id = rp.requirement_id
-        WHERE tv.version_status = 'active' AND tv.project_status = 'active'
-          AND rp.usage = 'delivery' AND rp.status = 'active'
-          AND (SELECT COUNT(*) FROM requirement_projects active_delivery
-            WHERE active_delivery.requirement_id = r.id
-              AND active_delivery.usage = 'delivery' AND active_delivery.status = 'active') = 1
-          AND r.stage = 'integration' AND r.status = 'awaiting_merge'
-          AND r.id != COALESCE(tv.pending_requirement_id, '')
-      )
-      SELECT id, code, title, status, updated_at, owner
-      FROM queue_entries ORDER BY sort_group, updated_at, code`).all(versionId) as any[];
+    const rows = this.db.prepare(versionApplicationQueueSql).all(versionId) as any[];
     return rows.map((row, index) => ({
       requirementId: row.id,
       code: row.code,
@@ -1682,7 +1689,8 @@ function isVersionApplicationError(error: unknown) {
     "REQUIREMENT_NOT_FOUND",
     "VERSION_APPLICATION_NOT_ALLOWED",
     "REQUIREMENT_VERSION_PROJECT_MISMATCH",
-    "PROJECT_VERSION_APPLICATION_BUSY"
+    "PROJECT_VERSION_APPLICATION_BUSY",
+    "PROJECT_VERSION_APPLICATION_NOT_NEXT"
   ]).has(message);
 }
 
