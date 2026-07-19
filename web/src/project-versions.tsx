@@ -42,6 +42,28 @@ export type VersionRefreshState = {
   snapshots: Record<string, VersionSnapshot>;
 };
 
+export const projectVersionNavigationEvent = "flowgate:project-version-navigation";
+
+export function projectVersionSectionId(projectId: string) {
+  return `project-version-${encodeURIComponent(projectId)}`;
+}
+
+export function projectVersionSectionView(projectId: string, hash: string) {
+  const id = projectVersionSectionId(projectId);
+  const targeted = hash === `#${id}`;
+  return { id, targeted, open: targeted };
+}
+
+export function shouldLoadProjectVersions(open: boolean, loaded: boolean, loading: boolean) {
+  return open && !loaded && !loading;
+}
+
+export function navigateToProjectVersionSection(projectId: string) {
+  const id = projectVersionSectionId(projectId);
+  window.location.hash = id;
+  window.dispatchEvent(new CustomEvent(projectVersionNavigationEvent, { detail: projectId }));
+}
+
 export function beginVersionRefresh(state: VersionRefreshState, _generation: number): VersionRefreshState {
   return { ...state, generation: _generation };
 }
@@ -359,7 +381,8 @@ async function fetchVersionSnapshot(versionId: string): Promise<Pick<VersionSnap
 }
 
 export function ProjectVersions({ project }: { project: VersionProject }) {
-  const [expanded, setExpanded] = useState(false);
+  const section = projectVersionSectionView(project.id, typeof window === "undefined" ? "" : window.location.hash);
+  const [expanded, setExpanded] = useState(section.open);
   const [refresh, setRefresh] = useState<VersionRefreshState>({ generation: 0, versions: [], snapshots: {} });
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -370,9 +393,32 @@ export function ProjectVersions({ project }: { project: VersionProject }) {
   const activeRef = useRef(true);
   const loadGeneration = useRef(0);
   const busyRef = useRef<ReadonlySet<string>>(new Set());
+  const sectionRef = useRef<HTMLDetailsElement>(null);
   const versions = refresh.versions, snapshots = refresh.snapshots;
 
   useEffect(() => () => { activeRef.current = false; loadGeneration.current += 1; }, []);
+  useEffect(() => {
+    let frame = 0;
+    const focusSection = (requestedProjectId?: string) => {
+      const targeted = projectVersionSectionView(project.id, window.location.hash).targeted;
+      if (!targeted && requestedProjectId !== project.id) return;
+      setExpanded(true);
+      frame = window.requestAnimationFrame(() => {
+        sectionRef.current?.scrollIntoView({ block: "start" });
+        sectionRef.current?.focus({ preventScroll: true });
+      });
+    };
+    const onHashChange = () => focusSection();
+    const onNavigate = (event: Event) => focusSection((event as CustomEvent<string>).detail);
+    focusSection();
+    window.addEventListener("hashchange", onHashChange);
+    window.addEventListener(projectVersionNavigationEvent, onNavigate);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("hashchange", onHashChange);
+      window.removeEventListener(projectVersionNavigationEvent, onNavigate);
+    };
+  }, [project.id]);
 
   const setOperation = (operation: "recheck" | "preflight" | "close", versionId: string, busy: boolean) => {
     const key = `${operation}:${versionId}`;
@@ -408,6 +454,9 @@ export function ProjectVersions({ project }: { project: VersionProject }) {
       if (activeRef.current && generation === loadGeneration.current) setLoading(false);
     }
   }, [project.id]);
+  useEffect(() => {
+    if (shouldLoadProjectVersions(expanded, loaded, loading)) void load();
+  }, [expanded, loaded, loading, load]);
 
   const pendingIds = useMemo(() => versions.filter((version) => version.pendingRequirementId || version.pendingIntegrationRunId).map((version) => version.id), [versions]);
   useEffect(() => {
@@ -503,10 +552,9 @@ export function ProjectVersions({ project }: { project: VersionProject }) {
   };
 
   return <>
-    <details className="project-versions" onToggle={(event) => {
+    <details ref={sectionRef} id={section.id} tabIndex={-1} open={expanded} className="project-versions" onToggle={(event) => {
       const open = event.currentTarget.open;
       setExpanded(open);
-      if (open && !loaded && !loading) void load();
     }}>
       <summary><span><GitBranch size={15} /><b>项目版本</b></span><span>{loaded ? `${grouped.active.length} 个使用中 · ${grouped.closed.length} 个已关闭` : "展开读取版本"}</span></summary>
       <div className="version-section-head"><span>{loading ? "正在读取项目版本" : `共 ${versions.length} 个版本`}</span>{project.status !== "archived" && <button type="button" className="secondary" onClick={() => setCreatorOpen(true)}><Plus size={15} />创建版本</button>}</div>

@@ -17,6 +17,10 @@ import {
   loadCloseAuthority,
   projectVersionView,
   projectVersionErrorMessage,
+  projectVersionSectionId,
+  projectVersionSectionView,
+  shouldLoadProjectVersions,
+  ProjectVersions,
   recordVersionValidation,
   updateVersionField,
   versionModeLabel,
@@ -57,6 +61,19 @@ const validation = (mode: ProjectVersionValidation["mode"] = "create_branch"): P
 });
 
 describe("project version view model", () => {
+  it("targets only the selected project's stable version section", () => {
+    expect(projectVersionSectionId("project/a b")).toBe("project-version-project%2Fa%20b");
+    expect(projectVersionSectionView("project/a b", "#project-version-project%2Fa%20b")).toEqual({ id: "project-version-project%2Fa%20b", targeted: true, open: true });
+    expect(projectVersionSectionView("other", "#project-version-project%2Fa%20b")).toMatchObject({ targeted: false, open: false });
+  });
+
+  it("loads an initially targeted section without waiting for a toggle event", () => {
+    expect(shouldLoadProjectVersions(true, false, false)).toBe(true);
+    expect(shouldLoadProjectVersions(false, false, false)).toBe(false);
+    expect(shouldLoadProjectVersions(true, true, false)).toBe(false);
+    expect(shouldLoadProjectVersions(true, false, true)).toBe(false);
+  });
+
   it("groups active and closed versions without losing their order", () => {
     const closed = version({ id: "closed", name: "1.0.0", status: "closed" });
     const active = version({ id: "active", name: "2.0.0" });
@@ -265,6 +282,14 @@ describe("project version view model", () => {
 });
 
 describe("project version dialogs", () => {
+  it("renders a stable focusable project version section", () => {
+    const markup = renderToStaticMarkup(React.createElement(ProjectVersions, {
+      project: { id: "project-1", name: "Orders", defaultBranch: "main" }
+    }));
+    expect(markup).toContain('id="project-version-project-1"');
+    expect(markup).toContain('tabindex="-1"');
+  });
+
   it("renders validation mode and keeps save disabled until validation succeeds", () => {
     const markup = renderToStaticMarkup(React.createElement(VersionDialog, {
       project: { id: "project-1", name: "Orders", defaultBranch: "main" },
