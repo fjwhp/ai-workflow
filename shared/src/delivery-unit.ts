@@ -44,20 +44,18 @@ export function validateDeliveryGraph(
   }
 
   const projectPositions = new Map(projectIds.map((projectId, index) => [projectId, index]));
-  let currentLayer = projectIds.filter((projectId) => inDegrees.get(projectId) === 0);
+  const candidates = projectIds.filter((projectId) => inDegrees.get(projectId) === 0);
   const order: string[] = [];
 
-  while (currentLayer.length > 0) {
-    order.push(...currentLayer);
-    const nextLayer: string[] = [];
-    for (const upstreamProjectId of currentLayer) {
-      for (const downstreamProjectId of adjacency.get(upstreamProjectId)!) {
-        const inDegree = inDegrees.get(downstreamProjectId)! - 1;
-        inDegrees.set(downstreamProjectId, inDegree);
-        if (inDegree === 0) nextLayer.push(downstreamProjectId);
-      }
+  while (candidates.length > 0) {
+    const upstreamProjectId = candidates.shift()!;
+    order.push(upstreamProjectId);
+    for (const downstreamProjectId of adjacency.get(upstreamProjectId)!) {
+      const inDegree = inDegrees.get(downstreamProjectId)! - 1;
+      inDegrees.set(downstreamProjectId, inDegree);
+      if (inDegree === 0) candidates.push(downstreamProjectId);
     }
-    currentLayer = nextLayer.sort((left, right) => projectPositions.get(left)! - projectPositions.get(right)!);
+    candidates.sort((left, right) => projectPositions.get(left)! - projectPositions.get(right)!);
   }
 
   if (order.length !== projectIds.length) {

@@ -18,6 +18,14 @@ describe("validateDeliveryGraph", () => {
     }]).order).toEqual(["docs", "backend", "frontend"]);
   });
 
+  it("reorders current candidates when a dependency becomes available", () => {
+    expect(validateDeliveryGraph(["backend", "frontend", "docs"], [{
+      upstreamProjectId: "backend",
+      downstreamProjectId: "frontend",
+      releaseCondition: "automated_testing_passed"
+    }]).order).toEqual(["backend", "frontend", "docs"]);
+  });
+
   it("rejects a dependency cycle", () => {
     expect(() => validateDeliveryGraph(["a", "b"], [
       { upstreamProjectId: "a", downstreamProjectId: "b", releaseCondition: "automated_testing_passed" },
