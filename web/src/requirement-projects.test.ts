@@ -1,3 +1,5 @@
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./api.js";
 import {
@@ -5,7 +7,8 @@ import {
   activeAssociations, historyAssociations, moveAssociation, requirementProjectsPayload,
   saveAssociationThenRefresh, selectedModuleProjectIds, shouldRequestModules,
   moduleRequestPath, mergeKnownModules,
-  hasMaterialAssociationEdit, initialAssociationState, phaseOneDeliveryGate,
+  isRequirementDeliveryPlanFrozen, initialAssociationState, phaseOneDeliveryGate,
+  RequirementProjectSummary, RequirementProjectsDialog,
   setPrimary, setUsage, validateAssociations, type Association
 } from "./requirement-projects.js";
 
@@ -35,7 +38,7 @@ describe("requirement project helpers", () => {
   it("gates zero, one, and multiple delivery projects", () => {
     expect(phaseOneDeliveryGate([]).kind).toBe("missing");
     expect(phaseOneDeliveryGate([delivery]).kind).toBe("ready");
-    expect(phaseOneDeliveryGate([delivery, { ...delivery, projectId: "mobile" }])).toMatchObject({ kind: "phase2", message: "多项目编码将在第二期启用；当前可继续完善总体技术设计" });
+    expect(phaseOneDeliveryGate([delivery, { ...delivery, projectId: "mobile" }])).toMatchObject({ kind: "phase2", message: "多项目编码将在第二期启用；当前可继续完善总体方案设计" });
   });
   it("excludes archived projects from choices but retains history", () => {
     const archived = { id: "old", name: "Old", status: "archived" as const };
@@ -82,11 +85,10 @@ describe("requirement project helpers", () => {
     expect(validateAssociations([{ ...primary, role: "collaborator" }], {}).rows[0]?.role).toBeTruthy();
     expect(validateAssociations([primary, { ...delivery, role: "primary" }], {}).rows[1]?.role).toBeTruthy();
   });
-  it("warns on material edits whenever an active scope snapshot is frozen", () => {
-    expect(hasMaterialAssociationEdit([primary], [{ ...primary, moduleMode: "all" }], "solution_design", { version: 1 })).toBe(true);
-    expect(hasMaterialAssociationEdit([primary], [{ ...primary, position: 4 }], "implementation", { version: 1 })).toBe(false);
-    expect(hasMaterialAssociationEdit([primary], [{ ...primary, moduleMode: "all" }], "definition", null)).toBe(false);
-    expect(hasMaterialAssociationEdit([{ ...delivery, projectVersionId: "v1" }], [{ ...delivery, projectVersionId: "v2" }], "acceptance_delivery", { version: 1 })).toBe(true);
+  it("freezes association editing for either an active snapshot or persisted delivery plan", () => {
+    expect(isRequirementDeliveryPlanFrozen({ version: 1 }, [])).toBe(true);
+    expect(isRequirementDeliveryPlanFrozen(null, [{ id: "unit-1" }])).toBe(true);
+    expect(isRequirementDeliveryPlanFrozen(null, [])).toBe(false);
   });
   it("maps API row issues and general errors", () => {
     expect(associationApiErrors(new ApiError("VALIDATION_ERROR", "invalid", { issues: [{ path: [1, "moduleIds"], message: "bad module" }] })).rows[1]?.moduleIds).toBe("bad module");
@@ -99,5 +101,51 @@ describe("requirement project helpers", () => {
     state = associationReducer(state, { type: "failure", requestId: 1, error: "old" });
     expect(state.busy).toBe(true);
     expect(associationReducer(state, { type: "failure", requestId: 2, error: "new" })).toMatchObject({ busy: false, error: "new" });
+  });
+});
+
+describe("requirement project components", () => {
+  it("disables project management after the delivery plan is frozen", () => {
+    const frozen = renderToStaticMarkup(React.createElement(RequirementProjectSummary, {
+      items: [primary, delivery], snapshot: { version: 2 }, frozen: true, onManage: () => undefined
+    }));
+    const editable = renderToStaticMarkup(React.createElement(RequirementProjectSummary, {
+      items: [primary, delivery], snapshot: null, frozen: false, onManage: () => undefined
+    }));
+
+    expect(frozen).toContain("已冻结 v2");
+    expect(frozen).toContain("交付范围已冻结");
+    expect(frozen).toContain('disabled=""');
+    expect(editable).toContain("管理关联项目");
+    expect(editable).not.toContain('disabled=""');
+  });
+
+  it("renders a frozen association dialog as read-only without obsolete design rollback copy", () => {
+    const markup = renderToStaticMarkup(React.createElement(RequirementProjectsDialog, {
+      requirementId: "req-1",
+      deliveryPlanFrozen: true,
+      onClose: () => undefined,
+      onSaved: async () => undefined,
+      onRefreshError: () => undefined,
+    }));
+
+    expect(markup).toContain("交付计划已冻结，关联项目、版本和模块范围只读");
+    expect(markup).toContain("交付范围已冻结");
+    expect(markup).not.toContain("技术设计");
+    expect(markup).not.toContain("失效");
+    expect(markup).not.toContain("退回");
+  });
+
+  it("keeps the save action available before a delivery plan is frozen", () => {
+    const markup = renderToStaticMarkup(React.createElement(RequirementProjectsDialog, {
+      requirementId: "req-1",
+      deliveryPlanFrozen: false,
+      onClose: () => undefined,
+      onSaved: async () => undefined,
+      onRefreshError: () => undefined,
+    }));
+
+    expect(markup).toContain("保存关联");
+    expect(markup).not.toContain("交付计划已冻结，关联项目、版本和模块范围只读");
   });
 });
