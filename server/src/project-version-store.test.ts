@@ -301,7 +301,7 @@ describe("project version persistence", () => {
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Active delivery"));
     expect(store.listVersionRequirements(version.id).map((item) => item.id)).toEqual([requirement.id]);
     expect(() => store.closeProjectVersion(version.id)).toThrow("PROJECT_VERSION_HAS_ACTIVE_REQUIREMENTS");
-    store.updateRequirementState(requirement.id, "integration", "completed");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "completed");
     const closed = store.closeProjectVersion(version.id);
     expect(closed).toMatchObject({ id: version.id, status: "closed" });
     expect(closed.closedAt).toBeTruthy();
@@ -359,7 +359,7 @@ describe("project version persistence", () => {
       }]);
 
       expect(() => store.closeProjectVersion(firstVersion.id)).toThrow("PROJECT_VERSION_HAS_ACTIVE_REQUIREMENTS");
-      store.updateRequirementState(requirement.id, "integration", terminalStatus);
+      store.updateRequirementState(requirement.id, "acceptance_delivery", terminalStatus);
       expect(store.closeProjectVersion(firstVersion.id)).toMatchObject({ id: firstVersion.id, status: "closed" });
     }
   );
@@ -389,7 +389,7 @@ describe("project version application leases", () => {
     const version = createVersion(store, project.id, "1.0.0", "/tmp/ordered-application-v1");
     const first = store.createRequirement(requirementInput(project.id, version.id, "First waiter"));
     const second = store.createRequirement(requirementInput(project.id, version.id, "Second waiter"));
-    for (const requirement of [first, second]) store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    for (const requirement of [first, second]) store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     const before = {
       version: store.getProjectVersion(version.id),
       first: store.getRequirement(first.id),
@@ -425,7 +425,7 @@ describe("project version application leases", () => {
     const waiter = store.createRequirement(requirementInput(project.id, firstVersion.id, "Waiter"));
     const independent = store.createRequirement(requirementInput(project.id, secondVersion.id, "Independent"));
     for (const requirement of [owner, waiter, independent]) {
-      store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+      store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     }
 
     const acquired = store.beginVersionApplication({
@@ -443,7 +443,7 @@ describe("project version application leases", () => {
       versionId: firstVersion.id, requirementId: waiter.id, run: applicationRun(firstVersion, "waiter")
     })).toThrow("PROJECT_VERSION_APPLICATION_BUSY");
     expect(store.getIntegrationRun("run-waiter")).toBeNull();
-    expect(store.getRequirement(waiter.id)).toMatchObject({ stage: "integration", status: "awaiting_merge" });
+    expect(store.getRequirement(waiter.id)).toMatchObject({ stage: "acceptance_delivery", status: "awaiting_merge" });
     expect(store.getProjectVersion(firstVersion.id)).toMatchObject({
       pendingRequirementId: owner.id, pendingIntegrationRunId: "run-owner"
     });
@@ -465,7 +465,7 @@ describe("project version application leases", () => {
     expect(() => store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "wrong-state")
     })).toThrow("VERSION_APPLICATION_NOT_ALLOWED");
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     store.replaceRequirementProjects(requirement.id, [{
       projectId: project.id, projectVersionId: otherVersion.id, role: "primary", usage: "delivery",
       deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0
@@ -509,7 +509,7 @@ describe("project version application leases", () => {
         deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 1
       }
     ]);
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     database.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?")
       .run("2000-01-01T00:00:00.000Z", requirement.id);
 
@@ -521,7 +521,7 @@ describe("project version application leases", () => {
     });
     expect(store.getIntegrationRun("run-multiple-deliveries")).toBeNull();
     expect(store.getRequirement(requirement.id)).toMatchObject({
-      stage: "integration", status: "awaiting_merge", updatedAt: "2000-01-01T00:00:00.000Z"
+      stage: "acceptance_delivery", status: "awaiting_merge", updatedAt: "2000-01-01T00:00:00.000Z"
     });
   });
 
@@ -532,7 +532,7 @@ describe("project version application leases", () => {
     const project = createProject(store, "Application rollback", join(path, "..", "application-rollback"));
     const version = createVersion(store, project.id, "1.0.0", join(path, "..", "application-rollback-v1"));
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Rollback"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     database.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", requirement.id);
     database.exec(`CREATE TRIGGER fail_application_run BEFORE INSERT ON integration_runs
       WHEN NEW.id = 'run-rollback' BEGIN SELECT RAISE(ABORT, 'forced raw sqlite failure'); END;`);
@@ -545,7 +545,7 @@ describe("project version application leases", () => {
     });
     expect(store.getIntegrationRun("run-rollback")).toBeNull();
     expect(store.getRequirement(requirement.id)).toMatchObject({
-      stage: "integration", status: "awaiting_merge", updatedAt: "2000-01-01T00:00:00.000Z"
+      stage: "acceptance_delivery", status: "awaiting_merge", updatedAt: "2000-01-01T00:00:00.000Z"
     });
   });
 
@@ -559,8 +559,8 @@ describe("project version application leases", () => {
       const version = createVersion(store, project.id, "1.0.0", join(path, "..", "application-race-v1"));
       const firstRequirement = store.createRequirement(requirementInput(project.id, version.id, "Race first"));
       const secondRequirement = store.createRequirement(requirementInput(project.id, version.id, "Race second"));
-      store.updateRequirementState(firstRequirement.id, "integration", "awaiting_merge");
-      store.updateRequirementState(secondRequirement.id, "integration", "awaiting_merge");
+      store.updateRequirementState(firstRequirement.id, "acceptance_delivery", "awaiting_merge");
+      store.updateRequirementState(secondRequirement.id, "acceptance_delivery", "awaiting_merge");
 
       const idleWaiter = spawnVersionApplicationWorker(path, {
         mode: "begin", begin: {
@@ -618,8 +618,8 @@ describe("project version application leases", () => {
     const secondVersion = createVersion(store, project.id, "2.0.0", join(path, "..", "independent-applications-v2"));
     const firstRequirement = store.createRequirement(requirementInput(project.id, firstVersion.id, "Independent first"));
     const secondRequirement = store.createRequirement(requirementInput(project.id, secondVersion.id, "Independent second"));
-    store.updateRequirementState(firstRequirement.id, "integration", "awaiting_merge");
-    store.updateRequirementState(secondRequirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(firstRequirement.id, "acceptance_delivery", "awaiting_merge");
+    store.updateRequirementState(secondRequirement.id, "acceptance_delivery", "awaiting_merge");
     const first = spawnVersionApplicationWorker(path, {
       mode: "begin", begin: {
         versionId: firstVersion.id, requirementId: firstRequirement.id,
@@ -656,7 +656,7 @@ describe("project version application leases", () => {
       const project = createProject(store, `Apply ${status}`, `/tmp/apply-${status}`);
       const version = createVersion(store, project.id, status, `/tmp/apply-${status}-v1`);
       const requirement = store.createRequirement(requirementInput(project.id, version.id, `Apply ${status}`));
-      store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+      store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
       store.beginVersionApplication({
         versionId: version.id, requirementId: requirement.id, run: applicationRun(version, status)
       });
@@ -673,7 +673,7 @@ describe("project version application leases", () => {
         commandResults: [{ command: "npm", args: ["test"], code: status === "merge_test_failed" ? 1 : 0 }],
         error: status === "merge_test_failed" ? "verification failed" : undefined
       });
-      expect(store.getRequirement(requirement.id)).toMatchObject({ stage: "integration", status });
+      expect(store.getRequirement(requirement.id)).toMatchObject({ stage: "acceptance_delivery", status });
       expect(store.getProjectVersion(version.id)).toMatchObject({
         pendingRequirementId: requirement.id, pendingIntegrationRunId: `run-${status}`
       });
@@ -685,7 +685,7 @@ describe("project version application leases", () => {
     const project = createProject(store, "Retest claim", "/tmp/retest-claim");
     const version = createVersion(store, project.id, "retest-claim", "/tmp/retest-claim-v1");
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Retest claim"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "retest-claim")
     });
@@ -707,7 +707,7 @@ describe("project version application leases", () => {
     const project = createProject(store, "Retest completion", "/tmp/retest-completion");
     const version = createVersion(store, project.id, "retest-completion", "/tmp/retest-completion-v1");
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Retest completion"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "retest-completion")
     });
@@ -733,7 +733,7 @@ describe("project version application leases", () => {
     const project = createProject(store, "Retest recovery", "/tmp/retest-recovery");
     const version = createVersion(store, project.id, "retest-recovery", "/tmp/retest-recovery-v1");
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Retest recovery"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "retest-recovery")
     });
@@ -754,7 +754,7 @@ describe("project version application leases", () => {
     const project = createProject(store, "Failed application", "/tmp/failed-application");
     const version = createVersion(store, project.id, "failed", "/tmp/failed-application-v1");
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Failed application"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "failed")
     });
@@ -776,7 +776,7 @@ describe("project version application leases", () => {
     });
     expect(run.completedAt).toBeTruthy();
     expect(store.getRequirement(requirement.id)).toMatchObject({
-      stage: "integration", status: "awaiting_merge"
+      stage: "acceptance_delivery", status: "awaiting_merge"
     });
     expect(store.getProjectVersion(version.id)).toMatchObject({
       pendingRequirementId: undefined, pendingIntegrationRunId: undefined
@@ -790,7 +790,7 @@ describe("project version application leases", () => {
     const project = createProject(store, "Late failed application", join(path, "..", "late-failed-application"));
     const version = createVersion(store, project.id, "late-failed", join(path, "..", "late-failed-application-v1"));
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Late failed application"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "late-failed")
     });
@@ -812,7 +812,7 @@ describe("project version application leases", () => {
     const project = createProject(store, "Late completion", join(path, "..", "late-completion"));
     const version = createVersion(store, project.id, "1.0.0", join(path, "..", "late-completion-v1"));
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Late completion"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "late-completion")
     });
@@ -830,7 +830,7 @@ describe("project version application leases", () => {
       pendingRequirementId: requirement.id, pendingIntegrationRunId: "run-late-completion"
     });
     expect(store.getRequirement(requirement.id)).toMatchObject({
-      stage: "integration", status: "cancelled", updatedAt: "2000-01-01T00:00:00.000Z"
+      stage: "acceptance_delivery", status: "cancelled", updatedAt: "2000-01-01T00:00:00.000Z"
     });
   });
 
@@ -842,7 +842,7 @@ describe("project version application leases", () => {
     const committed = store.createRequirement(requirementInput(project.id, committedVersion.id, "Committed"));
     const reverted = store.createRequirement(requirementInput(project.id, revertedVersion.id, "Reverted"));
     for (const requirement of [committed, reverted]) {
-      store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+      store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     }
     for (const [version, requirement, suffix] of [
       [committedVersion, committed, "committed"], [revertedVersion, reverted, "reverted"]
@@ -883,7 +883,7 @@ describe("project version application leases", () => {
     const project = createProject(store, "Premature resolution", "/tmp/premature-resolution");
     const version = createVersion(store, project.id, "premature", "/tmp/premature-resolution-v1");
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Premature"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "premature")
     });
@@ -907,7 +907,7 @@ describe("project version application leases", () => {
     const project = createProject(store, "Ambiguous resolution", "/tmp/ambiguous-resolution");
     const version = createVersion(store, project.id, "ambiguous", "/tmp/ambiguous-resolution-v1");
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Ambiguous"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "ambiguous")
     });
@@ -959,7 +959,7 @@ describe("project version application leases", () => {
       }
     ]);
     for (const requirement of [firstWaiter, secondWaiter, owner, wrongVersion, multipleDeliveries]) {
-      store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+      store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     }
     database.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?")
       .run("2026-01-02T00:00:00.000Z", firstWaiter.id);
@@ -1010,8 +1010,8 @@ describe("project version application leases", () => {
     const version = createVersion(store, project.id, "1.0.0", join(path, "..", "queue-snapshots-v1"));
     const owner = store.createRequirement(requirementInput(project.id, version.id, "Snapshot owner"));
     const waiter = store.createRequirement(requirementInput(project.id, version.id, "Snapshot waiter"));
-    store.updateRequirementState(owner.id, "integration", "awaiting_merge");
-    store.updateRequirementState(waiter.id, "integration", "awaiting_merge");
+    store.updateRequirementState(owner.id, "acceptance_delivery", "awaiting_merge");
+    store.updateRequirementState(waiter.id, "acceptance_delivery", "awaiting_merge");
     const worker = spawnVersionApplicationWorker(path, {
       mode: "lifecycle",
       begin: {
@@ -1082,7 +1082,7 @@ describe("project version application leases", () => {
     const version = createVersion(store, project.id, "guarded", "/tmp/guarded-mutations-v1");
     const replacement = createVersion(store, project.id, "replacement", "/tmp/guarded-mutations-v2");
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Guarded mutations"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     store.beginVersionApplication({
       versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "guarded-mutations")
     });
@@ -1096,21 +1096,20 @@ describe("project version application leases", () => {
       priority: "high", clarifications: "No changes", changeSummary: "Blocked"
     };
     const mutations = [
-      () => store.updateRequirementState(requirement.id, "acceptance", "returned"),
+      () => store.updateRequirementState(requirement.id, "acceptance_delivery", "returned"),
       () => store.reviseRequirement(requirement.id, revisionInput),
       () => store.replaceRequirementProjects(requirement.id, associationInput),
       () => store.createRequirementProjectSnapshot(requirement.id),
       () => store.supersedeRequirementProjectSnapshot(requirement.id),
-      () => store.invalidateTechnicalDesignForProjectChange(requirement.id),
-      () => store.addApproval(requirement.id, "integration", { decision: "approve", comment: "blocked" }),
+      () => store.invalidateSolutionDesignForProjectChange(requirement.id),
+      () => store.addApproval(requirement.id, "acceptance_delivery", { decision: "approve", comment: "blocked" }),
       () => store.applyGateDecision({
-        requirementId: requirement.id, stage: "integration", artifactId: "artifact-pending",
+        requirementId: requirement.id, stage: "acceptance_delivery", artifactId: "artifact-pending",
         decision: "human_review", reasons: ["blocked"]
       }),
-      () => store.applyHumanOverride(requirement.id, "code_review", "blocked"),
       () => store.addReworkContext(requirement.id, {
-        approvalId: "approval-pending", artifactId: null, sourceStage: "integration",
-        targetStage: "acceptance", actorType: "human", decisionAt: new Date().toISOString(),
+        approvalId: "approval-pending", artifactId: null, sourceStage: "acceptance_delivery",
+        targetStage: "acceptance_delivery", actorType: "human", decisionAt: new Date().toISOString(),
         unstructured: true, items: [], risks: [], openQuestions: []
       })
     ];
@@ -1118,7 +1117,7 @@ describe("project version application leases", () => {
     for (const mutation of mutations) {
       expect(mutation).toThrow("PROJECT_VERSION_APPLICATION_PENDING");
     }
-    expect(store.getRequirement(requirement.id)).toMatchObject({ stage: "integration", status: "awaiting_merge" });
+    expect(store.getRequirement(requirement.id)).toMatchObject({ stage: "acceptance_delivery", status: "awaiting_merge" });
     expect(store.listApprovals(requirement.id)).toEqual([]);
     expect(store.listRequirementProjects(requirement.id)[0]?.projectVersionId).toBe(version.id);
     expect(store.getRequirementProjectSnapshot(requirement.id)).toBeNull();
@@ -1131,7 +1130,7 @@ describe("project version application leases", () => {
     const version = createVersion(store, project.id, "current", join(path, "..", "mutation-race-current"));
     const replacement = createVersion(store, project.id, "replacement", join(path, "..", "mutation-race-replacement"));
     const requirement = store.createRequirement(requirementInput(project.id, version.id, "Mutation race"));
-    store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+    store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
     const application = spawnVersionApplicationWorker(path, {
       mode: "begin", begin: {
         versionId: version.id, requirementId: requirement.id, run: applicationRun(version, "mutation-race")

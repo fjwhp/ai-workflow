@@ -12,6 +12,9 @@ interface RequirementRouteDependencies {
 const approvalConflictCodes = new Set([
   "REQUIREMENT_APPROVAL_STATE_CHANGED",
   "REQUIREMENT_APPROVAL_NOT_READY",
+  "DEFINITION_APPROVAL_DECISION_INVALID",
+  "DEFINITION_ARTIFACT_NOT_FOUND",
+  "DEFINITION_ARTIFACT_INVALID",
   "SOLUTION_DESIGN_APPROVAL_DECISION_INVALID",
   "SOLUTION_DESIGN_ARTIFACT_NOT_FOUND",
   "SOLUTION_DESIGN_ARTIFACT_INVALID",
@@ -23,6 +26,7 @@ const approvalConflictCodes = new Set([
 ]);
 
 const approvalConflictPrefixes = ["DELIVERY_", "REQUIREMENT_PROJECT_SNAPSHOT_"];
+const deliveryUnitStages = new Set(["implementation", "quality_verification", "acceptance_delivery"]);
 
 export async function registerRequirementRoutes(
   app: FastifyInstance,
@@ -38,10 +42,28 @@ export async function registerRequirementRoutes(
     }
     const current = store.getRequirement(req.params.id);
     if (!current) return reply.code(404).send({ error: "NOT_FOUND" });
+    if (store.hasPendingVersionApplication(current.id)) {
+      return reply.code(409).send({
+        error: "PROJECT_VERSION_APPLICATION_PENDING",
+        message: "版本应用处理中，不能修改需求或项目关联"
+      });
+    }
+    if (deliveryUnitStages.has(current.stage)) {
+      return reply.code(409).send({ error: "REQUIREMENT_APPROVAL_STAGE_UNSUPPORTED" });
+    }
 
     let requirement;
     try {
-      if (current.stage === "solution_design" && parsed.data.decision !== "return") {
+      if (current.stage === "definition" && parsed.data.decision !== "return") {
+        requirement = service.approveDefinition({
+          requirementId: current.id,
+          approval: {
+            decision: parsed.data.decision,
+            comment: parsed.data.comment,
+            condition: parsed.data.condition
+          }
+        }).requirement;
+      } else if (current.stage === "solution_design" && parsed.data.decision !== "return") {
         requirement = service.approveSolutionDesign({
           requirementId: current.id,
           approval: {

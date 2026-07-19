@@ -100,7 +100,7 @@ async function pendingApplication(store: WorkflowStore, app: FastifyInstance, pr
     title: `Pending ${suffix}`, businessProblem: "Await local resolution", expectedOutcome: "Resolve lease",
     priority: "medium", primaryProjectId: projectId, primaryProjectVersionId: version.id
   });
-  store.updateRequirementState(requirement.id, "integration", "awaiting_merge");
+  store.updateRequirementState(requirement.id, "acceptance_delivery", "awaiting_merge");
   const runId = `pending-run-${suffix}`;
   store.beginVersionApplication({
     versionId: version.id, requirementId: requirement.id,
@@ -821,7 +821,7 @@ describe("project version application queue route", () => {
       title: "Queue owner", businessProblem: "Serialize application", expectedOutcome: "Own first version",
       priority: "high", primaryProjectId: firstProject.id, primaryProjectVersionId: firstVersion.id
     });
-    store.updateRequirementState(owner.id, "integration", "awaiting_merge");
+    store.updateRequirementState(owner.id, "acceptance_delivery", "awaiting_merge");
     store.beginVersionApplication({
       versionId: firstVersion.id,
       requirementId: owner.id,

@@ -1,13 +1,11 @@
 import type { WorkflowStage } from "@ai-workflow/shared";
 import { ensureProjectKnowledge, retrieveProjectKnowledge } from "./knowledge-service.js";
-import { MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED, resolveSoleDeliveryProject } from "./requirement-projects.js";
 import type { WorkflowStore } from "./store.js";
 
 export const DEFAULT_PROJECT_CONTEXT_MAX_CHARS = 200_000;
 export const MIN_PROJECT_CONTEXT_MAX_CHARS = 4_000;
 export const MAX_PROJECT_CONTEXT_MAX_CHARS = 1_000_000;
 const ENTRY_CAP = 24;
-const EXECUTION_STAGES = new Set<WorkflowStage>(["coding", "code_review", "testing", "acceptance", "integration"]);
 
 export class ProjectContextError extends Error {
   constructor(public readonly code: string, public readonly projects: Array<{ projectId: string; name: string }> = [], public readonly details?: { maxChars: number; minimumRequiredChars: number; projectCount: number }) {
@@ -33,15 +31,7 @@ export function resolveProjectContextBudget(value: unknown = process.env.AI_PROJ
 export async function buildRequirementProjectContext(store: WorkflowStore, requirementId: string, stage: WorkflowStage, budget: ProjectContextBudget = resolveProjectContextBudget()): Promise<RequirementProjectContext> {
   const requirement: any = store.getRequirement(requirementId);
   if (!requirement) throw new ProjectContextError("REQUIREMENT_NOT_FOUND");
-  const active = store.listRequirementProjects(requirementId);
-  let associations = active;
-  if (EXECUTION_STAGES.has(stage)) {
-    let delivery;
-    try { delivery = resolveSoleDeliveryProject(active); }
-    catch { throw new ProjectContextError(MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED); }
-    if (!delivery) throw new ProjectContextError("PROJECT_REQUIRED");
-    associations = [delivery];
-  }
+  const associations = store.listRequirementProjects(requirementId);
   const nameOf = (association: typeof associations[number]) => association.projectName ?? store.getProject(association.projectId)?.name ?? association.projectId;
   const archived = associations.filter((item) => item.projectStatus === "archived");
   if (archived.length) throw new ProjectContextError("PROJECT_ARCHIVED", archived.map((item) => ({ projectId: item.projectId, name: nameOf(item) })));

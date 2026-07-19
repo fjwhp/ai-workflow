@@ -32,12 +32,12 @@ function ready(store: WorkflowStore, projectId: string, summary: string, entries
 }
 
 describe("buildRequirementProjectContext", () => {
-  it("returns context primary and delivery collaborator in position order for technical design", async () => {
+  it("returns every active association in position order for solution design", async () => {
     const { store, primary, delivery, requirement } = fixture();
     ready(store, primary.id, "Architecture summary", [{ path: "docs/architecture.md", kind: "overview", title: "Architecture", content: "boundaries", tags: [] }]);
     ready(store, delivery.id, "Orders summary", [{ path: "src/orders", kind: "module", title: "Orders", content: "handlers", tags: [] }]);
 
-    const context = await buildRequirementProjectContext(store, requirement.id, "technical_design");
+    const context = await buildRequirementProjectContext(store, requirement.id, "solution_design");
 
     expect(context.projects.map((project) => project.projectId)).toEqual([primary.id, delivery.id]);
     expect(context.projects).toMatchObject([
@@ -56,7 +56,7 @@ describe("buildRequirementProjectContext", () => {
     ]);
     for (const project of [primary, delivery, third]) ready(store, project.id, `${project.name} summary`, Array.from({ length: 30 }, (_, index) => ({ path: `src/${index}`, kind: "module", title: `Module ${index}`, content: "x".repeat(1500), tags: [] })));
 
-    const context = await buildRequirementProjectContext(store, requirement.id, "technical_design", { maxChars: 12_000 });
+    const context = await buildRequirementProjectContext(store, requirement.id, "solution_design", { maxChars: 12_000 });
 
     expect(context.projects).toHaveLength(3);
     expect(context.projects.every((project) => project.entries.length > 0 && project.totalChars <= 4_000)).toBe(true);
@@ -66,11 +66,12 @@ describe("buildRequirementProjectContext", () => {
     expect(context.truncated).toBe(true);
   });
 
-  it("uses a 200k default that permits more than 60k of useful coding context", async () => {
-    const { store, delivery, requirement } = fixture();
+  it("uses a 200k default that permits more than 60k of useful definition context", async () => {
+    const { store, primary, delivery, requirement } = fixture();
+    ready(store, primary.id, "Architecture", []);
     ready(store, delivery.id, "Orders", Array.from({ length: 24 }, (_, index) => ({ path: `src/orders/${index}`, kind: "module", title: `Orders ${index}`, content: `order ${"x".repeat(3_900)}`, tags: ["order"] })));
 
-    const context = await buildRequirementProjectContext(store, requirement.id, "coding");
+    const context = await buildRequirementProjectContext(store, requirement.id, "definition");
 
     expect(context.budgetMaxChars).toBe(DEFAULT_PROJECT_CONTEXT_MAX_CHARS);
     expect(JSON.stringify(context.projects).length).toBeGreaterThan(60_000);
@@ -85,27 +86,24 @@ describe("buildRequirementProjectContext", () => {
     expect(resolveProjectContextBudget("2000000").maxChars).toBe(MAX_PROJECT_CONTEXT_MAX_CHARS);
   });
 
-  it("uses only the sole delivery project for coding", async () => {
+  it.each(["definition", "solution_design"] as const)("uses all active associations for %s", async (stage) => {
     const { store, primary, delivery, requirement } = fixture();
     ready(store, primary.id, "Architecture", []); ready(store, delivery.id, "Orders", []);
 
-    const context = await buildRequirementProjectContext(store, requirement.id, "coding", { maxChars: 20_000 });
+    const context = await buildRequirementProjectContext(store, requirement.id, stage, { maxChars: 20_000 });
 
-    expect(context.projects.map((project) => project.projectId)).toEqual([delivery.id]);
+    expect(context.projects.map((project) => project.projectId)).toEqual([primary.id, delivery.id]);
   });
 
-  it("rejects zero, multiple, and archived delivery projects with stable codes", async () => {
+  it("accepts multiple associations and rejects any archived project", async () => {
     const { store, primary, primaryVersion, delivery, deliveryVersion, requirement } = fixture(); ready(store, primary.id, "Architecture", []); ready(store, delivery.id, "Orders", []);
-    store.replaceRequirementProjects(requirement.id, [{ projectId: primary.id, role: "primary", usage: "context", deliveryRequired: false, moduleMode: "all", moduleIds: [], position: 0 }]);
-    await expect(buildRequirementProjectContext(store, requirement.id, "coding")).rejects.toMatchObject({ code: "PROJECT_REQUIRED" });
     store.replaceRequirementProjects(requirement.id, [
       { projectId: primary.id, projectVersionId: primaryVersion.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0 },
       { projectId: delivery.id, projectVersionId: deliveryVersion.id, role: "collaborator", usage: "delivery", deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 1 }
     ]);
-    await expect(buildRequirementProjectContext(store, requirement.id, "coding")).rejects.toMatchObject({ code: "MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED" });
-    store.replaceRequirementProjects(requirement.id, [{ projectId: delivery.id, projectVersionId: deliveryVersion.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0 }]);
+    expect((await buildRequirementProjectContext(store, requirement.id, "solution_design")).projects).toHaveLength(2);
     store.archiveProject(delivery.id);
-    await expect(buildRequirementProjectContext(store, requirement.id, "coding")).rejects.toMatchObject({ code: "PROJECT_ARCHIVED" });
+    await expect(buildRequirementProjectContext(store, requirement.id, "solution_design")).rejects.toMatchObject({ code: "PROJECT_ARCHIVED" });
   });
 
   it("reports every unready project in order and starts missing builds", async () => {
@@ -123,7 +121,7 @@ describe("buildRequirementProjectContext", () => {
     store.replaceRequirementProjects(requirement.id, [{ projectId: primary.id, role: "primary", usage: "context", deliveryRequired: false, moduleMode: "all", moduleIds: [], position: 0 }, { projectId: delivery.id, projectVersionId: deliveryVersion.id, role: "collaborator", usage: "delivery", deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 1 }]);
     store.beginProjectKnowledge(delivery.id, "head-delivery", "test");
 
-    await expect(buildRequirementProjectContext(store, requirement.id, "technical_design")).rejects.toMatchObject({ code: "PROJECT_KNOWLEDGE_BUILDING", projects: [{ projectId: primary.id, name: "Primary" }, { projectId: delivery.id, name: "Delivery" }] });
+    await expect(buildRequirementProjectContext(store, requirement.id, "solution_design")).rejects.toMatchObject({ code: "PROJECT_KNOWLEDGE_BUILDING", projects: [{ projectId: primary.id, name: "Primary" }, { projectId: delivery.id, name: "Delivery" }] });
     for (let attempt = 0; attempt < 20 && !store.getLatestProjectKnowledge(primary.id); attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
     expect(store.getLatestProjectKnowledge(primary.id)).not.toBeNull();
   });
@@ -137,7 +135,7 @@ describe("buildRequirementProjectContext", () => {
     ready(store, project.id, "summary".repeat(8_000), moduleIds.map((path, index) => ({ path, kind: "module", title: `Title-${index}-${"t".repeat(1_000)}`, content: "content".repeat(1_000), tags: Array.from({ length: 50 }, (_, tag) => `tag-${tag}-${"z".repeat(100)}`) })));
     store.replaceRequirementProjects(requirement.id, [{ projectId: project.id, projectVersionId: version.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "selected", moduleIds, position: 0 }]);
 
-    const context = await buildRequirementProjectContext(store, requirement.id, "coding", { maxChars: 20_000 });
+    const context = await buildRequirementProjectContext(store, requirement.id, "solution_design", { maxChars: 20_000 });
     const block = context.projects[0]!;
     expect(block.projectId).toBe(project.id); expect(block.name.length).toBeGreaterThan(0); expect(block.truncated).toBe(true);
     expect(JSON.stringify(block).length).toBeLessThanOrEqual(20_000);
@@ -155,13 +153,13 @@ describe("buildRequirementProjectContext", () => {
     for (const project of projects) ready(store, project.id, "", []);
 
     let minimumRequiredChars = 0;
-    try { await buildRequirementProjectContext(store, requirement.id, "technical_design", { maxChars: 4_000 }); }
+    try { await buildRequirementProjectContext(store, requirement.id, "solution_design", { maxChars: 4_000 }); }
     catch (error: any) {
       expect(error).toMatchObject({ code: "PROJECT_CONTEXT_BUDGET_TOO_SMALL", details: { maxChars: 4_000, projectCount: projects.length } });
       minimumRequiredChars = error.details.minimumRequiredChars;
     }
     expect(minimumRequiredChars).toBeGreaterThan(4_000);
-    const context = await buildRequirementProjectContext(store, requirement.id, "technical_design", { maxChars: minimumRequiredChars });
+    const context = await buildRequirementProjectContext(store, requirement.id, "solution_design", { maxChars: minimumRequiredChars });
     expect(context.totalChars).toBe(minimumRequiredChars);
   });
 
@@ -175,7 +173,7 @@ describe("buildRequirementProjectContext", () => {
     ready(store, project.id, emoji.repeat(2_000), [{ path: moduleIds[0], kind: "module", title: emoji.repeat(700), content: emoji.repeat(5_000), tags: [emoji.repeat(300)] }]);
     store.replaceRequirementProjects(requirement.id, [{ projectId: project.id, projectVersionId: version.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "selected", moduleIds, position: 0 }]);
 
-    const context = await buildRequirementProjectContext(store, requirement.id, "coding", { maxChars: 4_000 });
+    const context = await buildRequirementProjectContext(store, requirement.id, "definition", { maxChars: 4_000 });
     const serialized = JSON.stringify(context.projects);
     const hasLoneSurrogate = (value: string) => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value);
     expect(serialized.length).toBeLessThanOrEqual(4_000);

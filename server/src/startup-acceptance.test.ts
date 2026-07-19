@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 const tempDirectories: string[] = [];
@@ -13,13 +14,19 @@ afterEach(async () => {
 });
 
 describe("real server startup acceptance", () => {
-  it("backs up incompatible data and serves an empty phase-2-delivery-v1 database", { timeout: 15_000 }, async () => {
+  it("backs up a v1 database and starts with no legacy stages or gate settings", { timeout: 15_000 }, async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "workflow-startup-acceptance-"));
     tempDirectories.push(dataDir);
     const databasePath = join(dataDir, "workflow.db");
-    const oldBytes = Buffer.from("synthetic incompatible workflow database\n");
-    await writeFile(databasePath, oldBytes);
-    await writeFile(`${databasePath}.schema-version`, "project-versions-v1");
+    const oldDatabase = new DatabaseSync(databasePath);
+    oldDatabase.exec(`
+      CREATE TABLE requirements (id TEXT PRIMARY KEY, stage TEXT NOT NULL);
+      CREATE TABLE settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL);
+      INSERT INTO requirements VALUES ('legacy-requirement', 'prd');
+      INSERT INTO settings VALUES ('gate_config', '{"mandatoryHumanStages":["coding","acceptance"]}');
+    `);
+    oldDatabase.close();
+    await writeFile(`${databasePath}.schema-version`, "phase-2-delivery-v1");
     const stdout = boundedLogs();
     const allLogs = boundedLogs();
     const child = spawn(process.execPath, [resolve("node_modules/tsx/dist/cli.mjs"), resolve("server/src/index.ts")], {
@@ -36,10 +43,17 @@ describe("real server startup acceptance", () => {
       await waitForHealth(baseUrl, child, allLogs.read);
       await expect(getJson(baseUrl, "/api/projects")).resolves.toEqual([]);
       await expect(getJson(baseUrl, "/api/requirements")).resolves.toEqual([]);
+      await expect(getJson(baseUrl, "/api/settings/gates")).resolves.toMatchObject({
+        mandatoryHumanStages: ["implementation"]
+      });
       const backupNames = (await readdir(dataDir)).filter((name) => /^workflow\.db\.backup-\d{4}-\d{2}-\d{2}T/.test(name) && !name.endsWith("-wal") && !name.endsWith("-shm"));
       expect(backupNames).toHaveLength(1);
-      await expect(readFile(join(dataDir, backupNames[0]!))).resolves.toEqual(oldBytes);
-      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-delivery-v1");
+      const backup = new DatabaseSync(join(dataDir, backupNames[0]!));
+      expect(backup.prepare("SELECT stage FROM requirements").get()).toEqual({ stage: "prd" });
+      expect(JSON.parse((backup.prepare("SELECT value_json FROM settings WHERE key = 'gate_config'").get() as { value_json: string }).value_json))
+        .toEqual({ mandatoryHumanStages: ["coding", "acceptance"] });
+      backup.close();
+      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-five-stage-v2");
     } finally {
       await stopChild(child);
     }

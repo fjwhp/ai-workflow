@@ -5,17 +5,26 @@ const pass = { conclusion: "pass", confidence: 0.9, openQuestions: [], risks: []
 
 describe("evaluateGate", () => {
   it("automatically approves a clear low-risk artifact", () => {
-    expect(evaluateGate("prd", pass, defaultGateConfig).decision).toBe("auto_approve");
+    expect(evaluateGate("definition", pass, defaultGateConfig).decision).toBe("auto_approve");
   });
-  it("lets PRD continue with ordinary questions but escalates blocking decisions",()=>{
-    expect(evaluateGate("prd",{...pass,openQuestions:["按钮文案待验证"],blockingQuestions:[]},defaultGateConfig).decision).toBe("auto_approve");
-    expect(evaluateGate("prd",{...pass,blockingQuestions:[{question:"删除是否可恢复"}]},defaultGateConfig).decision).toBe("human_review");
-    expect(evaluateGate("requirement_review",{...pass,openQuestions:["范围是什么"]},defaultGateConfig).decision).toBe("human_review");
+
+  it("lets definition continue with ordinary questions", () => {
+    const artifact = { ...pass, openQuestions: ["按钮文案待验证"], blockingQuestions: [] };
+
+    expect(evaluateGate("definition", artifact, defaultGateConfig).decision).toBe("auto_approve");
+  });
+
+  it("requires human review for blocking definition questions", () => {
+    const artifact = { ...pass, blockingQuestions: [{ question: "删除是否可恢复" }] };
+    const result = evaluateGate("definition", artifact, defaultGateConfig);
+
+    expect(result.decision).toBe("human_review");
+    expect(result.reasons.join(" ")).toContain("1 个高风险阻塞问题");
   });
 
   it("automatically returns explicit returns and S0 findings", () => {
-    expect(evaluateGate("prd", { ...pass, conclusion: "return" }, defaultGateConfig).decision).toBe("auto_return");
-    expect(evaluateGate("testing", { ...pass, findings: [{ severity: "S0" }] }, defaultGateConfig).decision).toBe("auto_return");
+    expect(evaluateGate("definition", { ...pass, conclusion: "return" }, defaultGateConfig).decision).toBe("auto_return");
+    expect(evaluateGate("quality_verification", { ...pass, findings: [{ severity: "S0" }] }, defaultGateConfig).decision).toBe("auto_return");
   });
 
   it.each([
@@ -25,17 +34,18 @@ describe("evaluateGate", () => {
     [{ ...pass, risks: ["兼容风险"] }, "风险"],
     [{ ...pass, openQuestions: ["范围是什么"] }, "待确认"]
   ])("requires a human for ambiguous evidence", (artifact, reason) => {
-    const result = evaluateGate("requirement_review", artifact, defaultGateConfig);
+    const result = evaluateGate("solution_design", artifact, defaultGateConfig);
     expect(result.decision).toBe("human_review");
     expect(result.reasons.join(" ")).toContain(reason);
   });
 
-  it("always requires humans for coding and acceptance", () => {
-    expect(evaluateGate("coding", pass, defaultGateConfig).decision).toBe("human_review");
-    expect(evaluateGate("acceptance", pass, defaultGateConfig).decision).toBe("human_review");
+  it("defaults mandatory human review to implementation", () => {
+    expect(defaultGateConfig.mandatoryHumanStages).toEqual(["implementation"]);
+    expect(evaluateGate("implementation", pass, defaultGateConfig).decision).toBe("human_review");
+    expect(evaluateGate("acceptance_delivery", pass, defaultGateConfig).decision).toBe("auto_approve");
   });
 
   it("requires humans when automation is disabled", () => {
-    expect(evaluateGate("prd", pass, { ...defaultGateConfig, autoTransitionEnabled: false }).decision).toBe("human_review");
+    expect(evaluateGate("definition", pass, { ...defaultGateConfig, autoTransitionEnabled: false }).decision).toBe("human_review");
   });
 });

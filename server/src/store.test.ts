@@ -116,8 +116,8 @@ describe("WorkflowStore", () => {
   it("blocks archiving delivery projects throughout unfinished delivery stages",()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject({name:"Delivery",repoPath:"/tmp/archive-lifecycle",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
     const req=createRequirement(store,{title:"交付生命周期",businessProblem:"需要保护活动项目交付",expectedOutcome:"阻止错误归档",priority:"medium",primaryProjectId:project.id});
-    for(const [stage,status] of [["coding","ai_ready"],["code_review","awaiting_approval"],["testing","returned"],["acceptance","blocked"],["integration","awaiting_merge"]] as const){store.updateRequirementState(req.id,stage,status);expect(store.projectHasActiveDelivery(project.id)).toBe(true);}
-    store.updateRequirementState(req.id,"integration","completed");expect(store.projectHasActiveDelivery(project.id)).toBe(false);
+    for(const [stage,status] of [["implementation","ai_ready"],["quality_verification","awaiting_approval"],["quality_verification","returned"],["acceptance_delivery","blocked"],["acceptance_delivery","awaiting_merge"]] as const){store.updateRequirementState(req.id,stage,status);expect(store.projectHasActiveDelivery(project.id)).toBe(true);}
+    store.updateRequirementState(req.id,"acceptance_delivery","completed");expect(store.projectHasActiveDelivery(project.id)).toBe(false);
   });
 
   it("cancels building knowledge and ignores its late completion",()=>{
@@ -155,7 +155,7 @@ describe("WorkflowStore", () => {
     insertProject.run("p1", "One", "/tmp/one", "main", now, now);
     insertProject.run("p2", "Two", "/tmp/two", "main", now, now);
     db.prepare("INSERT INTO requirements (id,code,title,business_problem,expected_outcome,priority,stage,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
-      .run("r1", "REQ-0001", "Title", "Business problem", "Outcome", "medium", "prd", "ai_ready", now, now);
+      .run("r1", "REQ-0001", "Title", "Business problem", "Outcome", "medium", "definition", "ai_ready", now, now);
     const insertAssociation = db.prepare("INSERT INTO requirement_projects (id,requirement_id,project_id,role,usage,delivery_required,module_mode,module_ids_json,position,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
     insertAssociation.run("rp1", "r1", "p1", "primary", "delivery", 1, "all", "[]", 0, "active", now, now);
     expect(() => insertAssociation.run("rp2", "r1", "p2", "primary", "delivery", 1, "all", "[]", 1, "active", now, now)).toThrow(/UNIQUE constraint failed/);
@@ -166,7 +166,7 @@ describe("WorkflowStore", () => {
     const store=new WorkflowStore(":memory:");stores.push(store);
     const project=store.createProject({name:"Memory Repo",repoPath:"/tmp/repo-memory",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
     const req=createRequirement(store, {title:"用户规则",businessProblem:"缺少规则",expectedOutcome:"形成规则",priority:"medium",primaryProjectId:project.id});
-    const base={projectId:project.id,requirementId:req.id,layer:"decision",type:"product_decision",modules:[],tags:[],sourceStage:"prd",confidence:0.9,riskLevel:"normal",publishDecision:"auto_publish",evidence:[{artifactId:"a1",stage:"prd",version:1}]};
+    const base={projectId:project.id,requirementId:req.id,layer:"decision",type:"product_decision",modules:[],tags:[],sourceStage:"definition",confidence:0.9,riskLevel:"normal",publishDecision:"auto_publish",evidence:[{artifactId:"a1",stage:"definition",version:1}]};
     store.replaceKnowledgeCandidates(req.id,project.id,[{...base,subjectKey:"subject-1",title:"用户名唯一",content:"用户名必须唯一"},{...base,subjectKey:"subject-2",title:"权限规则",content:"仅管理员可创建",riskLevel:"high",publishDecision:"human_review"}]);
     expect(store.listKnowledgeCandidates(req.id)).toHaveLength(2);
     expect(store.publishKnowledgeCandidates(req.id)).toMatchObject({publishedCount:1,reviewCount:1,conflictCount:0});
@@ -190,14 +190,14 @@ describe("WorkflowStore", () => {
     const second = createRequirement(store, { title: "门店筛选优化", businessProblem: "运营查找目标门店需要花费较多时间", expectedOutcome: "可以快速筛选门店", priority: "low" });
     expect(first.code).toBe("REQ-0001");
     expect(second.code).toBe("REQ-0002");
-    expect(first.status).toBe("ai_ready");
+    expect(first).toMatchObject({ stage: "definition", status: "ai_ready" });
   });
 
   it("keeps artifact versions immutable", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const req = createRequirement(store, { title: "订单备注规则统一", businessProblem: "三个入口的备注规则存在不一致风险", expectedOutcome: "所有下单入口行为一致", priority: "medium" });
-    const a = store.addArtifact(req.id, "prd", "第一版", { conclusion: "pass" });
-    const b = store.addArtifact(req.id, "prd", "第二版", { conclusion: "pass" });
+    const a = store.addArtifact(req.id, "definition", "第一版", { conclusion: "pass" });
+    const b = store.addArtifact(req.id, "definition", "第二版", { conclusion: "pass" });
     expect(a.version).toBe(1);
     expect(b.version).toBe(2);
     expect(store.listArtifacts(req.id)).toHaveLength(2);
@@ -377,7 +377,7 @@ describe("WorkflowStore", () => {
       title: "订单备注规则统一", businessProblem: "三个入口规则不一致",
       expectedOutcome: "入口行为一致", priority: "medium"
     });
-    store.updateRequirementState(req.id, "prd", "returned");
+    store.updateRequirementState(req.id, "definition", "returned");
     const updated = store.reviseRequirement(req.id, {
       title: req.title,
       businessProblem: "H5、普通下单和开放接口的备注规则不一致",
@@ -387,26 +387,26 @@ describe("WorkflowStore", () => {
     });
     expect(updated?.version).toBe(2);
     expect(updated?.status).toBe("ai_ready");
-    expect(updated?.stage).toBe("prd");
+    expect(updated?.stage).toBe("definition");
     expect(updated?.clarifications).toContain("最多50字符");
     expect(store.listRequirementRevisions(req.id).map((revision) => revision.version)).toEqual([2, 1]);
   });
 
-  it("resumes the returned stage instead of forcing every correction to PRD", () => {
+  it("resumes the returned stage instead of forcing every correction to definition", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const req = createRequirement(store, { title: "接口实现", businessProblem: "现有接口缺少创建能力", expectedOutcome: "新增创建接口", priority: "medium" });
-    store.updateRequirementState(req.id, "technical_design", "returned");
+    store.updateRequirementState(req.id, "solution_design", "returned");
     const updated = store.reviseRequirement(req.id, { ...req, clarifications: "补充接口契约、错误码和回滚策略。" });
-    expect(updated?.stage).toBe("technical_design");
+    expect(updated?.stage).toBe("solution_design");
   });
 
   it("persists an ordered stage run and prevents duplicate active runs", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const req = createRequirement(store, { title: "接口实现", businessProblem: "缺少接口", expectedOutcome: "新增接口", priority: "medium" });
-    const run = store.createStageRun({ requirementId: req.id, stage: "prd", model: "gpt-5.5", input: { prompt: "hello" } });
+    const run = store.createStageRun({ requirementId: req.id, stage: "definition", model: "gpt-5.5", input: { prompt: "hello" } });
     expect((store as any).db.prepare("SELECT owner_type, owner_id FROM stage_runs WHERE id = ?").get(run.id))
       .toEqual({ owner_type: "requirement", owner_id: req.id });
-    expect(() => store.createStageRun({ requirementId: req.id, stage: "prd", model: "gpt-5.5", input: {} })).toThrow("RUN_ALREADY_ACTIVE");
+    expect(() => store.createStageRun({ requirementId: req.id, stage: "definition", model: "gpt-5.5", input: {} })).toThrow("RUN_ALREADY_ACTIVE");
     store.appendStageRunEvent(run.id, "request.sent", { ok: true });
     store.appendStageRunEvent(run.id, "output.delta", { text: "done" });
     expect(store.getStageRun(run.id)?.events.map((event: any) => event.sequence)).toEqual([1, 2, 3]);
@@ -414,97 +414,21 @@ describe("WorkflowStore", () => {
     expect(store.getStageRun(run.id)?.status).toBe("completed");
   });
 
-  it("atomically validates an execution-stage reservation against the prepared requirement version", () => {
-    const store = new WorkflowStore(":memory:"); stores.push(store);
-    const project = store.createProject({ name: "Reservation", repoPath: "/tmp/reservation", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
-    const version = ensureProjectVersion(store, project.id)!;
-    const req = createRequirement(store, { title: "原子预留", businessProblem: "准备期间关联可能变化", expectedOutcome: "拒绝过期运行", priority: "medium", primaryProjectId: project.id });
-    const prepared = store.updateRequirementState(req.id, "coding", "ai_ready")!;
-    const replacement = store.createProjectVersion({ projectId: project.id, name: "next", branch: "next", baseBranch: "main", worktreePath: "/tmp/reservation-next", headCommit: "next-head" });
-    store.replaceRequirementProjects(req.id, [{ projectId: project.id, projectVersionId: replacement.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "auto", moduleIds: [], position: 0 }]);
-
-    expect(() => store.createStageRun({ requirementId: req.id, stage: "coding", model: "gpt-5.5", input: {}, projectId: project.id, projectVersionId: version.id, expectedRequirementUpdatedAt: prepared.updatedAt, expectedProjectUpdatedAt: project.updatedAt }))
-      .toThrow("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
-    expect(store.listStageRuns(req.id)).toHaveLength(0);
-  });
-
-  it.each([
-    ["archived project", "PROJECT_ARCHIVED"],
-    ["closed version", "PROJECT_VERSION_NOT_ACTIVE"],
-    ["version ownership mismatch", "REQUIREMENT_VERSION_PROJECT_MISMATCH"]
-  ] as const)("revalidates %s inside the execution-stage reservation transaction", (scenario,errorCode) => {
-    const store = new WorkflowStore(":memory:"); stores.push(store);
-    const project = store.createProject({ name: `Reservation ${scenario}`, repoPath: `/tmp/reservation-${scenario}`, defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
-    const version = ensureProjectVersion(store, project.id)!;
-    const req = createRequirement(store, { title: "事务复核", businessProblem: "准备后项目版本状态可能变化", expectedOutcome: "事务内拒绝", priority: "medium", primaryProjectId: project.id });
-    const prepared = store.updateRequirementState(req.id, "coding", "ai_ready")!;
-    if(scenario==="archived project")(store as any).db.prepare("UPDATE projects SET status = 'archived' WHERE id = ?").run(project.id);
-    if(scenario==="closed version")(store as any).db.prepare("UPDATE project_versions SET status = 'closed' WHERE id = ?").run(version.id);
-    if(scenario==="version ownership mismatch"){const other=store.createProject({name:"Other owner",repoPath:"/tmp/reservation-other-owner",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});(store as any).db.prepare("UPDATE project_versions SET project_id = ? WHERE id = ?").run(other.id,version.id);}
-
-    expect(() => store.createStageRun({ requirementId: req.id, stage: "coding", model: "gpt-5.5", input: {}, projectId: project.id, projectVersionId: version.id, expectedRequirementUpdatedAt: prepared.updatedAt, expectedProjectUpdatedAt: project.updatedAt })).toThrow(errorCode);
-    expect(store.listStageRuns(req.id)).toHaveLength(0);
-  });
-
-  it("rejects a reservation when the delivery project changed during preparation", () => {
-    const store = new WorkflowStore(":memory:"); stores.push(store);
-    const project = store.createProject({ name: "Prepared project", repoPath: "/tmp/prepared-project", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
-    const version = ensureProjectVersion(store, project.id)!;
-    const req = createRequirement(store, { title: "项目准备竞态", businessProblem: "上下文准备时项目配置可能变化", expectedOutcome: "拒绝旧项目快照", priority: "medium", primaryProjectId: project.id });
-    const prepared = store.updateRequirementState(req.id, "coding", "ai_ready")!;
-    (store as any).db.prepare("UPDATE projects SET updated_at = 'changed-during-preparation' WHERE id = ?").run(project.id);
-
-    expect(() => store.createStageRun({ requirementId: req.id, stage: "coding", model: "gpt-5.5", input: {}, projectId: project.id, projectVersionId: version.id, expectedRequirementUpdatedAt: prepared.updatedAt, expectedProjectUpdatedAt: project.updatedAt }))
-      .toThrow("PROJECT_CHANGED_DURING_RUN_PREPARATION");
-    expect(store.listStageRuns(req.id)).toHaveLength(0);
-  });
-
-  it("freezes project execution identity while a delivery run is active", () => {
-    const store = new WorkflowStore(":memory:"); stores.push(store);
-    const project = store.createProject({ name: "Frozen", repoPath: "/tmp/frozen-project", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [], technology: ["node"] });
-    const version = ensureProjectVersion(store, project.id)!;
-    const req = createRequirement(store, { title: "项目身份冻结", businessProblem: "运行期间项目执行配置必须稳定", expectedOutcome: "阻止身份改写", priority: "medium", primaryProjectId: project.id });
-    const prepared = store.updateRequirementState(req.id, "coding", "ai_ready")!;
-    const run = store.createStageRun({ requirementId: req.id, stage: "coding", model: "gpt-5.5", input: {}, projectId: project.id, projectVersionId: version.id, expectedRequirementUpdatedAt: prepared.updatedAt, expectedProjectUpdatedAt: project.updatedAt });
-    for(const update of [{repoPath:"/tmp/frozen-next"},{defaultBranch:"next"},{allowedCommands:[{command:"npm"}]},{sensitivePatterns:["TOKEN"]},{technology:["java"]}]){
-      expect(() => store.updateProject(project.id,update)).toThrow("PROJECT_IN_ACTIVE_EXECUTION");
-      expect(store.getProject(project.id)).toMatchObject({repoPath:project.repoPath,defaultBranch:"main",allowedCommands:[],sensitivePatterns:[],technology:["node"]});
-    }
-    expect(store.updateProject(project.id,{name:"Renamed",category:"backend"})).toMatchObject({name:"Renamed",category:"backend"});
-    store.completeStageRun(run.id,{});
-    expect(store.updateProject(project.id,{defaultBranch:"next"})).toMatchObject({defaultBranch:"next"});
-  });
-
   it("prevents association replacement while any stage run is active", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = store.createProject({ name: "Guard", repoPath: "/tmp/run-association-guard", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
     const version = ensureProjectVersion(store, project.id)!;
     const req = createRequirement(store, { title: "运行关联", businessProblem: "运行期间关联必须稳定", expectedOutcome: "拒绝关联改写", priority: "medium", primaryProjectId: project.id });
-    store.createStageRun({ requirementId: req.id, stage: "prd", model: "gpt-5.5", input: {} });
+    store.createStageRun({ requirementId: req.id, stage: "definition", model: "gpt-5.5", input: {} });
 
     expect(() => store.replaceRequirementProjects(req.id, [{ projectId: project.id, projectVersionId: version.id, role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0 }]))
       .toThrow("RUN_ALREADY_ACTIVE");
   });
 
-  it("prevents two stores from reserving the same running requirement stage", () => {
-    const directory = mkdtempSync(join(tmpdir(), "workflow-run-reservation-")); directories.push(directory);
-    const path = join(directory, "workflow.db");
-    const first = new WorkflowStore(path), second = new WorkflowStore(path); stores.push(first, second);
-    const project = first.createProject({ name: "Shared", repoPath: join(directory, "repo"), defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
-    const version = ensureProjectVersion(first, project.id)!;
-    const req = createRequirement(first, { title: "并发预留", businessProblem: "两个进程同时启动运行", expectedOutcome: "仅一个运行", priority: "medium", primaryProjectId: project.id });
-    const prepared = first.updateRequirementState(req.id, "coding", "ai_ready")!;
-    const input = { requirementId: req.id, stage: "coding" as const, model: "gpt-5.5", input: {}, projectId: project.id, projectVersionId: version.id, expectedRequirementUpdatedAt: prepared.updatedAt, expectedProjectUpdatedAt: project.updatedAt };
-
-    first.createStageRun(input);
-    expect(() => second.createStageRun(input)).toThrow("RUN_ALREADY_ACTIVE");
-    expect(first.listStageRuns(req.id)).toHaveLength(1);
-  });
-
   it("marks abandoned active runs as interrupted", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const req = createRequirement(store, { title: "接口实现", businessProblem: "缺少接口", expectedOutcome: "新增接口", priority: "medium" });
-    const run = store.createStageRun({ requirementId: req.id, stage: "prd", model: "gpt-5.5", input: {} });
+    const run = store.createStageRun({ requirementId: req.id, stage: "definition", model: "gpt-5.5", input: {} });
     expect(store.interruptActiveStageRuns()).toBe(1);
     expect(store.getStageRun(run.id)?.status).toBe("interrupted");
   });
@@ -512,15 +436,15 @@ describe("WorkflowStore", () => {
   it("recovers requirements left in ai_running without an active run", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const req = createRequirement(store, { title: "接口实现", businessProblem: "缺少接口", expectedOutcome: "新增接口", priority: "medium" });
-    store.updateRequirementState(req.id, "prd", "ai_running");
+    store.updateRequirementState(req.id, "definition", "ai_running");
     expect(store.recoverInterruptedRequirements()).toBe(1);
     expect(store.getRequirement(req.id)?.status).toBe("ai_ready");
   });
 
   it("persists gate configuration with defaults", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
-    expect(store.getGateConfig()).toEqual({ autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: ["coding", "acceptance"] });
-    store.updateGateConfig({ autoTransitionEnabled: false, confidenceThreshold: 0.9, mandatoryHumanStages: ["coding"] });
+    expect(store.getGateConfig()).toEqual({ autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: ["implementation"] });
+    store.updateGateConfig({ autoTransitionEnabled: false, confidenceThreshold: 0.9, mandatoryHumanStages: ["implementation"] });
     expect(store.getGateConfig().confidenceThreshold).toBe(0.9);
     expect(store.getGateConfig().autoTransitionEnabled).toBe(false);
   });
@@ -542,7 +466,7 @@ describe("WorkflowStore", () => {
     const project = store.createProject({ name: "Repo", repoPath: "/tmp/repo", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
     const version = ensureProjectVersion(store, project.id)!;
     const req = createRequirement(store, { title: "接口", businessProblem: "缺少", expectedOutcome: "新增", priority: "medium", primaryProjectId: project.id });
-    const execution = store.addExecution({ requirementId: req.id, stage: "coding", projectId: project.id, projectVersionId: version.id, branch: "ai/one", worktreePath: "/tmp/wt", baseCommit: "version-head", status: "completed", diff: "diff", events: [] });
+    const execution = store.addExecution({ requirementId: req.id, stage: "implementation", projectId: project.id, projectVersionId: version.id, branch: "ai/one", worktreePath: "/tmp/wt", baseCommit: "version-head", status: "completed", diff: "diff", events: [] });
     expect(store.listExecutions(req.id)[0]).toMatchObject({ projectVersionId: version.id, baseCommit: "version-head" });
     const evidence = store.addCodingEvidence({ executionId: execution.id, requirementId: req.id, projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", diffHash: "abc", diff: "diff", originalChars: 4, truncated: false, files: ["a.ts"], additions: 1, deletions: 0, diagnostics: "" });
     expect(store.getLatestCodingEvidence(req.id)?.id).toBe(evidence.id);
@@ -556,7 +480,7 @@ describe("WorkflowStore", () => {
     const version = ensureProjectVersion(store, project.id)!;
     const otherVersion = ensureProjectVersion(store, other.id)!;
     const req = createRequirement(store, { title: "执行来源", businessProblem: "执行来源必须与项目匹配", expectedOutcome: "拒绝无效来源", priority: "medium", primaryProjectId: project.id });
-    const base: ExecutionInput = { requirementId: req.id, stage: "coding", projectId: project.id, projectVersionId: version.id, branch: "ai/REQ-0001", worktreePath: "/tmp/execution-wt", baseCommit: "base", status: "completed", commands: [], diff: "", events: [] };
+    const base: ExecutionInput = { requirementId: req.id, stage: "implementation", projectId: project.id, projectVersionId: version.id, branch: "ai/REQ-0001", worktreePath: "/tmp/execution-wt", baseCommit: "base", status: "completed", commands: [], diff: "", events: [] };
 
     expect(() => store.addExecution({ ...base, baseCommit: undefined })).toThrow("REQUIREMENT_VERSION_REQUIRED");
     expect(() => store.addExecution({ ...base, projectVersionId: otherVersion.id })).toThrow("REQUIREMENT_VERSION_PROJECT_MISMATCH");
@@ -566,32 +490,16 @@ describe("WorkflowStore", () => {
   it("stores one immutable rework context per return approval",()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);
     const req=createRequirement(store, {title:"接口",businessProblem:"缺少",expectedOutcome:"新增",priority:"medium"});
-    const approval=store.addApproval(req.id,"code_review",{decision:"return",comment:"修复权限",targetStage:"coding"});
-    const context=store.addReworkContext(req.id,{approvalId:approval.id,artifactId:null,sourceStage:"code_review",targetStage:"coding",actorType:"human",decisionAt:approval.created_at,unstructured:true,items:[{id:"i1",title:"修复权限"}],risks:[],openQuestions:[]});
+    const approval=store.addApproval(req.id,"quality_verification",{decision:"return",comment:"修复权限",targetStage:"implementation"});
+    const context=store.addReworkContext(req.id,{approvalId:approval.id,artifactId:null,sourceStage:"quality_verification",targetStage:"implementation",actorType:"human",decisionAt:approval.created_at,unstructured:true,items:[{id:"i1",title:"修复权限"}],risks:[],openQuestions:[]});
     expect(store.getLatestReworkContext(req.id)?.id).toBe(context.id);
     expect(()=>store.addReworkContext(req.id,{...context,id:undefined})).toThrow();
-  });
-
-  it("atomically records a human override and advances code review", () => {
-    const store = new WorkflowStore(":memory:"); stores.push(store);
-    const req = createRequirement(store, { title: "接口", businessProblem: "缺少", expectedOutcome: "新增", priority: "medium" });
-    store.updateRequirementState(req.id, "code_review", "awaiting_approval");
-    const artifact = store.addArtifact(req.id, "code_review", "Review", { risks: ["权限风险"], openQuestions: ["兼容旧数据？"] });
-    store.addApproval(req.id, "code_review", { decision: "return", comment: "修复权限", targetStage: "coding" });
-    store.addApproval(req.id, "code_review", { decision: "return", comment: "补充测试", targetStage: "coding" });
-
-    const result = store.applyHumanOverride(req.id, "code_review", "人工确认风险可接受");
-
-    expect(result.requirement?.stage).toBe("testing");
-    expect(result.requirement?.status).toBe("ai_ready");
-    expect(result.approval).toMatchObject({ actor_type: "human_override", artifact_id: artifact.id, return_count: 2 });
-    expect(result.approval.override).toMatchObject({ risks: ["权限风险"], openQuestions: ["兼容旧数据？"], targetStage: "testing" });
   });
 
   it("persists one active local integration and its terminal evidence", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const req = createRequirement(store, { title: "接口", businessProblem: "缺少接口能力", expectedOutcome: "新增接口", priority: "medium" });
-    store.updateRequirementState(req.id, "integration", "awaiting_merge");
+    store.updateRequirementState(req.id, "acceptance_delivery", "awaiting_merge");
     const run = store.createIntegrationRun({ requirementId: req.id, projectId: "project-1", executionId: "execution-1", evidenceId: "evidence-1", sourceBranch: "ai/req", worktreePath: "/tmp/wt", targetBranch: "main", preflight: { allowed: true } });
     expect(() => store.createIntegrationRun({ requirementId: req.id, projectId: "project-1", sourceBranch: "ai/req", worktreePath: "/tmp/wt", targetBranch: "main", preflight: {} })).toThrow("INTEGRATION_ALREADY_ACTIVE");
     const completed = store.completeIntegrationRun(run!.id, { status: "completed", sourceCommit: "a".repeat(40), targetCommit: "b".repeat(40), commandResults: [], error: null });

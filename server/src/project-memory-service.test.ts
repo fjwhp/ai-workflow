@@ -9,8 +9,8 @@ describe("project memory service",()=>{
     const project=store.createProject({name:"Repo",repoPath:"/tmp/memory-service",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
     const version=store.createProjectVersion({projectId:project.id,name:"fixture",branch:"main",baseBranch:"main",worktreePath:"/tmp/memory-service-version",headCommit:"fixture-head"});
     const req=store.createRequirement({title:"用户规则",businessProblem:"缺少",expectedOutcome:"明确",priority:"medium",primaryProjectId:project.id,primaryProjectVersionId:version.id});
-    const artifact=store.addArtifact(req.id,"prd","PRD",{confidence:0.9,productDecisions:[{decision:"用户名唯一",rationale:"登录标识",evidence:"User.java"}]});
-    store.addApproval(req.id,"prd",{decision:"approve",comment:"通过",artifactId:artifact.id});
+    const artifact=store.addArtifact(req.id,"definition","Product definition",{confidence:0.9,productDecisions:[{decision:"用户名唯一",rationale:"登录标识",evidence:"User.java"}]});
+    store.addApproval(req.id,"definition",{decision:"approve",comment:"通过",artifactId:artifact.id});
     expect(refreshRequirementKnowledge(store,req.id)).toHaveLength(1);
     expect(publishRequirementKnowledge(store,req.id).publishedCount).toBe(1);
     expect(publishRequirementKnowledge(store,req.id).publishedCount).toBe(0);

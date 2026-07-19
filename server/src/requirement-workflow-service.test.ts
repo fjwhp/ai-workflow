@@ -104,8 +104,12 @@ function count(databasePath: string, table: string, requirementId: string) {
 }
 
 describe("RequirementWorkflowService", () => {
-  it("selects only requirement-owned solution artifacts across explicit and transitional ownership", () => {
+  it("selects only explicitly requirement-owned solution artifacts", () => {
     const fixture = createFixture();
+    const ownershipDatabase = new DatabaseSync(fixture.databasePath);
+    expect(ownershipDatabase.prepare("SELECT owner_type, owner_id FROM artifacts WHERE requirement_id = ? AND version = 1")
+      .get(fixture.requirement.id)).toEqual({ owner_type: "requirement", owner_id: fixture.requirement.id });
+    ownershipDatabase.close();
     const snapshot = fixture.store.createRequirementProjectSnapshot(fixture.requirement.id);
     const plan = fixture.store.deliveryUnits.createPlan({
       requirementId: fixture.requirement.id,
@@ -139,10 +143,7 @@ describe("RequirementWorkflowService", () => {
     cleanup.prepare("DELETE FROM artifacts WHERE owner_type = 'requirement' AND owner_id = ?")
       .run(fixture.requirement.id);
     cleanup.close();
-    expect(fixture.store.getLatestArtifact(fixture.requirement.id, "solution_design")).toMatchObject({
-      version: 1,
-      title: "Solution design"
-    });
+    expect(fixture.store.getLatestArtifact(fixture.requirement.id, "solution_design")).toBeNull();
   });
 
   it("approves persisted solution design and creates the frozen delivery plan atomically", () => {

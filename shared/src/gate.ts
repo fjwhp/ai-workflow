@@ -7,7 +7,7 @@ export type GateResult = { decision: GateDecision; reasons: string[] };
 export const defaultGateConfig: GateConfig = {
   autoTransitionEnabled: true,
   confidenceThreshold: 0.85,
-  mandatoryHumanStages: ["coding", "acceptance"]
+  mandatoryHumanStages: ["implementation"]
 };
 
 export function evaluateGate(stage: WorkflowStage, artifact: any, config: GateConfig): GateResult {
@@ -25,10 +25,10 @@ export function evaluateGate(stage: WorkflowStage, artifact: any, config: GateCo
   if (s1) reasons.push(`存在 ${s1} 个 S1 发现`);
   const risks = Array.isArray(artifact?.risks) ? artifact.risks.length : 0;
   if (risks) reasons.push(`存在 ${risks} 项风险`);
-  if(stage==="prd"){
-    const blockers=Array.isArray(artifact?.blockingQuestions)?artifact.blockingQuestions.length:0;
-    if(blockers)reasons.push(`存在 ${blockers} 个高风险阻塞问题`);
-  }else{
+  if (stage === "definition") {
+    const blockers = Array.isArray(artifact?.blockingQuestions) ? artifact.blockingQuestions.length : 0;
+    if (blockers) reasons.push(`存在 ${blockers} 个高风险阻塞问题`);
+  } else {
     const questions = Array.isArray(artifact?.openQuestions) ? artifact.openQuestions.length : 0;
     if (questions) reasons.push(`存在 ${questions} 个待确认问题`);
   }

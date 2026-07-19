@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type ProjectVersion, type RequirementInput, type RequirementProject, type RequirementProjectInput, type WorkflowStage } from "@ai-workflow/shared";
-import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./human-override.js";
 import { hasMaterialAssociationChange, validateRequirementProjects } from "./requirement-projects.js";
 import { buildReworkContext } from "./rework-context.js";
 import { createPhase2Schema } from "./database-schema.js";
@@ -125,8 +124,6 @@ export interface VersionApplicationQueueEntry {
   position: number;
 }
 
-const executionStages = new Set<WorkflowStage>(["coding", "code_review", "testing", "acceptance", "integration"]);
-
 const versionApplicationQueueSql = `WITH target_version AS (
     SELECT pv.id, pv.project_id, pv.status AS version_status, pv.pending_requirement_id,
       p.status AS project_status
@@ -146,7 +143,7 @@ const versionApplicationQueueSql = `WITH target_version AS (
       AND (SELECT COUNT(*) FROM requirement_projects active_delivery
         WHERE active_delivery.requirement_id = r.id
           AND active_delivery.usage = 'delivery' AND active_delivery.status = 'active') = 1
-      AND r.stage = 'integration' AND r.status = 'awaiting_merge'
+      AND r.stage = 'acceptance_delivery' AND r.status = 'awaiting_merge'
       AND r.id != COALESCE(tv.pending_requirement_id, '')
   )
   SELECT id, code, title, status, updated_at, owner
@@ -212,7 +209,7 @@ export class WorkflowStore {
       const code = this.nextRequirementCode();
       this.db.prepare(`INSERT INTO requirements
         (id, code, title, business_problem, expected_outcome, priority, stage, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'prd', 'ai_ready', ?, ?)`)
+        VALUES (?, ?, ?, ?, ?, ?, 'definition', 'ai_ready', ?, ?)`)
         .run(id, code, input.title, input.businessProblem, input.expectedOutcome, input.priority, now, now);
       this.insertRequirementRevision(id, 1, { ...input, clarifications: "" }, "创建需求", now);
       this.insertRequirementAssociation(id, association, now);
@@ -305,10 +302,10 @@ export class WorkflowStore {
       const before = this.listRequirementProjects(requirementId);
       const projects = this.replaceRequirementProjectsInTransaction(requirementId, inputs, now);
       const materialChange = hasMaterialAssociationChange(before, projects);
-      const technicalDesignInvalidated = materialChange &&
-        this.invalidateTechnicalDesignForProjectChangeInTransaction(requirementId, now);
+      const solutionDesignInvalidated = materialChange &&
+        this.invalidateSolutionDesignForProjectChangeInTransaction(requirementId, now);
       this.db.exec("COMMIT");
-      return { projects, materialChange, technicalDesignInvalidated: Boolean(technicalDesignInvalidated) };
+      return { projects, materialChange, solutionDesignInvalidated: Boolean(solutionDesignInvalidated) };
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
@@ -384,27 +381,27 @@ export class WorkflowStore {
       .run(now, requirementId).changes);
   }
 
-  invalidateTechnicalDesignForProjectChange(requirementId: string) {
+  invalidateSolutionDesignForProjectChange(requirementId: string) {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.assertNoPendingVersionApplication(requirementId);
-      const invalidated = this.invalidateTechnicalDesignForProjectChangeInTransaction(requirementId, now);
+      const invalidated = this.invalidateSolutionDesignForProjectChangeInTransaction(requirementId, now);
       this.db.exec("COMMIT");
       return invalidated;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
-  private invalidateTechnicalDesignForProjectChangeInTransaction(requirementId: string, now: string) {
+  private invalidateSolutionDesignForProjectChangeInTransaction(requirementId: string, now: string) {
     const requirement = this.db.prepare("SELECT stage FROM requirements WHERE id = ?").get(requirementId) as { stage: WorkflowStage } | undefined;
-    if (!requirement || workflowStages.indexOf(requirement.stage) < workflowStages.indexOf("technical_design")) return false;
-    const approved = this.db.prepare("SELECT id FROM approvals WHERE requirement_id = ? AND stage = 'technical_design' AND decision = 'approve' LIMIT 1").get(requirementId);
-    const artifact = this.db.prepare("SELECT id FROM artifacts WHERE requirement_id = ? AND stage = 'technical_design' LIMIT 1").get(requirementId);
+    if (!requirement || workflowStages.indexOf(requirement.stage) < workflowStages.indexOf("solution_design")) return false;
+    const approved = this.db.prepare("SELECT id FROM approvals WHERE requirement_id = ? AND stage = 'solution_design' AND decision = 'approve' LIMIT 1").get(requirementId);
+    const artifact = this.db.prepare("SELECT id FROM artifacts WHERE requirement_id = ? AND stage = 'solution_design' LIMIT 1").get(requirementId);
     if (!approved || !artifact || !this.getRequirementProjectSnapshot(requirementId)) return false;
     const reason = "项目关联或模块范围发生变化";
-    this.insertApprovalInTransaction(requirementId, "technical_design", { decision: "return", comment: reason, targetStage: "technical_design", actorType: "system", reasons: [reason] }, now);
+    this.insertApprovalInTransaction(requirementId, "solution_design", { decision: "return", comment: reason, targetStage: "solution_design", actorType: "system", reasons: [reason] }, now);
     this.supersedeRequirementProjectSnapshotInTransaction(requirementId, now);
-    this.db.prepare("UPDATE requirements SET stage = 'technical_design', status = 'ai_ready', updated_at = ? WHERE id = ?")
+    this.db.prepare("UPDATE requirements SET stage = 'solution_design', status = 'ai_ready', updated_at = ? WHERE id = ?")
       .run(now, requirementId);
     return true;
   }
@@ -412,7 +409,7 @@ export class WorkflowStore {
   projectHasActiveDelivery(projectId: string) {
     return Boolean(this.db.prepare(`SELECT r.id FROM requirements r JOIN requirement_projects rp ON rp.requirement_id = r.id
       WHERE rp.project_id = ? AND rp.status = 'active' AND rp.usage = 'delivery'
-      AND r.stage IN ('coding','code_review','testing','acceptance','integration') AND r.status != 'completed' LIMIT 1`).get(projectId));
+      AND r.stage IN ('implementation','quality_verification','acceptance_delivery') AND r.status != 'completed' LIMIT 1`).get(projectId));
   }
 
   private projectValidationRows(projectIds: string[]) {
@@ -468,7 +465,7 @@ export class WorkflowStore {
         return null;
       }
       const version = (current.version ?? 1) + 1;
-      const resumeStage = current.stage === "intake" ? "prd" : current.stage;
+      const resumeStage = current.stage;
       this.db.prepare(`UPDATE requirements SET title = ?, business_problem = ?, expected_outcome = ?, priority = ?,
         clarifications = ?, version = ?, stage = ?, status = 'ai_ready', updated_at = ? WHERE id = ?`)
         .run(input.title, input.businessProblem, input.expectedOutcome, input.priority, input.clarifications ?? "", version, resumeStage, now, id);
@@ -540,11 +537,14 @@ export class WorkflowStore {
   }
 
   addArtifact(requirementId: string, stage: WorkflowStage, title: string, content: unknown) {
-    const versionRow = this.db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM artifacts WHERE requirement_id = ? AND stage = ?")
+    const versionRow = this.db.prepare(`SELECT COALESCE(MAX(version), 0) + 1 AS version FROM artifacts
+      WHERE owner_type = 'requirement' AND owner_id = ? AND stage = ?`)
       .get(requirementId, stage) as { version: number };
     const artifact = { id: randomUUID(), requirementId, stage, version: versionRow.version, title, content, createdAt: new Date().toISOString() };
-    this.db.prepare("INSERT INTO artifacts (id, requirement_id, stage, version, title, content_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(artifact.id, requirementId, stage, artifact.version, title, JSON.stringify(content), artifact.createdAt);
+    this.db.prepare(`INSERT INTO artifacts
+      (id, requirement_id, owner_type, owner_id, stage, version, title, content_json, created_at)
+      VALUES (?, ?, 'requirement', ?, ?, ?, ?, ?, ?)`)
+      .run(artifact.id, requirementId, requirementId, stage, artifact.version, title, JSON.stringify(content), artifact.createdAt);
     return artifact;
   }
 
@@ -557,10 +557,8 @@ export class WorkflowStore {
 
   getLatestArtifact(requirementId: string, stage: WorkflowStage): RequirementArtifact | null {
     const row = this.db.prepare(`SELECT * FROM artifacts
-      WHERE requirement_id = ? AND stage = ? AND (
-        (owner_type IS NULL AND owner_id IS NULL)
-        OR (owner_type = 'requirement' AND owner_id = requirement_id)
-      )
+      WHERE requirement_id = ? AND stage = ?
+        AND owner_type = 'requirement' AND owner_id = requirement_id
       ORDER BY version DESC, created_at DESC, rowid DESC LIMIT 1`).get(requirementId, stage) as any;
     return row ? {
       id: row.id,
@@ -584,21 +582,6 @@ export class WorkflowStore {
       }
       if (input.expectedRequirementUpdatedAt !== undefined && (requirement.updated_at !== input.expectedRequirementUpdatedAt || requirement.stage !== input.stage)) {
         throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
-      }
-      if (executionStages.has(input.stage)) {
-        if (!input.projectId || !input.projectVersionId || !input.expectedRequirementUpdatedAt) throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
-        if (!input.expectedProjectUpdatedAt) throw new Error("PROJECT_CHANGED_DURING_RUN_PREPARATION");
-        const delivery = this.db.prepare(`SELECT project_id, project_version_id FROM requirement_projects
-          WHERE requirement_id = ? AND status = 'active' AND usage = 'delivery' ORDER BY position`).all(input.requirementId) as Array<{ project_id: string; project_version_id: string | null }>;
-        if (delivery.length !== 1 || delivery[0]!.project_id !== input.projectId || delivery[0]!.project_version_id !== input.projectVersionId) {
-          throw new Error("REQUIREMENT_CHANGED_DURING_RUN_PREPARATION");
-        }
-        const project = this.db.prepare("SELECT status, updated_at FROM projects WHERE id = ?").get(input.projectId) as { status: string; updated_at: string } | undefined;
-        if(project&&project.updated_at!==input.expectedProjectUpdatedAt)throw new Error("PROJECT_CHANGED_DURING_RUN_PREPARATION");
-        if (!project || project.status !== "active") throw new Error("PROJECT_ARCHIVED");
-        const version = this.db.prepare("SELECT project_id, status FROM project_versions WHERE id = ?").get(input.projectVersionId) as { project_id: string; status: string } | undefined;
-        if (!version || version.project_id !== input.projectId) throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
-        if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
       }
       const item = { id: randomUUID(), ...input, status: "running", createdAt: new Date().toISOString(), completedAt: null };
       this.db.prepare(`INSERT INTO stage_runs
@@ -724,27 +707,6 @@ export class WorkflowStore {
     }));
   }
 
-  applyHumanOverride(requirementId: string, stage: "code_review" | "testing", comment: string) {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      this.assertNoPendingVersionApplication(requirementId);
-      const requirement: any = this.getRequirement(requirementId);
-      const artifact = this.listArtifacts(requirementId).find((item: any) => item.stage === stage);
-      const eligibility = buildHumanOverrideEligibility({ stage: requirement?.stage ?? "", status: requirement?.status ?? "", artifact });
-      if (!requirement || requirement.stage !== stage || !eligibility.allowed) throw new Error(eligibility.reason || "HUMAN_OVERRIDE_NOT_ALLOWED");
-      const countRow = this.db.prepare("SELECT COUNT(*) AS count FROM approvals WHERE requirement_id = ? AND stage = ? AND decision = 'return'").get(requirementId, stage) as { count: number };
-      const snapshot = buildHumanOverrideSnapshot({ stage, comment, artifact, returnCount: countRow.count });
-      const approval = this.insertApprovalInTransaction(requirementId, stage, {
-        decision: "approve", comment: snapshot.comment, targetStage: snapshot.targetStage,
-        actorType: "human_override", artifactId: snapshot.artifactId, returnCount: snapshot.returnCount, override: snapshot
-      }, new Date().toISOString());
-      this.db.prepare("UPDATE requirements SET stage = ?, status = 'ai_ready', updated_at = ? WHERE id = ?")
-        .run(snapshot.targetStage, new Date().toISOString(), requirementId);
-      this.db.exec("COMMIT");
-      return { requirement: this.getRequirement(requirementId), approval };
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
-  }
-
   createIntegrationRun(input: IntegrationRunInput) {
     if (this.db.prepare("SELECT id FROM integration_runs WHERE requirement_id = ? AND status = 'running'").get(input.requirementId)) throw new Error("INTEGRATION_ALREADY_ACTIVE");
     const item = { id: randomUUID(), status: "running", createdAt: new Date().toISOString(), ...input };
@@ -800,7 +762,7 @@ export class WorkflowStore {
         const index = workflowStages.indexOf(input.stage);
         const nextStage = workflowStages[index + 1];
         this.db.prepare("UPDATE requirements SET stage = ?, status = ?, updated_at = ? WHERE id = ?")
-          .run(nextStage ?? input.stage, input.stage === "acceptance" ? "awaiting_merge" : nextStage ? "ai_ready" : "completed", now, input.requirementId);
+          .run(nextStage ?? input.stage, nextStage ? "ai_ready" : "completed", now, input.requirementId);
       } else if (input.decision === "auto_return") {
         this.db.prepare("UPDATE requirements SET stage = ?, status = 'returned', updated_at = ? WHERE id = ?")
           .run(targetStage, now, input.requirementId);
@@ -943,7 +905,7 @@ export class WorkflowStore {
       const requirement = this.db.prepare("SELECT stage, status FROM requirements WHERE id = ?")
         .get(input.requirementId) as { stage: string; status: string } | undefined;
       if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
-      if (requirement.stage !== "integration" || requirement.status !== "awaiting_merge") {
+      if (requirement.stage !== "acceptance_delivery" || requirement.status !== "awaiting_merge") {
         throw new Error("VERSION_APPLICATION_NOT_ALLOWED");
       }
       const deliveries = this.db.prepare(`SELECT project_id, project_version_id
@@ -1010,7 +972,7 @@ export class WorkflowStore {
       if (!run) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       const requirementUpdated = this.db.prepare(`UPDATE requirements
         SET status = ?, updated_at = ?
-        WHERE id = ? AND stage = 'integration' AND status = 'awaiting_merge'`)
+        WHERE id = ? AND stage = 'acceptance_delivery' AND status = 'awaiting_merge'`)
         .run(input.status, now, run.requirement_id);
       if (requirementUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       this.db.prepare(`UPDATE integration_runs
@@ -1043,7 +1005,7 @@ export class WorkflowStore {
          AND ir.project_version_id = pv.id
         JOIN requirements r ON r.id = ir.requirement_id
         WHERE pv.id = ? AND pv.pending_integration_run_id = ?
-          AND ir.status = 'running' AND r.stage = 'integration' AND r.status = 'awaiting_merge'`)
+          AND ir.status = 'running' AND r.stage = 'acceptance_delivery' AND r.status = 'awaiting_merge'`)
         .get(input.versionId, input.runId) as any;
       if (!lease) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       const preflight = {
@@ -1056,8 +1018,8 @@ export class WorkflowStore {
         .run(input.status, input.sourceCommit ?? null, JSON.stringify(preflight), input.error, now, input.runId);
       if (runUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       const requirementUpdated = this.db.prepare(`UPDATE requirements
-        SET stage = 'integration', status = 'awaiting_merge', updated_at = ?
-        WHERE id = ? AND stage = 'integration' AND status = 'awaiting_merge'`)
+        SET stage = 'acceptance_delivery', status = 'awaiting_merge', updated_at = ?
+        WHERE id = ? AND stage = 'acceptance_delivery' AND status = 'awaiting_merge'`)
         .run(now, lease.requirement_id);
       if (requirementUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       const released = this.db.prepare(`UPDATE project_versions
@@ -1083,7 +1045,7 @@ export class WorkflowStore {
          AND ir.project_version_id = pv.id
         JOIN requirements r ON r.id = ir.requirement_id
         WHERE pv.id = ? AND pv.pending_integration_run_id = ?
-          AND r.stage = 'integration'`).get(input.versionId, input.runId) as any;
+          AND r.stage = 'acceptance_delivery'`).get(input.versionId, input.runId) as any;
       if (!lease) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       if (lease.run_status === "retesting") throw new Error("VERSION_APPLICATION_RETEST_BUSY");
       if (lease.run_status !== "merge_test_failed" || lease.requirement_status !== "merge_test_failed") {
@@ -1135,7 +1097,7 @@ export class WorkflowStore {
         .run(input.status, JSON.stringify(input.commandResults), input.error ?? null, now, input.runId);
       if (runUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       const requirementUpdated = this.db.prepare(`UPDATE requirements SET status = ?, updated_at = ?
-        WHERE id = ? AND stage = 'integration' AND status = 'merge_test_failed'`)
+        WHERE id = ? AND stage = 'acceptance_delivery' AND status = 'merge_test_failed'`)
         .run(input.status, now, lease.requirement_id);
       if (requirementUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       this.db.exec("COMMIT");
@@ -1173,7 +1135,7 @@ export class WorkflowStore {
       this.db.prepare(`UPDATE integration_runs
         SET resolution_status = ?, resolution_commit = ? WHERE id = ?`)
         .run(input.resolution, input.resolutionCommit ?? null, input.runId);
-      this.db.prepare("UPDATE requirements SET stage = 'integration', status = ?, updated_at = ? WHERE id = ?")
+      this.db.prepare("UPDATE requirements SET stage = 'acceptance_delivery', status = ?, updated_at = ? WHERE id = ?")
         .run(input.resolution === "committed" ? "completed" : "awaiting_merge", now, lease.requirement_id);
       const headCommit = input.resolution === "committed" ? input.resolutionCommit : lease.pre_apply_head;
       const released = this.db.prepare(`UPDATE project_versions
@@ -1226,7 +1188,7 @@ export class WorkflowStore {
             completed_at = COALESCE(completed_at, ?)
         WHERE id = ?`)
         .run(input.currentHead, input.error ?? null, now, input.runId);
-      this.db.prepare(`UPDATE requirements SET stage = 'integration',
+      this.db.prepare(`UPDATE requirements SET stage = 'acceptance_delivery',
         status = 'manual_resolution_required', updated_at = ? WHERE id = ?`)
         .run(now, lease.requirement_id);
       this.db.exec("COMMIT");

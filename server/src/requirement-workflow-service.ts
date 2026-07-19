@@ -1,4 +1,4 @@
-import { solutionDesignArtifactSchema } from "@ai-workflow/shared";
+import { productArtifactSchema, solutionDesignArtifactSchema } from "@ai-workflow/shared";
 import type { WorkflowStore } from "./store.js";
 
 interface SolutionDesignApproval {
@@ -17,6 +17,46 @@ export class RequirementWorkflowService {
     private readonly store: WorkflowStore,
     private readonly clock: () => Date = () => new Date()
   ) {}
+
+  approveDefinition(input: ApproveSolutionDesignInput) {
+    if (!(["approve", "conditional"] as string[]).includes(input.approval.decision)) {
+      throw new Error("DEFINITION_APPROVAL_DECISION_INVALID");
+    }
+    const now = this.clock().toISOString();
+    return this.store.withImmediateTransaction(() => {
+      const state = this.store.getRequirementStateInTransaction(input.requirementId);
+      if (!state) throw new Error("REQUIREMENT_NOT_FOUND");
+      if (state.stage !== "definition") throw new Error("REQUIREMENT_APPROVAL_STATE_CHANGED");
+      if (state.status !== "awaiting_approval") throw new Error("REQUIREMENT_APPROVAL_NOT_READY");
+
+      let artifact;
+      try {
+        artifact = this.store.getLatestArtifact(input.requirementId, "definition");
+      } catch {
+        throw new Error("DEFINITION_ARTIFACT_INVALID");
+      }
+      if (!artifact) throw new Error("DEFINITION_ARTIFACT_NOT_FOUND");
+      if (!productArtifactSchema.safeParse(artifact.content).success) {
+        throw new Error("DEFINITION_ARTIFACT_INVALID");
+      }
+
+      const approval = this.store.insertApprovalInTransaction(input.requirementId, "definition", {
+        decision: input.approval.decision,
+        comment: input.approval.comment,
+        condition: input.approval.condition,
+        artifactId: artifact.id
+      }, now);
+      const requirement = this.store.updateRequirementInTransaction(
+        input.requirementId,
+        "solution_design",
+        "ai_ready",
+        now,
+        "definition",
+        "awaiting_approval"
+      );
+      return { requirement, approval };
+    });
+  }
 
   approveSolutionDesign(input: ApproveSolutionDesignInput) {
     if (!(["approve", "conditional"] as string[]).includes(input.approval.decision)) {

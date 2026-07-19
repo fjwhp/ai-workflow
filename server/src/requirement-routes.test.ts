@@ -40,6 +40,23 @@ function solutionDesignArtifact(backendProjectId: string, frontendProjectId: str
   };
 }
 
+function definitionArtifact(summary = "Approved definition") {
+  return {
+    conclusion: "pass" as const,
+    confidence: 0.95,
+    summary,
+    facts: [], assumptions: [], openQuestions: [], risks: [], findings: [],
+    underlyingGoal: "Deliver the requested workflow",
+    targetUsers: ["operator"],
+    productDecisions: [],
+    scope: { mvp: ["workflow"], nonGoals: [] },
+    flows: { primary: ["complete workflow"], exceptions: [] },
+    acceptanceCriteria: ["The workflow completes"],
+    evidence: [],
+    blockingQuestions: []
+  };
+}
+
 function createFixture(options: { artifact?: unknown | false } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "requirement-routes-"));
   directories.push(directory);
@@ -246,7 +263,7 @@ describe("requirement approval routes", () => {
     const second = await request();
 
     expect(second.statusCode).toBe(409);
-    expect(second.json()).toEqual({ error: "REQUIREMENT_APPROVAL_NOT_READY" });
+    expect(second.json()).toEqual({ error: "REQUIREMENT_APPROVAL_STAGE_UNSUPPORTED" });
     expect(queryCount(fixture.databasePath, "requirement_project_snapshots", fixture.requirement.id)).toBe(1);
     expect(queryCount(fixture.databasePath, "delivery_units", fixture.requirement.id)).toBe(2);
     expect(queryCount(fixture.databasePath, "delivery_dependencies", fixture.requirement.id)).toBe(1);
@@ -300,9 +317,11 @@ describe("requirement approval routes", () => {
     await app.close();
   });
 
-  it("advances definition approval through the current five-stage generic flow", async () => {
-    const fixture = createFixture();
+  it.each(["approve", "conditional"] as const)("binds the latest definition artifact for %s and ignores a client artifact id", async (decision) => {
+    const fixture = createFixture({ artifact: false });
     fixture.store.updateRequirementState(fixture.requirement.id, "definition", "awaiting_approval");
+    fixture.store.addArtifact(fixture.requirement.id, "definition", "Older definition", definitionArtifact("Older"));
+    const latest = fixture.store.addArtifact(fixture.requirement.id, "definition", "Latest definition", definitionArtifact("Latest"));
     const app = Fastify();
     await registerRequirementRoutes(app, {
       store: fixture.store,
@@ -311,14 +330,76 @@ describe("requirement approval routes", () => {
 
     const response = await app.inject({
       method: "POST", url: `/api/requirements/${fixture.requirement.id}/approve`,
-      payload: { decision: "conditional", comment: "Proceed conditionally", condition: "Track the risk" }
+      payload: {
+        decision,
+        comment: "Approve the latest definition",
+        condition: decision === "conditional" ? "Track the risk" : undefined,
+        artifactId: "client-forged-artifact-id"
+      }
     });
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ stage: "solution_design", status: "ai_ready" });
     expect(fixture.store.listApprovals(fixture.requirement.id)).toMatchObject([{
-      stage: "definition", decision: "conditional", condition_text: "Track the risk"
+      stage: "definition", decision, artifact_id: latest.id
     }]);
     await app.close();
   });
+
+  it("rejects missing and invalid latest definition artifacts without falling back", async () => {
+    const missing = createFixture({ artifact: false });
+    missing.store.updateRequirementState(missing.requirement.id, "definition", "awaiting_approval");
+    const missingApp = await buildApp(missing.store);
+
+    const missingResponse = await missingApp.inject({
+      method: "POST", url: `/api/requirements/${missing.requirement.id}/approve`,
+      payload: { decision: "approve", comment: "Approve definition" }
+    });
+
+    expect(missingResponse.statusCode).toBe(409);
+    expect(missingResponse.json()).toEqual({ error: "DEFINITION_ARTIFACT_NOT_FOUND" });
+    expect(missing.store.listApprovals(missing.requirement.id)).toEqual([]);
+    await missingApp.close();
+
+    const invalid = createFixture({ artifact: false });
+    invalid.store.updateRequirementState(invalid.requirement.id, "definition", "awaiting_approval");
+    invalid.store.addArtifact(invalid.requirement.id, "definition", "Valid older definition", definitionArtifact());
+    invalid.store.addArtifact(invalid.requirement.id, "definition", "Invalid latest definition", { summary: "invalid" });
+    const invalidApp = await buildApp(invalid.store);
+
+    const invalidResponse = await invalidApp.inject({
+      method: "POST", url: `/api/requirements/${invalid.requirement.id}/approve`,
+      payload: { decision: "approve", comment: "Do not fall back" }
+    });
+
+    expect(invalidResponse.statusCode).toBe(409);
+    expect(invalidResponse.json()).toEqual({ error: "DEFINITION_ARTIFACT_INVALID" });
+    expect(invalid.store.listApprovals(invalid.requirement.id)).toEqual([]);
+    expect(invalid.store.getRequirement(invalid.requirement.id)).toMatchObject({
+      stage: "definition", status: "awaiting_approval"
+    });
+    await invalidApp.close();
+  });
+
+  it.each(["implementation", "quality_verification", "acceptance_delivery"] as const)(
+    "rejects requirement-level approval at %s without changing aggregate state",
+    async (stage) => {
+      const fixture = createFixture({ artifact: false });
+      fixture.store.updateRequirementState(fixture.requirement.id, stage, "awaiting_approval");
+      const app = await buildApp(fixture.store);
+
+      const response = await app.inject({
+        method: "POST", url: `/api/requirements/${fixture.requirement.id}/approve`,
+        payload: { decision: "approve", comment: "Do not bypass delivery units" }
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toEqual({ error: "REQUIREMENT_APPROVAL_STAGE_UNSUPPORTED" });
+      expect(fixture.store.listApprovals(fixture.requirement.id)).toEqual([]);
+      expect(fixture.store.getRequirement(fixture.requirement.id)).toMatchObject({
+        stage, status: "awaiting_approval"
+      });
+      await app.close();
+    }
+  );
 });

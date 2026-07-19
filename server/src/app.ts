@@ -8,7 +8,6 @@ import { redactSensitive } from "./redaction.js";
 import { hashDiff } from "./coding-evidence.js";
 import { getWorktreeSnapshot } from "./repository.js";
 import { buildReworkContext } from "./rework-context.js";
-import { buildHumanOverrideEligibility } from "./human-override.js";
 import { executeLocalIntegration, preflightLocalIntegration, rerunIntegrationTests } from "./integration.js";
 import { ensureProjectKnowledge } from "./knowledge-service.js";
 import { getRepositoryHead } from "./project-knowledge.js";
@@ -62,17 +61,8 @@ export async function buildApp(store: WorkflowStore) {
       catch { codingEvidence.status = "unverifiable"; }
     }
     const artifacts=store.listArtifacts(item.id),approvals=store.listApprovals(item.id);
-    let reworkContext:any=store.getLatestReworkContext(item.id);
-    if(!reworkContext){
-      const approval:any=approvals.find((entry:any)=>entry.decision==="return");
-      if(approval){const artifact=artifacts.find((entry:any)=>entry.stage===approval.stage);reworkContext={id:`legacy-${approval.id}`,...buildReworkContext({approval,artifact})};}
-    }
-    const overrideArtifact=artifacts.find((entry:any)=>entry.stage===item.stage);
-    const overrideEligibility=buildHumanOverrideEligibility({stage:item.stage,status:item.status,artifact:overrideArtifact});
-    const humanOverride={visible:["code_review","testing"].includes(item.stage),...overrideEligibility,
-      targetStage:item.stage==="code_review"?"testing":item.stage==="testing"?"acceptance":null,
-      returnCount:approvals.filter((entry:any)=>entry.stage===item.stage&&entry.decision==="return").length};
-    return { ...item, artifacts, approvals, executions: store.listExecutions(item.id), revisions: store.listRequirementRevisions(item.id), runs: store.listStageRuns(item.id), codingEvidence, reworkContext, humanOverride, integrationRun:store.getLatestIntegrationRun(item.id),knowledgeChanges:store.getKnowledgeChangeSet(item.id),deliveryUnits:store.deliveryUnits.listForRequirement(item.id),deliveryDependencies:store.deliveryUnits.listDependencies(item.id) };
+    const reworkContext=store.getLatestReworkContext(item.id);
+    return { ...item, artifacts, approvals, executions: store.listExecutions(item.id), revisions: store.listRequirementRevisions(item.id), runs: store.listStageRuns(item.id), codingEvidence, reworkContext, integrationRun:store.getLatestIntegrationRun(item.id),knowledgeChanges:store.getKnowledgeChangeSet(item.id),deliveryUnits:store.deliveryUnits.listForRequirement(item.id),deliveryDependencies:store.deliveryUnits.listDependencies(item.id) };
   });
   app.patch("/api/requirements/:id", async (req: any, reply) => {
     const input = requirementRevisionSchema.safeParse(req.body);
@@ -198,19 +188,6 @@ export async function buildApp(store: WorkflowStore) {
     const timer = setInterval(flush, 500); flush();
     req.raw.on("close", () => clearInterval(timer));
   });
-  app.post("/api/requirements/:id/human-override", async (req: any, reply) => {
-    const comment=typeof req.body?.comment==="string"?req.body.comment.trim():"";
-    if(!comment)return reply.code(400).send({error:"VALIDATION_ERROR",message:"必须填写人工审核意见"});
-    const item=store.getRequirement(req.params.id);
-    if(!item)return reply.code(404).send({error:"NOT_FOUND"});
-    if(store.hasPendingVersionApplication(item.id))return sendDomainError(reply,new Error("PROJECT_VERSION_APPLICATION_PENDING"));
-    const stage=item.stage as "code_review"|"testing";
-    const artifact=store.listArtifacts(item.id).find((entry:any)=>entry.stage===item.stage);
-    const eligibility=buildHumanOverrideEligibility({stage:item.stage,status:item.status,artifact});
-    if(!eligibility.allowed)return reply.code(409).send({error:"HUMAN_OVERRIDE_NOT_ALLOWED",message:eligibility.reason});
-    try{const result=store.applyHumanOverride(item.id,stage,comment);refreshRequirementKnowledge(store,item.id);return result;}
-    catch(error){return error instanceof Error&&error.message==="PROJECT_VERSION_APPLICATION_PENDING"?sendDomainError(reply,error):reply.code(409).send({error:"HUMAN_OVERRIDE_NOT_ALLOWED",message:error instanceof Error?error.message:"当前状态已变化，请刷新后重试"});}
-  });
   app.get("/api/requirements/:id/integration-check",async(req:any,reply)=>{
     const context=integrationContext(store,req.params.id);
     if(!context.item)return reply.code(404).send({error:"NOT_FOUND"});
@@ -265,7 +242,7 @@ export async function buildApp(store: WorkflowStore) {
   });
   app.post("/api/requirements/:id/integration-test",async(req:any,reply)=>{
     const item=store.getRequirement(req.params.id);if(!item)return reply.code(404).send({error:"NOT_FOUND"});
-    if(item.stage!=="integration"||item.status!=="merge_test_failed")return reply.code(409).send({error:"INTEGRATION_TEST_NOT_ALLOWED",message:"只有本地应用后测试失败时才能重新运行"});
+    if(item.stage!=="acceptance_delivery"||item.status!=="merge_test_failed")return reply.code(409).send({error:"INTEGRATION_TEST_NOT_ALLOWED",message:"只有本地应用后测试失败时才能重新运行"});
     let deliveryProject:any,version:any;
     try{deliveryProject=resolveSoleDeliveryProject(item.projects);version=resolveDeliveryVersion(store,deliveryProject);}
     catch(error){return sendDomainError(reply,error);}
@@ -375,7 +352,7 @@ export function resolveDeliveryVersion(store:WorkflowStore,deliveryProject:any){
 }
 function sendProjectContextError(reply:any,error:unknown){
   if(!(error instanceof ProjectContextError))return reply.code(409).send({error:"PROJECT_KNOWLEDGE_UNAVAILABLE",message:error instanceof Error?error.message:"项目知识库不可用"});
-  const messages:Record<string,string>={PROJECT_REQUIRED:"当前阶段必须关联一个交付项目",PROJECT_ARCHIVED:"归档项目不能启动新执行",MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED:"多项目交付执行将在第二阶段提供",PROJECT_KNOWLEDGE_BUILDING:"项目知识库正在生成，请稍后重试",PROJECT_KNOWLEDGE_UNAVAILABLE:"项目知识库不可用",PROJECT_CONTEXT_BUDGET_TOO_SMALL:"项目上下文预算不足，请提高配置或减少关联项目"};
+  const messages:Record<string,string>={PROJECT_REQUIRED:"当前阶段必须关联一个交付项目",PROJECT_ARCHIVED:"归档项目不能启动新执行",PROJECT_KNOWLEDGE_BUILDING:"项目知识库正在生成，请稍后重试",PROJECT_KNOWLEDGE_UNAVAILABLE:"项目知识库不可用",PROJECT_CONTEXT_BUDGET_TOO_SMALL:"项目上下文预算不足，请提高配置或减少关联项目"};
   return reply.code(error.code==="REQUIREMENT_NOT_FOUND"?404:409).send({error:error.code,message:messages[error.code]??error.code,projects:error.projects,details:error.details});
 }
 
@@ -387,7 +364,7 @@ export function resolveReusableSourceCommit(run:any,evidence:any,targetBranch:st
 function integrationContext(store:WorkflowStore,id:string){
   const item:any=store.getRequirement(id);
   if(!item)return {item:null,allowed:false,reason:"需求不存在"};
-  if(item.stage!=="integration"||item.status!=="awaiting_merge")return {item,allowed:false,reason:"需求当前不处于待应用状态"};
+  if(item.stage!=="acceptance_delivery"||item.status!=="awaiting_merge")return {item,allowed:false,reason:"需求当前不处于待应用状态"};
   let deliveryProject:any,version:any;
   try{deliveryProject=resolveSoleDeliveryProject(item.projects);version=resolveDeliveryVersion(store,deliveryProject);}
   catch(error){return {item,allowed:false,error:error instanceof Error?error.message:"INTEGRATION_NOT_ALLOWED",reason:"需求缺少唯一有效的交付版本"};}
