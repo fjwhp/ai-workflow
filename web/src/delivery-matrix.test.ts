@@ -229,6 +229,33 @@ describe("deliveryMatrixRowViews", () => {
     expect(renderedRoleQueries(markup).getAllByRole("cell")
       .filter((cell) => cell.name === "交付依赖数据异常")).toHaveLength(4);
   });
+
+  it("keeps every row in a valid diamond dependency graph free of data errors", () => {
+    const units = ["api", "web", "worker", "release"].map((projectId) => ({
+      ...unit,
+      id: `unit-${projectId}`,
+      projectId,
+      projectVersionId: `${projectId}-v1`
+    }));
+    const edge = (upstreamUnitId: string, downstreamUnitId: string) => ({
+      upstreamUnitId,
+      downstreamUnitId,
+      releaseCondition: "automated_testing_passed" as const,
+      releasedAt: null
+    });
+    const views = deliveryMatrixRowViews(units, [
+      edge("unit-api", "unit-web"),
+      edge("unit-api", "unit-worker"),
+      edge("unit-web", "unit-release"),
+      edge("unit-worker", "unit-release")
+    ]);
+
+    expect([...views.values()]).toHaveLength(4);
+    for (const view of views.values()) {
+      expect(view.dependencyLabel).not.toBe("交付依赖数据异常");
+      expect(view.blocker).not.toBe("交付依赖数据异常");
+    }
+  });
 });
 
 describe("DeliveryMatrix", () => {
@@ -296,5 +323,20 @@ describe("DeliveryMatrix", () => {
     const stackBreakpoint = Number(stackRule![1]);
     expect(stackBreakpoint).toBeGreaterThanOrEqual(937);
     expect(390).toBeLessThanOrEqual(stackBreakpoint);
+  });
+
+  it("stacks from the named matrix container width while preserving the desktop grid", () => {
+    const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+
+    expect(css).toMatch(/\.delivery-matrix\{(?=[^}]*container-name:delivery-matrix)(?=[^}]*container-type:inline-size)[^}]*\}/);
+    expect(css).toMatch(/\.delivery-row-grid\{[^}]*display:grid[^}]*grid-template-columns:/);
+    const containerRule = css.match(/@container delivery-matrix \(max-width:(\d+)px\)\{([\s\S]*?)(?=@media\(max-width:940px\))/);
+    expect(containerRule).not.toBeNull();
+    const containerBreakpoint = Number(containerRule![1]);
+    expect(containerBreakpoint).toBeGreaterThanOrEqual(760);
+    expect(containerBreakpoint).toBeLessThanOrEqual(800);
+    expect(containerRule![2]).toMatch(/\.delivery-matrix-header\{(?=[^}]*position:absolute)(?=[^}]*clip:)[^}]*\}/);
+    expect(containerRule![2]).toMatch(/\.delivery-row-stack\{grid-template-columns:1fr/);
+    expect(containerRule![2]).toMatch(/\.delivery-field\{display:grid/);
   });
 });
