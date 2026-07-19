@@ -4,9 +4,8 @@ import { evaluateGate, projectInputSchema, projectUpdateSchema, requirementInput
 import { WorkflowStore } from "./store.js";
 import { runAgent } from "./ai.js";
 import { createBackup } from "./backup.js";
-import { runCodexCoding } from "./codex-runner.js";
 import { redactSensitive } from "./redaction.js";
-import { buildCodingEvidence, hashDiff } from "./coding-evidence.js";
+import { hashDiff } from "./coding-evidence.js";
 import { getWorktreeSnapshot } from "./repository.js";
 import { buildReworkContext } from "./rework-context.js";
 import { buildHumanOverrideEligibility } from "./human-override.js";
@@ -106,87 +105,63 @@ export async function buildApp(store: WorkflowStore) {
   app.post("/api/requirements/:id/run", async (req: any, reply) => {
     const item = store.getRequirement(req.params.id);
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
+    if (["implementation", "quality_verification", "acceptance_delivery"].includes(item.stage)) {
+      return {
+        requirement: item,
+        stage: item.stage,
+        deliveryUnits: store.deliveryUnits.listForRequirement(item.id),
+        deliveryDependencies: store.deliveryUnits.listDependencies(item.id),
+        automationPending: true
+      };
+    }
+    if (item.stage !== "definition" && item.stage !== "solution_design") {
+      return reply.code(409).send({ error: "REQUIREMENT_AI_STAGE_UNSUPPORTED", stage: item.stage });
+    }
     if(store.hasPendingVersionApplication(item.id))return sendDomainError(reply,new Error("PROJECT_VERSION_APPLICATION_PENDING"));
-    const executionStage=["coding","code_review","testing","acceptance","integration"].includes(item.stage);
-    let deliveryProject:any,deliveryVersion:any;
-    if(executionStage){try{deliveryProject=resolveSoleDeliveryProject(item.projects);}catch(error){return sendDomainError(reply,error);}}
-    if(deliveryProject?.projectStatus==="archived")return reply.code(409).send({error:"PROJECT_ARCHIVED",message:"归档项目不能启动新执行"});
-    if(executionStage){try{deliveryVersion=resolveDeliveryVersion(store,deliveryProject);}catch(error){return sendDomainError(reply,error);}}
-    if(item.stage==="integration")return reply.code(409).send({error:"INTEGRATION_REQUIRES_MANUAL_ACTION",message:"代码应用节点不会启动 AI，请执行应用预检"});
     const existing = store.listStageRuns(item.id, item.stage).find((run: any) => run.status === "running");
     if (existing) return reply.code(409).send({ error: "RUN_ALREADY_ACTIVE", message: "当前阶段已有 AI 正在执行" });
     const associatedProjects=(item.projects??[]).map((association:any)=>store.getProject(association.projectId)).filter(Boolean);
     const sensitivePatterns=[...new Set(associatedProjects.flatMap((associated:any)=>associated.sensitivePatterns??[]))] as string[];
-    const project = deliveryProject ? store.getProject(deliveryProject.projectId) : null;
     const reworkContext=item.status==="returned"?store.getLatestReworkContext(item.id):null;
-    let projectContext:any=undefined;
-    if(["prd","requirement_review","technical_design","coding","code_review","testing","acceptance"].includes(item.stage)){
-      const projectContextBudget=resolveProjectContextBudget(process.env.AI_PROJECT_CONTEXT_MAX_CHARS);
-      try{projectContext=await buildRequirementProjectContext(store,item.id,item.stage,projectContextBudget);}
-      catch(error){return sendProjectContextError(reply,error);}
-    }
-    const context = redactSensitive({ requirement: item, priorArtifacts: store.listArtifacts(item.id), approvalHistory: store.listApprovals(item.id), projectContext, reworkRequired:Boolean(reworkContext), reworkContext, userContext: req.body?.context },sensitivePatterns);
+    const projectContextBudget=resolveProjectContextBudget(process.env.AI_PROJECT_CONTEXT_MAX_CHARS);
+    let projectContext:any;
+    try{projectContext=await buildRequirementProjectContext(store,item.id,item.stage,projectContextBudget);}
+    catch(error){return sendProjectContextError(reply,error);}
+    const priorArtifacts=store.listArtifacts(item.id),approvalHistory=store.listApprovals(item.id);
+    const approvedDefinition=item.stage==="solution_design"?approvedDefinitionFrom(priorArtifacts,approvalHistory):undefined;
+    const context = redactSensitive({ requirement: item, priorArtifacts, approvalHistory, approvedDefinition, projectContext, reworkRequired:Boolean(reworkContext), reworkContext, userContext: req.body?.context },sensitivePatterns);
     if(context.projectContext){
       for(const block of context.projectContext.projects){do{block.totalChars=JSON.stringify(block).length;}while(block.totalChars!==JSON.stringify(block).length);}
       context.projectContext.totalChars=JSON.stringify(context.projectContext.projects).length;
       if(context.projectContext.totalChars>context.projectContext.budgetMaxChars)return sendProjectContextError(reply,new ProjectContextError("PROJECT_CONTEXT_BUDGET_TOO_SMALL",[],{maxChars:context.projectContext.budgetMaxChars,minimumRequiredChars:context.projectContext.totalChars,projectCount:context.projectContext.projects.length}));
     }
-    const model = item.stage === "coding" ? (process.env.OPENAI_CODING_MODEL || process.env.OPENAI_MODEL || "gpt-5.5") : (process.env.OPENAI_MODEL || "gpt-5.5");
+    const model = process.env.OPENAI_MODEL || "gpt-5.5";
     let run:any;
-    try{run=store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: context,
-      ...(executionStage?{projectId:deliveryProject.projectId,projectVersionId:deliveryVersion.id,expectedRequirementUpdatedAt:item.updatedAt,expectedProjectUpdatedAt:project!.updatedAt}:{}) });}
+    try{run=store.createStageRun({ requirementId: item.id, stage: item.stage, model, input: context });}
     catch(error){return sendDomainError(reply,error);}
     for(const block of context.projectContext?.projects??[])store.appendStageRunEvent(run.id,"knowledge.retrieved",{projectId:block.projectId,version:block.version,sourceHead:block.sourceHead,paths:block.entries.map((entry:any)=>entry.path),totalAvailable:block.totalAvailable,budgetMaxChars:context.projectContext.budgetMaxChars,totalChars:block.totalChars,contextTotalChars:context.projectContext.totalChars,truncated:block.truncated});
     store.updateRequirementState(item.id, item.stage, "ai_running");
-    void executeRun(run.id, item, context, project, deliveryVersion, sensitivePatterns);
+    void executeRun(run.id, item, context, sensitivePatterns);
     return reply.code(202).send(run);
 
-    async function executeRun(runId: string, runItem: any, runContext: any, runProject: any, runVersion:any, patterns:string[]) {
+    async function executeRun(runId: string, runItem: any, runContext: any, patterns:string[]) {
       const emit = (type: string, payload: unknown) => store.appendStageRunEvent(runId, type, redactSensitive(payload, patterns));
     try {
-      if (runItem.stage === "coding") {
-        if (!runItem.projectId) throw new Error("编码阶段必须先关联本地项目");
-        if (!runProject) throw new Error("关联项目不存在");
-        const projectContext = runContext.projectContext?.projects?.[0];
-        if (!projectContext) throw new Error("编码阶段缺少交付项目上下文");
-        const coding = await runCodexCoding({ requirement: runContext.requirement, artifacts: runContext.priorArtifacts, project: runProject, version: runVersion, projectContext, reworkContext: runContext.reworkContext, onEvent: emit });
-        const conclusion = coding.diff ? "pass" : "return";
-        const execution = store.addExecution({ requirementId: runItem.id, stage: runItem.stage, projectId: runProject.id, projectVersionId: runVersion.id, branch: coding.branch, worktreePath: coding.worktreePath, baseCommit: coding.baseCommit, status: conclusion === "pass" ? "completed" : "needs_review", commands: [], diff: coding.diff, codexThreadId: coding.codexThreadId, events: coding.events, diagnostics: coding.diagnostics.join("\n"), completedAt: new Date().toISOString() });
-        const snapshot = buildCodingEvidence({ diff: coding.diff, files: coding.files, additions: coding.additions, deletions: coding.deletions });
-        const evidence = store.addCodingEvidence({ ...snapshot, executionId: execution.id, requirementId: runItem.id, projectId: runProject.id,
-          branch: coding.branch, worktreePath: coding.worktreePath, diagnostics: coding.diagnostics.join("\n") });
-        const content = {
-          conclusion, confidence: coding.diff ? 0.88 : 0.4, summary: coding.summary,
-          facts: [`Codex 会话：${coding.codexThreadId}`, `分支：${coding.branch}`, `worktree：${coding.worktreePath}`, `变更字符数：${coding.diff.length}`],
-          assumptions: [], openQuestions: [], risks: coding.diff ? [] : ["Codex 未产生文件差异"], findings: [],
-          evidenceId: evidence.id, evidenceExecutionId: execution.id, evidenceDiffHash: evidence.diffHash
-        };
-        const artifact = store.addArtifact(runItem.id, runItem.stage, "coding AI 成果", content);
-        const gate = evaluateGate(runItem.stage, content, store.getGateConfig());
-        emit("gate.decided", gate);
-        store.applyGateDecision({ requirementId: runItem.id, stage: runItem.stage, artifactId: artifact.id, ...gate });
-        refreshRequirementKnowledge(store,runItem.id);
-        store.completeStageRun(runId, redactSensitive(content,patterns));
-        return;
-      }
-      let evidence: any = null;
-      let evidenceStatus = "not_required";
-      const needsEvidence = ["code_review", "testing", "acceptance"].includes(runItem.stage);
-      if (needsEvidence) {
-        evidence = store.getLatestCodingEvidence(runItem.id);
-        if (!evidence) evidenceStatus = "missing";
-        else {
-          try { evidenceStatus = hashDiff((await getWorktreeSnapshot(evidence.worktreePath)).diff) === evidence.diffHash ? (evidence.truncated ? "truncated" : "valid") : "stale"; }
-          catch { evidenceStatus = "unverifiable"; }
-        }
-      }
-      const result = needsEvidence && !["valid", "truncated"].includes(evidenceStatus)
-        ? { conclusion: "conditional", confidence: 0, summary: `编码证据状态为 ${evidenceStatus}，无法自动执行${stageLabel(runItem.stage)}。`, facts: [], assumptions: [], openQuestions: ["请重新执行编码自测生成有效证据"], risks: ["缺少可验证的真实代码证据"], findings: [] }
-        : await runAgent(runItem.stage, redactSensitive({ ...runContext, codingEvidence: evidence ? { ...evidence, status: evidenceStatus } : undefined },patterns), emit);
-      const content = evidence ? { ...result, evidenceId: evidence.id, evidenceExecutionId: evidence.executionId, evidenceDiffHash: evidence.diffHash, evidenceStatus } : result;
+      const content = await runAgent(runItem.stage, runContext, emit);
       const artifact = store.addArtifact(runItem.id, runItem.stage, `${stageLabel(runItem.stage)} AI 成果`, content);
       let gate = evaluateGate(runItem.stage, content, store.getGateConfig());
-      if (needsEvidence && evidenceStatus !== "valid") gate = { decision: "human_review" as const, reasons: [`编码证据状态为 ${evidenceStatus}`] };
+      const blockingQuestions=runItem.stage==="definition"&&"blockingQuestions" in content&&Array.isArray(content.blockingQuestions)?content.blockingQuestions:[];
+      if (blockingQuestions.length) {
+        gate = {
+          decision: "human_review" as const,
+          reasons: [`存在 ${blockingQuestions.length} 个高风险阻塞问题`]
+        };
+      } else if (runItem.stage === "solution_design") {
+        gate = {
+          decision: "human_review" as const,
+          reasons: ["方案设计必须经人工审批，审批将冻结项目关联并创建交付计划"]
+        };
+      }
       emit("gate.decided", gate);
       const applied=store.applyGateDecision({ requirementId: runItem.id, stage: runItem.stage, artifactId: artifact.id, ...gate });
       refreshRequirementKnowledge(store,runItem.id);
@@ -376,6 +351,13 @@ export async function buildApp(store: WorkflowStore) {
 }
 
 function stageLabel(stage: string) { return stage.replaceAll("_", " "); }
+
+function approvedDefinitionFrom(artifacts:any[],approvals:any[]){
+  const approval=approvals.find((entry:any)=>entry.stage==="definition"&&["approve","conditional"].includes(entry.decision)&&entry.artifact_id);
+  if(!approval)return undefined;
+  const artifact=artifacts.find((entry:any)=>entry.id===approval.artifact_id);
+  return artifact?{artifactId:artifact.id,content:artifact.content}:undefined;
+}
 
 function invalidRepository(reply:any,details:any){return reply.code(400).send({error:"PROJECT_REPOSITORY_INVALID",message:details.warnings?.[0]||"项目仓库无效",details});}
 function applyRequirementProjects(store:WorkflowStore,requirementId:string,inputs:any[]){
