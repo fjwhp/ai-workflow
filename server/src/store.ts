@@ -1113,6 +1113,8 @@ export class WorkflowStore {
     sourceCommit: string;
     preApplyHead: string;
     status: "awaiting_local_resolution" | "merge_test_failed";
+    commandResults?: unknown[];
+    error?: string;
   }): IntegrationRun {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
@@ -1130,8 +1132,8 @@ export class WorkflowStore {
         .run(input.status, now, run.requirement_id);
       if (requirementUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
       this.db.prepare(`UPDATE integration_runs
-        SET status = ?, source_commit = ?, pre_apply_head = ?, completed_at = ? WHERE id = ?`)
-        .run(input.status, input.sourceCommit, input.preApplyHead, now, input.runId);
+        SET status = ?, source_commit = ?, pre_apply_head = ?, commands_json = ?, error = ?, completed_at = ? WHERE id = ?`)
+        .run(input.status, input.sourceCommit, input.preApplyHead, JSON.stringify(input.commandResults ?? []), input.error ?? null, now, input.runId);
       this.db.exec("COMMIT");
       return this.getIntegrationRun(input.runId)!;
     } catch (error) {

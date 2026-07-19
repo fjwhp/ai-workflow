@@ -280,7 +280,7 @@ export async function buildApp(store: WorkflowStore) {
       return markAmbiguous(error);
     }
     if(result.status==="completed"||result.status==="test_failed"){
-      try{return store.completeVersionApplicationApply({runId:run.id,sourceCommit:result.sourceCommit!,preApplyHead:result.preApplyHead,status:result.status==="completed"?"awaiting_local_resolution":"merge_test_failed"});}
+      try{return store.completeVersionApplicationApply({runId:run.id,sourceCommit:result.sourceCommit!,preApplyHead:result.preApplyHead,status:result.status==="completed"?"awaiting_local_resolution":"merge_test_failed",commandResults:result.commandResults??[],error:result.error});}
       catch(error){return markAmbiguous(error);}
     }
     if(result.status==="conflict"&&result.targetState==="rolled_back_clean"){

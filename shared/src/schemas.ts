@@ -9,7 +9,7 @@ const nonEmptyIdSchema = z.string().trim().min(1);
 export const projectCategorySchema = z.string().trim().min(1);
 const allowedCommandSchema = z.object({
   command: z.string().trim().min(1),
-  argsPrefix: z.array(z.string()).optional()
+  argsPrefix: z.array(z.string()).default([])
 });
 
 export const projectInputSchema = z.object({

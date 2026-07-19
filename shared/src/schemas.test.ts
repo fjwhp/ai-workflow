@@ -201,6 +201,13 @@ describe("project schemas", () => {
     }).success).toBe(true);
   });
 
+  it("defaults omitted allowed-command arguments to an empty prefix", () => {
+    expect(projectInputSchema.parse({
+      name: "Repository", repoPath: "/tmp/repository", defaultBranch: "main",
+      allowedCommands: [{ command: "npm" }], sensitivePatterns: []
+    }).allowedCommands).toEqual([{ command: "npm", argsPrefix: [] }]);
+  });
+
   it("rejects an empty project update", () => {
     expect(projectUpdateSchema.safeParse({}).success).toBe(false);
   });

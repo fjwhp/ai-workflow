@@ -616,7 +616,8 @@ describe("stage run API", () => {
     expect(response.statusCode, JSON.stringify(response.json())).toBe(200);
     expect(response.json()).toMatchObject({
       status: "awaiting_local_resolution", projectVersionId: fixture.version.id,
-      preApplyHead: fixture.targetHead
+      preApplyHead: fixture.targetHead,
+      commandResults: [expect.objectContaining({ command: "npm", args: ["--version"], code: 0 })]
     });
     expect(store.getRequirement(fixture.requirement.id)?.status).toBe("awaiting_local_resolution");
     expect(store.getProjectVersion(fixture.version.id)).toMatchObject({
@@ -626,6 +627,25 @@ describe("stage run API", () => {
     expect((await execFileAsync("git", ["-C", fixture.targetWorktreePath, "status", "--porcelain"])).stdout).toContain("A  feature.txt");
     expect((await execFileAsync("git", ["-C", fixture.repoPath, "rev-parse", "HEAD"])).stdout.trim()).toBe(mainHead);
     expect((await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} })).statusCode).toBe(409);
+    await app.close();
+  });
+
+  it("normalizes a persisted command without args before application preflight", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const fixture = await versionApplicationFixture(store);
+    store.updateProject(fixture.project.id, { allowedCommands: [{ command: "npm" }] });
+    const app = await buildApp(store);
+
+    const check = await app.inject({ method: "GET", url: `/api/requirements/${fixture.requirement.id}/integration-check` });
+    expect(check.statusCode, JSON.stringify(check.json())).toBe(200);
+    expect(check.json().plannedCommands).toEqual([{ command: "npm", argsPrefix: [] }]);
+
+    const response = await app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/integrate`, payload: {} });
+    expect(response.statusCode, JSON.stringify(response.json())).toBe(200);
+    expect(response.json().status).toBe("merge_test_failed");
+    expect(response.json().commandResults).toEqual([
+      expect.objectContaining({ command: "npm", args: [], code: 1 })
+    ]);
     await app.close();
   });
 

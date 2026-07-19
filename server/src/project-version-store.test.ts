@@ -662,12 +662,16 @@ describe("project version application leases", () => {
       });
 
       const run = store.completeVersionApplicationApply({
-        runId: `run-${status}`, sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40), status
+        runId: `run-${status}`, sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40), status,
+        commandResults: [{ command: "npm", args: ["test"], code: status === "merge_test_failed" ? 1 : 0 }],
+        error: status === "merge_test_failed" ? "verification failed" : undefined
       });
 
       expect(run).toMatchObject({
         status, sourceCommit: "c".repeat(40), preApplyHead: "d".repeat(40),
-        projectVersionId: version.id
+        projectVersionId: version.id,
+        commandResults: [{ command: "npm", args: ["test"], code: status === "merge_test_failed" ? 1 : 0 }],
+        error: status === "merge_test_failed" ? "verification failed" : undefined
       });
       expect(store.getRequirement(requirement.id)).toMatchObject({ stage: "integration", status });
       expect(store.getProjectVersion(version.id)).toMatchObject({
