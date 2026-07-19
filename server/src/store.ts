@@ -509,14 +509,16 @@ export class WorkflowStore {
         if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
       }
       const item = { id: randomUUID(), ...input, status: "running", createdAt: new Date().toISOString(), completedAt: null };
-      this.db.prepare("INSERT INTO stage_runs (id, requirement_id, stage, status, model, input_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        .run(item.id, item.requirementId, item.stage, item.status, item.model, JSON.stringify(item.input), item.createdAt);
+      this.db.prepare(`INSERT INTO stage_runs
+        (id, requirement_id, owner_type, owner_id, stage, status, model, input_json, created_at)
+        VALUES (?, ?, 'requirement', ?, ?, ?, ?, ?, ?)`)
+        .run(item.id, item.requirementId, item.requirementId, item.stage, item.status, item.model, JSON.stringify(item.input), item.createdAt);
       this.appendStageRunEvent(item.id, "run.started", { stage: item.stage, model: item.model });
       this.db.exec("COMMIT");
       return item;
     } catch (error) {
       this.db.exec("ROLLBACK");
-      if (error instanceof Error && error.message.includes("UNIQUE constraint failed: stage_runs.requirement_id, stage_runs.stage")) throw new Error("RUN_ALREADY_ACTIVE");
+      if (error instanceof Error && error.message.includes("UNIQUE constraint failed: stage_runs.owner_type, stage_runs.owner_id, stage_runs.stage")) throw new Error("RUN_ALREADY_ACTIVE");
       throw error;
     }
   }

@@ -404,6 +404,8 @@ describe("WorkflowStore", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const req = createRequirement(store, { title: "接口实现", businessProblem: "缺少接口", expectedOutcome: "新增接口", priority: "medium" });
     const run = store.createStageRun({ requirementId: req.id, stage: "prd", model: "gpt-5.5", input: { prompt: "hello" } });
+    expect((store as any).db.prepare("SELECT owner_type, owner_id FROM stage_runs WHERE id = ?").get(run.id))
+      .toEqual({ owner_type: "requirement", owner_id: req.id });
     expect(() => store.createStageRun({ requirementId: req.id, stage: "prd", model: "gpt-5.5", input: {} })).toThrow("RUN_ALREADY_ACTIVE");
     store.appendStageRunEvent(run.id, "request.sent", { ok: true });
     store.appendStageRunEvent(run.id, "output.delta", { text: "done" });

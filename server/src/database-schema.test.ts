@@ -56,11 +56,62 @@ function insertRequirement(db: DatabaseSync, id = "r1") {
       "implementation", "ai_ready", "2026-07-20T00:00:00.000Z", "2026-07-20T00:00:00.000Z");
 }
 
+function insertDeliveryFixture(db: DatabaseSync) {
+  insertRequirement(db, "r1");
+  insertRequirement(db, "r2");
+  const now = "2026-07-20T00:00:00.000Z";
+  const insertProject = db.prepare(`INSERT INTO projects
+    (id, name, repo_path, default_branch, created_at, updated_at) VALUES (?, ?, ?, 'main', ?, ?)`);
+  const insertVersion = db.prepare(`INSERT INTO project_versions
+    (id, project_id, name, branch, base_branch, worktree_path, status, head_commit, created_at, updated_at)
+    VALUES (?, ?, 'fixture', ?, 'main', ?, 'active', 'head', ?, ?)`);
+  for (const suffix of ["1", "2", "3"]) {
+    insertProject.run(`p${suffix}`, `Project ${suffix}`, `/tmp/project-${suffix}`, now, now);
+    insertVersion.run(`v${suffix}`, `p${suffix}`, `branch-${suffix}`, `/tmp/worktree-${suffix}`, now, now);
+  }
+  db.prepare(`INSERT INTO requirement_project_snapshots
+    (id, requirement_id, version, associations_json, status, created_at) VALUES (?, ?, 1, '[]', 'active', ?)`)
+    .run("s1", "r1", now);
+  db.prepare(`INSERT INTO requirement_project_snapshots
+    (id, requirement_id, version, associations_json, status, created_at) VALUES (?, ?, 1, '[]', 'active', ?)`)
+    .run("s2", "r2", now);
+  const insertUnit = db.prepare(`INSERT INTO delivery_units
+    (id, requirement_id, association_snapshot_id, project_id, project_version_id, required, position,
+      phase, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 1, ?, 'implementation', 'ready', ?, ?)`);
+  insertUnit.run("u1", "r1", "s1", "p1", "v1", 0, now, now);
+  insertUnit.run("u2", "r1", "s1", "p2", "v2", 1, now, now);
+  insertUnit.run("u3", "r2", "s2", "p3", "v3", 0, now, now);
+}
+
 function insertArtifact(db: DatabaseSync, input: { id: string; ownerType: string | null; ownerId: string | null; stage?: string }) {
   db.prepare(`INSERT INTO artifacts
     (id, requirement_id, owner_type, owner_id, stage, version, title, content_json, created_at)
     VALUES (?, 'r1', ?, ?, ?, 1, 'Evidence', '{}', '2026-07-20T00:00:00.000Z')`)
     .run(input.id, input.ownerType, input.ownerId, input.stage ?? "implementation");
+}
+
+function insertStageRun(db: DatabaseSync, input: { id: string; requirementId?: string; ownerType: string | null; ownerId: string | null; stage?: string; status?: string }) {
+  db.prepare(`INSERT INTO stage_runs
+    (id, requirement_id, owner_type, owner_id, stage, status, input_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, '{}', '2026-07-20T00:00:00.000Z')`)
+    .run(input.id, input.requirementId ?? "r1", input.ownerType, input.ownerId, input.stage ?? "implementation", input.status ?? "running");
+}
+
+function insertAutomationJob(db: DatabaseSync, input: {
+  id: string;
+  ownerType?: string;
+  ownerId?: string;
+  status?: string;
+  attempt?: number;
+  leaseOwner?: string | null;
+  leaseExpiresAt?: string | null;
+}) {
+  db.prepare(`INSERT INTO automation_jobs
+    (id, dedupe_key, owner_type, owner_id, action, status, attempt, lease_owner, lease_expires_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, 'run', ?, ?, ?, ?, '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.000Z')`)
+    .run(input.id, `dedupe-${input.id}`, input.ownerType ?? "requirement", input.ownerId ?? "r1", input.status ?? "pending",
+      input.attempt ?? 0, input.leaseOwner ?? null, input.leaseExpiresAt ?? null);
 }
 
 describe("Phase 2 database schema", () => {
@@ -76,14 +127,16 @@ describe("Phase 2 database schema", () => {
     db.close();
   });
 
-  it("keeps transitional owner columns nullable and constrains new domain values", () => {
+  it("requires stage run owners while keeping transitional artifact owners nullable", () => {
     const db = openFreshStoreDatabase();
-    const ownerColumns = ["stage_runs", "artifacts"].flatMap((table) =>
-      (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string; notnull: number }>)
-        .filter(({ name }) => name === "owner_type" || name === "owner_id")
-    );
-    expect(ownerColumns).toHaveLength(4);
-    expect(ownerColumns.every(({ notnull }) => notnull === 0)).toBe(true);
+    const stageOwnerColumns = (db.prepare("PRAGMA table_info(stage_runs)").all() as Array<{ name: string; notnull: number }>)
+      .filter(({ name }) => name === "owner_type" || name === "owner_id");
+    const artifactOwnerColumns = (db.prepare("PRAGMA table_info(artifacts)").all() as Array<{ name: string; notnull: number }>)
+      .filter(({ name }) => name === "owner_type" || name === "owner_id");
+    expect(stageOwnerColumns).toHaveLength(2);
+    expect(stageOwnerColumns.every(({ notnull }) => notnull === 1)).toBe(true);
+    expect(artifactOwnerColumns).toHaveLength(2);
+    expect(artifactOwnerColumns.every(({ notnull }) => notnull === 0)).toBe(true);
     expect(tableSql(db, "delivery_units")).toMatch(/phase TEXT NOT NULL CHECK\s*\(phase IN \('implementation', 'quality_verification', 'acceptance_delivery'\)\)/i);
     for (const status of [
       "waiting_dependency", "ready", "running", "awaiting_gate", "returned",
@@ -125,7 +178,7 @@ describe("Phase 2 database schema", () => {
 
   it("scopes delivery artifacts to their owner", () => {
     const db = openFreshStoreDatabase();
-    insertRequirement(db);
+    insertDeliveryFixture(db);
 
     insertArtifact(db, { id: "a1", ownerType: "delivery_unit", ownerId: "u1" });
     expect(() => insertArtifact(db, { id: "a2", ownerType: "delivery_unit", ownerId: "u2" })).not.toThrow();
@@ -154,6 +207,64 @@ describe("Phase 2 database schema", () => {
       .toThrow(/CHECK constraint failed/);
     expect(() => insertArtifact(db, { id: "a3", ownerType: "project", ownerId: "p1" }))
       .toThrow(/CHECK constraint failed/);
+    db.close();
+  });
+
+  it("enforces stage run owners and running uniqueness", () => {
+    const db = openFreshStoreDatabase();
+    insertRequirement(db);
+
+    insertStageRun(db, { id: "run-1", ownerType: "requirement", ownerId: "r1" });
+    expect(() => insertStageRun(db, { id: "run-2", ownerType: "requirement", ownerId: "r1" }))
+      .toThrow(/UNIQUE constraint failed: stage_runs\.owner_type, stage_runs\.owner_id, stage_runs\.stage/);
+    expect(() => insertStageRun(db, { id: "run-3", ownerType: "requirement", ownerId: null, stage: "solution_design" }))
+      .toThrow(/NOT NULL constraint failed/);
+    expect(() => insertStageRun(db, { id: "run-4", ownerType: null, ownerId: "r1", stage: "quality_verification" }))
+      .toThrow(/NOT NULL constraint failed/);
+    expect(() => insertStageRun(db, { id: "run-5", ownerType: "project", ownerId: "p1", stage: "acceptance_delivery" }))
+      .toThrow(/CHECK constraint failed/);
+    db.close();
+  });
+
+  it("enforces automation job attempts and lease field invariants", () => {
+    const db = openFreshStoreDatabase();
+    insertRequirement(db);
+
+    expect(() => insertAutomationJob(db, { id: "job-negative", attempt: -1 })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "job-leased-empty", status: "leased" })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "job-half-lease", leaseOwner: "worker-1" })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "job-half-expiry", leaseExpiresAt: "2026-07-20T00:05:00.000Z" })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, {
+      id: "job-leased", status: "leased", leaseOwner: "worker-1", leaseExpiresAt: "2026-07-20T00:05:00.000Z"
+    })).not.toThrow();
+    expect(() => insertAutomationJob(db, {
+      id: "job-pending-leased", leaseOwner: "worker-1", leaseExpiresAt: "2026-07-20T00:05:00.000Z"
+    })).not.toThrow();
+    db.close();
+  });
+
+  it("rejects missing polymorphic owners and cross-requirement evidence", () => {
+    const db = openFreshStoreDatabase();
+    insertDeliveryFixture(db);
+
+    expect(() => insertAutomationJob(db, { id: "job-missing-requirement", ownerId: "missing" })).toThrow("OWNER_NOT_FOUND");
+    expect(() => insertAutomationJob(db, { id: "job-missing-unit", ownerType: "delivery_unit", ownerId: "missing" })).toThrow("OWNER_NOT_FOUND");
+    expect(() => insertArtifact(db, { id: "artifact-cross-requirement", ownerType: "delivery_unit", ownerId: "u3" }))
+      .toThrow("OWNER_REQUIREMENT_MISMATCH");
+    expect(() => insertStageRun(db, { id: "run-missing", ownerType: "delivery_unit", ownerId: "missing" })).toThrow("OWNER_NOT_FOUND");
+    db.close();
+  });
+
+  it("validates polymorphic owners when owner or requirement fields change", () => {
+    const db = openFreshStoreDatabase();
+    insertDeliveryFixture(db);
+    insertArtifact(db, { id: "artifact-1", ownerType: "delivery_unit", ownerId: "u1" });
+    insertStageRun(db, { id: "run-1", ownerType: "delivery_unit", ownerId: "u1" });
+    insertAutomationJob(db, { id: "job-1", ownerType: "delivery_unit", ownerId: "u1" });
+
+    expect(() => db.prepare("UPDATE artifacts SET requirement_id = 'r2' WHERE id = 'artifact-1'").run()).toThrow("OWNER_REQUIREMENT_MISMATCH");
+    expect(() => db.prepare("UPDATE stage_runs SET requirement_id = 'r2' WHERE id = 'run-1'").run()).toThrow("OWNER_REQUIREMENT_MISMATCH");
+    expect(() => db.prepare("UPDATE automation_jobs SET owner_id = 'missing' WHERE id = 'job-1'").run()).toThrow("OWNER_NOT_FOUND");
     db.close();
   });
 

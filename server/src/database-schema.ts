@@ -127,7 +127,9 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(project_knowledge_version_id) REFERENCES project_knowledge_versions(id)
     );
     CREATE TABLE IF NOT EXISTS stage_runs (
-      id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, owner_type TEXT, owner_id TEXT, stage TEXT NOT NULL,
+      id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL,
+      owner_type TEXT NOT NULL CHECK(owner_type IN ('requirement', 'delivery_unit')),
+      owner_id TEXT NOT NULL, stage TEXT NOT NULL,
       status TEXT NOT NULL, model TEXT, input_json TEXT NOT NULL, output_json TEXT,
       error TEXT, created_at TEXT NOT NULL, completed_at TEXT,
       FOREIGN KEY(requirement_id) REFERENCES requirements(id)
@@ -183,13 +185,18 @@ export function createPhase2Schema(db: DatabaseSync) {
       owner_id TEXT NOT NULL,
       action TEXT NOT NULL,
       status TEXT NOT NULL CHECK(status IN ('pending', 'leased', 'completed', 'failed', 'canceled')),
-      attempt INTEGER NOT NULL DEFAULT 0,
+      attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
       lease_owner TEXT,
       lease_expires_at TEXT,
       payload_json TEXT NOT NULL DEFAULT '{}',
       last_error TEXT,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      CHECK(
+        (lease_owner IS NULL AND lease_expires_at IS NULL)
+        OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+      ),
+      CHECK(status <> 'leased' OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL))
     );
     CREATE TABLE IF NOT EXISTS coding_evidence (
       id TEXT PRIMARY KEY, execution_id TEXT NOT NULL UNIQUE, requirement_id TEXT NOT NULL, project_id TEXT NOT NULL,
@@ -267,5 +274,85 @@ export function createPhase2Schema(db: DatabaseSync) {
       WHERE owner_type IS NULL AND owner_id IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_automation_job_dedupe
       ON automation_jobs(dedupe_key);
+    CREATE TRIGGER IF NOT EXISTS validate_stage_run_owner_insert
+    BEFORE INSERT ON stage_runs
+    BEGIN
+      SELECT RAISE(ABORT, 'OWNER_NOT_FOUND')
+      WHERE NEW.owner_id IS NOT NULL AND ((NEW.owner_type = 'requirement' AND NOT EXISTS (
+        SELECT 1 FROM requirements WHERE id = NEW.owner_id
+      )) OR (NEW.owner_type = 'delivery_unit' AND NOT EXISTS (
+        SELECT 1 FROM delivery_units WHERE id = NEW.owner_id
+      )));
+      SELECT RAISE(ABORT, 'OWNER_REQUIREMENT_MISMATCH')
+      WHERE (NEW.owner_type = 'requirement' AND NEW.owner_id <> NEW.requirement_id)
+        OR (NEW.owner_type = 'delivery_unit' AND EXISTS (
+          SELECT 1 FROM delivery_units WHERE id = NEW.owner_id AND requirement_id <> NEW.requirement_id
+        ));
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_stage_run_owner_update
+    BEFORE UPDATE OF owner_type, owner_id, requirement_id ON stage_runs
+    BEGIN
+      SELECT RAISE(ABORT, 'OWNER_NOT_FOUND')
+      WHERE NEW.owner_id IS NOT NULL AND ((NEW.owner_type = 'requirement' AND NOT EXISTS (
+        SELECT 1 FROM requirements WHERE id = NEW.owner_id
+      )) OR (NEW.owner_type = 'delivery_unit' AND NOT EXISTS (
+        SELECT 1 FROM delivery_units WHERE id = NEW.owner_id
+      )));
+      SELECT RAISE(ABORT, 'OWNER_REQUIREMENT_MISMATCH')
+      WHERE (NEW.owner_type = 'requirement' AND NEW.owner_id <> NEW.requirement_id)
+        OR (NEW.owner_type = 'delivery_unit' AND EXISTS (
+          SELECT 1 FROM delivery_units WHERE id = NEW.owner_id AND requirement_id <> NEW.requirement_id
+        ));
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_artifact_owner_insert
+    BEFORE INSERT ON artifacts
+    BEGIN
+      SELECT RAISE(ABORT, 'OWNER_NOT_FOUND')
+      WHERE NEW.owner_id IS NOT NULL AND ((NEW.owner_type = 'requirement' AND NOT EXISTS (
+        SELECT 1 FROM requirements WHERE id = NEW.owner_id
+      )) OR (NEW.owner_type = 'delivery_unit' AND NOT EXISTS (
+        SELECT 1 FROM delivery_units WHERE id = NEW.owner_id
+      )));
+      SELECT RAISE(ABORT, 'OWNER_REQUIREMENT_MISMATCH')
+      WHERE (NEW.owner_type = 'requirement' AND NEW.owner_id <> NEW.requirement_id)
+        OR (NEW.owner_type = 'delivery_unit' AND EXISTS (
+          SELECT 1 FROM delivery_units WHERE id = NEW.owner_id AND requirement_id <> NEW.requirement_id
+        ));
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_artifact_owner_update
+    BEFORE UPDATE OF owner_type, owner_id, requirement_id ON artifacts
+    BEGIN
+      SELECT RAISE(ABORT, 'OWNER_NOT_FOUND')
+      WHERE NEW.owner_id IS NOT NULL AND ((NEW.owner_type = 'requirement' AND NOT EXISTS (
+        SELECT 1 FROM requirements WHERE id = NEW.owner_id
+      )) OR (NEW.owner_type = 'delivery_unit' AND NOT EXISTS (
+        SELECT 1 FROM delivery_units WHERE id = NEW.owner_id
+      )));
+      SELECT RAISE(ABORT, 'OWNER_REQUIREMENT_MISMATCH')
+      WHERE (NEW.owner_type = 'requirement' AND NEW.owner_id <> NEW.requirement_id)
+        OR (NEW.owner_type = 'delivery_unit' AND EXISTS (
+          SELECT 1 FROM delivery_units WHERE id = NEW.owner_id AND requirement_id <> NEW.requirement_id
+        ));
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_automation_job_owner_insert
+    BEFORE INSERT ON automation_jobs
+    BEGIN
+      SELECT RAISE(ABORT, 'OWNER_NOT_FOUND')
+      WHERE (NEW.owner_type = 'requirement' AND NOT EXISTS (
+        SELECT 1 FROM requirements WHERE id = NEW.owner_id
+      )) OR (NEW.owner_type = 'delivery_unit' AND NOT EXISTS (
+        SELECT 1 FROM delivery_units WHERE id = NEW.owner_id
+      ));
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_automation_job_owner_update
+    BEFORE UPDATE OF owner_type, owner_id ON automation_jobs
+    BEGIN
+      SELECT RAISE(ABORT, 'OWNER_NOT_FOUND')
+      WHERE (NEW.owner_type = 'requirement' AND NOT EXISTS (
+        SELECT 1 FROM requirements WHERE id = NEW.owner_id
+      )) OR (NEW.owner_type = 'delivery_unit' AND NOT EXISTS (
+        SELECT 1 FROM delivery_units WHERE id = NEW.owner_id
+      ));
+    END;
   `);
 }
