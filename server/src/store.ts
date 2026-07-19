@@ -6,6 +6,7 @@ import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type P
 import { buildHumanOverrideEligibility, buildHumanOverrideSnapshot } from "./human-override.js";
 import { hasMaterialAssociationChange, validateRequirementProjects } from "./requirement-projects.js";
 import { buildReworkContext } from "./rework-context.js";
+import { createPhase2Schema } from "./database-schema.js";
 
 export type RequirementProjectWithVersionMetadata = RequirementProject & {
   projectVersionWorktreePath?: string;
@@ -141,217 +142,7 @@ export class WorkflowStore {
   constructor(path: string) {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
-    this.migrate();
-  }
-
-  private migrate() {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS projects (
-        id TEXT PRIMARY KEY, name TEXT NOT NULL, repo_path TEXT NOT NULL UNIQUE,
-        default_branch TEXT NOT NULL, allowed_commands TEXT NOT NULL DEFAULT '[]',
-        sensitive_patterns TEXT NOT NULL DEFAULT '[]', category TEXT, technology_json TEXT NOT NULL DEFAULT '[]',
-        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'archived')),
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS project_versions (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        branch TEXT NOT NULL,
-        base_branch TEXT NOT NULL,
-        worktree_path TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL CHECK(status IN ('active','closed')),
-        head_commit TEXT NOT NULL,
-        pending_requirement_id TEXT,
-        pending_integration_run_id TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        closed_at TEXT,
-        UNIQUE(project_id,name),
-        UNIQUE(project_id,branch),
-        FOREIGN KEY(project_id) REFERENCES projects(id)
-      );
-      CREATE TABLE IF NOT EXISTS counters (
-        key TEXT PRIMARY KEY,
-        value INTEGER NOT NULL
-      );
-      INSERT INTO counters (key,value)
-        SELECT 'requirement',0 WHERE NOT EXISTS (SELECT 1 FROM counters WHERE key = 'requirement');
-      CREATE TABLE IF NOT EXISTS requirements (
-        id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
-        business_problem TEXT NOT NULL, expected_outcome TEXT NOT NULL, priority TEXT NOT NULL,
-        stage TEXT NOT NULL, status TEXT NOT NULL,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS requirement_projects (
-        id TEXT PRIMARY KEY,
-        requirement_id TEXT NOT NULL,
-        project_id TEXT NOT NULL,
-        project_version_id TEXT,
-        role TEXT NOT NULL CHECK(role IN ('primary', 'collaborator')),
-        usage TEXT NOT NULL CHECK(usage IN ('context', 'delivery')),
-        delivery_required INTEGER NOT NULL,
-        module_mode TEXT NOT NULL CHECK(module_mode IN ('auto', 'all', 'selected')),
-        module_ids_json TEXT NOT NULL DEFAULT '[]',
-        position INTEGER NOT NULL,
-        status TEXT NOT NULL DEFAULT 'active',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id),
-        FOREIGN KEY(project_id) REFERENCES projects(id),
-        FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
-      );
-      CREATE TABLE IF NOT EXISTS requirement_project_snapshots (
-        id TEXT PRIMARY KEY,
-        requirement_id TEXT NOT NULL,
-        version INTEGER NOT NULL,
-        associations_json TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status IN ('active', 'superseded')),
-        superseded_at TEXT,
-        created_at TEXT NOT NULL,
-        UNIQUE(requirement_id, version),
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
-      );
-      CREATE TABLE IF NOT EXISTS stage_runs (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL,
-        status TEXT NOT NULL, model TEXT, input_json TEXT NOT NULL, output_json TEXT,
-        error TEXT, created_at TEXT NOT NULL, completed_at TEXT,
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
-      );
-      CREATE TABLE IF NOT EXISTS stage_run_events (
-        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, sequence INTEGER NOT NULL,
-        type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
-        UNIQUE(run_id, sequence), FOREIGN KEY(run_id) REFERENCES stage_runs(id)
-      );
-      CREATE TABLE IF NOT EXISTS artifacts (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL,
-        version INTEGER NOT NULL, title TEXT NOT NULL, content_json TEXT NOT NULL,
-        created_at TEXT NOT NULL, UNIQUE(requirement_id, stage, version),
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
-      );
-      CREATE TABLE IF NOT EXISTS approvals (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL,
-        decision TEXT NOT NULL, comment TEXT NOT NULL, condition_text TEXT,
-        target_stage TEXT, created_at TEXT NOT NULL,
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
-      );
-      CREATE TABLE IF NOT EXISTS executions (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL,
-        project_id TEXT NOT NULL, project_version_id TEXT, branch TEXT NOT NULL, worktree_path TEXT NOT NULL,
-        base_commit TEXT,
-        status TEXT NOT NULL, commands_json TEXT NOT NULL, diff_text TEXT NOT NULL,
-        error TEXT, created_at TEXT NOT NULL, completed_at TEXT,
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id),
-        FOREIGN KEY(project_id) REFERENCES projects(id),
-        FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
-      );
-      CREATE TABLE IF NOT EXISTS requirement_revisions (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, version INTEGER NOT NULL,
-        title TEXT NOT NULL, business_problem TEXT NOT NULL, expected_outcome TEXT NOT NULL,
-        priority TEXT NOT NULL, clarifications TEXT NOT NULL DEFAULT '', change_summary TEXT NOT NULL,
-        created_at TEXT NOT NULL, UNIQUE(requirement_id, version),
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
-      );
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS coding_evidence (
-        id TEXT PRIMARY KEY, execution_id TEXT NOT NULL UNIQUE, requirement_id TEXT NOT NULL, project_id TEXT NOT NULL,
-        branch TEXT NOT NULL, worktree_path TEXT NOT NULL, diff_hash TEXT NOT NULL, diff_text TEXT NOT NULL,
-        original_chars INTEGER NOT NULL, truncated INTEGER NOT NULL, files_json TEXT NOT NULL,
-        additions INTEGER NOT NULL, deletions INTEGER NOT NULL, diagnostics_text TEXT NOT NULL, created_at TEXT NOT NULL,
-        FOREIGN KEY(execution_id) REFERENCES executions(id), FOREIGN KEY(requirement_id) REFERENCES requirements(id)
-      );
-      CREATE TABLE IF NOT EXISTS rework_contexts (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, approval_id TEXT NOT NULL UNIQUE, artifact_id TEXT,
-        source_stage TEXT NOT NULL, target_stage TEXT NOT NULL, actor_type TEXT NOT NULL, decision_at TEXT NOT NULL,
-        unstructured INTEGER NOT NULL, items_json TEXT NOT NULL, risks_json TEXT NOT NULL, questions_json TEXT NOT NULL, created_at TEXT NOT NULL,
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
-      );
-      CREATE TABLE IF NOT EXISTS integration_runs (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, project_id TEXT NOT NULL, project_version_id TEXT,
-        execution_id TEXT, evidence_id TEXT, status TEXT NOT NULL,
-        source_branch TEXT NOT NULL, worktree_path TEXT NOT NULL, target_branch TEXT NOT NULL,
-        source_commit TEXT, target_commit TEXT, pre_apply_head TEXT,
-        resolution_status TEXT, resolution_commit TEXT, preflight_json TEXT NOT NULL,
-        commands_json TEXT NOT NULL DEFAULT '[]', error TEXT, created_at TEXT NOT NULL, completed_at TEXT,
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id),
-        FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
-      );
-      CREATE TABLE IF NOT EXISTS project_knowledge_versions (
-        id TEXT PRIMARY KEY, project_id TEXT NOT NULL, version INTEGER NOT NULL, status TEXT NOT NULL,
-        source_head TEXT NOT NULL, refresh_reason TEXT NOT NULL, summary TEXT, entries_json TEXT NOT NULL DEFAULT '[]',
-        entry_count INTEGER NOT NULL DEFAULT 0, module_count INTEGER NOT NULL DEFAULT 0, error TEXT,
-        created_at TEXT NOT NULL, completed_at TEXT, UNIQUE(project_id,version), FOREIGN KEY(project_id) REFERENCES projects(id)
-      );
-      CREATE TABLE IF NOT EXISTS knowledge_records (
-        id TEXT PRIMARY KEY, project_id TEXT NOT NULL, subject_key TEXT NOT NULL, layer TEXT NOT NULL, type TEXT NOT NULL,
-        status TEXT NOT NULL, current_version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-        UNIQUE(project_id,subject_key), FOREIGN KEY(project_id) REFERENCES projects(id)
-      );
-      CREATE TABLE IF NOT EXISTS knowledge_record_versions (
-        id TEXT PRIMARY KEY, record_id TEXT NOT NULL, version INTEGER NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
-        modules_json TEXT NOT NULL, tags_json TEXT NOT NULL, evidence_json TEXT NOT NULL, source_requirement_id TEXT NOT NULL,
-        source_stage TEXT NOT NULL, confidence REAL NOT NULL, risk_level TEXT NOT NULL, created_at TEXT NOT NULL,
-        UNIQUE(record_id,version), FOREIGN KEY(record_id) REFERENCES knowledge_records(id)
-      );
-      CREATE TABLE IF NOT EXISTS knowledge_candidates (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, project_id TEXT NOT NULL, subject_key TEXT NOT NULL,
-        status TEXT NOT NULL, publish_decision TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-        UNIQUE(requirement_id,subject_key), FOREIGN KEY(requirement_id) REFERENCES requirements(id), FOREIGN KEY(project_id) REFERENCES projects(id)
-      );
-      CREATE TABLE IF NOT EXISTS knowledge_change_sets (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL UNIQUE, project_id TEXT NOT NULL, status TEXT NOT NULL,
-        published_count INTEGER NOT NULL, review_count INTEGER NOT NULL, conflict_count INTEGER NOT NULL,
-        created_at TEXT NOT NULL, completed_at TEXT NOT NULL, FOREIGN KEY(requirement_id) REFERENCES requirements(id)
-      );
-    `);
-    this.ensureColumn("requirements", "version", "INTEGER NOT NULL DEFAULT 1");
-    this.ensureColumn("projects", "category", "TEXT");
-    this.ensureColumn("projects", "technology_json", "TEXT NOT NULL DEFAULT '[]'");
-    this.ensureColumn("projects", "status", "TEXT NOT NULL DEFAULT 'active'");
-    this.ensureColumn("projects", "updated_at", "TEXT");
-    this.ensureColumn("requirements", "clarifications", "TEXT NOT NULL DEFAULT ''");
-    this.ensureColumn("executions", "codex_thread_id", "TEXT");
-    this.ensureColumn("executions", "events_json", "TEXT NOT NULL DEFAULT '[]'");
-    this.ensureColumn("executions", "diagnostics_text", "TEXT NOT NULL DEFAULT ''");
-    this.ensureColumn("executions", "project_version_id", "TEXT");
-    this.ensureColumn("executions", "base_commit", "TEXT");
-    this.ensureColumn("approvals", "actor_type", "TEXT NOT NULL DEFAULT 'human'");
-    this.ensureColumn("approvals", "artifact_id", "TEXT");
-    this.ensureColumn("approvals", "reasons_json", "TEXT NOT NULL DEFAULT '[]'");
-    this.ensureColumn("approvals", "override_json", "TEXT");
-    this.ensureColumn("approvals", "return_count", "INTEGER");
-    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_ai_gate_artifact ON approvals(artifact_id) WHERE actor_type = 'ai_gate' AND artifact_id IS NOT NULL");
-    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_runs_active ON integration_runs(requirement_id) WHERE status = 'running'");
-    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_project_knowledge_active ON project_knowledge_versions(project_id) WHERE status = 'building'");
-    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_stage_runs_running ON stage_runs(requirement_id, stage) WHERE status = 'running'");
-    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_projects_active_primary ON requirement_projects(requirement_id) WHERE role = 'primary' AND status = 'active'");
-    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_projects_active_project ON requirement_projects(requirement_id, project_id) WHERE status = 'active'");
-    this.migrateRequirementProjectSnapshots();
-    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_project_snapshots_active ON requirement_project_snapshots(requirement_id) WHERE status = 'active'");
-  }
-
-  private migrateRequirementProjectSnapshots() {
-    const columns = this.db.prepare("PRAGMA table_info(requirement_project_snapshots)").all() as { name: string }[];
-    if (columns.some(({ name }) => name === "status")) return;
-    this.db.exec(`
-      ALTER TABLE requirement_project_snapshots RENAME TO requirement_project_snapshots_legacy;
-      CREATE TABLE requirement_project_snapshots (
-        id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, version INTEGER NOT NULL,
-        associations_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active', 'superseded')),
-        superseded_at TEXT, created_at TEXT NOT NULL, UNIQUE(requirement_id, version),
-        FOREIGN KEY(requirement_id) REFERENCES requirements(id)
-      );
-      INSERT INTO requirement_project_snapshots (id, requirement_id, version, associations_json, status, created_at)
-        SELECT id, requirement_id, version, associations_json, 'active', created_at FROM requirement_project_snapshots_legacy;
-      DROP TABLE requirement_project_snapshots_legacy;
-    `);
-  }
-
-  private ensureColumn(table: string, column: string, definition: string) {
-    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-    if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    createPhase2Schema(this.db);
   }
 
   private assertNoPendingVersionApplication(requirementId: string) {
@@ -678,7 +469,7 @@ export class WorkflowStore {
     const versionRow = this.db.prepare("SELECT COALESCE(MAX(version), 0) + 1 AS version FROM artifacts WHERE requirement_id = ? AND stage = ?")
       .get(requirementId, stage) as { version: number };
     const artifact = { id: randomUUID(), requirementId, stage, version: versionRow.version, title, content, createdAt: new Date().toISOString() };
-    this.db.prepare("INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?)")
+    this.db.prepare("INSERT INTO artifacts (id, requirement_id, stage, version, title, content_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
       .run(artifact.id, requirementId, stage, artifact.version, title, JSON.stringify(content), artifact.createdAt);
     return artifact;
   }

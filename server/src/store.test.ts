@@ -48,26 +48,6 @@ describe("WorkflowStore", () => {
     expect(store.listProjects()).toEqual([]);
   });
 
-  it("migrates existing executions with project version provenance columns", () => {
-    const directory = mkdtempSync(join(tmpdir(), "workflow-execution-migration-")); directories.push(directory);
-    const path = join(directory, "workflow.db");
-    const legacy = new DatabaseSync(path);
-    legacy.exec(`CREATE TABLE executions (
-      id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL, project_id TEXT NOT NULL,
-      branch TEXT NOT NULL, worktree_path TEXT NOT NULL, status TEXT NOT NULL, commands_json TEXT NOT NULL,
-      diff_text TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, completed_at TEXT
-    )`);
-    legacy.close();
-
-    const store = new WorkflowStore(path); stores.push(store);
-    const inspection = new DatabaseSync(path);
-    const columns = (inspection.prepare("PRAGMA table_info(executions)").all() as Array<{name:string}>).map((item) => item.name);
-    inspection.close();
-
-    expect(columns).toContain("project_version_id");
-    expect(columns).toContain("base_commit");
-  });
-
   it("creates and lists project metadata", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const project = store.createProject({
@@ -158,10 +138,10 @@ describe("WorkflowStore", () => {
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'requirement_projects'").get()).toBeTruthy();
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'requirement_project_snapshots'").get()).toBeTruthy();
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_requirement_projects_active_primary'").get()).toBeTruthy();
-    expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_stage_runs_running'").get())
-      .toMatchObject({ sql: expect.stringMatching(/UNIQUE.*requirement_id,\s*stage.*WHERE status = 'running'/i) });
+    expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_delivery_unit_active_run'").get())
+      .toMatchObject({ sql: expect.stringMatching(/UNIQUE[\s\S]*owner_type,\s*owner_id,\s*stage[\s\S]*WHERE status = 'running'/i) });
     expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_requirement_projects_active_project'").get())
-      .toMatchObject({ sql: expect.stringMatching(/UNIQUE.*requirement_id,\s*project_id.*WHERE status = 'active'/i) });
+      .toMatchObject({ sql: expect.stringMatching(/UNIQUE[\s\S]*requirement_id,\s*project_id[\s\S]*WHERE status = 'active'/i) });
     db.close();
   });
 
@@ -546,12 +526,12 @@ describe("WorkflowStore", () => {
   it("applies one automatic gate decision per artifact", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const req = createRequirement(store, { title: "接口实现", businessProblem: "缺少接口", expectedOutcome: "新增接口", priority: "medium" });
-    const artifact = store.addArtifact(req.id, "prd", "PRD", { conclusion: "pass" });
-    const first = store.applyGateDecision({ requirementId: req.id, stage: "prd", artifactId: artifact.id, decision: "auto_approve", reasons: ["安全通过"] });
-    const second = store.applyGateDecision({ requirementId: req.id, stage: "prd", artifactId: artifact.id, decision: "auto_approve", reasons: ["安全通过"] });
+    const artifact = store.addArtifact(req.id, "definition", "Definition", { conclusion: "pass" });
+    const first = store.applyGateDecision({ requirementId: req.id, stage: "definition", artifactId: artifact.id, decision: "auto_approve", reasons: ["安全通过"] });
+    const second = store.applyGateDecision({ requirementId: req.id, stage: "definition", artifactId: artifact.id, decision: "auto_approve", reasons: ["安全通过"] });
     expect(first.applied).toBe(true);
     expect(second.applied).toBe(false);
-    expect(store.getRequirement(req.id)?.stage).toBe("requirement_review");
+    expect(store.getRequirement(req.id)?.stage).toBe("solution_design");
     expect(store.listApprovals(req.id)).toHaveLength(1);
   });
 
