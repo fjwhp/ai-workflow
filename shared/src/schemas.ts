@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { deliveryReleaseConditions, validateDeliveryGraph } from "./delivery-unit.js";
 import { workflowStages, workflowStatuses } from "./domain.js";
 import { moduleModes, projectRoles, projectUsages } from "./project-association.js";
 import { projectVersionStatuses } from "./project-version.js";
@@ -109,6 +110,52 @@ export const aiArtifactSchema = z.object({
   confidence: z.number().min(0).max(1),
   summary: z.string().min(1), facts: z.array(z.string()), assumptions: z.array(z.string()),
   openQuestions: z.array(z.string()), risks: z.array(z.string()), findings: z.array(findingSchema)
+});
+
+export const deliveryDependencyInputSchema = z.object({
+  upstreamProjectId: nonEmptyIdSchema,
+  downstreamProjectId: nonEmptyIdSchema,
+  releaseCondition: z.enum(deliveryReleaseConditions)
+});
+
+export const solutionDesignArtifactSchema = aiArtifactSchema.extend({
+  deliveryPlan: z.object({
+    units: z.array(z.object({
+      projectId: nonEmptyIdSchema,
+      moduleIds: z.array(nonEmptyIdSchema),
+      acceptanceCriteria: z.array(z.string().trim().min(1)).min(1)
+    })).min(1),
+    dependencies: z.array(deliveryDependencyInputSchema)
+  }),
+  contracts: z.array(z.object({
+    name: z.string(),
+    producerProjectId: nonEmptyIdSchema,
+    consumerProjectIds: z.array(nonEmptyIdSchema),
+    description: z.string()
+  }))
+}).superRefine((value, ctx) => {
+  const projectIds = value.deliveryPlan.units.map((unit) => unit.projectId);
+  const seenProjectIds = new Set<string>();
+  for (const [index, projectId] of projectIds.entries()) {
+    if (seenProjectIds.has(projectId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["deliveryPlan", "units", index, "projectId"],
+        message: "DELIVERY_UNIT_DUPLICATE_PROJECT"
+      });
+    }
+    seenProjectIds.add(projectId);
+  }
+
+  try {
+    validateDeliveryGraph(projectIds, value.deliveryPlan.dependencies);
+  } catch (error) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["deliveryPlan", "dependencies"],
+      message: error instanceof Error ? error.message : "DELIVERY_DEPENDENCY_INVALID"
+    });
+  }
 });
 
 export const productDecisionSchema=z.object({decision:z.string(),rationale:z.string(),evidence:z.string()});

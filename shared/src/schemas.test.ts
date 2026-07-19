@@ -5,7 +5,8 @@ import {
   projectUpdateSchema,
   projectVersionInputSchema,
   requirementInputSchema,
-  requirementProjectsInputSchema
+  requirementProjectsInputSchema,
+  solutionDesignArtifactSchema
 } from "./schemas.js";
 import { selectDeliveryProjects, selectPrimaryProject, type RequirementProject } from "./project-association.js";
 
@@ -40,6 +41,80 @@ describe("productArtifactSchema", () => {
       assumptions:[],scope:{mvp:["创建用户"],nonGoals:[]},flows:{primary:["提交"],exceptions:[]},acceptanceCriteria:["创建成功"],evidence:[],blockingQuestions:[]
     });
     expect(result.productDecisions[0]?.evidence).toBe("SysUserController.java");
+  });
+});
+
+const solutionDesignArtifact = () => ({
+  conclusion: "pass",
+  confidence: 0.9,
+  summary: "Backend and frontend delivery plan",
+  facts: [],
+  assumptions: [],
+  openQuestions: [],
+  risks: [],
+  findings: [],
+  deliveryPlan: {
+    units: [
+      { projectId: "backend", moduleIds: ["api"], acceptanceCriteria: ["API tests pass"] },
+      { projectId: "frontend", moduleIds: ["web"], acceptanceCriteria: ["UI tests pass"] }
+    ],
+    dependencies: [{
+      upstreamProjectId: "backend",
+      downstreamProjectId: "frontend",
+      releaseCondition: "automated_testing_passed"
+    }]
+  },
+  contracts: [{
+    name: "User API",
+    producerProjectId: "backend",
+    consumerProjectIds: ["frontend"],
+    description: "HTTP contract used by the web client"
+  }]
+});
+
+describe("solutionDesignArtifactSchema", () => {
+  it("parses delivery units, dependencies, and contracts", () => {
+    expect(solutionDesignArtifactSchema.parse(solutionDesignArtifact())).toMatchObject({
+      deliveryPlan: {
+        units: [{ projectId: "backend" }, { projectId: "frontend" }],
+        dependencies: [{ upstreamProjectId: "backend", downstreamProjectId: "frontend" }]
+      },
+      contracts: [{ producerProjectId: "backend", consumerProjectIds: ["frontend"] }]
+    });
+  });
+
+  it("rejects a dependency endpoint that is not a delivery unit", () => {
+    const artifact = solutionDesignArtifact();
+    artifact.deliveryPlan.dependencies[0]!.downstreamProjectId = "missing";
+    expect(solutionDesignArtifactSchema.safeParse(artifact).success).toBe(false);
+  });
+
+  it("rejects duplicate delivery unit project IDs", () => {
+    const artifact = solutionDesignArtifact();
+    artifact.deliveryPlan.units[1]!.projectId = "backend";
+    expect(solutionDesignArtifactSchema.safeParse(artifact).success).toBe(false);
+  });
+
+  it("rejects a self dependency", () => {
+    const artifact = solutionDesignArtifact();
+    artifact.deliveryPlan.dependencies[0]!.downstreamProjectId = "backend";
+    expect(solutionDesignArtifactSchema.safeParse(artifact).success).toBe(false);
+  });
+
+  it("rejects duplicate dependencies", () => {
+    const artifact = solutionDesignArtifact();
+    artifact.deliveryPlan.dependencies.push({ ...artifact.deliveryPlan.dependencies[0]! });
+    expect(solutionDesignArtifactSchema.safeParse(artifact).success).toBe(false);
+  });
+
+  it("rejects cyclic dependencies", () => {
+    const artifact = solutionDesignArtifact();
+    artifact.deliveryPlan.dependencies.push({
+      upstreamProjectId: "frontend",
+      downstreamProjectId: "backend",
+      releaseCondition: "automated_testing_passed"
+    });
+    expect(solutionDesignArtifactSchema.safeParse(artifact).success).toBe(false);
   });
 });
 
