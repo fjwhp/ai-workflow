@@ -116,7 +116,7 @@ describe("WorkflowStore", () => {
   it("blocks archiving delivery projects throughout unfinished delivery stages",()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const project=store.createProject({name:"Delivery",repoPath:"/tmp/archive-lifecycle",defaultBranch:"main",allowedCommands:[],sensitivePatterns:[]});
     const req=createRequirement(store,{title:"交付生命周期",businessProblem:"需要保护活动项目交付",expectedOutcome:"阻止错误归档",priority:"medium",primaryProjectId:project.id});
-    for(const [stage,status] of [["implementation","ai_ready"],["quality_verification","awaiting_approval"],["quality_verification","returned"],["acceptance_delivery","blocked"],["acceptance_delivery","awaiting_merge"]] as const){store.updateRequirementState(req.id,stage,status);expect(store.projectHasActiveDelivery(project.id)).toBe(true);}
+    for(const [stage,status] of [["implementation","ai_ready"],["quality_verification","awaiting_approval"],["quality_verification","returned"],["acceptance_delivery","blocked"]] as const){store.updateRequirementState(req.id,stage,status);expect(store.projectHasActiveDelivery(project.id)).toBe(true);}
     store.updateRequirementState(req.id,"acceptance_delivery","completed");expect(store.projectHasActiveDelivery(project.id)).toBe(false);
   });
 
@@ -497,15 +497,5 @@ describe("WorkflowStore", () => {
     expect(()=>store.addReworkContext(req.id,{...context,id:undefined})).toThrow();
   });
 
-  it("persists one active local integration and its terminal evidence", () => {
-    const store = new WorkflowStore(":memory:"); stores.push(store);
-    const req = createRequirement(store, { title: "接口", businessProblem: "缺少接口能力", expectedOutcome: "新增接口", priority: "medium" });
-    store.updateRequirementState(req.id, "acceptance_delivery", "awaiting_merge");
-    const run = store.createIntegrationRun({ requirementId: req.id, projectId: "project-1", executionId: "execution-1", evidenceId: "evidence-1", sourceBranch: "ai/req", worktreePath: "/tmp/wt", targetBranch: "main", preflight: { allowed: true } });
-    expect(() => store.createIntegrationRun({ requirementId: req.id, projectId: "project-1", sourceBranch: "ai/req", worktreePath: "/tmp/wt", targetBranch: "main", preflight: {} })).toThrow("INTEGRATION_ALREADY_ACTIVE");
-    const completed = store.completeIntegrationRun(run!.id, { status: "completed", sourceCommit: "a".repeat(40), targetCommit: "b".repeat(40), commandResults: [], error: null });
-    expect(completed).toMatchObject({ status: "completed", sourceCommit: "a".repeat(40), targetCommit: "b".repeat(40) });
-    expect(store.getLatestIntegrationRun(req.id)?.id).toBe(run!.id);
-  });
 
 });

@@ -14,7 +14,6 @@ await prepareCleanDatabase(databasePath, schemaVersion);
 const store = new WorkflowStore(databasePath);
 await writeDatabaseVersionMarker(databasePath, schemaVersion);
 store.interruptActiveStageRuns();
-store.interruptActiveIntegrationRuns();
 store.interruptActiveProjectKnowledge();
 store.recoverInterruptedRequirements();
 const app = await buildApp(store);

@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   hasMaterialAssociationChange,
   normalizeModuleId,
-  resolveSoleDeliveryProject,
   validateRequirementProjects
 } from "./requirement-projects.js";
 
@@ -18,12 +17,6 @@ const versions = new Map([
 describe("requirement project domain", () => {
   it("validates a context primary with a delivery collaborator", () => {
     expect(validateRequirementProjects([primary, delivery], { projects, versions })).toEqual([primary, delivery]);
-    expect(resolveSoleDeliveryProject([{ ...primary, status: "active" }, { ...delivery, status: "active" }])).toMatchObject({ projectId: "api" });
-  });
-
-  it("rejects ambiguous and absent delivery resolution with stable errors", () => {
-    expect(() => resolveSoleDeliveryProject([{ ...delivery, status: "active" }, { ...delivery, projectId: "worker", status: "active" }])).toThrow("MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED");
-    expect(resolveSoleDeliveryProject([{ ...primary, status: "active" }])).toBeNull();
   });
 
   it.each([

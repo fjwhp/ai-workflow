@@ -18,8 +18,6 @@ export function createPhase2Schema(db: DatabaseSync) {
       worktree_path TEXT NOT NULL UNIQUE,
       status TEXT NOT NULL CHECK(status IN ('active','closed')),
       head_commit TEXT NOT NULL,
-      pending_requirement_id TEXT,
-      pending_integration_run_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       closed_at TEXT,
@@ -153,7 +151,7 @@ export function createPhase2Schema(db: DatabaseSync) {
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL,
       decision TEXT NOT NULL, comment TEXT NOT NULL, condition_text TEXT,
       target_stage TEXT, actor_type TEXT NOT NULL DEFAULT 'human', artifact_id TEXT,
-      reasons_json TEXT NOT NULL DEFAULT '[]', override_json TEXT, return_count INTEGER,
+      reasons_json TEXT NOT NULL DEFAULT '[]', return_count INTEGER,
       created_at TEXT NOT NULL,
       FOREIGN KEY(requirement_id) REFERENCES requirements(id)
     );
@@ -211,16 +209,6 @@ export function createPhase2Schema(db: DatabaseSync) {
       unstructured INTEGER NOT NULL, items_json TEXT NOT NULL, risks_json TEXT NOT NULL, questions_json TEXT NOT NULL, created_at TEXT NOT NULL,
       FOREIGN KEY(requirement_id) REFERENCES requirements(id)
     );
-    CREATE TABLE IF NOT EXISTS integration_runs (
-      id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, project_id TEXT NOT NULL, project_version_id TEXT,
-      execution_id TEXT, evidence_id TEXT, status TEXT NOT NULL,
-      source_branch TEXT NOT NULL, worktree_path TEXT NOT NULL, target_branch TEXT NOT NULL,
-      source_commit TEXT, target_commit TEXT, pre_apply_head TEXT,
-      resolution_status TEXT, resolution_commit TEXT, preflight_json TEXT NOT NULL,
-      commands_json TEXT NOT NULL DEFAULT '[]', error TEXT, created_at TEXT NOT NULL, completed_at TEXT,
-      FOREIGN KEY(requirement_id) REFERENCES requirements(id),
-      FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
-    );
     CREATE TABLE IF NOT EXISTS project_knowledge_versions (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, version INTEGER NOT NULL, status TEXT NOT NULL,
       source_head TEXT NOT NULL, refresh_reason TEXT NOT NULL, summary TEXT, entries_json TEXT NOT NULL DEFAULT '[]',
@@ -250,8 +238,6 @@ export function createPhase2Schema(db: DatabaseSync) {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_ai_gate_artifact
       ON approvals(artifact_id) WHERE actor_type = 'ai_gate' AND artifact_id IS NOT NULL;
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_runs_active
-      ON integration_runs(requirement_id) WHERE status = 'running';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_project_knowledge_active
       ON project_knowledge_versions(project_id) WHERE status = 'building';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_requirement_projects_active_primary

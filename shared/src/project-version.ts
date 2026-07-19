@@ -12,8 +12,6 @@ export interface ProjectVersion {
   worktreePath: string;
   status: ProjectVersionStatus;
   headCommit: string;
-  pendingRequirementId?: string;
-  pendingIntegrationRunId?: string;
   createdAt: string;
   updatedAt: string;
   closedAt?: string;

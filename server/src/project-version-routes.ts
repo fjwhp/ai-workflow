@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { projectVersionInputSchema } from "@ai-workflow/shared";
 import type { FastifyInstance } from "fastify";
 import {
@@ -10,10 +8,6 @@ import {
 } from "./project-version-service.js";
 import { cleanupFailedManagedWorktreeCreation, withRepoWorktreeMutationLock } from "./repository.js";
 import type { WorkflowStore } from "./store.js";
-import { classifyLocalResolution } from "./version-application.js";
-import { publishRequirementKnowledge } from "./project-memory-service.js";
-
-const execFileAsync = promisify(execFile);
 
 type RouteOptions = { store: WorkflowStore };
 
@@ -43,7 +37,6 @@ const conflictCodes = new Set([
   "PROJECT_VERSION_WORKTREE_POSTCONDITION_FAILED",
   "PROJECT_VERSION_GIT_UNAVAILABLE",
   "PROJECT_VERSION_PERSISTENCE_FAILED",
-  "PROJECT_VERSION_CLOSE_BLOCKED",
   "PROJECT_VERSION_HAS_ACTIVE_REQUIREMENTS",
   "PROJECT_VERSION_WORKTREE_INVALID",
   "PROJECT_VERSION_WORKTREE_DIRTY"
@@ -87,63 +80,6 @@ function requireVersion(store: WorkflowStore, versionId: string) {
   const version = store.getProjectVersion(versionId);
   if (!version) throw new Error("PROJECT_VERSION_NOT_FOUND");
   return version;
-}
-
-export async function recheckVersionApplication(
-  store: WorkflowStore,
-  versionId: string,
-  options: { allowInterruptedRun?: boolean } = {}
-) {
-  const version = requireVersion(store, versionId);
-  if (!version.pendingIntegrationRunId || !version.pendingRequirementId) return null;
-  const run = store.getIntegrationRun(version.pendingIntegrationRunId);
-  if (!run || run.requirementId !== version.pendingRequirementId || run.projectVersionId !== version.id) {
-    throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-  }
-  if (run.status === "running" && !options.allowInterruptedRun) return { status: "pending" as const };
-  if (run.resolutionStatus === "ambiguous" && !run.preApplyHead) {
-    return { status: "ambiguous" as const, currentHead: run.resolutionCommit ?? "" };
-  }
-  const project = store.getProject(version.projectId);
-  const ambiguous = (currentHead: string) => {
-    store.markVersionResolutionAmbiguous({
-      versionId: version.id, runId: run.id, currentHead,
-      allowRunning: run.status === "running" && options.allowInterruptedRun,
-      allowFailed: run.status === "failed" && options.allowInterruptedRun
-    });
-    return { status: "ambiguous" as const, currentHead };
-  };
-  if (!project || project.status !== "active" || version.status !== "active" || !run.preApplyHead) {
-    return ambiguous(!project ? "project_not_found" : project.status !== "active" ? "project_inactive" : version.status !== "active" ? "version_inactive" : "missing_pre_apply_head");
-  }
-  const inspection = await inspectVersionWorktree({
-    repoPath: project.repoPath, worktreePath: version.worktreePath, branch: version.branch
-  });
-  if (!inspection.valid) return ambiguous(inspection.status);
-  try {
-    await execFileAsync("git", ["-C", version.worktreePath, "merge-base", "--is-ancestor", run.preApplyHead, inspection.headCommit]);
-  } catch {
-    return ambiguous(inspection.headCommit || "ancestry_unavailable");
-  }
-  const resolution = classifyLocalResolution({
-    statusPorcelain: inspection.clean ? "" : inspection.status,
-    preApplyHead: run.preApplyHead,
-    currentHead: inspection.headCommit
-  });
-  if (resolution.status === "pending") return resolution;
-  if (resolution.status === "committed") {
-    store.releaseVersionApplication({
-      versionId: version.id, runId: run.id, resolution: "committed", resolutionCommit: resolution.commit
-    });
-    try { publishRequirementKnowledge(store, run.requirementId); }
-    catch { /* Completion remains durable when knowledge extraction is unavailable. */ }
-    return resolution;
-  }
-  if (resolution.status === "reverted") {
-    store.releaseVersionApplication({ versionId: version.id, runId: run.id, resolution: "reverted" });
-    return resolution;
-  }
-  return ambiguous(resolution.currentHead);
 }
 
 function ensureNoDuplicate(store: WorkflowStore, projectId: string, name: string, branch: string) {
@@ -266,23 +202,12 @@ export async function registerProjectVersionRoutes(app: FastifyInstance, { store
     catch (error) { return sendError(reply, error); }
   });
 
-  app.get("/api/project-versions/:id/application-queue", async (request: any, reply) => {
-    const id = routeId(request.params?.id);
-    if (!id) return reply.code(400).send({ error: "VALIDATION_ERROR" });
-    try {
-      requireVersion(store, id);
-      return store.listVersionApplicationQueue(id);
-    } catch (error) { return sendError(reply, error); }
-  });
-
   app.post("/api/project-versions/:id/recheck", async (request: any, reply) => {
     const id = routeId(request.params?.id);
     if (!id) return reply.code(400).send({ error: "VALIDATION_ERROR" });
     try {
       const version = requireVersion(store, id);
       if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
-      const resolution = await recheckVersionApplication(store, version.id);
-      if (resolution) return resolution;
       const project = requireProject(store, version.projectId, true);
       const inspection = await inspectVersionWorktree({
         repoPath: project.repoPath,

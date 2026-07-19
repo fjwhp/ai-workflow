@@ -1,10 +1,7 @@
 import {
   requirementProjectsInputSchema,
-  type RequirementProject,
   type RequirementProjectInput
 } from "@ai-workflow/shared";
-
-export const MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED = "MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED";
 
 export interface RequirementProjectValidationContext {
   projects: Array<{ id: string; status: string }>;
@@ -57,12 +54,6 @@ export function validateRequirementProjects(
     if (moduleIds.some((moduleId) => !available.has(moduleId))) throw new Error("MODULE_NOT_FOUND");
     return { ...item, moduleIds };
   });
-}
-
-export function resolveSoleDeliveryProject<T extends Pick<RequirementProject, "usage" | "status">>(items: T[]): T | null {
-  const delivery = items.filter((item) => item.status === "active" && item.usage === "delivery");
-  if (delivery.length > 1) throw new Error(MULTI_PROJECT_EXECUTION_PHASE_2_REQUIRED);
-  return delivery[0] ?? null;
 }
 
 type MaterialAssociation = RequirementProjectInput & { id?: string; createdAt?: string; status?: string; projectName?: string; projectStatus?: string };

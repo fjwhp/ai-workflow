@@ -69,88 +69,6 @@ export interface StageRunInput {
   expectedProjectUpdatedAt?: string;
 }
 
-export interface IntegrationRunInput {
-  id?: string;
-  requirementId: string;
-  projectId: string;
-  projectVersionId?: string;
-  executionId?: string;
-  evidenceId?: string;
-  sourceBranch: string;
-  worktreePath: string;
-  targetBranch: string;
-  preflight: unknown;
-}
-
-export interface VersionApplicationRunInput {
-  id?: string;
-  projectId: string;
-  executionId: string;
-  evidenceId: string;
-  sourceBranch: string;
-  worktreePath: string;
-  targetBranch: string;
-  preflight: unknown;
-}
-
-export interface IntegrationRun {
-  id: string;
-  requirementId: string;
-  projectId: string;
-  projectVersionId?: string;
-  executionId?: string;
-  evidenceId?: string;
-  status: string;
-  sourceBranch: string;
-  worktreePath: string;
-  targetBranch: string;
-  sourceCommit?: string;
-  targetCommit?: string;
-  preApplyHead?: string;
-  resolutionStatus?: "committed" | "reverted" | "ambiguous";
-  resolutionCommit?: string;
-  preflight: unknown;
-  commandResults: unknown[];
-  error?: string;
-  createdAt: string;
-  completedAt?: string;
-}
-
-export interface VersionApplicationQueueEntry {
-  requirementId: string;
-  code: string;
-  title: string;
-  status: string;
-  updatedAt: string;
-  owner: boolean;
-  position: number;
-}
-
-const versionApplicationQueueSql = `WITH target_version AS (
-    SELECT pv.id, pv.project_id, pv.status AS version_status, pv.pending_requirement_id,
-      p.status AS project_status
-    FROM project_versions pv JOIN projects p ON p.id = pv.project_id
-    WHERE pv.id = ?
-  ), queue_entries AS (
-    SELECT r.id, r.code, r.title, r.status, r.updated_at, 1 AS owner, 0 AS sort_group
-    FROM target_version tv JOIN requirements r ON r.id = tv.pending_requirement_id
-    UNION ALL
-    SELECT DISTINCT r.id, r.code, r.title, r.status, r.updated_at, 0 AS owner, 1 AS sort_group
-    FROM target_version tv
-    JOIN requirement_projects rp
-      ON rp.project_version_id = tv.id AND rp.project_id = tv.project_id
-    JOIN requirements r ON r.id = rp.requirement_id
-    WHERE tv.version_status = 'active' AND tv.project_status = 'active'
-      AND rp.usage = 'delivery' AND rp.status = 'active'
-      AND (SELECT COUNT(*) FROM requirement_projects active_delivery
-        WHERE active_delivery.requirement_id = r.id
-          AND active_delivery.usage = 'delivery' AND active_delivery.status = 'active') = 1
-      AND r.stage = 'acceptance_delivery' AND r.status = 'awaiting_merge'
-      AND r.id != COALESCE(tv.pending_requirement_id, '')
-  )
-  SELECT id, code, title, status, updated_at, owner
-  FROM queue_entries ORDER BY sort_group, updated_at, code`;
-
 export class WorkflowStore {
   private db: DatabaseSync;
   private readonly deliveryUnitRepository: DeliveryUnitRepository;
@@ -184,15 +102,6 @@ export class WorkflowStore {
 
   createDeliveryPlanInTransaction(input: CreateDeliveryPlanInput): DeliveryPlanResult {
     return this.deliveryUnitRepository.createPlanInTransaction(input);
-  }
-
-  private assertNoPendingVersionApplication(requirementId: string) {
-    if (this.hasPendingVersionApplication(requirementId)) throw new Error("PROJECT_VERSION_APPLICATION_PENDING");
-  }
-
-  hasPendingVersionApplication(requirementId: string) {
-    return Boolean(this.db.prepare(`SELECT id FROM project_versions
-      WHERE pending_requirement_id = ? AND pending_integration_run_id IS NOT NULL LIMIT 1`).get(requirementId));
   }
 
   createRequirement(input: RequirementInput) {
@@ -289,7 +198,6 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(requirementId);
       const projects = this.replaceRequirementProjectsInTransaction(requirementId, inputs, now);
       this.db.exec("COMMIT");
       return projects;
@@ -300,7 +208,6 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(requirementId);
       const before = this.listRequirementProjects(requirementId);
       const projects = this.replaceRequirementProjectsInTransaction(requirementId, inputs, now);
       const materialChange = hasMaterialAssociationChange(before, projects);
@@ -341,7 +248,6 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(requirementId);
       const item = this.createRequirementProjectSnapshotInTransaction(requirementId, now);
       this.db.exec("COMMIT");
       return item;
@@ -377,7 +283,6 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(requirementId);
       const changed = this.supersedeRequirementProjectSnapshotInTransaction(requirementId, now);
       this.db.exec("COMMIT");
       return changed;
@@ -393,7 +298,6 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(requirementId);
       const invalidated = this.invalidateSolutionDesignForProjectChangeInTransaction(requirementId, now);
       this.db.exec("COMMIT");
       return invalidated;
@@ -466,7 +370,6 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(id);
       const current = this.getRequirement(id);
       if (!current || !["returned", "blocked", "draft"].includes(current.status)) {
         this.db.exec("COMMIT");
@@ -504,7 +407,6 @@ export class WorkflowStore {
   updateRequirementState(id: string, stage: WorkflowStage, status: string) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(id);
       this.db.prepare("UPDATE requirements SET stage = ?, status = ?, updated_at = ? WHERE id = ?")
         .run(stage, status, new Date().toISOString(), id);
       this.db.exec("COMMIT");
@@ -582,7 +484,6 @@ export class WorkflowStore {
   createStageRun(input: StageRunInput) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(input.requirementId);
       const requirement = this.db.prepare("SELECT stage, status, updated_at FROM requirements WHERE id = ?").get(input.requirementId) as { stage: string; status: string; updated_at: string } | undefined;
       if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
       if (this.db.prepare("SELECT id FROM stage_runs WHERE requirement_id = ? AND stage = ? AND status = 'running'").get(input.requirementId, input.stage)) {
@@ -690,7 +591,6 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(requirementId);
       const approval = this.insertApprovalInTransaction(requirementId, stage, input, now);
       this.db.exec("COMMIT");
       return approval;
@@ -700,18 +600,17 @@ export class WorkflowStore {
   insertApprovalInTransaction(requirementId: string, stage: WorkflowStage, input: any, now: string) {
     const id = randomUUID();
     this.db.prepare(`INSERT INTO approvals
-      (id, requirement_id, stage, decision, comment, condition_text, target_stage, created_at, actor_type, artifact_id, reasons_json, override_json, return_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      (id, requirement_id, stage, decision, comment, condition_text, target_stage, created_at, actor_type, artifact_id, reasons_json, return_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(id, requirementId, stage, input.decision, input.comment, input.condition ?? null, input.targetStage ?? null, now,
-        input.actorType ?? "human", input.artifactId ?? null, JSON.stringify(input.reasons ?? []), input.override ? JSON.stringify(input.override) : null, input.returnCount ?? null);
-    return { id, requirement_id: requirementId, stage, decision: input.decision, comment: input.comment, target_stage: input.targetStage ?? null, created_at: now, actor_type: input.actorType ?? "human", artifact_id: input.artifactId ?? null, return_count: input.returnCount ?? null, override: input.override ?? null };
+        input.actorType ?? "human", input.artifactId ?? null, JSON.stringify(input.reasons ?? []), input.returnCount ?? null);
+    return { id, requirement_id: requirementId, stage, decision: input.decision, comment: input.comment, target_stage: input.targetStage ?? null, created_at: now, actor_type: input.actorType ?? "human", artifact_id: input.artifactId ?? null, return_count: input.returnCount ?? null };
   }
 
   applyRequirementApproval(input: { requirementId: string; expectedStage: WorkflowStage; approval: any }) {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(input.requirementId);
       const requirement = this.db.prepare("SELECT stage, status FROM requirements WHERE id = ?").get(input.requirementId) as { stage: WorkflowStage; status: string } | undefined;
       if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
       if (requirement.stage !== input.expectedStage) throw new Error("REQUIREMENT_APPROVAL_STATE_CHANGED");
@@ -739,32 +638,9 @@ export class WorkflowStore {
   }
 
   listApprovals(requirementId: string) {
-    return this.db.prepare("SELECT * FROM approvals WHERE requirement_id = ? ORDER BY created_at DESC, rowid DESC").all(requirementId).map((row: any) => ({
-      ...row, override: row.override_json ? JSON.parse(row.override_json) : null
-    }));
+    return this.db.prepare("SELECT * FROM approvals WHERE requirement_id = ? ORDER BY created_at DESC, rowid DESC").all(requirementId);
   }
 
-  createIntegrationRun(input: IntegrationRunInput) {
-    if (this.db.prepare("SELECT id FROM integration_runs WHERE requirement_id = ? AND status = 'running'").get(input.requirementId)) throw new Error("INTEGRATION_ALREADY_ACTIVE");
-    const item = { id: randomUUID(), status: "running", createdAt: new Date().toISOString(), ...input };
-    this.db.prepare(`INSERT INTO integration_runs
-      (id,requirement_id,project_id,project_version_id,execution_id,evidence_id,status,source_branch,worktree_path,target_branch,preflight_json,commands_json,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(item.id,item.requirementId,item.projectId,item.projectVersionId??null,item.executionId??null,item.evidenceId??null,item.status,item.sourceBranch,item.worktreePath,item.targetBranch,JSON.stringify(item.preflight??{}),JSON.stringify([]),item.createdAt);
-    return this.getIntegrationRun(item.id);
-  }
-
-  completeIntegrationRun(id: string, result: any) {
-    const now = new Date().toISOString();
-    const current:any=this.db.prepare("SELECT preflight_json FROM integration_runs WHERE id = ?").get(id);
-    const preflight={...JSON.parse(current?.preflight_json||"{}"),conflictFiles:result.conflictFiles??[]};
-    this.db.prepare(`UPDATE integration_runs SET status=?,source_commit=?,target_commit=?,preflight_json=?,commands_json=?,error=?,completed_at=? WHERE id=?`)
-      .run(result.status,result.sourceCommit??null,result.targetCommit??null,JSON.stringify(preflight),JSON.stringify(result.commandResults??[]),result.error??null,now,id);
-    return this.getIntegrationRun(id);
-  }
-
-  getIntegrationRun(id: string): IntegrationRun | null { const row=this.db.prepare("SELECT * FROM integration_runs WHERE id = ?").get(id); return row?mapIntegrationRun(row):null; }
-  getLatestIntegrationRun(requirementId: string): IntegrationRun | null { const row=this.db.prepare("SELECT * FROM integration_runs WHERE requirement_id = ? ORDER BY created_at DESC LIMIT 1").get(requirementId); return row?mapIntegrationRun(row):null; }
-  interruptActiveIntegrationRuns(){return Number(this.db.prepare("UPDATE integration_runs SET status='failed',error='服务进程已重启，合并操作被中断',completed_at=? WHERE status='running'").run(new Date().toISOString()).changes);}
 
   getGateConfig(): GateConfig {
     const row = this.db.prepare("SELECT value_json FROM settings WHERE key = 'gate_config'").get() as { value_json: string } | undefined;
@@ -784,7 +660,6 @@ export class WorkflowStore {
     let gateApproval: any;
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(input.requirementId);
       if (this.db.prepare("SELECT id FROM approvals WHERE actor_type = 'ai_gate' AND artifact_id = ?").get(input.artifactId)) {
         this.db.exec("COMMIT");
         return { applied: false, requirement: this.getRequirement(input.requirementId) };
@@ -849,8 +724,8 @@ export class WorkflowStore {
       }
       this.db.prepare(`INSERT INTO project_versions
         (id, project_id, name, branch, base_branch, worktree_path, status, head_commit,
-         pending_requirement_id, pending_integration_run_id, created_at, updated_at, closed_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, NULL, ?, ?, NULL)`)
+         created_at, updated_at, closed_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, NULL)`)
         .run(id, input.projectId, input.name, input.branch, input.baseBranch, input.worktreePath, input.headCommit, now, now);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -893,9 +768,6 @@ export class WorkflowStore {
         this.db.exec("COMMIT");
         return this.getProjectVersion(id)!;
       }
-      if (version.pending_requirement_id || version.pending_integration_run_id) {
-        throw new Error("PROJECT_VERSION_CLOSE_BLOCKED");
-      }
       const activeRequirement = this.db.prepare(`SELECT r.id FROM requirements r
         JOIN requirement_projects rp ON rp.requirement_id = r.id
         WHERE rp.project_version_id = ?
@@ -919,355 +791,6 @@ export class WorkflowStore {
       .map((row) => this.mapRequirementWithProjects(row));
   }
 
-  beginVersionApplication(input: {
-    versionId: string;
-    requirementId: string;
-    run: VersionApplicationRunInput;
-  }): { version: ProjectVersion; run: IntegrationRun } {
-    const now = new Date().toISOString();
-    let transactionStarted = false;
-    try {
-      this.db.exec("BEGIN IMMEDIATE");
-      transactionStarted = true;
-      const version = this.db.prepare(`SELECT pv.*, p.status AS project_status
-        FROM project_versions pv JOIN projects p ON p.id = pv.project_id
-        WHERE pv.id = ?`).get(input.versionId) as any;
-      if (!version) throw new Error("PROJECT_VERSION_NOT_FOUND");
-      if (version.project_status !== "active") throw new Error("PROJECT_NOT_ACTIVE");
-      if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
-      if (version.pending_requirement_id || version.pending_integration_run_id) {
-        throw new Error("PROJECT_VERSION_APPLICATION_BUSY");
-      }
-
-      const requirement = this.db.prepare("SELECT stage, status FROM requirements WHERE id = ?")
-        .get(input.requirementId) as { stage: string; status: string } | undefined;
-      if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
-      if (requirement.stage !== "acceptance_delivery" || requirement.status !== "awaiting_merge") {
-        throw new Error("VERSION_APPLICATION_NOT_ALLOWED");
-      }
-      const deliveries = this.db.prepare(`SELECT project_id, project_version_id
-        FROM requirement_projects
-        WHERE requirement_id = ? AND usage = 'delivery' AND status = 'active'
-        ORDER BY position`).all(input.requirementId) as Array<{
-          project_id: string;
-          project_version_id: string | null;
-        }>;
-      const delivery = deliveries[0];
-      if (deliveries.length !== 1 || delivery?.project_id !== version.project_id ||
-          delivery?.project_version_id !== input.versionId || input.run.projectId !== version.project_id) {
-        throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
-      }
-      const next = this.db.prepare(`${versionApplicationQueueSql} LIMIT 1`).get(input.versionId) as { id: string } | undefined;
-      if (next?.id !== input.requirementId) throw new Error("PROJECT_VERSION_APPLICATION_NOT_NEXT");
-
-      const runId = input.run.id ?? randomUUID();
-      const leased = this.db.prepare(`UPDATE project_versions
-        SET pending_requirement_id = ?, pending_integration_run_id = ?, updated_at = ?
-        WHERE id = ? AND pending_requirement_id IS NULL AND pending_integration_run_id IS NULL`)
-        .run(input.requirementId, runId, now, input.versionId);
-      if (leased.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_BUSY");
-
-      this.db.prepare(`INSERT INTO integration_runs
-        (id, requirement_id, project_id, project_version_id, execution_id, evidence_id, status,
-         source_branch, worktree_path, target_branch, preflight_json, commands_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, '[]', ?)`)
-        .run(runId, input.requirementId, version.project_id, input.versionId,
-          input.run.executionId, input.run.evidenceId, input.run.sourceBranch,
-          input.run.worktreePath, input.run.targetBranch, JSON.stringify(input.run.preflight ?? {}), now);
-      this.db.prepare("UPDATE requirements SET updated_at = ? WHERE id = ?")
-        .run(now, input.requirementId);
-      this.db.exec("COMMIT");
-      return {
-        version: this.getProjectVersion(input.versionId)!,
-        run: this.getIntegrationRun(runId)!
-      };
-    } catch (error) {
-      if (transactionStarted) this.db.exec("ROLLBACK");
-      if (isSqliteBusy(error)) throw new Error("PROJECT_VERSION_APPLICATION_BUSY", { cause: error });
-      if (isVersionApplicationError(error)) throw error;
-      throw new Error("PROJECT_VERSION_APPLICATION_FAILED", { cause: error });
-    }
-  }
-
-  completeVersionApplicationApply(input: {
-    runId: string;
-    sourceCommit: string;
-    preApplyHead: string;
-    status: "awaiting_local_resolution" | "merge_test_failed";
-    commandResults?: unknown[];
-    error?: string;
-  }): IntegrationRun {
-    const now = new Date().toISOString();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const run = this.db.prepare(`SELECT ir.requirement_id, ir.project_version_id
-        FROM integration_runs ir JOIN project_versions pv
-          ON pv.pending_integration_run_id = ir.id
-         AND pv.pending_requirement_id = ir.requirement_id
-         AND pv.id = ir.project_version_id
-        WHERE ir.id = ? AND ir.status = 'running'`).get(input.runId) as any;
-      if (!run) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      const requirementUpdated = this.db.prepare(`UPDATE requirements
-        SET status = ?, updated_at = ?
-        WHERE id = ? AND stage = 'acceptance_delivery' AND status = 'awaiting_merge'`)
-        .run(input.status, now, run.requirement_id);
-      if (requirementUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      this.db.prepare(`UPDATE integration_runs
-        SET status = ?, source_commit = ?, pre_apply_head = ?, commands_json = ?, error = ?, completed_at = ? WHERE id = ?`)
-        .run(input.status, input.sourceCommit, input.preApplyHead, JSON.stringify(input.commandResults ?? []), input.error ?? null, now, input.runId);
-      this.db.exec("COMMIT");
-      return this.getIntegrationRun(input.runId)!;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  releaseFailedVersionApplication(input: {
-    versionId: string;
-    runId: string;
-    status: "failed" | "conflict";
-    sourceCommit?: string;
-    error: string;
-    conflictFiles?: string[];
-  }): IntegrationRun {
-    const now = new Date().toISOString();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const lease = this.db.prepare(`SELECT pv.pending_requirement_id AS requirement_id,
-          ir.preflight_json
-        FROM project_versions pv JOIN integration_runs ir
-          ON ir.id = pv.pending_integration_run_id
-         AND ir.requirement_id = pv.pending_requirement_id
-         AND ir.project_version_id = pv.id
-        JOIN requirements r ON r.id = ir.requirement_id
-        WHERE pv.id = ? AND pv.pending_integration_run_id = ?
-          AND ir.status = 'running' AND r.stage = 'acceptance_delivery' AND r.status = 'awaiting_merge'`)
-        .get(input.versionId, input.runId) as any;
-      if (!lease) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      const preflight = {
-        ...JSON.parse(lease.preflight_json || "{}"),
-        conflictFiles: input.conflictFiles ?? []
-      };
-      const runUpdated = this.db.prepare(`UPDATE integration_runs
-        SET status = ?, source_commit = ?, preflight_json = ?, error = ?, completed_at = ?
-        WHERE id = ? AND status = 'running'`)
-        .run(input.status, input.sourceCommit ?? null, JSON.stringify(preflight), input.error, now, input.runId);
-      if (runUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      const requirementUpdated = this.db.prepare(`UPDATE requirements
-        SET stage = 'acceptance_delivery', status = 'awaiting_merge', updated_at = ?
-        WHERE id = ? AND stage = 'acceptance_delivery' AND status = 'awaiting_merge'`)
-        .run(now, lease.requirement_id);
-      if (requirementUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      const released = this.db.prepare(`UPDATE project_versions
-        SET pending_requirement_id = NULL, pending_integration_run_id = NULL, updated_at = ?
-        WHERE id = ? AND pending_requirement_id = ? AND pending_integration_run_id = ?`)
-        .run(now, input.versionId, lease.requirement_id, input.runId);
-      if (released.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      this.db.exec("COMMIT");
-      return this.getIntegrationRun(input.runId)!;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  beginVersionApplicationRetest(input: { versionId: string; runId: string }): IntegrationRun {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const lease = this.db.prepare(`SELECT ir.status AS run_status, r.status AS requirement_status
-        FROM project_versions pv JOIN integration_runs ir
-          ON ir.id = pv.pending_integration_run_id
-         AND ir.requirement_id = pv.pending_requirement_id
-         AND ir.project_version_id = pv.id
-        JOIN requirements r ON r.id = ir.requirement_id
-        WHERE pv.id = ? AND pv.pending_integration_run_id = ?
-          AND r.stage = 'acceptance_delivery'`).get(input.versionId, input.runId) as any;
-      if (!lease) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      if (lease.run_status === "retesting") throw new Error("VERSION_APPLICATION_RETEST_BUSY");
-      if (lease.run_status !== "merge_test_failed" || lease.requirement_status !== "merge_test_failed") {
-        throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      }
-      const claimed = this.db.prepare(`UPDATE integration_runs
-        SET status = 'retesting', completed_at = NULL
-        WHERE id = ? AND status = 'merge_test_failed'`).run(input.runId);
-      if (claimed.changes !== 1) throw new Error("VERSION_APPLICATION_RETEST_BUSY");
-      this.db.exec("COMMIT");
-      return this.getIntegrationRun(input.runId)!;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  recoverInterruptedVersionApplicationRetests(): number {
-    const now = new Date().toISOString();
-    const restored = this.db.prepare(`UPDATE integration_runs
-      SET status = 'merge_test_failed', completed_at = ?
-      WHERE status = 'retesting'`).run(now);
-    return Number(restored.changes);
-  }
-
-  completeVersionApplicationRetest(input: {
-    versionId: string;
-    runId: string;
-    status: "awaiting_local_resolution" | "merge_test_failed";
-    commandResults: unknown[];
-    error?: string;
-  }): IntegrationRun {
-    const now = new Date().toISOString();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const lease = this.db.prepare(`SELECT pv.pending_requirement_id AS requirement_id
-        FROM project_versions pv JOIN integration_runs ir
-          ON ir.id = pv.pending_integration_run_id
-         AND ir.requirement_id = pv.pending_requirement_id
-         AND ir.project_version_id = pv.id
-        JOIN requirements r ON r.id = ir.requirement_id
-        WHERE pv.id = ? AND pv.pending_integration_run_id = ?
-          AND ir.status = 'retesting' AND r.status = 'merge_test_failed'`)
-        .get(input.versionId, input.runId) as any;
-      if (!lease) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      const runUpdated = this.db.prepare(`UPDATE integration_runs
-        SET status = ?, commands_json = ?, error = ?, completed_at = ?
-        WHERE id = ? AND status = 'retesting'`)
-        .run(input.status, JSON.stringify(input.commandResults), input.error ?? null, now, input.runId);
-      if (runUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      const requirementUpdated = this.db.prepare(`UPDATE requirements SET status = ?, updated_at = ?
-        WHERE id = ? AND stage = 'acceptance_delivery' AND status = 'merge_test_failed'`)
-        .run(input.status, now, lease.requirement_id);
-      if (requirementUpdated.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      this.db.exec("COMMIT");
-      return this.getIntegrationRun(input.runId)!;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  releaseVersionApplication(input: {
-    versionId: string;
-    runId: string;
-    resolution: "committed" | "reverted";
-    resolutionCommit?: string;
-  }): IntegrationRun {
-    if (input.resolution === "committed" && !input.resolutionCommit) {
-      throw new Error("VERSION_APPLICATION_RESOLUTION_COMMIT_REQUIRED");
-    }
-    const now = new Date().toISOString();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const lease = this.db.prepare(`SELECT pv.pending_requirement_id AS requirement_id,
-          ir.pre_apply_head
-        FROM project_versions pv JOIN integration_runs ir
-          ON ir.id = pv.pending_integration_run_id
-         AND ir.requirement_id = pv.pending_requirement_id
-         AND ir.project_version_id = pv.id
-        JOIN requirements r ON r.id = ir.requirement_id
-        WHERE pv.id = ? AND pv.pending_integration_run_id = ?
-          AND ir.status IN ('awaiting_local_resolution', 'merge_test_failed')
-          AND (r.status = ir.status OR r.status = 'manual_resolution_required')`)
-        .get(input.versionId, input.runId) as any;
-      if (!lease) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      this.db.prepare(`UPDATE integration_runs
-        SET resolution_status = ?, resolution_commit = ? WHERE id = ?`)
-        .run(input.resolution, input.resolutionCommit ?? null, input.runId);
-      this.db.prepare("UPDATE requirements SET stage = 'acceptance_delivery', status = ?, updated_at = ? WHERE id = ?")
-        .run(input.resolution === "committed" ? "completed" : "awaiting_merge", now, lease.requirement_id);
-      const headCommit = input.resolution === "committed" ? input.resolutionCommit : lease.pre_apply_head;
-      const released = this.db.prepare(`UPDATE project_versions
-        SET pending_requirement_id = NULL, pending_integration_run_id = NULL,
-            head_commit = COALESCE(?, head_commit), updated_at = ?
-        WHERE id = ? AND pending_requirement_id = ? AND pending_integration_run_id = ?`)
-        .run(headCommit ?? null, now, input.versionId, lease.requirement_id, input.runId);
-      if (released.changes !== 1) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      this.db.exec("COMMIT");
-      return this.getIntegrationRun(input.runId)!;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  markVersionResolutionAmbiguous(input: {
-    versionId: string;
-    runId: string;
-    currentHead: string;
-    allowRunning?: boolean;
-    allowFailed?: boolean;
-    allowRetesting?: boolean;
-    error?: string;
-  }): IntegrationRun {
-    const now = new Date().toISOString();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const lease = this.db.prepare(`SELECT pv.pending_requirement_id AS requirement_id
-        FROM project_versions pv JOIN integration_runs ir
-          ON ir.id = pv.pending_integration_run_id
-         AND ir.requirement_id = pv.pending_requirement_id
-         AND ir.project_version_id = pv.id
-        JOIN requirements r ON r.id = ir.requirement_id
-        WHERE pv.id = ? AND pv.pending_integration_run_id = ?
-          AND ((ir.status IN ('awaiting_local_resolution', 'merge_test_failed')
-                AND (r.status = ir.status OR
-                  (ir.resolution_status = 'ambiguous' AND r.status = 'manual_resolution_required')))
-            OR (? = 1 AND ir.status = 'running' AND r.status = 'awaiting_merge')
-            OR (? = 1 AND ir.status = 'failed' AND r.status = 'awaiting_merge')
-            OR (? = 1 AND ir.status = 'retesting' AND r.status = 'merge_test_failed'))`)
-        .get(input.versionId, input.runId, input.allowRunning ? 1 : 0,
-          input.allowFailed ? 1 : 0, input.allowRetesting ? 1 : 0) as any;
-      if (!lease) throw new Error("PROJECT_VERSION_APPLICATION_MISMATCH");
-      this.db.prepare(`UPDATE integration_runs
-        SET status = CASE WHEN status = 'running' THEN 'failed'
-                          WHEN status = 'retesting' THEN 'merge_test_failed' ELSE status END,
-            resolution_status = 'ambiguous', resolution_commit = ?,
-            error = COALESCE(?, CASE WHEN status = 'running' THEN '服务进程重启后无法确认本地应用状态' ELSE error END),
-            completed_at = COALESCE(completed_at, ?)
-        WHERE id = ?`)
-        .run(input.currentHead, input.error ?? null, now, input.runId);
-      this.db.prepare(`UPDATE requirements SET stage = 'acceptance_delivery',
-        status = 'manual_resolution_required', updated_at = ? WHERE id = ?`)
-        .run(now, lease.requirement_id);
-      this.db.exec("COMMIT");
-      return this.getIntegrationRun(input.runId)!;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  listVersionApplicationQueue(versionId: string): VersionApplicationQueueEntry[] {
-    const rows = this.db.prepare(versionApplicationQueueSql).all(versionId) as any[];
-    return rows.map((row, index) => ({
-      requirementId: row.id,
-      code: row.code,
-      title: row.title,
-      status: row.status,
-      updatedAt: row.updated_at,
-      owner: Boolean(row.owner),
-      position: index + 1
-    }));
-  }
-
-  listPendingVersionApplications(): Array<{
-    version: ProjectVersion;
-    requirement: ReturnType<WorkflowStore["getRequirement"]>;
-    run: IntegrationRun;
-  }> {
-    const rows = this.db.prepare(`SELECT pv.id AS version_id, pv.pending_requirement_id AS requirement_id,
-        pv.pending_integration_run_id AS run_id
-      FROM project_versions pv
-      WHERE pv.pending_requirement_id IS NOT NULL AND pv.pending_integration_run_id IS NOT NULL
-      ORDER BY pv.updated_at, pv.id`).all() as any[];
-    return rows.flatMap((row) => {
-      const version = this.getProjectVersion(row.version_id);
-      const requirement = this.getRequirement(row.requirement_id);
-      const run = this.getIntegrationRun(row.run_id);
-      if (!version || !requirement || !run || run.requirementId !== requirement.id ||
-          run.projectVersionId !== version.id) return [];
-      return [{ version, requirement, run }];
-    });
-  }
 
   updateProject(id: string, input: any) {
     const changesExecutionIdentity=["repoPath","defaultBranch","allowedCommands","sensitivePatterns","technology"].some((field)=>Object.prototype.hasOwnProperty.call(input,field));
@@ -1417,7 +940,6 @@ export class WorkflowStore {
     const now = new Date().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.assertNoPendingVersionApplication(requirementId);
       const item = this.insertReworkContext(requirementId, input, now);
       this.db.exec("COMMIT");
       return item;
@@ -1497,8 +1019,6 @@ function mapProjectVersion(row: any): ProjectVersion {
     worktreePath: row.worktree_path,
     status: row.status,
     headCommit: row.head_commit,
-    pendingRequirementId: row.pending_requirement_id ?? undefined,
-    pendingIntegrationRunId: row.pending_integration_run_id ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     closedAt: row.closed_at ?? undefined
@@ -1539,48 +1059,4 @@ function mapCodingEvidence(row: any) {
     diagnostics: row.diagnostics_text, createdAt: row.created_at };
 }
 
-function mapIntegrationRun(row: any): IntegrationRun {
-  return {
-    id: row.id,
-    requirementId: row.requirement_id,
-    projectId: row.project_id,
-    projectVersionId: row.project_version_id ?? undefined,
-    executionId: row.execution_id ?? undefined,
-    evidenceId: row.evidence_id ?? undefined,
-    status: row.status,
-    sourceBranch: row.source_branch,
-    worktreePath: row.worktree_path,
-    targetBranch: row.target_branch,
-    sourceCommit: row.source_commit ?? undefined,
-    targetCommit: row.target_commit ?? undefined,
-    preApplyHead: row.pre_apply_head ?? undefined,
-    resolutionStatus: row.resolution_status ?? undefined,
-    resolutionCommit: row.resolution_commit ?? undefined,
-    preflight: JSON.parse(row.preflight_json || "{}"),
-    commandResults: JSON.parse(row.commands_json || "[]"),
-    error: row.error ?? undefined,
-    createdAt: row.created_at,
-    completedAt: row.completed_at ?? undefined
-  };
-}
-
-function isVersionApplicationError(error: unknown) {
-  const message = error instanceof Error ? error.message : "";
-  return new Set([
-    "PROJECT_VERSION_NOT_FOUND",
-    "PROJECT_NOT_ACTIVE",
-    "PROJECT_VERSION_NOT_ACTIVE",
-    "REQUIREMENT_NOT_FOUND",
-    "VERSION_APPLICATION_NOT_ALLOWED",
-    "REQUIREMENT_VERSION_PROJECT_MISMATCH",
-    "PROJECT_VERSION_APPLICATION_BUSY",
-    "PROJECT_VERSION_APPLICATION_NOT_NEXT"
-  ]).has(message);
-}
-
-function isSqliteBusy(error: unknown) {
-  if (!(error instanceof Error)) return false;
-  const code = "code" in error ? String(error.code) : "";
-  return code === "SQLITE_BUSY" || /database is (?:busy|locked)/i.test(error.message);
-}
 function mapProjectKnowledge(row:any){return {id:row.id,projectId:row.project_id,version:row.version,status:row.status,sourceHead:row.source_head,refreshReason:row.refresh_reason,summary:row.summary??"",entries:JSON.parse(row.entries_json||"[]"),entryCount:row.entry_count,moduleCount:row.module_count,error:row.error,createdAt:row.created_at,completedAt:row.completed_at};}

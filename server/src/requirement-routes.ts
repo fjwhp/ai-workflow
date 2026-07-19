@@ -18,7 +18,6 @@ const approvalConflictCodes = new Set([
   "SOLUTION_DESIGN_APPROVAL_DECISION_INVALID",
   "SOLUTION_DESIGN_ARTIFACT_NOT_FOUND",
   "SOLUTION_DESIGN_ARTIFACT_INVALID",
-  "PROJECT_VERSION_APPLICATION_PENDING",
   "PROJECT_NOT_ACTIVE",
   "PROJECT_VERSION_NOT_ACTIVE",
   "REQUIREMENT_VERSION_REQUIRED",
@@ -42,12 +41,6 @@ export async function registerRequirementRoutes(
     }
     const current = store.getRequirement(req.params.id);
     if (!current) return reply.code(404).send({ error: "NOT_FOUND" });
-    if (store.hasPendingVersionApplication(current.id)) {
-      return reply.code(409).send({
-        error: "PROJECT_VERSION_APPLICATION_PENDING",
-        message: "版本应用处理中，不能修改需求或项目关联"
-      });
-    }
     if (deliveryUnitStages.has(current.stage)) {
       return reply.code(409).send({ error: "REQUIREMENT_APPROVAL_STAGE_UNSUPPORTED" });
     }
@@ -97,9 +90,6 @@ export async function registerRequirementRoutes(
 function sendRequirementApprovalError(reply: any, error: unknown) {
   const code = error instanceof Error ? error.message : "INTERNAL_ERROR";
   if (code === "REQUIREMENT_NOT_FOUND") return reply.code(404).send({ error: "NOT_FOUND" });
-  if (code === "PROJECT_VERSION_APPLICATION_PENDING") {
-    return reply.code(409).send({ error: code, message: "版本应用处理中，不能修改需求或项目关联" });
-  }
   if (approvalConflictCodes.has(code) || approvalConflictPrefixes.some((prefix) => code.startsWith(prefix))) {
     return reply.code(409).send({ error: code });
   }
