@@ -369,6 +369,8 @@ The stage model changes from nine stages to five and the execution owner changes
 
 Historical Phase 1 requirements remain available in the backup, not in the live application. The reset does not modify registered source repositories, source branches, project main worktrees, version worktrees, or requirement worktrees. Any pre-existing uncommitted version-worktree changes must be inventoried before reset and remain untouched.
 
+The fresh Phase 2 database and newly created requirements are authoritative after reset. The implementation may restructure legacy application modules where their responsibilities conflict with the five-stage and delivery-unit boundaries; it does not preserve obsolete internal APIs merely for source compatibility.
+
 No row migration, dual read, dual write, legacy stage fallback, or mixed workflow version is implemented.
 
 ## Testing
