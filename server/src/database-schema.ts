@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { MAX_AUTOMATION_EVIDENCE_VERSION } from "@ai-workflow/shared";
 
 export function createPhase2Schema(db: DatabaseSync) {
   db.exec(`
@@ -185,10 +186,10 @@ export function createPhase2Schema(db: DatabaseSync) {
       owner_type TEXT NOT NULL CHECK(owner_type IN ('requirement', 'delivery_unit')),
       owner_id TEXT NOT NULL CHECK(
         length(owner_id) BETWEEN 1 AND 256
-        AND owner_id = trim(owner_id, char(9) || char(10) || char(11) || char(12) || char(13) || ' ')
+        AND owner_id NOT GLOB '*[^A-Za-z0-9_-]*'
       ),
       evidence_version INTEGER NOT NULL CHECK(
-        typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND 2147483647
+        typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND ${MAX_AUTOMATION_EVIDENCE_VERSION}
       ),
       action TEXT NOT NULL CHECK(action IN ('implement', 'review', 'test', 'apply')),
       status TEXT NOT NULL CHECK(status IN ('pending', 'leased', 'completed', 'failed', 'canceled')),

@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { automationActions, type AutomationAction } from "@ai-workflow/shared";
+import {
+  automationActions,
+  MAX_AUTOMATION_EVIDENCE_VERSION,
+  type AutomationAction
+} from "@ai-workflow/shared";
 
 export type AutomationJobOwnerType = "requirement" | "delivery_unit";
 export type AutomationJobStatus = "pending" | "leased" | "completed" | "failed" | "canceled";
@@ -69,6 +73,7 @@ const MAX_ATTEMPTS = 100;
 const MAX_WORKER_ID_LENGTH = 128;
 const MAX_LEASE_MS = 86_400_000;
 const MAX_ERROR_LENGTH = 4096;
+const OWNER_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export class AutomationJobRepository {
   constructor(
@@ -174,13 +179,11 @@ export class AutomationJobRepository {
     evidenceVersion: number,
     ownerType: AutomationJobOwnerType = "delivery_unit"
   ): number {
-    validateBoundedId(ownerId, "AUTOMATION_JOB_OWNER_ID_INVALID");
+    validateOwnerId(ownerId);
     if (ownerType !== "requirement" && ownerType !== "delivery_unit") {
       throw new Error("AUTOMATION_JOB_OWNER_TYPE_INVALID");
     }
-    if (!Number.isSafeInteger(evidenceVersion) || evidenceVersion < 1) {
-      throw new Error("AUTOMATION_JOB_EVIDENCE_VERSION_INVALID");
-    }
+    validateEvidenceVersion(evidenceVersion);
     const cancelNow = validateDate(this.clock());
     const result = this.db.prepare(`UPDATE automation_jobs
       SET status = 'canceled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
@@ -224,10 +227,8 @@ function validateEnqueueInput(input: AutomationJobInput): string {
   if (input.ownerType !== "requirement" && input.ownerType !== "delivery_unit") {
     throw new Error("AUTOMATION_JOB_OWNER_TYPE_INVALID");
   }
-  validateBoundedId(input.ownerId, "AUTOMATION_JOB_OWNER_ID_INVALID");
-  if (!Number.isSafeInteger(input.evidenceVersion) || input.evidenceVersion < 1) {
-    throw new Error("AUTOMATION_JOB_EVIDENCE_VERSION_INVALID");
-  }
+  validateOwnerId(input.ownerId);
+  validateEvidenceVersion(input.evidenceVersion);
   if (!(automationActions as readonly unknown[]).includes(input.action)) {
     throw new Error("AUTOMATION_JOB_ACTION_INVALID");
   }
@@ -244,6 +245,27 @@ function validateEnqueueInput(input: AutomationJobInput): string {
 
 function validateBoundedId(value: unknown, errorCode: string) {
   validateBoundedString(value, MAX_OWNER_ID_LENGTH, errorCode);
+}
+
+function validateOwnerId(value: unknown) {
+  if (
+    typeof value !== "string"
+    || value.length < 1
+    || value.length > MAX_OWNER_ID_LENGTH
+    || !OWNER_ID_PATTERN.test(value)
+  ) {
+    throw new Error("AUTOMATION_JOB_OWNER_INVALID");
+  }
+}
+
+function validateEvidenceVersion(value: unknown) {
+  if (
+    !Number.isSafeInteger(value)
+    || (value as number) < 1
+    || (value as number) > MAX_AUTOMATION_EVIDENCE_VERSION
+  ) {
+    throw new Error("AUTOMATION_JOB_EVIDENCE_VERSION_INVALID");
+  }
 }
 
 function validateBoundedString(value: unknown, maxLength: number, errorCode: string) {
@@ -318,6 +340,17 @@ function assertJsonValue(value: unknown, ancestors: Set<object>): void {
   ancestors.delete(value);
 }
 
+function parseStoredPayload(payloadJson: string) {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(payloadJson);
+  } catch {
+    throw new Error("AUTOMATION_JOB_PAYLOAD_INVALID");
+  }
+  assertJsonValue(payload, new Set());
+  return payload;
+}
+
 function mapAutomationJob(row: AutomationJobRow): AutomationJob {
   return {
     id: row.id,
@@ -331,7 +364,7 @@ function mapAutomationJob(row: AutomationJobRow): AutomationJob {
     maxAttempts: row.max_attempts,
     leaseOwner: row.lease_owner,
     leaseExpiresAt: row.lease_expires_at,
-    payload: JSON.parse(row.payload_json),
+    payload: parseStoredPayload(row.payload_json),
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at

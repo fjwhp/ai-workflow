@@ -1,10 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { automationActions, validateDeliveryGraph, type AutomationAction } from "./delivery-unit.js";
+import {
+  automationActions,
+  MAX_AUTOMATION_EVIDENCE_VERSION,
+  validateDeliveryGraph,
+  type AutomationAction
+} from "./delivery-unit.js";
 
 describe("automation action contract", () => {
   it("exposes only the planned delivery execution actions", () => {
     const actions: readonly AutomationAction[] = automationActions;
     expect(actions).toEqual(["implement", "review", "test", "apply"]);
+    expect(MAX_AUTOMATION_EVIDENCE_VERSION).toBe(2_147_483_647);
   });
 });
 

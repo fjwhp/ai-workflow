@@ -16,13 +16,13 @@ npm run dev
 
 浏览器打开 `http://127.0.0.1:5173`。API 默认监听 `http://127.0.0.1:3210`。密钥只从环境变量读取，不写入 SQLite 或前端。
 
-## 首次启动 v3
+## 首次启动 phase-2-automation-v2
 
 当前 schema marker 是 `phase-2-automation-v2`。升级前停止所有服务，并确认没有正在运行的任务。首次以本版本打开 `phase-2-automation-v1` 或其他旧 live 数据目录时：
 
 1. 服务复制旧 SQLite 主文件以及当时存在的 WAL/SHM，形成同一时间戳的备份集。
 2. 只有备份集全部写入成功后，服务才移走旧 live 文件。
-3. 服务创建空的 v3 数据库和新的 marker；项目、版本、需求和编号从新库重新开始。
+3. 服务创建空的 `phase-2-automation-v2` 数据库和新的 marker；项目、版本、需求和编号从新库重新开始。
 
 这是 backup + fresh reset，不是迁移。Phase 1 history 只在 backup；不执行 row migration、dual read/write 或 fallback，也不提供旧库与新库并行读写入口。用户已授权旧数据以新跑为准。
 
@@ -33,7 +33,7 @@ npm run dev
 - marker：`workflow.db.schema-version`
 - backup：`workflow.db.backup-<timestamp>` 及对应的 `-wal`、`-shm`
 
-不要把旧备份交给当前服务打开。需要查历史时，使用兼容旧 schema 的代码在隔离目录只读导出；不要把导出结果写回 v3 live DB。
+不要把旧备份交给当前服务打开。需要查历史时，使用兼容旧 schema 的代码在隔离目录只读导出；不要把导出结果写回 `phase-2-automation-v2` live DB。
 
 ## 建立新工作流
 

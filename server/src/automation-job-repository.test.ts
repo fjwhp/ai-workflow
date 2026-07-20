@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it } from "vitest";
+import { MAX_AUTOMATION_EVIDENCE_VERSION } from "@ai-workflow/shared";
 import { AutomationJobRepository, type AutomationJobInput } from "./automation-job-repository.js";
 import { WorkflowStore } from "./store.js";
 
@@ -62,6 +63,15 @@ function insertCollidingDeliveryOwner(fixture: ReturnType<typeof createFixture>)
       fixture.version.id, timestamp, timestamp
     );
   return fixture.requirement.id;
+}
+
+function insertRequirementOwner(fixture: ReturnType<typeof createFixture>, ownerId: string) {
+  const timestamp = now.toISOString();
+  fixture.secondDatabase.prepare(`INSERT INTO requirements
+    (id, code, title, business_problem, expected_outcome, priority, stage, status, created_at, updated_at)
+    VALUES (?, ?, 'Queue owner', 'Queue owner must be valid', 'Queue owner is persisted', 'medium',
+      'implementation', 'ai_ready', ?, ?)`)
+    .run(ownerId, `REQ-OWNER-${ownerId}`, timestamp, timestamp);
 }
 
 function job(ownerId: string, overrides: Partial<AutomationJobInput> = {}): AutomationJobInput {
@@ -196,6 +206,28 @@ describe("AutomationJobRepository", () => {
     expect(fixture.first.listPending()).toHaveLength(3);
   });
 
+  it("accepts the evidence version maximum and rejects overflow consistently", () => {
+    const fixture = createFixture();
+    const maximum = fixture.first.enqueue(job(fixture.requirement.id, {
+      evidenceVersion: MAX_AUTOMATION_EVIDENCE_VERSION
+    }));
+
+    expect(maximum.evidenceVersion).toBe(MAX_AUTOMATION_EVIDENCE_VERSION);
+    expect(fixture.first.cancelByOwnerVersion(
+      fixture.requirement.id,
+      MAX_AUTOMATION_EVIDENCE_VERSION,
+      "requirement"
+    )).toBe(1);
+    expect(() => fixture.first.enqueue(job(fixture.requirement.id, {
+      evidenceVersion: MAX_AUTOMATION_EVIDENCE_VERSION + 1
+    }))).toThrow("AUTOMATION_JOB_EVIDENCE_VERSION_INVALID");
+    expect(() => fixture.first.cancelByOwnerVersion(
+      fixture.requirement.id,
+      MAX_AUTOMATION_EVIDENCE_VERSION + 1,
+      "requirement"
+    )).toThrow("AUTOMATION_JOB_EVIDENCE_VERSION_INVALID");
+  });
+
   it("scopes canonical dedupe keys by polymorphic owner and reads them directly", () => {
     const fixture = createFixture();
     const ownerId = insertCollidingDeliveryOwner(fixture);
@@ -209,6 +241,20 @@ describe("AutomationJobRepository", () => {
     expect(fixture.first.byDedupe(requirementJob.dedupeKey)).toEqual(requirementJob);
     expect(fixture.second.byDedupe(deliveryJob.dedupeKey)).toEqual(deliveryJob);
     expect(fixture.store.automationJobs.byDedupe(deliveryJob.dedupeKey)).toEqual(deliveryJob);
+  });
+
+  it("rejects separator-bearing owners before they can collide with canonical prefixes", () => {
+    const fixture = createFixture();
+    insertRequirementOwner(fixture, "abc");
+
+    const requirementJob = fixture.first.enqueue(job("abc"));
+
+    expect(requirementJob.dedupeKey).toBe("implement:requirement:abc:v1");
+    expect(() => fixture.first.enqueue(job("requirement:abc", { ownerType: "delivery_unit" })))
+      .toThrow("AUTOMATION_JOB_OWNER_INVALID");
+    expect(() => fixture.first.enqueue(job("unit%3Aabc", { ownerType: "delivery_unit" })))
+      .toThrow("AUTOMATION_JOB_OWNER_INVALID");
+    expect(fixture.first.listPending()).toEqual([requirementJob]);
   });
 
   it("defaults cancellation to delivery units and can explicitly cancel requirements", () => {
@@ -274,6 +320,18 @@ describe("AutomationJobRepository", () => {
     expect(() => fixture.first.enqueue(job(fixture.requirement.id, invalid as Partial<AutomationJobInput>)))
       .toThrow(/AUTOMATION_JOB_/);
     expect(fixture.first.listPending()).toEqual([]);
+  });
+
+  it.each([
+    ["root", "1e999"],
+    ["nested", "{\"nested\":[1e999]}"],
+  ])("rejects stored %s non-finite JSON numbers", (_label, payloadJson) => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    fixture.secondDatabase.prepare("UPDATE automation_jobs SET payload_json = ? WHERE id = ?")
+      .run(payloadJson, queued.id);
+
+    expect(() => fixture.first.get(queued.id)).toThrow("AUTOMATION_JOB_PAYLOAD_INVALID");
   });
 
   it("leases pending jobs in stable created-at and id order", () => {
@@ -487,7 +545,8 @@ describe("AutomationJobRepository", () => {
     expect(() => fixture.first.fail(queued.id, "worker-a", "", true)).toThrow("AUTOMATION_JOB_ERROR_INVALID");
     expect(() => fixture.first.fail(queued.id, "worker-a", "error", "yes" as unknown as boolean))
       .toThrow("AUTOMATION_JOB_RETRYABLE_INVALID");
-    expect(() => fixture.first.cancelByOwnerVersion("", 1)).toThrow("AUTOMATION_JOB_OWNER_ID_INVALID");
+    expect(() => fixture.first.cancelByOwnerVersion("", 1)).toThrow("AUTOMATION_JOB_OWNER_INVALID");
+    expect(() => fixture.first.cancelByOwnerVersion("unsafe:owner", 1)).toThrow("AUTOMATION_JOB_OWNER_INVALID");
     expect(() => fixture.first.cancelByOwnerVersion(fixture.requirement.id, 0))
       .toThrow("AUTOMATION_JOB_EVIDENCE_VERSION_INVALID");
     expect(() => fixture.first.recoverExpired(new Date(Number.NaN))).toThrow("AUTOMATION_JOB_DATE_INVALID");

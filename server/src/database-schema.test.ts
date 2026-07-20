@@ -184,6 +184,7 @@ describe("Phase 2 database schema", () => {
       expect(tableSql(db, "delivery_units")).toContain(`'${status}'`);
     }
     expect(tableSql(db, "automation_jobs")).toMatch(/owner_type TEXT NOT NULL CHECK\s*\(owner_type IN \('requirement', 'delivery_unit'\)\)/i);
+    expect(tableSql(db, "automation_jobs")).toContain("owner_id NOT GLOB '*[^A-Za-z0-9_-]*'");
     expect(tableSql(db, "automation_jobs")).toMatch(/action TEXT NOT NULL CHECK\s*\(action IN \('implement', 'review', 'test', 'apply'\)\)/i);
     expect(tableSql(db, "automation_jobs")).toMatch(/status TEXT NOT NULL CHECK\s*\(status IN \('pending', 'leased', 'completed', 'failed', 'canceled'\)\)/i);
     expect(columns(db, "automation_jobs")).toEqual(expect.arrayContaining(["evidence_version", "max_attempts"]));
@@ -288,6 +289,8 @@ describe("Phase 2 database schema", () => {
     expect(() => insertAutomationJob(db, { id: "job-negative", attempt: -1 })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-invalid-action", action: "invented" })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-invalid-evidence", evidenceVersion: 0 })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "job-overflow-evidence", evidenceVersion: 2_147_483_648 }))
+      .toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-invalid-max", maxAttempts: 0 })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-attempt-cap", attempt: 4, maxAttempts: 3 })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-leased-empty", status: "leased" })).toThrow(/CHECK constraint failed/);
@@ -340,6 +343,12 @@ describe("Phase 2 database schema", () => {
       id: "job-lease-before-update", status: "leased", leaseOwner: "worker",
       leaseExpiresAt: "2026-07-20T00:00:00.000Z"
     });
+    insertRequirement(db, "unsafe:owner");
+    expect(() => insertAutomationJob(db, { id: "job-colon-owner", ownerId: "unsafe:owner" }))
+      .toThrow(/CHECK constraint failed/);
+    insertRequirement(db, "unsafe%owner");
+    expect(() => insertAutomationJob(db, { id: "job-percent-owner", ownerId: "unsafe%owner" }))
+      .toThrow(/CHECK constraint failed/);
     db.close();
   });
 
