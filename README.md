@@ -6,8 +6,8 @@ Flowgate 是本地优先的 AI 研发工作台。当前 foundation 使用五个�
 |---|---|
 | `definition` | 澄清业务目标、范围、约束和可验证验收标准 |
 | `solution_design` | 定义跨项目方案、交付单元、依赖、接口和风险 |
-| `implementation` | 按交付单元实现代码并保存实现证据 |
-| `quality_verification` | 对实现做独立 Review，并由另一条独立活动执行自动化测试 |
+| `implementation` | 按交付单元实现代码并保存 diff/文件证据，不执行项目命令 |
+| `quality_verification` | 对实现做独立 Review，并由另一条独立活动执行冻结的自动化测试命令 |
 | `acceptance_delivery` | 汇总交付成果，供总体业务验收与后续本地应用使用 |
 
 阶段不得互相代办。尤其是 Review 与自动化测试必须独立记录、独立判定；测试通过不能替代 Review，Review 通过也不能替代测试。安全、确定、可审计的节点可以自动推进，但总体业务验收始终由人工负责。

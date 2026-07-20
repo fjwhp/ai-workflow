@@ -175,7 +175,7 @@ Expected: FAIL because execution is still requirement-owned.
 
 - [ ] **Step 3: Implement unit-owned implementation**
 
-Add `deliveryUnitId` and `evidenceVersion` to execution/run/evidence writes. `implement(unitId)` must atomically claim `ready -> running`, create the run, then invoke the existing Codex coding agent with the snapshot. On success it writes diff/file/command evidence and changes the unit to `awaiting_gate`; on failure it changes only that unit to `failed` or `returned`.
+Add `deliveryUnitId` and `evidenceVersion` to execution/run/evidence writes. `implement(unitId)` must atomically claim `ready -> running`, create the run, then invoke the existing Codex coding agent with the snapshot. The implementation agent may search, read, write, and inspect the diff, but must not execute project commands. On success it writes diff/file evidence with `commands: []` and changes the unit to `awaiting_gate`; on failure it changes only that unit to `failed` or `returned`. Frozen `allowedCommands` remain in the delivery snapshot for Task 4's independent automated-testing handler.
 
 Do not read live `requirement_projects` after the unit claim.
 
@@ -222,7 +222,7 @@ Expected: FAIL because delivery review/test handlers and evidence kinds do not e
 
 - [ ] **Step 3: Implement separate handlers and prompts**
 
-Review receives diff, complete changed files, frozen definition/design, and implementation command evidence. Testing receives the same frozen inputs plus project verification commands and acceptance-criterion trace. Persist separate `code_review` and `automated_testing` artifacts; never overwrite either with the other.
+Review receives diff, complete changed files, and frozen definition/design context. Testing receives the same frozen inputs plus the snapshot's project verification commands and acceptance-criterion trace, and owns command execution. Persist separate `code_review` and `automated_testing` artifacts; never overwrite either with the other.
 
 When implementation evidence becomes valid, enqueue both jobs with different dedupe keys:
 

@@ -69,7 +69,7 @@ function codingResult() {
     reused: false,
     summary: "implemented",
     diff: "diff --git a/src/orders/index.ts b/src/orders/index.ts\n+export const ready = true;",
-    commands: [{ command: "npm", args: ["test"], exitCode: 0 }],
+    commands: [{ command: "legacy-runner", args: ["test"], code: 0 }],
     files: ["src/orders/index.ts"],
     additions: 1,
     deletions: 0,
@@ -105,7 +105,8 @@ describe("DeliveryExecutionService", () => {
         deliveryUnitId: fixture.unit.id,
         evidenceVersion: 1,
         moduleIds: ["src/orders"],
-        acceptanceCriteria: ["Order contract tests pass"]
+        acceptanceCriteria: ["Order contract tests pass"],
+        allowedCommands: [{ command: "npm", argsPrefix: ["test"] }]
       })
     }));
     await expect(service.implement(fixture.unit.id)).rejects.toThrow("DELIVERY_UNIT_RUN_ACTIVE");
@@ -133,7 +134,7 @@ describe("DeliveryExecutionService", () => {
         deliveryUnitId: fixture.unit.id,
         evidenceVersion: 1,
         status: "completed",
-        commands: codingResult().commands
+        commands: []
       })
     ]);
     expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toMatchObject({

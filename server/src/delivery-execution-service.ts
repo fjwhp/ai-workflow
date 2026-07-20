@@ -44,7 +44,7 @@ export class DeliveryExecutionService {
       branch: result.branch,
       worktreePath: result.worktreePath,
       baseCommit: result.baseCommit,
-      commands: result.commands,
+      commands: [],
       diff: evidence.diff,
       diffHash: evidence.diffHash,
       originalChars: evidence.originalChars,

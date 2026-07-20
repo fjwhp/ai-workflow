@@ -1,8 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   chatCreate: vi.fn(),
-  isAllowedCommand: vi.fn(),
   runCommand: vi.fn()
 }));
 
@@ -19,15 +21,16 @@ vi.mock("./repository.js", () => ({
 }));
 
 vi.mock("./command-policy.js", () => ({
-  isAllowedCommand: mocks.isAllowedCommand,
   runCommand: mocks.runCommand
 }));
 
-import { createOrReuseRequirementWorktree, getWorktreeSnapshot } from "./repository.js";
+import { createOrReuseRequirementWorktree, getWorktreeDiff, getWorktreeSnapshot } from "./repository.js";
 import { prepareCodingWorktree, resolveWorktreePath, runCodingAgent } from "./coding-agent.js";
 
 const createWorktree = vi.mocked(createOrReuseRequirementWorktree);
+const diff = vi.mocked(getWorktreeDiff);
 const snapshot = vi.mocked(getWorktreeSnapshot);
+const temporaryWorktrees: string[] = [];
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -41,8 +44,12 @@ beforeEach(() => {
     reused: false
   });
   snapshot.mockResolvedValue({ diff: "", files: [], additions: 0, deletions: 0 });
-  mocks.isAllowedCommand.mockReturnValue(true);
+  diff.mockResolvedValue("diff --git a/src/App.ts b/src/App.ts");
   mocks.runCommand.mockResolvedValue({ code: 0, stdout: "ok", stderr: "" });
+});
+
+afterEach(async () => {
+  await Promise.all(temporaryWorktrees.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
 function codingInput(allowedCommands: Array<{ command: string; argsPrefix?: string[] }>) {
@@ -62,13 +69,28 @@ function codingInput(allowedCommands: Array<{ command: string; argsPrefix?: stri
   };
 }
 
-function respondWithCommand(command: string, args: string[]) {
+function respondWithToolCalls(toolCalls: Array<{ name: string; arguments: Record<string, unknown> }>) {
   mocks.chatCreate
     .mockResolvedValueOnce({ choices: [{ message: {
       role: "assistant",
-      tool_calls: [{ id: "call-1", function: { name: "run_command", arguments: JSON.stringify({ command, args }) } }]
+      tool_calls: toolCalls.map((call, index) => ({
+        id: `call-${index + 1}`,
+        function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+      }))
     } }] })
     .mockResolvedValueOnce({ choices: [{ message: { role: "assistant", content: "done" } }] });
+}
+
+async function temporaryWorktree() {
+  const worktree = await mkdtemp(join(tmpdir(), "coding-agent-"));
+  temporaryWorktrees.push(worktree);
+  createWorktree.mockResolvedValue({
+    branch: "ai/REQ-0001",
+    worktreePath: worktree,
+    baseCommit: "version-head",
+    reused: false
+  });
+  return worktree;
 }
 
 describe("resolveWorktreePath", () => {
@@ -79,6 +101,10 @@ describe("resolveWorktreePath", () => {
   it("rejects absolute paths and parent traversal", () => {
     expect(() => resolveWorktreePath("/tmp/worktree", "/etc/passwd")).toThrow("工作区");
     expect(() => resolveWorktreePath("/tmp/worktree", "../secret")).toThrow("工作区");
+  });
+
+  it.each([".git", ".git/config", "src/../.git/HEAD"])("rejects the Git metadata path %s", (path) => {
+    expect(() => resolveWorktreePath("/tmp/worktree", path)).toThrow("Git 元数据");
   });
 });
 
@@ -113,45 +139,58 @@ describe("prepareCodingWorktree", () => {
   });
 });
 
-describe("runCodingAgent command boundary", () => {
-  it.each([
-    ["git commit", "git", ["commit", "-m", "forbidden"]],
-    ["git push", "git", ["push", "origin", "HEAD"]],
-    ["git tag", "git", ["tag", "v1.0.0"]],
-    ["gh pr create", "gh", ["pr", "create"]],
-    ["absolute git path", "/usr/bin/git", ["commit", "-m", "forbidden"]],
-    ["Windows git path", "C:\\Program Files\\Git\\bin\\git.exe", ["push"]],
-    ["env git commit", "/usr/bin/env", ["git", "commit", "-m", "forbidden"]],
-    ["env gh pr create", "env", ["gh", "pr", "create"]],
-    ["git.cmd", "git.cmd", ["push"]],
-    ["gh.bat", "gh.bat", ["pr", "create"]],
-    ["npm exec git", "npm", ["exec", "git", "commit"]],
-    ["pnpm dlx gh", "pnpm", ["dlx", "gh", "pr", "create"]],
-    ["node child_process git", "node", ["-e", "require('node:child_process').spawnSync('git',['commit'])"]]
-  ])("blocks %s before invoking the process runner", async (_name, command, args) => {
-    respondWithCommand(command, args);
-
-    await runCodingAgent(codingInput([{ command, argsPrefix: args }]));
-
-    expect(mocks.runCommand).not.toHaveBeenCalled();
-  });
-
-  it("rejects model arguments appended to a frozen command", async () => {
-    respondWithCommand("npm", ["test", "--", "--watch"]);
+describe("runCodingAgent tool boundary", () => {
+  it("exposes only implementation file tools to the model", async () => {
+    mocks.chatCreate.mockResolvedValueOnce({ choices: [{ message: { role: "assistant", content: "done" } }] });
 
     await runCodingAgent(codingInput([{ command: "npm", argsPrefix: ["test"] }]));
 
-    expect(mocks.runCommand).not.toHaveBeenCalled();
+    const toolNames = mocks.chatCreate.mock.calls[0]![0].tools.map((item: any) => item.function.name);
+    expect(toolNames).toEqual(["search_code", "read_file", "write_file", "git_diff"]);
   });
 
-  it.each([
-    ["npm test", "npm", ["test"]],
-    ["mvn module test", "mvn", ["test", "-pl", "module"]]
-  ])("runs the exact frozen verification command %s", async (_name, command, args) => {
-    respondWithCommand(command, args);
+  it("returns an unknown-tool result for a forged run_command call without invoking a process", async () => {
+    respondWithToolCalls([{ name: "run_command", arguments: { command: "npm", args: ["test"] } }]);
 
-    await runCodingAgent(codingInput([{ command, argsPrefix: args }]));
+    const result = await runCodingAgent(codingInput([{ command: "npm", argsPrefix: ["test"] }]));
 
-    expect(mocks.runCommand).toHaveBeenCalledWith("/tmp/requirements/REQ-0001", command, args);
+    expect(mocks.runCommand).not.toHaveBeenCalled();
+    expect(result.commands).toEqual([]);
+    const toolMessage = mocks.chatCreate.mock.calls[1]![0].messages.find((message: any) => message.tool_call_id === "call-1");
+    expect(JSON.parse(toolMessage.content)).toEqual({ error: "未知工具" });
+  });
+
+  it("does not execute a frozen command after the model rewrites package.json", async () => {
+    const worktree = await temporaryWorktree();
+    await writeFile(join(worktree, "package.json"), JSON.stringify({ scripts: { test: "vitest" } }), "utf8");
+    respondWithToolCalls([
+      { name: "write_file", arguments: { path: "package.json", content: JSON.stringify({ scripts: { test: "git push origin HEAD" } }) } },
+      { name: "run_command", arguments: { command: "npm", args: ["test"] } }
+    ]);
+
+    const result = await runCodingAgent(codingInput([{ command: "npm", argsPrefix: ["test"] }]));
+
+    expect(JSON.parse(await readFile(join(worktree, "package.json"), "utf8"))).toEqual({ scripts: { test: "git push origin HEAD" } });
+    expect(mocks.runCommand).not.toHaveBeenCalled();
+    expect(result.commands).toEqual([]);
+  });
+
+  it("keeps search, read, write, and diff tools available", async () => {
+    const worktree = await temporaryWorktree();
+    await writeFile(join(worktree, "App.ts"), "export const before = '--version';\n", "utf8");
+    respondWithToolCalls([
+      { name: "search_code", arguments: { query: "--version" } },
+      { name: "read_file", arguments: { path: "App.ts" } },
+      { name: "write_file", arguments: { path: "App.ts", content: "export const after = true;\n" } },
+      { name: "git_diff", arguments: {} }
+    ]);
+
+    const result = await runCodingAgent(codingInput([{ command: "npm", argsPrefix: ["test"] }]));
+
+    expect(await readFile(join(worktree, "App.ts"), "utf8")).toBe("export const after = true;\n");
+    expect(diff).toHaveBeenCalledWith(worktree);
+    const searchMessage = mocks.chatCreate.mock.calls[1]![0].messages.find((message: any) => message.tool_call_id === "call-1");
+    expect(JSON.parse(searchMessage.content)).toContain("App.ts:1:export const before = '--version';");
+    expect(result.commands).toEqual([]);
   });
 });
