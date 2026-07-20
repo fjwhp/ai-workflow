@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import type { EvidenceChangedFile, EvidenceManifest } from "./evidence-tree.js";
 
 export type DeliveryQualityKind = "code_review" | "automated_testing";
 export type DeliveryQualityResult = "passed" | "failed";
@@ -14,7 +15,9 @@ export interface DeliveryQualityInput {
   };
   codingEvidence: {
     id: string; deliveryUnitId: string; requirementId: string; evidenceVersion: number;
-    diffHash: string; worktreePath: string; branch: string;
+    diffHash: string; diff: string; changedFiles: EvidenceChangedFile[]; worktreePath: string; branch: string;
+    sourceRepoPath: string; gitCommonDir: string; sourceHead: string;
+    manifestHash: string; manifest: EvidenceManifest;
   };
 }
 
@@ -41,6 +44,7 @@ export interface DeliveryQualityEvidence {
 export interface DeliveryQualityPersistence {
   claim(unitId: string, evidenceVersion: number | undefined, kind: DeliveryQualityKind, claimToken?: string): DeliveryQualityClaim;
   complete(claim: DeliveryQualityClaim, completion: DeliveryQualityCompletion): DeliveryQualityEvidence;
+  abort(claim: DeliveryQualityClaim, error: string): void;
   latest(unitId: string, kind: DeliveryQualityKind): DeliveryQualityEvidence | null;
 }
 
@@ -120,6 +124,16 @@ export class DeliveryQualityRepository {
     return this.getEvidence(evidenceId)!;
   }
 
+  abortInTransaction(claim: DeliveryQualityClaim, error: string) {
+    validateKind(claim.kind);
+    if (!/^[A-Z][A-Z0-9_]*$/.test(error)) throw new Error("DELIVERY_QUALITY_ABORT_INVALID");
+    const now = new Date().toISOString();
+    const settled = this.db.prepare(`UPDATE delivery_quality_runs SET status = 'failed', error = ?, completed_at = ?
+      WHERE id = ? AND delivery_unit_id = ? AND evidence_version = ? AND kind = ? AND status = 'running'`)
+      .run(error, now, claim.id, claim.deliveryUnitId, claim.evidenceVersion, claim.kind);
+    if (settled.changes !== 1) throw new Error("DELIVERY_QUALITY_RUN_STALE");
+  }
+
   latest(unitId: string, kind: DeliveryQualityKind): DeliveryQualityEvidence | null {
     validateKind(kind);
     const row = this.db.prepare(`SELECT * FROM delivery_quality_evidence
@@ -143,7 +157,9 @@ export class DeliveryQualityRepository {
         dus.head_commit, dus.module_ids_json, dus.acceptance_criteria_json,
         dus.sensitive_patterns_json, dus.allowed_commands_json,
         ce.id AS coding_evidence_id, ce.evidence_version AS coding_evidence_version,
-        ce.diff_hash, ce.worktree_path AS coding_worktree_path, ce.branch AS coding_branch, sr.input_json
+        ce.diff_hash, ce.diff_text, ce.changed_files_json, ce.worktree_path AS coding_worktree_path,
+        ce.branch AS coding_branch, ce.source_repo_path, ce.git_common_dir, ce.source_head,
+        ce.manifest_hash, ce.manifest_json, sr.input_json
       FROM delivery_units du
       JOIN delivery_unit_snapshots dus ON dus.delivery_unit_id = du.id
       JOIN coding_evidence ce ON ce.delivery_unit_id = du.id AND ce.evidence_version = ?
@@ -167,7 +183,11 @@ export class DeliveryQualityRepository {
       codingEvidence: {
         id: row.coding_evidence_id, deliveryUnitId: unitId, requirementId: row.requirement_id,
         evidenceVersion: row.coding_evidence_version, diffHash: row.diff_hash,
-        worktreePath: row.coding_worktree_path, branch: row.coding_branch
+        diff: row.diff_text, changedFiles: parseJsonArray(row.changed_files_json) as EvidenceChangedFile[],
+        worktreePath: row.coding_worktree_path, branch: row.coding_branch,
+        sourceRepoPath: row.source_repo_path, gitCommonDir: row.git_common_dir,
+        sourceHead: row.source_head, manifestHash: row.manifest_hash,
+        manifest: parseManifest(row.manifest_json)
       }
     };
   }
@@ -193,6 +213,15 @@ function parseCommands(json: string): Array<{ command: string; argsPrefix?: stri
         && item.argsPrefix.every((arg: unknown) => typeof arg === "string"))))) return value;
   } catch {}
   throw new Error("DELIVERY_QUALITY_INPUT_INVALID");
+}
+function parseJsonArray(json: string): unknown[] {
+  try { const value = JSON.parse(json); if (Array.isArray(value)) return value; } catch {}
+  throw new Error("DELIVERY_QUALITY_INPUT_INVALID");
+}
+function parseManifest(json: string): EvidenceManifest {
+  const value = parseObject(json);
+  if (value.version !== 1 || !Array.isArray(value.entries)) throw new Error("DELIVERY_QUALITY_INPUT_INVALID");
+  return value as unknown as EvidenceManifest;
 }
 function stringifyJson(value: unknown) {
   const json = JSON.stringify(value); if (json === undefined) throw new Error("DELIVERY_QUALITY_CONTENT_INVALID"); return json;

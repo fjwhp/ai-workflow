@@ -60,17 +60,17 @@ describe("prepareCodexCodingWorktree", () => {
     const repoPath=await setupRepository();
 
     const first=await prepareCodexCodingWorktree(
-      { id: "project-1", repoPath, defaultBranch: "main" },
+      { id: "project-1", repoPath, defaultBranch: "main", sensitivePatterns: [] },
       { id: "version-1", projectId: "project-1", branch: "release/2.2.1", worktreePath: "/tmp/version", status: "active" },
       "REQ-0001"
     );
-    await expect(prepareCodexCodingWorktree({ id:"project-1",repoPath,defaultBranch:"main" },{ id:"version-1",projectId:"project-1",branch:"release/2.2.1",worktreePath:"/tmp/version",status:"active" },"REQ-0001")).resolves.toEqual({...first,reused:true});
+    await expect(prepareCodexCodingWorktree({ id:"project-1",repoPath,defaultBranch:"main",sensitivePatterns:[] },{ id:"version-1",projectId:"project-1",branch:"release/2.2.1",worktreePath:"/tmp/version",status:"active" },"REQ-0001")).resolves.toEqual({...first,reused:true});
   });
 
   it("rejects a closed version before touching Git", async () => {
     const repoPath=await setupRepository();const before=await gitState(repoPath);
     await expect(prepareCodexCodingWorktree(
-      { id: "project-1", repoPath, defaultBranch: "main" },
+      { id: "project-1", repoPath, defaultBranch: "main", sensitivePatterns: [] },
       { id: "version-1", projectId: "project-1", branch: "release/2.2.1", worktreePath: "/tmp/version", status: "closed" },
       "REQ-0001"
     )).rejects.toThrow("PROJECT_VERSION_NOT_ACTIVE");
@@ -79,14 +79,14 @@ describe("prepareCodexCodingWorktree", () => {
 
   it("rejects a version owned by another project before touching Git", async () => {
     const repoPath=await setupRepository();const before=await gitState(repoPath);
-    await expect(prepareCodexCodingWorktree({id:"project-1",repoPath,defaultBranch:"main"},{id:"version-1",projectId:"project-2",branch:"release/2.2.1",worktreePath:"/tmp/version",status:"active"},"REQ-0001")).rejects.toThrow("REQUIREMENT_VERSION_PROJECT_MISMATCH");
+    await expect(prepareCodexCodingWorktree({id:"project-1",repoPath,defaultBranch:"main",sensitivePatterns:[]},{id:"version-1",projectId:"project-2",branch:"release/2.2.1",worktreePath:"/tmp/version",status:"active"},"REQ-0001")).rejects.toThrow("REQUIREMENT_VERSION_PROJECT_MISMATCH");
     expect(await gitState(repoPath)).toEqual(before);
   });
 
   it("rejects missing relay configuration without changing Git refs or worktrees", async () => {
     const repoPath=await setupRepository(),before=await gitState(repoPath);const apiKey=process.env.OPENAI_API_KEY,baseUrl=process.env.OPENAI_BASE_URL;delete process.env.OPENAI_API_KEY;delete process.env.OPENAI_BASE_URL;
     try{
-      await expect(runCodexCoding({requirement:{code:"REQ-0001"},artifacts:[],project:{id:"project-1",repoPath,defaultBranch:"main"},version:{id:"version-1",projectId:"project-1",branch:"release/2.2.1",worktreePath:"/tmp/version",status:"active"},projectContext:{} as any})).rejects.toThrow("Codex 中转执行需要");
+      await expect(runCodexCoding({requirement:{code:"REQ-0001"},artifacts:[],project:{id:"project-1",repoPath,defaultBranch:"main",sensitivePatterns:[]},version:{id:"version-1",projectId:"project-1",branch:"release/2.2.1",worktreePath:"/tmp/version",status:"active"},projectContext:{} as any})).rejects.toThrow("Codex 中转执行需要");
       expect(await gitState(repoPath)).toEqual(before);
     }finally{if(apiKey===undefined)delete process.env.OPENAI_API_KEY;else process.env.OPENAI_API_KEY=apiKey;if(baseUrl===undefined)delete process.env.OPENAI_BASE_URL;else process.env.OPENAI_BASE_URL=baseUrl;}
   });

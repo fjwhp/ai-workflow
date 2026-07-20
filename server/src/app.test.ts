@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const agent = vi.hoisted(() => ({ run: vi.fn() }));
+const repository = vi.hoisted(() => ({ getWorktreeSnapshot: vi.fn() }));
 vi.mock("./ai.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./ai.js")>();
   return { ...actual, runAgent: agent.run };
 });
 vi.mock("./codex-runner.js", () => ({ runCodexCoding: vi.fn() }));
+vi.mock("./repository.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./repository.js")>();
+  return { ...actual, getWorktreeSnapshot: repository.getWorktreeSnapshot };
+});
 
 import { buildApp } from "./app.js";
 import { runCodexCoding } from "./codex-runner.js";
@@ -19,11 +24,11 @@ import { publishRequirementKnowledge } from "./project-memory-service.js";
 import { buildAgentPrompt, runAgent } from "./ai.js";
 
 const execFileAsync=promisify(execFile);const tempDirs:string[]=[];
-const codingResult={runId:crypto.randomUUID(),branch:"ai/REQ-0001",worktreePath:"/tmp/requirements/REQ-0001",baseCommit:"version-head",reused:false,diff:"diff --git a/a.ts b/a.ts\n+change",files:["a.ts"],changedFiles:[{path:"a.ts",status:"modified" as const,kind:"text" as const,content:"change"}],additions:1,deletions:0,codexThreadId:"thread-1",events:[],diagnostics:[],summary:"implemented"};
+const codingResult={runId:crypto.randomUUID(),branch:"ai/REQ-0001",worktreePath:"/tmp/requirements/REQ-0001",baseCommit:"version-head",reused:false,diff:"diff --git a/a.ts b/a.ts\n+change",files:["a.ts"],changedFiles:[{path:"a.ts",status:"modified" as const,kind:"text" as const,content:"change"}],additions:1,deletions:0,codexThreadId:"thread-1",events:[],diagnostics:[],summary:"implemented",evidenceSnapshot:{diff:"diff --git a/a.ts b/a.ts\n+change",files:["a.ts"],changedFiles:[{path:"a.ts",status:"modified" as const,kind:"text" as const,content:"change"}],additions:1,deletions:0,identity:{repositoryPath:"/tmp/repo",gitCommonDir:"/tmp/repo/.git",worktreePath:"/tmp/requirements/REQ-0001",branch:"ai/REQ-0001",headCommit:"version-head"},manifest:{version:1 as const,entries:[]},manifestHash:"manifest-hash",evidenceHash:"evidence-hash"}};
 const genericResult={conclusion:"pass",confidence:0.99,summary:"ready",facts:[],assumptions:[],openQuestions:[],risks:[],findings:[]};
 const definitionResult={...genericResult,underlyingGoal:"ship",targetUsers:["buyer"],productDecisions:[],assumptions:[],scope:{mvp:["checkout"],nonGoals:[]},flows:{primary:["order"],exceptions:[]},acceptanceCriteria:["order succeeds"],evidence:[],blockingQuestions:[]};
 const solutionResult=(projectIds:string[])=>({...genericResult,deliveryPlan:{units:projectIds.map(projectId=>({projectId,moduleIds:[],acceptanceCriteria:[`${projectId} acceptance`]})),dependencies:projectIds.length>1?[{upstreamProjectId:projectIds[0]!,downstreamProjectId:projectIds[1]!,releaseCondition:"automated_testing_passed" as const}]:[]},contracts:[]});
-beforeEach(()=>{vi.mocked(runCodexCoding).mockReset().mockResolvedValue(codingResult);agent.run.mockReset().mockResolvedValue(definitionResult);});
+beforeEach(()=>{vi.mocked(runCodexCoding).mockReset().mockResolvedValue(codingResult);agent.run.mockReset().mockResolvedValue(definitionResult);repository.getWorktreeSnapshot.mockReset();});
 
 const stores: WorkflowStore[] = [];
 const initialProjectContextBudget = process.env.AI_PROJECT_CONTEXT_MAX_CHARS;
@@ -324,6 +329,47 @@ describe("project and requirement association APIs",()=>{
 
     expect(response.statusCode).toBe(200);expect(response.json()).toMatchObject({stage:"implementation",deliveryUnits:[],deliveryDependencies:[],automationPending:true});
     expect(runAgent).not.toHaveBeenCalled();expect(runCodexCoding).not.toHaveBeenCalled();expect(store.listStageRuns(req.id)).toEqual([]);expect(store.listExecutions(req.id)).toEqual([]);
+    await app.close();
+  });
+
+  it("reports coding evidence validity from the complete evidence fingerprint", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject(projectPayload("/tmp/evidence-status-project", { sensitivePatterns: [".env*"] }));
+    const version = ensureProjectVersion(store, project.id);
+    const req = createRequirement(store, {
+      title: "证据状态", businessProblem: "完整证据哈希需要正确展示", expectedOutcome: "有效证据不被误报", priority: "medium",
+      primaryProjectId: project.id, primaryProjectVersionId: version.id
+    });
+    const unit = store.deliveryUnits.createPlan({
+      requirementId: req.id,
+      snapshot: store.createRequirementProjectSnapshot(req.id),
+      plan: { units: [{ projectId: project.id, moduleIds: [], acceptanceCriteria: ["passes"] }], dependencies: [] }
+    }).units[0]!;
+    const execution = store.addExecution({
+      requirementId: req.id, deliveryUnitId: unit.id, evidenceVersion: 1, stage: "implementation",
+      projectId: project.id, projectVersionId: version.id, branch: "ai/REQ-0001",
+      worktreePath: "/tmp/evidence-status-worktree", baseCommit: "base", status: "completed", diff: "legacy diff"
+    });
+    store.addCodingEvidence({
+      executionId: execution.id, requirementId: req.id, deliveryUnitId: unit.id, evidenceVersion: 1,
+      projectId: project.id, branch: "ai/REQ-0001", worktreePath: "/tmp/evidence-status-worktree",
+      diffHash: "complete-evidence-fingerprint", diff: "legacy diff",
+      sourceRepoPath: "/tmp/evidence-status-project", gitCommonDir: "/tmp/evidence-status-project/.git",
+      sourceHead: "base", manifestHash: "manifest-hash", manifest: { version: 1, entries: [] },
+      changedFiles: [], originalChars: 11, truncated: false
+    });
+    repository.getWorktreeSnapshot.mockResolvedValue({
+      diff: "different diff-only hash", evidenceHash: "complete-evidence-fingerprint"
+    });
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "GET", url: `/api/requirements/${req.id}` });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().codingEvidence.status).toBe("valid");
+    expect(repository.getWorktreeSnapshot).toHaveBeenCalledWith("/tmp/evidence-status-worktree", {
+      sensitivePatterns: [".env*"]
+    });
     await app.close();
   });
 

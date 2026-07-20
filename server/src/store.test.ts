@@ -549,7 +549,7 @@ describe("WorkflowStore", () => {
     }).units[0]!;
     const execution = store.addExecution({ requirementId: req.id, deliveryUnitId: unit.id, evidenceVersion: 1, stage: "implementation", projectId: project.id, projectVersionId: version.id, branch: "ai/one", worktreePath: "/tmp/wt", baseCommit: "version-head", status: "completed", diff: "diff", events: [] });
     expect(store.listExecutions(req.id)[0]).toMatchObject({ projectVersionId: version.id, baseCommit: "version-head" });
-    const evidence = store.addCodingEvidence({ executionId: execution.id, requirementId: req.id, deliveryUnitId: unit.id, evidenceVersion: 1, projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", diffHash: "abc", diff: "diff", originalChars: 4, truncated: false, files: ["a.ts"], additions: 1, deletions: 0, diagnostics: "" });
+    const evidence = store.addCodingEvidence({ executionId: execution.id, requirementId: req.id, deliveryUnitId: unit.id, evidenceVersion: 1, projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", diffHash: "abc", diff: "diff", sourceRepoPath: "/tmp/repo", gitCommonDir: "/tmp/repo/.git", sourceHead: "version-head", manifestHash: "manifest-hash", manifest: { version: 1, entries: [] }, changedFiles: [], originalChars: 4, truncated: false, files: ["a.ts"], additions: 1, deletions: 0, diagnostics: "" });
     expect(store.getLatestCodingEvidence(req.id)?.id).toBe(evidence.id);
     expect(() => store.addCodingEvidence({ ...evidence, id: undefined } as any)).toThrow();
   });

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { DeliveryUnit } from "./delivery-unit-repository.js";
+import type { EvidenceChangedFile, EvidenceManifest, WorktreeEvidenceIdentity } from "./evidence-tree.js";
 
 export interface DeliveryExecutionClaim {
   deliveryUnit: DeliveryUnit;
@@ -56,6 +57,10 @@ export interface DeliveryExecutionSuccess {
   commands: readonly [];
   diff: string;
   diffHash: string;
+  changedFiles: EvidenceChangedFile[];
+  identity: WorktreeEvidenceIdentity;
+  manifest: EvidenceManifest;
+  manifestHash: string;
   originalChars: number;
   truncated: boolean;
   files: string[];
@@ -201,13 +206,16 @@ export class DeliveryExecutionRepository {
     this.insertRunEvent(claim.runId, 2, "run.completed", { completedAt: now }, now);
     this.db.prepare(`INSERT INTO coding_evidence
       (id, execution_id, requirement_id, delivery_unit_id, evidence_version, project_id, branch,
-       worktree_path, diff_hash, diff_text, original_chars, truncated, files_json, additions,
-       deletions, diagnostics_text, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+       worktree_path, diff_hash, diff_text, source_repo_path, git_common_dir, source_head,
+       manifest_hash, manifest_json, changed_files_json, original_chars, truncated, files_json,
+       additions, deletions, diagnostics_text, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(randomUUID(), claim.executionId, claim.deliveryUnit.requirementId, unitId, evidenceVersion,
         claim.deliveryUnit.projectId, result.branch, result.worktreePath, result.diffHash, result.diff,
-        result.originalChars, result.truncated ? 1 : 0, JSON.stringify(result.files), result.additions,
-        result.deletions, result.diagnostics, now);
+        result.identity.repositoryPath, result.identity.gitCommonDir, result.identity.headCommit,
+        result.manifestHash, JSON.stringify(result.manifest), JSON.stringify(result.changedFiles),
+        result.originalChars, result.truncated ? 1 : 0, JSON.stringify(result.files),
+        result.additions, result.deletions, result.diagnostics, now);
     return this.getUnit(unitId)!;
   }
 
@@ -337,6 +345,12 @@ function mapDeliveryCodingEvidence(row: any) {
     worktreePath: row.worktree_path,
     diffHash: row.diff_hash,
     diff: row.diff_text,
+    sourceRepoPath: row.source_repo_path,
+    gitCommonDir: row.git_common_dir,
+    sourceHead: row.source_head,
+    manifestHash: row.manifest_hash,
+    manifest: JSON.parse(row.manifest_json),
+    changedFiles: JSON.parse(row.changed_files_json),
     originalChars: row.original_chars,
     truncated: Boolean(row.truncated),
     files,

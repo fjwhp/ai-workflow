@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +11,7 @@ import {
   runAutomatedTesting,
   type AutomatedTestingInput
 } from "./automated-testing.js";
+import { getWorktreeSnapshot } from "./repository.js";
 
 const directories: string[] = [];
 const untrustedEvidence: AutomatedTestingInput["untrustedEvidence"] = {
@@ -31,6 +33,10 @@ function initializeSource(source: string) {
   execFileSync("git", ["-C", source, "add", "--all"]);
 }
 
+async function frozenSource(source: string) {
+  return { sourceManifest: (await getWorktreeSnapshot(source)).manifest, sensitivePatterns: [] as string[] };
+}
+
 function initializeTarget() {
   const target = mkdtempSync(join(tmpdir(), "automated-test-target-"));
   directories.push(target);
@@ -39,6 +45,52 @@ function initializeTarget() {
 }
 
 describe("automated testing safety", () => {
+  it("materializes only the frozen manifest after the live source changes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "automated-test-frozen-manifest-")); directories.push(root);
+    const source = join(root, "source");
+    mkdirSync(source);
+    writeFileSync(join(source, "value.txt"), "frozen\n");
+    const content = Buffer.from("frozen\n");
+    const manifest = { version: 1 as const, entries: [{
+      path: "value.txt", type: "file" as const, mode: "100644" as const,
+      size: content.length, sha256: createHash("sha256").update(content).digest("hex"),
+      contentBase64: content.toString("base64")
+    }] };
+    writeFileSync(join(source, "value.txt"), "mutated live source\n");
+    const target = initializeTarget();
+    const execFile = vi.fn(async (_file: string, _args: string[], options: any) => {
+      expect(readFileSync(join(options.cwd, "value.txt"), "utf8")).toBe("frozen\n");
+      return { stdout: "ok", stderr: "" };
+    });
+
+    await expect(runAutomatedTesting({
+      sourceManifest: manifest, sensitivePatterns: [],
+      targetWorktree: target, gitCommonDir: join(target, ".git"),
+      allowedCommands: [{ command: "npm", argsPrefix: ["test"] }],
+      acceptanceCriteria: ["tests pass"], untrustedEvidence
+    } as any, { platform: "darwin", sandboxExecutableAvailable: async () => true, execFile }))
+      .resolves.toMatchObject({ result: "passed" });
+  });
+
+  it("redacts frozen secret values from command output before returning evidence", async () => {
+    const target = initializeTarget();
+    const execFile = vi.fn(async () => ({
+      stdout: "token=super-secret-value\n", stderr: "Bearer super-secret-value\n"
+    }));
+
+    const result = await runAutomatedTesting({
+      sourceManifest: { version: 1, entries: [] }, sensitivePatterns: ["super-secret-value"],
+      targetWorktree: target, gitCommonDir: join(target, ".git"),
+      allowedCommands: [{ command: "npm", argsPrefix: ["test"] }],
+      acceptanceCriteria: ["tests pass"], untrustedEvidence
+    }, { platform: "darwin", sandboxExecutableAvailable: async () => true, execFile });
+
+    expect(JSON.stringify(result)).not.toContain("super-secret-value");
+    expect(result.commandResults[0]).toMatchObject({
+      stdout: "token=[REDACTED]\n", stderr: "Bearer [REDACTED]\n"
+    });
+  });
+
   it("builds commands only from frozen rules and traces every criterion", () => {
     const plan = buildVerificationPlan(
       [{ command: "npm", argsPrefix: ["test", "--", "orders"] }],
@@ -76,7 +128,8 @@ describe("automated testing safety", () => {
 
   it("fails closed when sandbox-exec is unavailable", async () => {
     await expect(runAutomatedTesting({
-      sourceWorktree: "/tmp/source", targetWorktree: "/tmp/target", gitCommonDir: "/tmp/repo/.git",
+      sourceManifest: { version: 1, entries: [] }, sensitivePatterns: [],
+      targetWorktree: "/tmp/target", gitCommonDir: "/tmp/repo/.git",
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], acceptanceCriteria: ["passes"], untrustedEvidence
     }, { platform: "linux" })).resolves.toMatchObject({
       result: "failed", error: "AUTOMATED_TEST_SANDBOX_UNAVAILABLE", commandResults: []
@@ -97,7 +150,7 @@ describe("automated testing safety", () => {
       return { stdout: "ok\n", stderr: "" };
     });
     const result = await runAutomatedTesting({
-      sourceWorktree: source, targetWorktree: target, gitCommonDir: join(target, ".git"),
+      ...(await frozenSource(source)), targetWorktree: target, gitCommonDir: join(target, ".git"),
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], acceptanceCriteria: ["tests pass"], untrustedEvidence
     }, { platform: "darwin", sandboxExecutableAvailable: async () => true, execFile });
 
@@ -130,7 +183,7 @@ describe("automated testing safety", () => {
     });
 
     await runAutomatedTesting({
-      sourceWorktree: source, targetWorktree: target, gitCommonDir: join(target, ".git"),
+      ...(await frozenSource(source)), targetWorktree: target, gitCommonDir: join(target, ".git"),
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], acceptanceCriteria: ["tests pass"], untrustedEvidence
     }, { platform: "darwin", sandboxExecutableAvailable: async () => true, execFile });
 
@@ -152,7 +205,10 @@ describe("automated testing safety", () => {
     const execFile = vi.fn();
 
     await expect(runAutomatedTesting({
-      sourceWorktree: source, targetWorktree: "/real/target", gitCommonDir: "/real/repo/.git",
+      sourceManifest: { version: 1, entries: [{
+        path: "linked-secret", type: "symlink", mode: "120000",
+        target: outside, sha256: createHash("sha256").update(outside).digest("hex")
+      }] }, sensitivePatterns: [], targetWorktree: "/real/target", gitCommonDir: "/real/repo/.git",
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], acceptanceCriteria: ["tests pass"], untrustedEvidence
     }, { platform: "darwin", sandboxExecutableAvailable: async () => true, execFile }))
       .resolves.toMatchObject({ result: "failed", error: "AUTOMATED_TEST_MATERIALIZATION_UNSAFE" });
@@ -175,7 +231,7 @@ describe("automated testing safety", () => {
     });
 
     await expect(runAutomatedTesting({
-      sourceWorktree: source, targetWorktree: target, gitCommonDir: join(target, ".git"),
+      ...(await frozenSource(source)), targetWorktree: target, gitCommonDir: join(target, ".git"),
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], acceptanceCriteria: ["tests pass"], untrustedEvidence
     }, { platform: "darwin", sandboxExecutableAvailable: async () => true, execFile }))
       .resolves.toMatchObject({ result: "passed" });
@@ -193,7 +249,10 @@ describe("automated testing safety", () => {
     const execFile = vi.fn();
 
     await expect(runAutomatedTesting({
-      sourceWorktree: source, targetWorktree: target, gitCommonDir: join(target, ".git"),
+      sourceManifest: { version: 1, entries: [{
+        path: "tool.js", type: "symlink", mode: "120000", target: "ignored/tool.js",
+        sha256: createHash("sha256").update("ignored/tool.js").digest("hex")
+      }] }, sensitivePatterns: [], targetWorktree: target, gitCommonDir: join(target, ".git"),
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], acceptanceCriteria: ["tests pass"], untrustedEvidence
     }, { platform: "darwin", sandboxExecutableAvailable: async () => true, execFile }))
       .resolves.toMatchObject({ result: "failed", error: "AUTOMATED_TEST_MATERIALIZATION_UNSAFE" });
@@ -215,7 +274,7 @@ describe("automated testing safety", () => {
     });
 
     await expect(runAutomatedTesting({
-      sourceWorktree: source, targetWorktree: target, gitCommonDir: join(target, ".git"),
+      ...(await frozenSource(source)), targetWorktree: target, gitCommonDir: join(target, ".git"),
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], acceptanceCriteria: ["tests pass"], untrustedEvidence
     }, { platform: "darwin", sandboxExecutableAvailable: async () => true, execFile }))
       .resolves.toMatchObject({ result: "passed" });
@@ -237,7 +296,7 @@ describe("automated testing safety", () => {
     });
 
     await expect(runAutomatedTesting({
-      sourceWorktree: source, targetWorktree: target, gitCommonDir: join(target, ".git"),
+      ...(await frozenSource(source)), targetWorktree: target, gitCommonDir: join(target, ".git"),
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], acceptanceCriteria: ["tests pass"], untrustedEvidence
     }, { platform: "darwin", sandboxExecutableAvailable: async () => true, execFile }))
       .resolves.toMatchObject({
@@ -286,7 +345,7 @@ exit 0
       initializeSource(source);
 
       const result = await runAutomatedTesting({
-        sourceWorktree: source, targetWorktree: target, gitCommonDir: join(target, ".git"),
+        ...(await frozenSource(source)), targetWorktree: target, gitCommonDir: join(target, ".git"),
         allowedCommands: [{ command: "/bin/sh", argsPrefix: ["probe.sh"] }],
         acceptanceCriteria: ["sandbox contains mutations"], untrustedEvidence
       });

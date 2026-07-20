@@ -1,8 +1,10 @@
 import OpenAI from "openai";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createOrReuseRequirementWorktree, getWorktreeDiff, getWorktreeSnapshot } from "./repository.js";
+import { posix } from "node:path";
+import { createOrReuseRequirementWorktree, getWorktreeSnapshot } from "./repository.js";
 import { resolveWorktreePath, safeReadWorktreeFile, safeWriteWorktreeFile } from "./worktree-file-safety.js";
+import { matchesSensitivePath } from "./evidence-tree.js";
 
 export { resolveWorktreePath } from "./worktree-file-safety.js";
 
@@ -42,6 +44,7 @@ export interface CodingAgentResult {
   diagnostics?: string[] | string;
   codexThreadId?: string;
   events?: unknown[];
+  evidenceSnapshot: Awaited<ReturnType<typeof getWorktreeSnapshot>>;
 }
 
 export async function prepareCodingWorktree(project: CodingProject, version: CodingVersion, requirementCode: string) {
@@ -76,12 +79,21 @@ export async function runCodingAgent(input: CodingAgentInput): Promise<CodingAge
     if (!message) throw new Error("编码模型未返回消息");
     messages.push(message);
     if (!message.tool_calls?.length) {
-      const snapshot = await getWorktreeSnapshot(worktree.worktreePath);
-      return { ...worktree, ...snapshot, runId, summary: message.content || "编码代理已完成", commands: [] };
+      const snapshot = await getWorktreeSnapshot(worktree.worktreePath, {
+        sensitivePatterns: input.deliveryContext.sensitivePatterns
+      });
+      return {
+        ...worktree, diff: snapshot.diff, files: snapshot.files, additions: snapshot.additions,
+        deletions: snapshot.deletions, evidenceSnapshot: snapshot,
+        runId, summary: message.content || "编码代理已完成", commands: []
+      };
     }
     for (const call of message.tool_calls) {
       let result: unknown;
-      try { result = await executeTool(call.function.name, JSON.parse(call.function.arguments || "{}"), worktree.worktreePath); }
+      try {
+        result = await executeTool(call.function.name, JSON.parse(call.function.arguments || "{}"),
+          worktree.worktreePath, input.deliveryContext.sensitivePatterns);
+      }
       catch (error) { result = { error: error instanceof Error ? error.message : "工具执行失败" }; }
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
     }
@@ -93,16 +105,22 @@ function tool(name: string, description: string, properties: any, required: stri
   return { type: "function", function: { name, description, parameters: { type: "object", properties, required, additionalProperties: false } } };
 }
 
-async function executeTool(name: string, args: any, worktree: string) {
+async function executeTool(name: string, args: any, worktree: string, sensitivePatterns: string[]) {
   if (name === "search_code") {
-    const { stdout } = await execFileAsync("rg", ["-n", "--hidden", "-g", "!.git", "-g", "!target", "-F", "--", String(args.query), "."], { cwd: worktree, maxBuffer: 1024 * 1024 });
+    const exclusions = sensitivePatterns.flatMap((pattern) => ["-g", `!${pattern}`]);
+    const { stdout } = await execFileAsync("rg", ["-n", "--hidden", "-g", "!.git", "-g", "!target",
+      ...exclusions, "-F", "--", String(args.query), "."], { cwd: worktree, maxBuffer: 1024 * 1024 });
     return stdout.split("\n").slice(0, 120).join("\n");
+  }
+  const requestedPath = typeof args.path === "string" ? posix.normalize(args.path.replaceAll("\\", "/")) : "";
+  if ((name === "read_file" || name === "write_file") && matchesSensitivePath(requestedPath, sensitivePatterns)) {
+    throw new Error("CODING_FILE_PATH_SENSITIVE");
   }
   if (name === "read_file") return (await safeReadWorktreeFile(worktree, String(args.path))).slice(0, 60000);
   if (name === "write_file") {
     await safeWriteWorktreeFile(worktree, String(args.path), String(args.content));
     return { written: args.path };
   }
-  if (name === "git_diff") return (await getWorktreeDiff(worktree)).slice(0, 80000);
+  if (name === "git_diff") return (await getWorktreeSnapshot(worktree, { sensitivePatterns })).diff.slice(0, 80000);
   throw new Error("未知工具");
 }

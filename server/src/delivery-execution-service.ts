@@ -13,11 +13,13 @@ import {
 } from "./automated-testing.js";
 import type { DeliveryQualityCompletion, DeliveryQualityPersistence } from "./delivery-quality-repository.js";
 import { getWorktreeSnapshot } from "./repository.js";
-import type { AutomationHandlers } from "./automation-worker.js";
+import { evidenceFingerprint, evidenceManifestHash } from "./evidence-tree.js";
+import { redactSensitive } from "./redaction.js";
+import { retryable, type AutomationHandlers } from "./automation-worker.js";
 import type { AutomationJob } from "./automation-job-repository.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -26,7 +28,6 @@ export type CodingAgent = (input: CodingAgentInput) => Promise<CodingAgentResult
 type WorktreeSnapshot = Awaited<ReturnType<typeof getWorktreeSnapshot>>;
 type TargetState = { head: string; refsHash: string; diffHash: string; gitCommonDir: string };
 export interface DeliveryQualityDependencies {
-  getSnapshot?: (worktreePath: string) => Promise<WorktreeSnapshot>;
   review?: (input: unknown) => Promise<CodeReviewResult>;
   testing?: (input: AutomatedTestingInput) => Promise<AutomatedTestingResult>;
   inspectTarget?: (worktreePath: string) => Promise<TargetState>;
@@ -52,6 +53,7 @@ export class DeliveryExecutionService {
   async implement(unitId: string) {
     const claim = this.persistence.claimImplementation(unitId, this.model);
     let result: CodingAgentResult;
+    let snapshot: WorktreeSnapshot;
     try {
       result = await this.codingAgent({
         requirement: claim.requirement,
@@ -60,6 +62,9 @@ export class DeliveryExecutionService {
         version: claim.version,
         deliveryContext: claim.deliveryContext
       });
+      if (!result.evidenceSnapshot) throw new Error("IMPLEMENTATION_EVIDENCE_REQUIRED");
+      snapshot = result.evidenceSnapshot;
+      validateImplementationIdentity(claim, result, snapshot);
     } catch (error) {
       try {
         this.persistence.failImplementation(claim, errorText(error));
@@ -70,21 +75,25 @@ export class DeliveryExecutionService {
     }
 
     const evidence = buildCodingEvidence({
-      diff: result.diff,
-      files: result.files,
-      additions: result.additions,
-      deletions: result.deletions
+      diff: snapshot.diff, maxDiffChars: Number.MAX_SAFE_INTEGER, files: snapshot.files,
+      additions: snapshot.additions, deletions: snapshot.deletions
     });
-    const diagnostics = Array.isArray(result.diagnostics)
+    const diagnostics = redactSensitive(Array.isArray(result.diagnostics)
       ? result.diagnostics.map(String).join("\n")
-      : String(result.diagnostics ?? "");
+      : String(result.diagnostics ?? ""), claim.deliveryContext.sensitivePatterns);
+    const events = redactSensitive(result.events ?? [], claim.deliveryContext.sensitivePatterns);
+    const summary = redactSensitive(String(result.summary ?? ""), claim.deliveryContext.sensitivePatterns);
     return this.persistence.completeImplementation(claim, {
       branch: result.branch,
       worktreePath: result.worktreePath,
       baseCommit: result.baseCommit,
       commands: [],
       diff: evidence.diff,
-      diffHash: evidence.diffHash,
+      diffHash: snapshot.evidenceHash,
+      changedFiles: snapshot.changedFiles,
+      identity: snapshot.identity,
+      manifest: snapshot.manifest,
+      manifestHash: snapshot.manifestHash,
       originalChars: evidence.originalChars,
       truncated: evidence.truncated,
       files: evidence.files,
@@ -92,8 +101,8 @@ export class DeliveryExecutionService {
       deletions: evidence.deletions,
       diagnostics,
       codexThreadId: result.codexThreadId,
-      events: result.events,
-      output: { runId: result.runId, summary: result.summary }
+      events,
+      output: { runId: result.runId, summary }
     });
   }
 
@@ -101,11 +110,17 @@ export class DeliveryExecutionService {
     const quality = this.requireQualityPersistence();
     const claim = quality.claim(unitId, evidenceVersion, "code_review", claimToken);
     if (claim.settledEvidence) return claim.settledEvidence;
-    let completion: DeliveryQualityCompletion;
+    let snapshot: ReturnType<DeliveryExecutionService["loadImmutableSnapshot"]>;
     try {
-      const snapshot = await this.loadImmutableSnapshot(claim.input.codingEvidence.worktreePath,
-        claim.input.codingEvidence.diffHash, claim.input.snapshot.sensitivePatterns);
-      const result = await (this.qualityDependencies.review ?? runCodeReview)({
+      snapshot = this.loadImmutableSnapshot(claim.input.codingEvidence);
+    } catch (error) {
+      const code = qualityErrorCode(error);
+      quality.abort(claim, code);
+      return { status: "aborted" as const, error: code };
+    }
+    let result: CodeReviewResult;
+    try {
+      result = await (this.qualityDependencies.review ?? runCodeReview)({
         requirement: claim.input.requirement,
         approvedArtifacts: claim.input.artifacts,
         deliveryContext: {
@@ -114,30 +129,40 @@ export class DeliveryExecutionService {
         },
         implementation: { diff: snapshot.diff, changedFiles: snapshot.changedFiles }
       });
-      completion = { ...codeReviewDecision(result), content: result };
     } catch (error) {
-      completion = {
-        result: "failed",
-        content: { error: qualityErrorCode(error) }
-      };
+      throw retryable("DELIVERY_QUALITY_PROVIDER_UNAVAILABLE", error);
     }
-    return quality.complete(claim, completion);
+    return quality.complete(claim, { ...codeReviewDecision(result), content: result });
   }
 
   async test(unitId: string, evidenceVersion?: number, claimToken?: string) {
     const quality = this.requireQualityPersistence();
     const claim = quality.claim(unitId, evidenceVersion, "automated_testing", claimToken);
     if (claim.settledEvidence) return claim.settledEvidence;
-    let testResult: AutomatedTestingResult | undefined;
-    let completion: DeliveryQualityCompletion;
+    let snapshot: ReturnType<DeliveryExecutionService["loadImmutableSnapshot"]>;
     try {
-      const snapshot = await this.loadImmutableSnapshot(claim.input.codingEvidence.worktreePath,
-        claim.input.codingEvidence.diffHash, claim.input.snapshot.sensitivePatterns);
-      const inspectTarget = this.qualityDependencies.inspectTarget ?? inspectTargetState;
-      const before = await inspectTarget(claim.input.snapshot.worktreePath);
-      if (before.head !== claim.input.snapshot.headCommit) throw new Error("AUTOMATED_TEST_TARGET_HEAD_STALE");
+      snapshot = this.loadImmutableSnapshot(claim.input.codingEvidence);
+    } catch (error) {
+      const code = qualityErrorCode(error);
+      quality.abort(claim, code);
+      return { status: "aborted" as const, error: code };
+    }
+    const inspectTarget = this.qualityDependencies.inspectTarget ?? inspectTargetState;
+    let before: TargetState;
+    try {
+      before = await inspectTarget(claim.input.snapshot.worktreePath);
+    } catch (error) {
+      throw retryable("AUTOMATED_TEST_INFRASTRUCTURE_UNAVAILABLE", error);
+    }
+    if (before.head !== claim.input.snapshot.headCommit) {
+      quality.abort(claim, "AUTOMATED_TEST_TARGET_HEAD_STALE");
+      return { status: "aborted" as const, error: "AUTOMATED_TEST_TARGET_HEAD_STALE" };
+    }
+    let testResult: AutomatedTestingResult;
+    try {
       testResult = await (this.qualityDependencies.testing ?? runAutomatedTesting)({
-        sourceWorktree: claim.input.codingEvidence.worktreePath,
+        sourceManifest: snapshot.manifest,
+        sensitivePatterns: [...claim.input.snapshot.sensitivePatterns],
         targetWorktree: claim.input.snapshot.worktreePath,
         gitCommonDir: before.gitCommonDir,
         allowedCommands: claim.input.snapshot.allowedCommands.map((command) => ({
@@ -166,25 +191,32 @@ export class DeliveryExecutionService {
           }
         }
       });
-      await this.loadImmutableSnapshot(claim.input.codingEvidence.worktreePath,
-        claim.input.codingEvidence.diffHash, claim.input.snapshot.sensitivePatterns);
-      const after = await inspectTarget(claim.input.snapshot.worktreePath);
-      if (before.head !== after.head || before.refsHash !== after.refsHash || before.diffHash !== after.diffHash) {
-        throw new Error("AUTOMATED_TEST_TARGET_MUTATED");
-      }
-      completion = {
-        result: testResult.result,
-        content: { ...(testResult.error ? { error: testResult.error } : {}), summary: "automated testing completed" },
-        commandResults: testResult.commandResults,
-        acceptanceTrace: testResult.acceptanceTrace
-      };
     } catch (error) {
-      completion = {
-        result: "failed", content: { error: qualityErrorCode(error) },
-        commandResults: testResult?.commandResults ?? [], acceptanceTrace: testResult?.acceptanceTrace ?? []
-      };
+      throw retryable("AUTOMATED_TEST_INFRASTRUCTURE_UNAVAILABLE", error);
     }
-    return quality.complete(claim, completion);
+    if (testResult.error === "AUTOMATED_TEST_SANDBOX_UNAVAILABLE") {
+      throw retryable("AUTOMATED_TEST_INFRASTRUCTURE_UNAVAILABLE");
+    }
+    if (testResult.error && testResult.commandResults.length === 0) {
+      quality.abort(claim, testResult.error);
+      return { status: "aborted" as const, error: testResult.error };
+    }
+    let after: TargetState;
+    try {
+      after = await inspectTarget(claim.input.snapshot.worktreePath);
+    } catch (error) {
+      throw retryable("AUTOMATED_TEST_INFRASTRUCTURE_UNAVAILABLE", error);
+    }
+    if (before.head !== after.head || before.refsHash !== after.refsHash || before.diffHash !== after.diffHash) {
+      quality.abort(claim, "AUTOMATED_TEST_TARGET_MUTATED");
+      return { status: "aborted" as const, error: "AUTOMATED_TEST_TARGET_MUTATED" };
+    }
+    return quality.complete(claim, {
+      result: testResult.result,
+      content: { ...(testResult.error ? { error: testResult.error } : {}), summary: "automated testing completed" },
+      commandResults: testResult.commandResults,
+      acceptanceTrace: testResult.acceptanceTrace
+    });
   }
 
   private requireQualityPersistence() {
@@ -192,14 +224,50 @@ export class DeliveryExecutionService {
     return this.qualityPersistence;
   }
 
-  private async loadImmutableSnapshot(worktreePath: string, expectedDiffHash: string, sensitivePatterns: string[]) {
-    const snapshot = await (this.qualityDependencies.getSnapshot ?? getWorktreeSnapshot)(worktreePath);
-    if (buildCodingEvidence({ diff: snapshot.diff }).diffHash !== expectedDiffHash) {
+  private loadImmutableSnapshot(codingEvidence: DeliveryQualityClaimInput) {
+    const manifestHash = evidenceManifestHash(codingEvidence.manifest);
+    const diffHash = evidenceFingerprint({
+      identity: {
+        repositoryPath: codingEvidence.sourceRepoPath,
+        gitCommonDir: codingEvidence.gitCommonDir,
+        worktreePath: codingEvidence.worktreePath,
+        branch: codingEvidence.branch,
+        headCommit: codingEvidence.sourceHead
+      },
+      manifestHash,
+      diff: codingEvidence.diff,
+      changedFiles: codingEvidence.changedFiles
+    });
+    if (manifestHash !== codingEvidence.manifestHash || diffHash !== codingEvidence.diffHash) {
       throw new Error("IMPLEMENTATION_EVIDENCE_STALE");
     }
-    const sensitive = snapshot.files.find((file) => sensitivePatterns.some((pattern) => globMatches(pattern, file)));
-    if (sensitive) throw new Error("IMPLEMENTATION_EVIDENCE_SENSITIVE_PATH");
-    return snapshot;
+    return { diff: codingEvidence.diff, changedFiles: codingEvidence.changedFiles, manifest: codingEvidence.manifest };
+  }
+}
+
+type DeliveryQualityClaimInput = ReturnType<DeliveryQualityPersistence["claim"]>["input"]["codingEvidence"];
+
+function validateImplementationIdentity(
+  claim: Parameters<DeliveryExecutionPersistence["completeImplementation"]>[0],
+  result: CodingAgentResult,
+  snapshot: WorktreeSnapshot
+) {
+  const identity = snapshot.identity;
+  const expectedWorktreePath = resolve(
+    claim.project.repoPath, "..", ".ai-workflow-worktrees", basename(claim.project.repoPath),
+    "requirements", claim.requirement.code
+  );
+  const manifestHash = evidenceManifestHash(snapshot.manifest);
+  const evidenceHash = evidenceFingerprint({
+    identity, manifestHash, diff: snapshot.diff, changedFiles: snapshot.changedFiles
+  });
+  if (snapshot.manifestHash !== manifestHash || snapshot.evidenceHash !== evidenceHash
+    || snapshot.diff !== result.diff || identity.repositoryPath !== resolve(claim.project.repoPath)
+    || identity.gitCommonDir !== resolve(claim.project.repoPath, ".git")
+    || identity.worktreePath !== resolve(result.worktreePath) || identity.worktreePath !== expectedWorktreePath
+    || identity.branch !== result.branch || result.branch !== `ai/${claim.requirement.code}`
+    || identity.headCommit !== result.baseCommit || result.baseCommit !== claim.version.headCommit) {
+    throw new Error("IMPLEMENTATION_EVIDENCE_IDENTITY_MISMATCH");
   }
 }
 

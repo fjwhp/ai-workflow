@@ -2,8 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { realpath } from "node:fs/promises";
 import { basename, resolve } from "node:path";
-import { getWorktreeSnapshot, inspectActualWorktreeIdentity } from "./repository.js";
-import { hashDiff } from "./coding-evidence.js";
+import { getCommitSnapshot, getWorktreeSnapshot, inspectActualWorktreeIdentity } from "./repository.js";
 import { buildVerificationPlan, type VerificationCommand } from "./verification-plan.js";
 
 const execFileAsync = promisify(execFile);
@@ -13,7 +12,8 @@ type Input = {
   targetBranch: string;
   sourceWorktreePath: string;
   sourceBranch: string;
-  evidenceDiffHash: string;
+  evidenceHash: string;
+  sensitivePatterns: string[];
   expectedTargetHead?: string;
   sourceCommit?: string;
   changedFiles?: string[];
@@ -29,23 +29,6 @@ type TargetState = {
 
 async function git(cwd: string, args: string[]) {
   return execFileAsync("git", ["-C", cwd, ...args], { maxBuffer: 10 * 1024 * 1024 });
-}
-
-async function getCommitEvidence(worktreePath: string, commit: string) {
-  const parent = `${commit}^`;
-  const tracked = (await git(worktreePath, [
-    "diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv",
-    "--diff-filter=MD", parent, commit, "--", "."
-  ])).stdout;
-  const addedOutput = await execFileAsync("git", ["-C", worktreePath, "diff", "--name-only", "--diff-filter=A", "-z", parent, commit, "--", "."], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any });
-  const added = Buffer.from(addedOutput.stdout as any).toString("utf8").split("\0").filter(Boolean);
-  const patches: string[] = [tracked];
-  for (const file of added) {
-    const content = (await git(worktreePath, ["show", `${commit}:${file}`])).stdout;
-    const lines = content.split("\n");
-    patches.push(`diff --git a/${file} b/${file}\nnew file mode 100644\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((line) => `+${line}`).join("\n")}\n`);
-  }
-  return { diff: patches.filter(Boolean).join("\n"), files: [...new Set([...added, ...(await git(worktreePath, ["diff", "--name-only", "--diff-filter=MD", parent, commit, "--", "."])).stdout.trim().split("\n").filter(Boolean)])] };
 }
 
 function parseRegisteredWorktrees(output: string) {
@@ -145,16 +128,19 @@ export async function preflightLocalIntegration(input: Input) {
     if (input.sourceCommit) {
       const commit = (await git(input.sourceWorktreePath, ["rev-parse", "--verify", `${input.sourceCommit}^{commit}`])).stdout.trim();
       await git(input.sourceWorktreePath, ["merge-base", "--is-ancestor", commit, input.sourceBranch]);
-      const evidence = await getCommitEvidence(input.sourceWorktreePath, commit);
-      const patchHash = hashDiff(evidence.diff);
+      const evidence = await getCommitSnapshot(input.sourceWorktreePath, commit, {
+        sensitivePatterns: input.sensitivePatterns
+      });
       checks.push({ id: "source_changes", label: "存在待合并变更", ok: evidence.files.length > 0 && evidence.diff.length > 0, detail: `${evidence.files.length} 个文件（已提交）` });
-      checks.push({ id: "evidence_valid", label: "编码证据仍有效", ok: patchHash === input.evidenceDiffHash, detail: patchHash.slice(0, 12) });
+      checks.push({ id: "evidence_valid", label: "编码证据仍有效", ok: evidence.evidenceHash === input.evidenceHash, detail: evidence.evidenceHash.slice(0, 12) });
       evidenceMode = "commit";
       resolvedSourceCommit = commit;
     } else {
-      const snapshot = await getWorktreeSnapshot(input.sourceWorktreePath);
+      const snapshot = await getWorktreeSnapshot(input.sourceWorktreePath, {
+        sensitivePatterns: input.sensitivePatterns
+      });
       checks.push({ id: "source_changes", label: "存在待合并变更", ok: snapshot.files.length > 0 && snapshot.diff.length > 0, detail: `${snapshot.files.length} 个文件` });
-      checks.push({ id: "evidence_valid", label: "编码证据仍有效", ok: hashDiff(snapshot.diff) === input.evidenceDiffHash, detail: hashDiff(snapshot.diff).slice(0, 12) });
+      checks.push({ id: "evidence_valid", label: "编码证据仍有效", ok: snapshot.evidenceHash === input.evidenceHash, detail: snapshot.evidenceHash.slice(0, 12) });
       evidenceMode = "worktree";
     }
   } catch { checks.push({ id: "source_branch", label: "AI 分支匹配", ok: false, detail: "AI worktree 不存在或不可访问" }); }
@@ -201,8 +187,10 @@ export async function executeLocalIntegration(input: Input & { commitMessage: st
       inspectRegisteredWorktree(input, "source"), inspectTargetState(input)
     ]);
     if (!sourceIdentityAfterCommit.valid) throw new Error("来源工作树身份在提交后失效");
-    const evidence = await getCommitEvidence(input.sourceWorktreePath, sourceCommit!);
-    if (!evidence.diff || hashDiff(evidence.diff) !== input.evidenceDiffHash) throw new Error("提交后的编码证据与原始证据不一致");
+    const evidence = await getCommitSnapshot(input.sourceWorktreePath, sourceCommit!, {
+      sensitivePatterns: input.sensitivePatterns
+    });
+    if (!evidence.diff || evidence.evidenceHash !== input.evidenceHash) throw new Error("提交后的编码证据与原始证据不一致");
     if (!target.identityValid || !target.clean || target.head !== preApplyHead) {
       return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead, targetState: "uncertain" as const,
         statusPorcelain: target.statusPorcelain, error: "目标工作树在应用前发生变化", commandResults: [] };
@@ -223,7 +211,9 @@ export async function executeLocalIntegration(input: Input & { commitMessage: st
     let conflictFiles: string[] = [];
     try { conflictFiles = (await git(input.targetWorktreePath, ["diff", "--name-only", "--diff-filter=U"])).stdout.trim().split("\n").filter(Boolean); }
     catch { /* Preserve the original error. */ }
-    const evidence = await getCommitEvidence(input.sourceWorktreePath, sourceCommit!);
+    const evidence = await getCommitSnapshot(input.sourceWorktreePath, sourceCommit!, {
+      sensitivePatterns: input.sensitivePatterns
+    });
     const changedFiles = await changedTargetFiles(input.targetWorktreePath).catch(() => []);
     let rollbackError = "";
     let rollbackPostcondition: TargetState | undefined;

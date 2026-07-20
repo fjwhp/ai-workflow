@@ -32,6 +32,14 @@ function columns(db: DatabaseSync, table: string) {
   return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(({ name }) => name);
 }
 
+function columnDefinitions(db: DatabaseSync, table: string) {
+  return db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+    notnull: number;
+    dflt_value: string | null;
+  }>;
+}
+
 function tableSql(db: DatabaseSync, table: string) {
   return (db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { sql: string }).sql;
 }
@@ -167,6 +175,21 @@ describe("Phase 2 database schema", () => {
     expect(columns(db, "executions")).toEqual(expect.arrayContaining(["delivery_unit_id", "evidence_version"]));
     expect(columns(db, "coding_evidence")).toEqual(expect.arrayContaining(["delivery_unit_id", "evidence_version"]));
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_stage_runs_running'").get()).toBeUndefined();
+    db.close();
+  });
+
+  it("requires complete coding evidence identity without schema defaults", () => {
+    const db = openFreshStoreDatabase();
+    const required = new Set([
+      "source_repo_path", "git_common_dir", "source_head", "manifest_hash", "manifest_json", "changed_files_json"
+    ]);
+    const definitions = columnDefinitions(db, "coding_evidence").filter((column) => required.has(column.name));
+
+    expect(definitions).toHaveLength(required.size);
+    expect(definitions.every((column) => column.notnull === 1 && column.dflt_value === null)).toBe(true);
+    expect(tableSql(db, "coding_evidence")).toMatch(
+      /length\(CAST\(diff_text AS BLOB\)\)\s*\+\s*length\(CAST\(manifest_json AS BLOB\)\)\s*\+\s*length\(CAST\(changed_files_json AS BLOB\)\)\s*<=\s*33554432/i
+    );
     db.close();
   });
 

@@ -1,10 +1,9 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { promisify, TextDecoder } from "node:util";
-import { safeReadWorktreeFileBuffer } from "./worktree-file-safety.js";
+import { promisify } from "node:util";
+import { captureCommitEvidence, captureWorktreeEvidence, type EvidenceOptions } from "./evidence-tree.js";
 
 const execFileAsync = promisify(execFile);
 const protectedBranches=new Set(["prod","production","main","master"]);
@@ -22,6 +21,11 @@ function codingGitEnvironment(config: readonly GitConfigEntry[] = []) {
     if (exact.has(key) || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) delete env[key];
   }
   env.GIT_ATTR_NOSYSTEM = "1";
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  env.GIT_CONFIG_SYSTEM = "/dev/null";
+  env.GIT_PAGER = "cat";
+  env.PAGER = "cat";
   env.GIT_LFS_SKIP_SMUDGE = "1";
   env.GIT_CONFIG_COUNT = String(config.length);
   config.forEach(([key, value], index) => {
@@ -450,81 +454,20 @@ export async function createIsolatedWorktree(repoPath: string, defaultBranch: st
 }
 
 export async function getWorktreeDiff(worktreePath: string) {
-  const { stdout } = await execFileAsync("git", [
-    "-C", worktreePath, "diff", "--no-ext-diff", "--no-textconv", "--", "."
-  ], { maxBuffer: 10 * 1024 * 1024, env: codingGitEnvironmentWithFsmonitor() });
-  return stdout;
+  return (await getWorktreeSnapshot(worktreePath)).diff;
 }
 
-export async function getWorktreeSnapshot(worktreePath: string) {
-  const env = codingGitEnvironmentWithFsmonitor();
-  const tracked = await getCompleteTrackedDiff(worktreePath, env);
-  const { stdout: status } = await execFileAsync("git", [
-    "-C", worktreePath, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"
-  ], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any, env });
-  const entries = Buffer.from(status as any).toString("utf8").split("\0").filter(Boolean);
-  const { stdout: untrackedOutput } = await execFileAsync("git", [
-    "-C", worktreePath, "ls-files", "--others", "--exclude-standard", "-z"
-  ], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any, env });
-  const untracked = Buffer.from(untrackedOutput as any).toString("utf8").split("\0").filter(Boolean);
-  const trackedFiles = entries.filter((entry) => !entry.startsWith("?? ")).map((entry) => entry.slice(3)).filter(Boolean);
-  const files = [...new Set([...trackedFiles, ...untracked])];
-  const statuses = new Map(entries.map((entry) => [entry.slice(3), entry.slice(0, 2)]));
-  const patches: string[] = [tracked];
-  for (const file of untracked) {
-    const content = await safeReadWorktreeFileBuffer(worktreePath, file);
-    let text: string | undefined;
-    if (!content.includes(0)) {
-      try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(content); }
-      catch { /* binary content */ }
-    }
-    if (text === undefined) {
-      const digest = createHash("sha256").update(content).digest("hex");
-      patches.push(`diff --git a/${file} b/${file}\nnew file mode 100644\nBinary files /dev/null and b/${file} differ\nbinary-size: ${content.length}\nbinary-sha256: ${digest}\n`);
-    } else {
-      const lines = text.split("\n");
-      patches.push(`diff --git a/${file} b/${file}\nnew file mode 100644\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((line) => `+${line}`).join("\n")}\n`);
-    }
-  }
-  const diff = patches.filter(Boolean).join("\n");
-  const additions = diff.split("\n").filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
-  const deletions = diff.split("\n").filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
-  const changedFiles = await Promise.all(files.map(async (file) => {
-    const statusCode = statuses.get(file) ?? "??";
-    if (statusCode.includes("D")) return { path: file, status: "deleted" as const };
-    const content = await safeReadWorktreeFileBuffer(worktreePath, file);
-    const status = statusCode === "??" || statusCode.includes("A") ? "added" as const : "modified" as const;
-    let text: string | undefined;
-    if (!content.includes(0)) {
-      try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(content); } catch {}
-    }
-    if (text !== undefined) return { path: file, status, kind: "text" as const, content: text };
-    return {
-      path: file, status, kind: "binary" as const, size: content.length,
-      sha256: createHash("sha256").update(content).digest("hex")
-    };
-  }));
-  return { diff, files, changedFiles, additions, deletions };
+export async function getWorktreeSnapshot(
+  worktreePath: string,
+  options: EvidenceOptions = {}
+) {
+  return captureWorktreeEvidence(worktreePath, codingGitEnvironmentWithFsmonitor(), options);
 }
 
-async function getCompleteTrackedDiff(worktreePath: string, env: NodeJS.ProcessEnv) {
-  const options = { maxBuffer: 10 * 1024 * 1024, env };
-  const args = ["--binary", "--full-index", "--no-ext-diff", "--no-textconv"];
-  let hasHead = true;
-  try {
-    await execFileAsync("git", ["-C", worktreePath, "rev-parse", "--verify", "--quiet", "HEAD"], options);
-  } catch (error) {
-    const failure = error as { code?: unknown; signal?: unknown };
-    if (failure.code !== 1 || failure.signal) throw error;
-    hasHead = false;
-  }
-  if (hasHead) {
-    const { stdout } = await execFileAsync("git", ["-C", worktreePath, "diff", ...args, "HEAD", "--", "."], options);
-    return stdout;
-  }
-  const [{ stdout: staged }, { stdout: unstaged }] = await Promise.all([
-    execFileAsync("git", ["-C", worktreePath, "diff", ...args, "--cached", "--", "."], options),
-    execFileAsync("git", ["-C", worktreePath, "diff", ...args, "--", "."], options)
-  ]);
-  return [staged, unstaged].filter(Boolean).join("\n");
+export async function getCommitSnapshot(
+  worktreePath: string,
+  commit: string,
+  options: EvidenceOptions = {}
+) {
+  return captureCommitEvidence(worktreePath, commit, codingGitEnvironmentWithFsmonitor(), options);
 }

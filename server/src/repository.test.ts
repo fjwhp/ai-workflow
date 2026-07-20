@@ -20,6 +20,91 @@ const exec = promisify(execFile); const dirs: string[] = [];
 afterEach(async()=>{for(const dir of dirs.splice(0))await rm(dir,{recursive:true,force:true})});
 
 describe("getWorktreeSnapshot",()=>{
+  it("never executes repository clean filters while capturing evidence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-filter-evidence-")); dirs.push(root);
+    const repoPath = join(root, "repo");
+    const marker = join(root, "filter-ran");
+    await exec("git", ["init", "-b", "main", repoPath]);
+    await git(repoPath, "config", "user.email", "test@example.com");
+    await git(repoPath, "config", "user.name", "Test");
+    await writeFile(join(repoPath, ".gitattributes"), "*.txt filter=evil\n");
+    await writeFile(join(repoPath, "value.txt"), "base\n");
+    await git(repoPath, "add", "--all");
+    await git(repoPath, "commit", "-m", "base");
+    await git(repoPath, "config", "filter.evil.clean", `sh -c 'touch "${marker}"; git tag filter-ran; cat'`);
+    await writeFile(join(repoPath, "value.txt"), "changed\n");
+
+    const snapshot = await getWorktreeSnapshot(repoPath);
+
+    expect(snapshot.diff).toContain("+changed");
+    expect(await pathExists(marker)).toBe(false);
+    await expect(git(repoPath, "show-ref", "--verify", "refs/tags/filter-ran")).rejects.toThrow();
+  });
+
+  it("binds repository identity, HEAD, modes, symlinks, and raw content into the evidence hash", async () => {
+    const capture = async (message: string) => {
+      const dir = await mkdtemp(join(tmpdir(), "workflow-identity-evidence-")); dirs.push(dir);
+      await exec("git", ["init", "-b", "main", dir]);
+      await git(dir, "config", "user.email", "test@example.com");
+      await git(dir, "config", "user.name", "Test");
+      await writeFile(join(dir, "value.txt"), "base\n");
+      await writeFile(join(dir, "deleted.txt"), "delete\n");
+      await git(dir, "add", "--all");
+      await git(dir, "commit", "-m", message);
+      await writeFile(join(dir, "value.txt"), "changed\n");
+      await writeFile(join(dir, "binary.bin"), Buffer.from([0, 0x80, 0xff]));
+      await writeFile(join(dir, "tool.sh"), "#!/bin/sh\nexit 0\n");
+      await chmod(join(dir, "tool.sh"), 0o755);
+      await symlink("value.txt", join(dir, "value-link"));
+      await rm(join(dir, "deleted.txt"));
+      return getWorktreeSnapshot(dir);
+    };
+
+    const first = await capture("base one");
+    const second = await capture("base two");
+
+    expect(first.diff).toBe(second.diff);
+    expect(first.identity.headCommit).not.toBe(second.identity.headCommit);
+    expect(first.evidenceHash).not.toBe(second.evidenceHash);
+    expect(first.manifest.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "value.txt", type: "file", mode: "100644" }),
+      expect.objectContaining({ path: "binary.bin", type: "file", mode: "100644", size: 3 }),
+      expect.objectContaining({ path: "tool.sh", type: "file", mode: "100755" }),
+      expect.objectContaining({ path: "value-link", type: "symlink", mode: "120000", target: "value.txt" })
+    ]));
+    expect(first.manifest.entries).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "deleted.txt" })
+    ]));
+  });
+
+  it("excludes frozen sensitive content and every symlink that resolves to it from evidence", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "workflow-sensitive-evidence-")); dirs.push(dir);
+    await exec("git", ["init", "-b", "main", dir]);
+    await git(dir, "config", "user.email", "test@example.com");
+    await git(dir, "config", "user.name", "Test");
+    await writeFile(join(dir, ".env.local"), "API_TOKEN=super-secret-value\n");
+    await writeFile(join(dir, "app.ts"), "export const ready = true;\n");
+    await symlink(".env.local", join(dir, "secret-link"));
+    await git(dir, "add", "--all");
+    await git(dir, "commit", "-m", "base");
+
+    const snapshot = await getWorktreeSnapshot(dir, { sensitivePatterns: [".env*"] });
+    const serialized = JSON.stringify(snapshot);
+
+    expect(snapshot.manifest.entries.map((entry) => entry.path)).toEqual(["app.ts"]);
+    expect(serialized).not.toContain("super-secret-value");
+    expect(serialized).not.toContain("secret-link");
+  });
+
+  it("rejects an evidence tree whose persisted payload exceeds the total byte budget", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "workflow-evidence-budget-")); dirs.push(dir);
+    await exec("git", ["init", dir]);
+    await writeFile(join(dir, "payload.txt"), "x".repeat(1024));
+
+    await expect(getWorktreeSnapshot(dir, { maxTotalBytes: 128 }))
+      .rejects.toThrow("CODING_EVIDENCE_SIZE_LIMIT");
+  });
+
   it("includes files nested inside an untracked directory",async()=>{
     const dir=await mkdtemp(join(tmpdir(),"workflow-git-"));dirs.push(dir);
     await exec("git",["init",dir]);

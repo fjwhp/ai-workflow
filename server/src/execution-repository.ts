@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { WorkflowStage } from "@ai-workflow/shared";
+import type { EvidenceChangedFile, EvidenceManifest } from "./evidence-tree.js";
 
 export interface ExecutionInput {
   requirementId: string;
@@ -32,6 +33,12 @@ export interface CodingEvidenceInput {
   worktreePath: string;
   diffHash: string;
   diff: string;
+  sourceRepoPath: string;
+  gitCommonDir: string;
+  sourceHead: string;
+  manifestHash: string;
+  manifest: EvidenceManifest;
+  changedFiles: EvidenceChangedFile[];
   originalChars: number;
   truncated: boolean;
   files?: string[];
@@ -83,11 +90,14 @@ export class ExecutionRepository {
     const item = { id: randomUUID(), createdAt: new Date().toISOString(), ...input };
     this.db.prepare(`INSERT INTO coding_evidence
       (id, execution_id, requirement_id, delivery_unit_id, evidence_version, project_id, branch,
-       worktree_path, diff_hash, diff_text, original_chars, truncated, files_json, additions, deletions,
-       diagnostics_text, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+       worktree_path, diff_hash, diff_text, source_repo_path, git_common_dir, source_head,
+       manifest_hash, manifest_json, changed_files_json, original_chars, truncated, files_json,
+       additions, deletions, diagnostics_text, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       item.id, item.executionId, item.requirementId, item.deliveryUnitId, item.evidenceVersion,
       item.projectId, item.branch, item.worktreePath, item.diffHash, item.diff,
+      item.sourceRepoPath, item.gitCommonDir, item.sourceHead, item.manifestHash,
+      JSON.stringify(item.manifest), JSON.stringify(item.changedFiles),
       item.originalChars, item.truncated ? 1 : 0, JSON.stringify(item.files ?? []),
       item.additions ?? 0, item.deletions ?? 0, item.diagnostics ?? "", item.createdAt
     );
@@ -95,8 +105,10 @@ export class ExecutionRepository {
   }
 
   getLatestCodingEvidence(requirementId: string) {
-    const row = this.db.prepare(`SELECT * FROM coding_evidence WHERE requirement_id = ?
-      ORDER BY created_at DESC LIMIT 1`).get(requirementId);
+    const row = this.db.prepare(`SELECT ce.*, dus.sensitive_patterns_json
+      FROM coding_evidence ce
+      JOIN delivery_unit_snapshots dus ON dus.delivery_unit_id = ce.delivery_unit_id
+      WHERE ce.requirement_id = ? ORDER BY ce.created_at DESC LIMIT 1`).get(requirementId);
     return row ? mapCodingEvidence(row as any) : null;
   }
 }
@@ -138,6 +150,13 @@ function mapCodingEvidence(row: any) {
     worktreePath: row.worktree_path,
     diffHash: row.diff_hash,
     diff: row.diff_text,
+    sourceRepoPath: row.source_repo_path,
+    gitCommonDir: row.git_common_dir,
+    sourceHead: row.source_head,
+    manifestHash: row.manifest_hash,
+    manifest: JSON.parse(row.manifest_json),
+    changedFiles: JSON.parse(row.changed_files_json),
+    sensitivePatterns: JSON.parse(row.sensitive_patterns_json),
     originalChars: row.original_chars,
     truncated: Boolean(row.truncated),
     files,

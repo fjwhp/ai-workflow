@@ -95,6 +95,8 @@ describe("project versions fresh schema", () => {
       "idx_requirement_projects_active_project"
     ]);
     expect(schemaObjectNames(database, "trigger")).toEqual([
+      "coding_evidence_immutable_delete",
+      "coding_evidence_immutable_update",
       "delivery_quality_evidence_immutable_delete",
       "delivery_quality_evidence_immutable_update",
       "validate_artifact_owner_insert",

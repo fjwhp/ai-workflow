@@ -36,7 +36,7 @@ export function buildCodexArgs(input: { model: string; baseUrl: string; cwd: str
   ];
 }
 
-type CodexProject = { id: string; repoPath: string; defaultBranch: string };
+type CodexProject = { id: string; repoPath: string; defaultBranch: string; sensitivePatterns: string[] };
 
 export async function prepareCodexCodingWorktree(project: CodexProject, version: CodingVersion, requirementCode: string) {
   if (version.projectId !== project.id) throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
@@ -85,9 +85,15 @@ export async function runCodexCoding(input: { requirement: any; artifacts: any[]
     child.on("close", (code) => resolve(code ?? -1));
   });
   const summary = summarizeCodexEvents(events);
-  const snapshot = await getWorktreeSnapshot(worktree.worktreePath);
+  const snapshot = await getWorktreeSnapshot(worktree.worktreePath, {
+    sensitivePatterns: input.project.sensitivePatterns
+  });
   const diff = snapshot.diff;
   if (exitCode !== 0) throw new Error(`Codex 执行失败（exit ${exitCode}）：${diagnostics.slice(-5).join("\n")}`);
   if (!summary.threadId) throw new Error("Codex 未返回独立会话 ID");
-  return { ...worktree, ...snapshot, runId, codexThreadId: summary.threadId, summary: summary.lastMessage || "Codex 编码完成", events, diagnostics };
+  return {
+    ...worktree, diff: snapshot.diff, files: snapshot.files, additions: snapshot.additions,
+    deletions: snapshot.deletions, evidenceSnapshot: snapshot, runId, codexThreadId: summary.threadId,
+    summary: summary.lastMessage || "Codex 编码完成", events, diagnostics
+  };
 }

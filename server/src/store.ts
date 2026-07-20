@@ -145,6 +145,9 @@ export class WorkflowStore {
       complete: (claim, completion) => this.withImmediateTransaction(
         () => this.deliveryQualityRepository.completeInTransaction(claim, completion)
       ),
+      abort: (claim, error) => this.withImmediateTransaction(
+        () => this.deliveryQualityRepository.abortInTransaction(claim, error)
+      ),
       latest: (unitId, kind) => this.deliveryQualityRepository.latest(unitId, kind)
     };
   }

@@ -27,7 +27,7 @@ vi.mock("./command-policy.js", () => ({
 }));
 
 import { createOrReuseRequirementWorktree, getWorktreeDiff, getWorktreeSnapshot } from "./repository.js";
-import { prepareCodingWorktree, resolveWorktreePath, runCodingAgent, type CodingAgentResult } from "./coding-agent.js";
+import { prepareCodingWorktree, resolveWorktreePath, runCodingAgent, type CodingAgentInput, type CodingAgentResult } from "./coding-agent.js";
 
 const createWorktree = vi.mocked(createOrReuseRequirementWorktree);
 const diff = vi.mocked(getWorktreeDiff);
@@ -46,7 +46,14 @@ beforeEach(() => {
     baseCommit: "version-head",
     reused: false
   });
-  snapshot.mockResolvedValue({ diff: "", files: [], changedFiles: [], additions: 0, deletions: 0 });
+  snapshot.mockResolvedValue({
+    diff: "", files: [], changedFiles: [], additions: 0, deletions: 0,
+    identity: {
+      repositoryPath: "/tmp/repo", gitCommonDir: "/tmp/repo/.git",
+      worktreePath: "/tmp/requirements/REQ-0001", branch: "ai/REQ-0001", headCommit: "version-head"
+    },
+    manifest: { version: 1, entries: [] }, manifestHash: "manifest-hash", evidenceHash: "evidence-hash"
+  });
   diff.mockResolvedValue("diff --git a/src/App.ts b/src/App.ts");
   mocks.runCommand.mockResolvedValue({ code: 0, stdout: "ok", stderr: "" });
 });
@@ -55,7 +62,7 @@ afterEach(async () => {
   await Promise.all(temporaryWorktrees.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-function codingInput(allowedCommands: Array<{ command: string; argsPrefix?: string[] }>) {
+function codingInput(allowedCommands: Array<{ command: string; argsPrefix?: string[] }>): CodingAgentInput {
   return {
     requirement: { id: "requirement-1", code: "REQ-0001" },
     artifacts: [],
@@ -177,6 +184,18 @@ describe("runCodingAgent tool boundary", () => {
     expect(toolNames).toEqual(["search_code", "read_file", "write_file", "git_diff"]);
   });
 
+  it("captures final evidence with the frozen sensitive path policy", async () => {
+    mocks.chatCreate.mockResolvedValueOnce({ choices: [{ message: { role: "assistant", content: "done" } }] });
+    const input = codingInput([]);
+    input.deliveryContext.sensitivePatterns = [".env*", "config/secrets/**"];
+
+    await runCodingAgent(input);
+
+    expect(snapshot).toHaveBeenCalledWith("/tmp/requirements/REQ-0001", {
+      sensitivePatterns: [".env*", "config/secrets/**"]
+    });
+  });
+
   it("returns an unknown-tool result for a forged run_command call without invoking a process", async () => {
     respondWithToolCalls([{ name: "run_command", arguments: { command: "npm", args: ["test"] } }]);
 
@@ -261,6 +280,34 @@ describe("runCodingAgent tool boundary", () => {
     expect(toolResult()).toEqual({ error: "CODING_FILE_NOT_TEXT" });
   });
 
+  it("keeps frozen sensitive paths out of every model-facing repository tool", async () => {
+    const worktree = await temporaryWorktree();
+    await writeFile(join(worktree, ".env.local"), "API_TOKEN=model-visible-secret\n");
+    await writeFile(join(worktree, "app.ts"), "export const ready = true;\n");
+    snapshot.mockResolvedValue({
+      ...(await snapshot.getMockImplementation()?.(worktree) as any),
+      diff: "filtered diff", files: ["app.ts"], changedFiles: [], additions: 1, deletions: 0,
+      identity: { repositoryPath: "/tmp/repo", gitCommonDir: "/tmp/repo/.git", worktreePath: worktree, branch: "ai/REQ-0001", headCommit: "version-head" },
+      manifest: { version: 1, entries: [] }, manifestHash: "manifest", evidenceHash: "evidence"
+    });
+    respondWithToolCalls([
+      { name: "search_code", arguments: { query: "model-visible-secret" } },
+      { name: "read_file", arguments: { path: ".env.local" } },
+      { name: "write_file", arguments: { path: ".env.local", content: "overwritten" } },
+      { name: "git_diff", arguments: {} }
+    ]);
+    const input = codingInput([]);
+    input.deliveryContext.sensitivePatterns = [".env*"];
+
+    await runCodingAgent(input);
+
+    expect(toolResult("call-1")).not.toContain("model-visible-secret");
+    expect(toolResult("call-2")).toEqual({ error: "CODING_FILE_PATH_SENSITIVE" });
+    expect(toolResult("call-3")).toEqual({ error: "CODING_FILE_PATH_SENSITIVE" });
+    expect(toolResult("call-4")).toBe("filtered diff");
+    expect(await readFile(join(worktree, ".env.local"), "utf8")).toContain("model-visible-secret");
+  });
+
   it("rejects write_file when the final file is a symlink outside the worktree", async () => {
     const { worktree, outside } = await temporaryWorktreeWithOutside();
     const externalFile = join(outside, "target.txt");
@@ -331,7 +378,7 @@ describe("runCodingAgent tool boundary", () => {
     const result = await runCodingAgent(codingInput([{ command: "npm", argsPrefix: ["test"] }]));
 
     expect(await readFile(join(worktree, "App.ts"), "utf8")).toBe("export const after = true;\n");
-    expect(diff).toHaveBeenCalledWith(worktree);
+    expect(snapshot).toHaveBeenCalledWith(worktree, { sensitivePatterns: [] });
     const searchMessage = mocks.chatCreate.mock.calls[1]![0].messages.find((message: any) => message.tool_call_id === "call-1");
     expect(JSON.parse(searchMessage.content)).toContain("App.ts:1:export const before = '--version';");
     expect(result.commands).toEqual([]);

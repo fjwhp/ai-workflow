@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { prepareCleanDatabase, writeDatabaseVersionMarker } from "./database-reset.js";
 
 const directories: string[] = [];
-const currentSchemaVersion = "phase-2-delivery-quality-v6";
+const currentSchemaVersion = "phase-2-evidence-tree-v7";
 
 afterEach(async () => {
   const { rm } = await import("node:fs/promises");

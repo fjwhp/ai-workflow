@@ -16,7 +16,7 @@ import {
   DeliveryExecutionService
 } from "./delivery-execution-service.js";
 
-const schemaVersion = "phase-2-delivery-quality-v6";
+const schemaVersion = "phase-2-evidence-tree-v7";
 
 interface StartupApp {
   addHook(name: "onClose", hook: () => Promise<void> | void): unknown;

@@ -77,6 +77,12 @@ describe("ExecutionRepository", () => {
       worktreePath: input.worktreePath,
       diffHash: "abc",
       diff: "diff",
+      sourceRepoPath: "/tmp/execution-repository",
+      gitCommonDir: "/tmp/execution-repository/.git",
+      sourceHead: "version-head",
+      manifestHash: "manifest-hash",
+      manifest: { version: 1, entries: [] },
+      changedFiles: [],
       originalChars: 4,
       truncated: false,
       files: ["src/index.ts"],
@@ -97,6 +103,8 @@ describe("ExecutionRepository", () => {
       id: evidence.id,
       deliveryUnitId: item.unit.id,
       evidenceVersion: 1,
+      sourceHead: "version-head",
+      manifest: { version: 1, entries: [] },
       files: ["src/index.ts"],
       fileCount: 1
     });

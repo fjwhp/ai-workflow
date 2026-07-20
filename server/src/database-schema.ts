@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { MAX_AUTOMATION_EVIDENCE_VERSION } from "@ai-workflow/shared";
+import { MAX_EVIDENCE_TOTAL_BYTES } from "./evidence-tree.js";
 
 export function createPhase2Schema(db: DatabaseSync) {
   db.exec(`
@@ -282,8 +283,14 @@ export function createPhase2Schema(db: DatabaseSync) {
       ),
       project_id TEXT NOT NULL,
       branch TEXT NOT NULL, worktree_path TEXT NOT NULL, diff_hash TEXT NOT NULL, diff_text TEXT NOT NULL,
+      source_repo_path TEXT NOT NULL, git_common_dir TEXT NOT NULL, source_head TEXT NOT NULL,
+      manifest_hash TEXT NOT NULL, manifest_json TEXT NOT NULL, changed_files_json TEXT NOT NULL,
       original_chars INTEGER NOT NULL, truncated INTEGER NOT NULL, files_json TEXT NOT NULL,
       additions INTEGER NOT NULL, deletions INTEGER NOT NULL, diagnostics_text TEXT NOT NULL, created_at TEXT NOT NULL,
+      CHECK(
+        length(CAST(diff_text AS BLOB)) + length(CAST(manifest_json AS BLOB))
+          + length(CAST(changed_files_json AS BLOB)) <= ${MAX_EVIDENCE_TOTAL_BYTES}
+      ),
       FOREIGN KEY(execution_id) REFERENCES executions(id),
       FOREIGN KEY(requirement_id) REFERENCES requirements(id),
       FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
@@ -586,6 +593,12 @@ export function createPhase2Schema(db: DatabaseSync) {
           AND project_id = NEW.project_id
       );
     END;
+    CREATE TRIGGER IF NOT EXISTS coding_evidence_immutable_update
+    BEFORE UPDATE ON coding_evidence
+    BEGIN SELECT RAISE(ABORT, 'CODING_EVIDENCE_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS coding_evidence_immutable_delete
+    BEFORE DELETE ON coding_evidence
+    BEGIN SELECT RAISE(ABORT, 'CODING_EVIDENCE_IMMUTABLE'); END;
     CREATE TRIGGER IF NOT EXISTS validate_delivery_quality_run_insert
     BEFORE INSERT ON delivery_quality_runs
     BEGIN

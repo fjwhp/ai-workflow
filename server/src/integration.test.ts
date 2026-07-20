@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { executeLocalIntegration, preflightLocalIntegration } from "./integration.js";
 import { getWorktreeSnapshot } from "./repository.js";
-import { hashDiff } from "./coding-evidence.js";
 
 const exec = promisify(execFile);
 const roots: string[] = [];
@@ -26,7 +25,7 @@ async function fixture() {
   await exec("git", ["-C", repo, "worktree", "add", "-b", "ai/REQ-0001", sourceWorktree, "main"]);
   await writeFile(join(sourceWorktree, "feature.txt"), "implemented\n");
   const snapshot = await getWorktreeSnapshot(sourceWorktree);
-  return { root, repo, targetWorktree, sourceWorktree, diffHash: hashDiff(snapshot.diff) };
+  return { root, repo, targetWorktree, sourceWorktree, evidenceHash: snapshot.evidenceHash };
 }
 
 function integrationInput(item: Awaited<ReturnType<typeof fixture>>) {
@@ -36,7 +35,8 @@ function integrationInput(item: Awaited<ReturnType<typeof fixture>>) {
     targetBranch: "release/1.0",
     sourceWorktreePath: item.sourceWorktree,
     sourceBranch: "ai/REQ-0001",
-    evidenceDiffHash: item.diffHash
+    evidenceHash: item.evidenceHash,
+    sensitivePatterns: []
   };
 }
 
@@ -95,7 +95,7 @@ describe("local integration", () => {
     await exec("git", ["-C", item.sourceWorktree, "add", "--all"]);
     await exec("git", ["-C", item.sourceWorktree, "commit", "-m", "source evidence"]);
     const sourceCommit = (await exec("git", ["-C", item.sourceWorktree, "rev-parse", "HEAD"])).stdout.trim();
-    const check = await preflightLocalIntegration({ ...integrationInput(item), evidenceDiffHash: hashDiff("different"), sourceCommit });
+    const check = await preflightLocalIntegration({ ...integrationInput(item), evidenceHash: "0".repeat(64), sourceCommit });
     expect(check.allowed).toBe(false);
     expect(check.checks.find((entry) => entry.id === "evidence_valid")?.ok).toBe(false);
   });
@@ -132,7 +132,7 @@ describe("local integration", () => {
     await writeFile(join(item.targetWorktree, "value.txt"), "target\n");
     await exec("git", ["-C", item.targetWorktree, "add", "--all"]); await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target"]);
     const targetHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
-    const result = await executeLocalIntegration({ ...integrationInput(item), evidenceDiffHash: hashDiff(sourceSnapshot.diff), commitMessage: "REQ-0001 conflict", commands: [] });
+    const result = await executeLocalIntegration({ ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash, commitMessage: "REQ-0001 conflict", commands: [] });
     expect(result.status, JSON.stringify(result)).toBe("conflict");
     expect(result.conflictFiles).toEqual(["value.txt"]);
     expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
@@ -196,7 +196,7 @@ describe("local integration", () => {
     await chmod(hook, 0o755);
 
     const result = await executeLocalIntegration({
-      ...integrationInput(item), evidenceDiffHash: hashDiff(snapshot.diff),
+      ...integrationInput(item), evidenceHash: snapshot.evidenceHash,
       commitMessage: "REQ-0001 target race", commands: []
     });
 

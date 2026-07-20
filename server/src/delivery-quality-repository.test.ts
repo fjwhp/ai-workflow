@@ -31,6 +31,10 @@ function fixture(path = ":memory:") {
   store.deliveryExecutions.completeImplementation(claim, {
     branch: "ai/REQ-0001", worktreePath: "/tmp/quality-run", baseCommit: version.headCommit,
     commands: [], diff: "diff", diffHash: "abc123", originalChars: 4, truncated: false,
+    changedFiles: [], identity: {
+      repositoryPath: "/tmp/quality", gitCommonDir: "/tmp/quality/.git",
+      worktreePath: "/tmp/quality-run", branch: "ai/REQ-0001", headCommit: version.headCommit
+    }, manifest: { version: 1, entries: [] }, manifestHash: "manifest-hash",
     files: ["src/index.ts"], additions: 1, deletions: 0, diagnostics: "", output: {}
   });
   return { store, requirement, unit };
@@ -109,6 +113,21 @@ describe("delivery quality evidence schema", () => {
       expect(() => db.prepare("UPDATE delivery_quality_evidence SET result = 'failed' WHERE id = ?")
         .run(store.deliveryQuality.latest(unit.id, "code_review")!.id))
         .toThrow("DELIVERY_QUALITY_EVIDENCE_IMMUTABLE");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("makes the persisted coding evidence tree immutable", () => {
+    const { store, unit } = fixture();
+    try {
+      const evidence = store.deliveryExecutions.getCodingEvidence(unit.id, 1) as { id: string };
+      const db = (store as any).db;
+      expect(() => db.prepare("UPDATE coding_evidence SET manifest_json = ? WHERE id = ?")
+        .run('{"version":1,"entries":[]}', evidence.id))
+        .toThrow("CODING_EVIDENCE_IMMUTABLE");
+      expect(() => db.prepare("DELETE FROM coding_evidence WHERE id = ?").run(evidence.id))
+        .toThrow("CODING_EVIDENCE_IMMUTABLE");
     } finally {
       store.close();
     }

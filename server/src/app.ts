@@ -5,7 +5,6 @@ import { WorkflowStore } from "./store.js";
 import { runAgent } from "./ai.js";
 import { createBackup } from "./backup.js";
 import { redactSensitive } from "./redaction.js";
-import { hashDiff } from "./coding-evidence.js";
 import { getWorktreeSnapshot } from "./repository.js";
 import { ensureProjectKnowledge } from "./knowledge-service.js";
 import { getRepositoryHead } from "./project-knowledge.js";
@@ -48,7 +47,9 @@ export async function buildApp(store: WorkflowStore) {
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
     const codingEvidence: any = store.getLatestCodingEvidence(item.id);
     if (codingEvidence) {
-      try { codingEvidence.status = hashDiff((await getWorktreeSnapshot(codingEvidence.worktreePath)).diff) === codingEvidence.diffHash ? (codingEvidence.truncated ? "truncated" : "valid") : "stale"; }
+      try { codingEvidence.status = (await getWorktreeSnapshot(codingEvidence.worktreePath, {
+        sensitivePatterns: codingEvidence.sensitivePatterns
+      })).evidenceHash === codingEvidence.diffHash ? (codingEvidence.truncated ? "truncated" : "valid") : "stale"; }
       catch { codingEvidence.status = "unverifiable"; }
     }
     const artifacts=store.listArtifacts(item.id),approvals=store.listApprovals(item.id);
