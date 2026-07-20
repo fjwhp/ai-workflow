@@ -156,6 +156,124 @@ function concurrentEnqueueWorker(input: AutomationJobInput, databasePath: string
   return { worker, ready, result };
 }
 
+function concurrentLeaseWorker(databasePath: string, workerId: string) {
+  const worker = new Worker(`
+    const { parentPort, workerData } = require("node:worker_threads");
+    const { DatabaseSync } = require("node:sqlite");
+    let database;
+    try {
+      const { AutomationJobRepository } = require(workerData.repositoryPath);
+      database = new DatabaseSync(workerData.databasePath);
+      database.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
+      const repository = new AutomationJobRepository(database, () => new Date(workerData.now));
+      parentPort.postMessage({ type: "ready" });
+      parentPort.once("message", (message) => {
+        try {
+          if (message?.type !== "go") throw new Error("INVALID_BARRIER_MESSAGE");
+          parentPort.postMessage({
+            type: "result",
+            job: repository.leaseNext(workerData.workerId, new Date(workerData.now), workerData.leaseMs)
+          });
+        } catch (error) {
+          parentPort.postMessage({
+            type: "error",
+            message: error instanceof Error ? error.message : String(error),
+            code: error && typeof error === "object" && "code" in error ? error.code : undefined
+          });
+        } finally {
+          database.close();
+          parentPort.close();
+        }
+      });
+    } catch (error) {
+      if (database) database.close();
+      parentPort.postMessage({
+        type: "error",
+        message: error instanceof Error ? error.message : String(error),
+        code: error && typeof error === "object" && "code" in error ? error.code : undefined
+      });
+      parentPort.close();
+    }
+  `, {
+    eval: true,
+    execArgv: ["--require", "tsx/cjs"],
+    workerData: {
+      databasePath,
+      repositoryPath: fileURLToPath(new URL("./automation-job-repository.ts", import.meta.url)),
+      workerId,
+      leaseMs: 30_000,
+      now: now.toISOString()
+    }
+  });
+  let readyResolve!: () => void;
+  let readyReject!: (error: Error) => void;
+  let resultResolve!: (job: ReturnType<AutomationJobRepository["leaseNext"]>) => void;
+  let resultReject!: (error: Error) => void;
+  let exitResolve!: (code: number) => void;
+  let readySeen = false;
+  let resultSeen = false;
+  const ready = new Promise<void>((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+  const result = new Promise<ReturnType<AutomationJobRepository["leaseNext"]>>((resolve, reject) => {
+    resultResolve = resolve;
+    resultReject = reject;
+  });
+  const exited = new Promise<number>((resolve) => {
+    exitResolve = resolve;
+  });
+  void ready.catch(() => {});
+  void result.catch(() => {});
+  worker.on("message", (message: {
+    type?: string;
+    job?: ReturnType<AutomationJobRepository["leaseNext"]>;
+    message?: string;
+    code?: string;
+  }) => {
+    if (message.type === "ready") {
+      readySeen = true;
+      readyResolve();
+    }
+    if (message.type === "result") {
+      resultSeen = true;
+      resultResolve(message.job ?? null);
+    }
+    if (message.type === "error") {
+      const error = Object.assign(new Error(message.message ?? "LEASE_WORKER_FAILED"), { code: message.code });
+      readyReject(error);
+      resultReject(error);
+    }
+  });
+  worker.on("error", (error) => {
+    readyReject(error);
+    resultReject(error);
+  });
+  worker.on("exit", (code) => {
+    exitResolve(code);
+    if (!readySeen || !resultSeen) {
+      const error = new Error(`LEASE_WORKER_EXIT_${code}`);
+      readyReject(error);
+      resultReject(error);
+    }
+  });
+  return { worker, ready, result, exited };
+}
+
+async function withTimeout<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out`)), milliseconds);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 describe("AutomationJobRepository", () => {
   it("exports the persistent queue repository", () => {
     expect(AutomationJobRepository).toBeTypeOf("function");
@@ -190,6 +308,31 @@ describe("AutomationJobRepository", () => {
 
       expect(secondJob.id).toBe(firstJob.id);
       expect(fixture.first.listPending()).toEqual([firstJob]);
+    } finally {
+      await Promise.all([first.worker.terminate(), second.worker.terminate()]);
+    }
+  });
+
+  it("leases one pending job exactly once across simultaneous repository workers", { timeout: 15_000 }, async () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    const databasePath = fixture.firstDatabase.prepare("PRAGMA database_list").get() as { file: string };
+    const first = concurrentLeaseWorker(databasePath.file, "worker-a");
+    const second = concurrentLeaseWorker(databasePath.file, "worker-b");
+
+    try {
+      await withTimeout(Promise.all([first.ready, second.ready]), 5_000, "lease workers ready");
+      first.worker.postMessage({ type: "go" });
+      second.worker.postMessage({ type: "go" });
+      const results = await withTimeout(
+        Promise.all([first.result, second.result]), 5_000, "lease workers result"
+      );
+
+      expect(results.filter((result) => result?.id === queued.id)).toHaveLength(1);
+      expect(results.filter((result) => result === null)).toHaveLength(1);
+      await expect(withTimeout(
+        Promise.all([first.exited, second.exited]), 5_000, "lease workers exit"
+      )).resolves.toEqual([0, 0]);
     } finally {
       await Promise.all([first.worker.terminate(), second.worker.terminate()]);
     }
@@ -331,7 +474,118 @@ describe("AutomationJobRepository", () => {
     fixture.secondDatabase.prepare("UPDATE automation_jobs SET payload_json = ? WHERE id = ?")
       .run(payloadJson, queued.id);
 
-    expect(() => fixture.first.get(queued.id)).toThrow("AUTOMATION_JOB_PAYLOAD_INVALID");
+    expect(() => fixture.first.get(queued.id)).toThrow("AUTOMATION_JOB_ROW_INVALID");
+  });
+
+  it.each([
+    ["id runtime type", "id = x'616263'", "byDedupe"],
+    ["empty id", "id = ''", "byDedupe"],
+    ["dedupe runtime type", "dedupe_key = x'616263'", "get"],
+    ["noncanonical dedupe key", "dedupe_key = 'forged'", "get"],
+    ["owner type", "owner_type = 'invented'", "get"],
+    ["evidence runtime type", "evidence_version = x'31'", "get"],
+    ["evidence range", "evidence_version = 0", "get"],
+    ["action", "action = 'invented'", "get"],
+    ["status", "status = 'invented'", "get"],
+    ["attempt runtime type", "attempt = x'31'", "get"],
+    ["maximum attempts runtime type", "max_attempts = x'33'", "get"],
+    ["maximum attempts range", "max_attempts = 101", "get"],
+    ["exhausted pending attempt", "attempt = max_attempts", "get"],
+    [
+      "zero leased attempt",
+      "status = 'leased', attempt = 0, lease_owner = 'worker', lease_expires_at = '2026-07-20T00:05:00.000Z'",
+      "get"
+    ],
+    ["missing leased fields", "status = 'leased', attempt = 1", "get"],
+    [
+      "unexpected pending lease fields",
+      "lease_owner = 'worker', lease_expires_at = '2026-07-20T00:05:00.000Z'",
+      "get"
+    ],
+    [
+      "lease owner runtime type",
+      "status = 'leased', attempt = 1, lease_owner = x'77', lease_expires_at = '2026-07-20T00:05:00.000Z'",
+      "get"
+    ],
+    [
+      "lease timestamp format",
+      "status = 'leased', attempt = 1, lease_owner = 'worker', lease_expires_at = '2026-07-20T00:05:00Z'",
+      "get"
+    ],
+    ["payload runtime type", "payload_json = x'7B7D'", "get"],
+    ["malformed payload", "payload_json = '{'", "get"],
+    ["non-finite payload", "payload_json = '1e999'", "get"],
+    ["last error runtime type", "last_error = x'65'", "get"],
+    ["last error length", `last_error = '${"x".repeat(4097)}'`, "get"],
+    ["created timestamp", "created_at = '2026-07-20 00:00:00'", "get"],
+    ["updated timestamp", "updated_at = '2026-07-20T00:00:00Z'", "get"],
+    [
+      "timestamp order",
+      "created_at = '2026-07-20T00:00:01.000Z', updated_at = '2026-07-20T00:00:00.000Z'",
+      "get"
+    ]
+  ] as const)("rejects a stored row with invalid %s", (_label, assignment, readPath) => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    fixture.secondDatabase.exec("PRAGMA ignore_check_constraints = ON");
+    fixture.secondDatabase.prepare(`UPDATE automation_jobs SET ${assignment} WHERE id = ?`).run(queued.id);
+
+    const read = readPath === "byDedupe"
+      ? () => fixture.first.byDedupe(queued.dedupeKey)
+      : () => fixture.first.get(queued.id);
+    expect(read).toThrow("AUTOMATION_JOB_ROW_INVALID");
+  });
+
+  it("rejects a stored row with an unsafe owner", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    insertRequirementOwner(fixture, "unsafe:owner");
+    fixture.secondDatabase.exec("PRAGMA ignore_check_constraints = ON");
+    fixture.secondDatabase.prepare("UPDATE automation_jobs SET owner_id = 'unsafe:owner' WHERE id = ?")
+      .run(queued.id);
+
+    expect(() => fixture.first.get(queued.id)).toThrow("AUTOMATION_JOB_ROW_INVALID");
+  });
+
+  it("decodes duplicate enqueue, direct lookup, and pending list through the same row validator", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    fixture.secondDatabase.exec("PRAGMA ignore_check_constraints = ON");
+
+    fixture.secondDatabase.prepare("UPDATE automation_jobs SET status = 'invented' WHERE id = ?").run(queued.id);
+    expect(() => fixture.first.enqueue(job(fixture.requirement.id))).toThrow("AUTOMATION_JOB_ROW_INVALID");
+    expect(() => fixture.first.byDedupe(queued.dedupeKey)).toThrow("AUTOMATION_JOB_ROW_INVALID");
+
+    fixture.secondDatabase.prepare(
+      "UPDATE automation_jobs SET status = 'pending', created_at = 'not-a-date' WHERE id = ?"
+    ).run(queued.id);
+    expect(() => fixture.first.listPending()).toThrow("AUTOMATION_JOB_ROW_INVALID");
+  });
+
+  it("lists only lease-eligible pending jobs through the pending partial index", () => {
+    const fixture = createFixture();
+    const exhausted = fixture.first.enqueue(job(fixture.requirement.id));
+    fixture.secondDatabase.exec("PRAGMA ignore_check_constraints = ON");
+    fixture.secondDatabase.prepare("UPDATE automation_jobs SET attempt = max_attempts WHERE id = ?")
+      .run(exhausted.id);
+
+    expect(fixture.first.listPending()).toEqual([]);
+    const queryPlan = fixture.firstDatabase.prepare(`EXPLAIN QUERY PLAN SELECT * FROM automation_jobs
+      WHERE status = 'pending' AND attempt < max_attempts ORDER BY created_at, id`).all() as Array<{ detail: string }>;
+    expect(queryPlan.some(({ detail }) => detail.includes("idx_automation_jobs_pending_lease"))).toBe(true);
+  });
+
+  it("preserves normal Unicode in repository-owned queue text", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id, {
+      payload: { message: "构建完成 😀" }
+    }));
+
+    expect(fixture.first.leaseNext("工作者-😀", now, 30_000)).toMatchObject({
+      id: queued.id, leaseOwner: "工作者-😀", payload: { message: "构建完成 😀" }
+    });
+    expect(fixture.first.fail(queued.id, "工作者-😀", "临时错误 😀", false)).toBe(true);
+    expect(fixture.first.get(queued.id)?.lastError).toBe("临时错误 😀");
   });
 
   it("leases pending jobs in stable created-at and id order", () => {
@@ -415,6 +669,37 @@ describe("AutomationJobRepository", () => {
 
     expect(fixture.second.get(queued.id)).toMatchObject({
       status: "pending", attempt: 0, leaseOwner: null, leaseExpiresAt: null
+    });
+  });
+
+  it("rolls back a lease when the stored row cannot be decoded", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    fixture.secondDatabase.prepare("UPDATE automation_jobs SET payload_json = '1e999' WHERE id = ?")
+      .run(queued.id);
+
+    expect(() => fixture.first.leaseNext("worker-a", now, 30_000))
+      .toThrow("AUTOMATION_JOB_ROW_INVALID");
+
+    expect(fixture.secondDatabase.prepare(
+      "SELECT status, attempt, lease_owner, lease_expires_at FROM automation_jobs WHERE id = ?"
+    ).get(queued.id)).toEqual({
+      status: "pending", attempt: 0, lease_owner: null, lease_expires_at: null
+    });
+  });
+
+  it("preserves the original error when SQLite already rolled back the lease transaction", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    fixture.secondDatabase.exec(`CREATE TRIGGER rollback_test_lease BEFORE UPDATE OF status ON automation_jobs
+      WHEN NEW.status = 'leased' BEGIN SELECT RAISE(ROLLBACK, 'forced lease rollback'); END;`);
+
+    expect(() => fixture.first.leaseNext("worker-a", now, 30_000)).toThrow("forced lease rollback");
+
+    expect(fixture.secondDatabase.prepare(
+      "SELECT status, attempt, lease_owner, lease_expires_at FROM automation_jobs WHERE id = ?"
+    ).get(queued.id)).toEqual({
+      status: "pending", attempt: 0, lease_owner: null, lease_expires_at: null
     });
   });
 

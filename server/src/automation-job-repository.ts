@@ -49,24 +49,6 @@ export interface AutomationJobPersistence {
   listPending(): AutomationJob[];
 }
 
-interface AutomationJobRow {
-  id: string;
-  dedupe_key: string;
-  owner_type: AutomationJobOwnerType;
-  owner_id: string;
-  evidence_version: number;
-  action: AutomationAction;
-  status: AutomationJobStatus;
-  attempt: number;
-  max_attempts: number;
-  lease_owner: string | null;
-  lease_expires_at: string | null;
-  payload_json: string;
-  last_error: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
 const MAX_OWNER_ID_LENGTH = 256;
 const MAX_PAYLOAD_BYTES = 65_536;
 const MAX_ATTEMPTS = 100;
@@ -92,17 +74,18 @@ export class AutomationJobRepository {
       ON CONFLICT(dedupe_key) DO NOTHING`)
       .run(randomUUID(), dedupeKey, input.ownerType, input.ownerId, input.evidenceVersion, input.action,
         input.maxAttempts, payloadJson, now, now);
-    const row = this.db.prepare("SELECT * FROM automation_jobs WHERE dedupe_key = ?").get(dedupeKey) as AutomationJobRow | undefined;
+    const row = this.db.prepare("SELECT * FROM automation_jobs WHERE dedupe_key = ?").get(dedupeKey);
     if (!row) throw new Error("AUTOMATION_JOB_ENQUEUE_FAILED");
+    const persisted = decodeAutomationJobRow(row);
     if (
-      row.owner_type !== input.ownerType
-      || row.owner_id !== input.ownerId
-      || row.evidence_version !== input.evidenceVersion
-      || row.action !== input.action
+      persisted.ownerType !== input.ownerType
+      || persisted.ownerId !== input.ownerId
+      || persisted.evidenceVersion !== input.evidenceVersion
+      || persisted.action !== input.action
     ) {
       throw new Error("AUTOMATION_JOB_DEDUPE_CONFLICT");
     }
-    return mapAutomationJob(row);
+    return persisted;
   }
 
   leaseNext(workerId: string, now: Date, leaseMs: number): AutomationJob | null {
@@ -124,11 +107,16 @@ export class AutomationJobRepository {
         this.db.exec("COMMIT");
         return null;
       }
-      const row = this.db.prepare("SELECT * FROM automation_jobs WHERE id = ?").get(candidate.id) as unknown as AutomationJobRow;
+      const row = this.db.prepare("SELECT * FROM automation_jobs WHERE id = ?").get(candidate.id);
+      const job = decodeAutomationJobRow(row);
       this.db.exec("COMMIT");
-      return mapAutomationJob(row);
+      return job;
     } catch (error) {
-      this.db.exec("ROLLBACK");
+      if (this.db.isTransaction) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch {}
+      }
       throw error;
     }
   }
@@ -206,19 +194,20 @@ export class AutomationJobRepository {
 
   get(jobId: string): AutomationJob | null {
     validateBoundedId(jobId, "AUTOMATION_JOB_ID_INVALID");
-    const row = this.db.prepare("SELECT * FROM automation_jobs WHERE id = ?").get(jobId) as AutomationJobRow | undefined;
-    return row ? mapAutomationJob(row) : null;
+    const row = this.db.prepare("SELECT * FROM automation_jobs WHERE id = ?").get(jobId);
+    return row ? decodeAutomationJobRow(row) : null;
   }
 
   byDedupe(dedupeKey: string): AutomationJob | null {
     validateBoundedString(dedupeKey, 512, "AUTOMATION_JOB_DEDUPE_KEY_INVALID");
-    const row = this.db.prepare("SELECT * FROM automation_jobs WHERE dedupe_key = ?").get(dedupeKey) as AutomationJobRow | undefined;
-    return row ? mapAutomationJob(row) : null;
+    const row = this.db.prepare("SELECT * FROM automation_jobs WHERE dedupe_key = ?").get(dedupeKey);
+    return row ? decodeAutomationJobRow(row) : null;
   }
 
   listPending(): AutomationJob[] {
-    return (this.db.prepare("SELECT * FROM automation_jobs WHERE status = 'pending' ORDER BY created_at, id").all() as unknown as AutomationJobRow[])
-      .map(mapAutomationJob);
+    return this.db.prepare(`SELECT * FROM automation_jobs
+      WHERE status = 'pending' AND attempt < max_attempts
+      ORDER BY created_at, id`).all().map(decodeAutomationJobRow);
   }
 }
 
@@ -351,22 +340,104 @@ function parseStoredPayload(payloadJson: string) {
   return payload;
 }
 
-function mapAutomationJob(row: AutomationJobRow): AutomationJob {
-  return {
-    id: row.id,
-    dedupeKey: row.dedupe_key,
-    ownerType: row.owner_type,
-    ownerId: row.owner_id,
-    evidenceVersion: row.evidence_version,
-    action: row.action,
-    status: row.status,
-    attempt: row.attempt,
-    maxAttempts: row.max_attempts,
-    leaseOwner: row.lease_owner,
-    leaseExpiresAt: row.lease_expires_at,
-    payload: parseStoredPayload(row.payload_json),
-    lastError: row.last_error,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
-  };
+function decodeAutomationJobRow(row: unknown): AutomationJob {
+  try {
+    if (!isRecord(row)) throw new Error("invalid row");
+    const id = decodeStoredString(row.id, MAX_OWNER_ID_LENGTH, true);
+    const dedupeKey = decodeStoredString(row.dedupe_key, 512, false);
+    if (row.owner_type !== "requirement" && row.owner_type !== "delivery_unit") {
+      throw new Error("invalid owner type");
+    }
+    const ownerType = row.owner_type;
+    if (typeof row.owner_id !== "string" || !OWNER_ID_PATTERN.test(row.owner_id)
+      || row.owner_id.length > MAX_OWNER_ID_LENGTH) {
+      throw new Error("invalid owner");
+    }
+    const ownerId = row.owner_id;
+    if (!Number.isSafeInteger(row.evidence_version) || (row.evidence_version as number) < 1
+      || (row.evidence_version as number) > MAX_AUTOMATION_EVIDENCE_VERSION) {
+      throw new Error("invalid evidence version");
+    }
+    const evidenceVersion = row.evidence_version as number;
+    if (!(automationActions as readonly unknown[]).includes(row.action)) throw new Error("invalid action");
+    const action = row.action as AutomationAction;
+    if (!isAutomationJobStatus(row.status)) throw new Error("invalid status");
+    const status = row.status;
+    if (!Number.isSafeInteger(row.attempt) || (row.attempt as number) < 0) throw new Error("invalid attempt");
+    const attempt = row.attempt as number;
+    if (!Number.isSafeInteger(row.max_attempts) || (row.max_attempts as number) < 1
+      || (row.max_attempts as number) > MAX_ATTEMPTS) {
+      throw new Error("invalid maximum attempts");
+    }
+    const maxAttempts = row.max_attempts as number;
+    if (attempt > maxAttempts || (status === "pending" && attempt >= maxAttempts)
+      || (status === "leased" && attempt < 1)) {
+      throw new Error("invalid attempt state");
+    }
+
+    let leaseOwner: string | null;
+    let leaseExpiresAt: string | null;
+    if (status === "leased") {
+      leaseOwner = decodeStoredString(row.lease_owner, MAX_WORKER_ID_LENGTH, true);
+      leaseExpiresAt = decodeStoredTimestamp(row.lease_expires_at);
+    } else {
+      if (row.lease_owner !== null || row.lease_expires_at !== null) throw new Error("invalid lease state");
+      leaseOwner = null;
+      leaseExpiresAt = null;
+    }
+
+    const payloadJson = decodeStoredString(row.payload_json, MAX_PAYLOAD_BYTES, false, true);
+    if (Buffer.byteLength(payloadJson, "utf8") > MAX_PAYLOAD_BYTES) throw new Error("invalid payload length");
+    const payload = parseStoredPayload(payloadJson);
+    let lastError: string | null;
+    if (row.last_error === null) {
+      lastError = null;
+    } else {
+      if (typeof row.last_error !== "string" || row.last_error.includes("\0")
+        || Array.from(row.last_error).length > MAX_ERROR_LENGTH) {
+        throw new Error("invalid last error");
+      }
+      lastError = row.last_error;
+    }
+    const createdAt = decodeStoredTimestamp(row.created_at);
+    const updatedAt = decodeStoredTimestamp(row.updated_at);
+    if (updatedAt < createdAt) throw new Error("invalid timestamp order");
+    if (leaseExpiresAt !== null && leaseExpiresAt <= updatedAt) throw new Error("invalid lease expiry");
+    if (dedupeKey !== canonicalDedupeKey({ ownerType, ownerId, evidenceVersion, action })) {
+      throw new Error("invalid dedupe key");
+    }
+
+    return {
+      id, dedupeKey, ownerType, ownerId, evidenceVersion, action, status, attempt, maxAttempts,
+      leaseOwner, leaseExpiresAt, payload, lastError, createdAt, updatedAt
+    };
+  } catch {
+    throw new Error("AUTOMATION_JOB_ROW_INVALID");
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isAutomationJobStatus(value: unknown): value is AutomationJobStatus {
+  return value === "pending" || value === "leased" || value === "completed"
+    || value === "failed" || value === "canceled";
+}
+
+function decodeStoredString(value: unknown, maxLength: number, trim: boolean, allowEmpty = false): string {
+  if (typeof value !== "string" || value.includes("\0") || (!allowEmpty && value.length < 1)
+    || value.length > maxLength || (trim && value.trim() !== value)) {
+    throw new Error("invalid string");
+  }
+  return value;
+}
+
+function decodeStoredTimestamp(value: unknown): string {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error("invalid timestamp");
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) {
+    throw new Error("invalid timestamp");
+  }
+  return value;
 }

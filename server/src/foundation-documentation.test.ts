@@ -9,7 +9,7 @@ describe("Phase 2 foundation documentation contract", () => {
 
   it("documents the automation fresh reset and the staged delivery roadmap", () => {
     for (const file of documentationFiles) {
-      expect(readFileSync(join(root, file), "utf8"), file).toContain("phase-2-automation-v2");
+      expect(readFileSync(join(root, file), "utf8"), file).toContain("phase-2-automation-v3");
     }
     expect(documentation).toContain("definition");
     expect(documentation).toContain("solution_design");
@@ -27,8 +27,8 @@ describe("Phase 2 foundation documentation contract", () => {
     const gettingStarted = readFileSync(join(root, "docs/getting-started.md"), "utf8");
     expect(gettingStarted).toContain("自动显示只读交付矩阵");
     expect(gettingStarted).not.toMatch(/点击 `\/run`/);
+    expect(gettingStarted).toContain("phase-2-automation-v3");
     expect(gettingStarted).toContain("phase-2-automation-v2");
-    expect(gettingStarted).not.toMatch(/\bv3\b/i);
   });
 
   it("assigns Phase 3 application orchestration to delivery units and retained primitives", () => {

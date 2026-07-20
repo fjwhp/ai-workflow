@@ -183,10 +183,16 @@ describe("Phase 2 database schema", () => {
     ]) {
       expect(tableSql(db, "delivery_units")).toContain(`'${status}'`);
     }
-    expect(tableSql(db, "automation_jobs")).toMatch(/owner_type TEXT NOT NULL CHECK\s*\(owner_type IN \('requirement', 'delivery_unit'\)\)/i);
+    expect(tableSql(db, "automation_jobs")).toMatch(/owner_type TEXT NOT NULL CHECK\s*\([\s\S]*owner_type IN \('requirement', 'delivery_unit'\)/i);
     expect(tableSql(db, "automation_jobs")).toContain("owner_id NOT GLOB '*[^A-Za-z0-9_-]*'");
-    expect(tableSql(db, "automation_jobs")).toMatch(/action TEXT NOT NULL CHECK\s*\(action IN \('implement', 'review', 'test', 'apply'\)\)/i);
-    expect(tableSql(db, "automation_jobs")).toMatch(/status TEXT NOT NULL CHECK\s*\(status IN \('pending', 'leased', 'completed', 'failed', 'canceled'\)\)/i);
+    expect(tableSql(db, "automation_jobs")).toMatch(/action TEXT NOT NULL CHECK\s*\([\s\S]*action IN \('implement', 'review', 'test', 'apply'\)/i);
+    expect(tableSql(db, "automation_jobs")).toMatch(/status TEXT NOT NULL CHECK\s*\([\s\S]*status IN \('pending', 'leased', 'completed', 'failed', 'canceled'\)/i);
+    for (const column of [
+      "id", "dedupe_key", "owner_type", "owner_id", "action", "status", "lease_owner",
+      "lease_expires_at", "payload_json", "last_error", "created_at", "updated_at"
+    ]) {
+      expect(tableSql(db, "automation_jobs")).toContain(`instr(${column}, char(0)) = 0`);
+    }
     expect(columns(db, "automation_jobs")).toEqual(expect.arrayContaining(["evidence_version", "max_attempts"]));
     db.close();
   });
@@ -293,11 +299,18 @@ describe("Phase 2 database schema", () => {
       .toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-invalid-max", maxAttempts: 0 })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-attempt-cap", attempt: 4, maxAttempts: 3 })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "job-exhausted-pending", attempt: 3, maxAttempts: 3 }))
+      .toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-leased-empty", status: "leased" })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, {
+      id: "job-leased-zero", status: "leased", attempt: 0, leaseOwner: "worker-1",
+      leaseExpiresAt: "2026-07-20T00:05:00.000Z"
+    })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-half-lease", leaseOwner: "worker-1" })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-half-expiry", leaseExpiresAt: "2026-07-20T00:05:00.000Z" })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, {
-      id: "job-leased", status: "leased", leaseOwner: "worker-1", leaseExpiresAt: "2026-07-20T00:05:00.000Z"
+      id: "job-leased", status: "leased", attempt: 1, leaseOwner: "worker-1",
+      leaseExpiresAt: "2026-07-20T00:05:00.000Z"
     })).not.toThrow();
     expect(() => insertAutomationJob(db, {
       id: "job-pending-leased", leaseOwner: "worker-1", leaseExpiresAt: "2026-07-20T00:05:00.000Z"
@@ -308,6 +321,39 @@ describe("Phase 2 database schema", () => {
     expect(() => insertAutomationJob(db, {
       id: "job-multibyte-payload", payloadJson: JSON.stringify({ value: "界".repeat(22_000) })
     })).toThrow(/CHECK constraint failed/);
+    db.close();
+  });
+
+  it.each([
+    ["id", { id: "job\0suffix" }],
+    ["dedupe key", { id: "job-nul-dedupe", dedupeKey: "implement:requirement:r1:v1\0" }],
+    ["owner type", { id: "job-nul-owner-type", ownerType: "requirement\0" }],
+    ["owner id", { id: "job-nul-owner", ownerId: "r1\0" }],
+    ["action", { id: "job-nul-action", action: "implement\0" }],
+    ["status", { id: "job-nul-status", status: "pending\0" }],
+    [
+      "lease owner",
+      {
+        id: "job-nul-worker", status: "leased", attempt: 1, leaseOwner: "worker\0suffix",
+        leaseExpiresAt: "2026-07-20T00:05:00.000Z"
+      }
+    ],
+    [
+      "lease expiry",
+      {
+        id: "job-nul-expiry", status: "leased", attempt: 1, leaseOwner: "worker",
+        leaseExpiresAt: "2026-07-20T00:05:00.000Z\0suffix"
+      }
+    ],
+    ["payload", { id: "job-nul-payload", payloadJson: "{}\0" }],
+    ["last error", { id: "job-nul-error", lastError: "failure\0suffix" }],
+    ["created timestamp", { id: "job-nul-created", createdAt: "2026-07-20T00:00:00.000Z\0suffix" }],
+    ["updated timestamp", { id: "job-nul-updated", updatedAt: "2026-07-20T00:00:00.000Z\0suffix" }]
+  ] as const)("rejects an embedded NUL in automation job %s", (_label, input) => {
+    const db = openFreshStoreDatabase();
+    insertRequirement(db);
+
+    expect(() => insertAutomationJob(db, input)).toThrow();
     db.close();
   });
 
