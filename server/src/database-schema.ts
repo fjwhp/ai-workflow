@@ -289,6 +289,47 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
       UNIQUE(delivery_unit_id, evidence_version)
     );
+    CREATE TABLE IF NOT EXISTS delivery_quality_runs (
+      id TEXT PRIMARY KEY,
+      requirement_id TEXT NOT NULL,
+      delivery_unit_id TEXT NOT NULL,
+      evidence_version INTEGER NOT NULL CHECK(
+        typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND ${MAX_AUTOMATION_EVIDENCE_VERSION}
+      ),
+      kind TEXT NOT NULL CHECK(kind IN ('code_review', 'automated_testing')),
+      claim_token TEXT NOT NULL CHECK(instr(claim_token, char(0)) = 0 AND length(claim_token) BETWEEN 1 AND 256),
+      status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
+      error TEXT,
+      created_at TEXT NOT NULL,
+      completed_at TEXT,
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
+      UNIQUE(delivery_unit_id, evidence_version, kind)
+    );
+    CREATE TABLE IF NOT EXISTS delivery_quality_evidence (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL UNIQUE,
+      requirement_id TEXT NOT NULL,
+      delivery_unit_id TEXT NOT NULL,
+      evidence_version INTEGER NOT NULL CHECK(
+        typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND ${MAX_AUTOMATION_EVIDENCE_VERSION}
+      ),
+      kind TEXT NOT NULL CHECK(kind IN ('code_review', 'automated_testing')),
+      result TEXT NOT NULL CHECK(result IN ('passed', 'failed')),
+      input_coding_evidence_id TEXT NOT NULL,
+      input_evidence_version INTEGER NOT NULL,
+      input_diff_hash TEXT NOT NULL,
+      content_json TEXT NOT NULL,
+      command_results_json TEXT NOT NULL DEFAULT '[]',
+      acceptance_trace_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      completed_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES delivery_quality_runs(id),
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
+      FOREIGN KEY(input_coding_evidence_id) REFERENCES coding_evidence(id),
+      UNIQUE(delivery_unit_id, evidence_version, kind)
+    );
     CREATE TABLE IF NOT EXISTS rework_contexts (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, approval_id TEXT NOT NULL UNIQUE, artifact_id TEXT,
       source_stage TEXT NOT NULL, target_stage TEXT NOT NULL, actor_type TEXT NOT NULL, decision_at TEXT NOT NULL,
@@ -358,6 +399,8 @@ export function createPhase2Schema(db: DatabaseSync) {
       ON executions(delivery_unit_id, evidence_version);
     CREATE INDEX IF NOT EXISTS idx_coding_evidence_delivery_unit_version
       ON coding_evidence(delivery_unit_id, evidence_version);
+    CREATE INDEX IF NOT EXISTS idx_delivery_quality_evidence_unit_version
+      ON delivery_quality_evidence(delivery_unit_id, evidence_version, kind);
     DROP TRIGGER IF EXISTS validate_stage_run_owner_insert;
     DROP TRIGGER IF EXISTS validate_stage_run_owner_update;
     CREATE TRIGGER validate_stage_run_owner_insert
@@ -543,5 +586,47 @@ export function createPhase2Schema(db: DatabaseSync) {
           AND project_id = NEW.project_id
       );
     END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_quality_run_insert
+    BEFORE INSERT ON delivery_quality_runs
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_QUALITY_RUN_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units
+        WHERE id = NEW.delivery_unit_id
+          AND requirement_id = NEW.requirement_id
+          AND evidence_version = NEW.evidence_version
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_quality_run_identity_update
+    BEFORE UPDATE OF requirement_id, delivery_unit_id, evidence_version, kind, claim_token ON delivery_quality_runs
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_QUALITY_RUN_IDENTITY_IMMUTABLE');
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_quality_evidence_insert
+    BEFORE INSERT ON delivery_quality_evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_QUALITY_EVIDENCE_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_quality_runs qr
+        JOIN coding_evidence ce
+          ON ce.id = NEW.input_coding_evidence_id
+         AND ce.delivery_unit_id = NEW.delivery_unit_id
+         AND ce.requirement_id = NEW.requirement_id
+         AND ce.evidence_version = NEW.input_evidence_version
+         AND ce.diff_hash = NEW.input_diff_hash
+        WHERE qr.id = NEW.run_id
+          AND qr.delivery_unit_id = NEW.delivery_unit_id
+          AND qr.requirement_id = NEW.requirement_id
+          AND qr.evidence_version = NEW.evidence_version
+          AND qr.kind = NEW.kind
+          AND qr.status = 'running'
+      ) OR NEW.input_evidence_version <> NEW.evidence_version;
+    END;
+    CREATE TRIGGER IF NOT EXISTS delivery_quality_evidence_immutable_update
+    BEFORE UPDATE ON delivery_quality_evidence
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_QUALITY_EVIDENCE_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_quality_evidence_immutable_delete
+    BEFORE DELETE ON delivery_quality_evidence
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_QUALITY_EVIDENCE_IMMUTABLE'); END;
   `);
 }

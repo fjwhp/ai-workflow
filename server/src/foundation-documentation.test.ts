@@ -9,7 +9,7 @@ describe("Phase 2 foundation documentation contract", () => {
 
   it("documents the automation fresh reset and the staged delivery roadmap", () => {
     for (const file of documentationFiles) {
-      expect(readFileSync(join(root, file), "utf8"), file).toContain("phase-2-delivery-execution-v5");
+      expect(readFileSync(join(root, file), "utf8"), file).toContain("phase-2-delivery-quality-v6");
     }
     expect(documentation).toContain("definition");
     expect(documentation).toContain("solution_design");
@@ -29,7 +29,7 @@ describe("Phase 2 foundation documentation contract", () => {
     const gettingStarted = readFileSync(join(root, "docs/getting-started.md"), "utf8");
     expect(gettingStarted).toContain("自动显示只读交付矩阵");
     expect(gettingStarted).not.toMatch(/点击 `\/run`/);
-    expect(gettingStarted).toContain("phase-2-delivery-execution-v5");
+    expect(gettingStarted).toContain("phase-2-delivery-quality-v6");
     expect(gettingStarted).toContain("phase-2-automation-v4");
   });
 
@@ -46,7 +46,6 @@ describe("Phase 2 foundation documentation contract", () => {
       ["requirement", "review"].join("_"),
       ["technical", "design"].join("_"),
       ["test", "design"].join("_"),
-      ["code", "review"].join("_"),
       ["awaiting", "merge"].join("_"),
       ["MULTI", "PROJECT", "EXECUTION", "PHASE", "2", "REQUIRED"].join("_"),
       ["human", "override"].join("-")

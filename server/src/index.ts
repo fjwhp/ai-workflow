@@ -12,7 +12,7 @@ import {
   type AutomationWorkerOptions
 } from "./automation-worker.js";
 
-const schemaVersion = "phase-2-delivery-execution-v5";
+const schemaVersion = "phase-2-delivery-quality-v6";
 
 interface StartupApp {
   addHook(name: "onClose", hook: () => Promise<void> | void): unknown;

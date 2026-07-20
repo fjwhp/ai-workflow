@@ -28,6 +28,9 @@ describe("getWorktreeSnapshot",()=>{
     const snapshot=await getWorktreeSnapshot(dir);
     expect(snapshot.files).toContain("src/test/new.txt");
     expect(snapshot.diff).toContain("+hello");
+    expect(snapshot.changedFiles).toContainEqual({
+      path: "src/test/new.txt", status: "added", kind: "text", content: "hello\n"
+    });
   });
 
   it("keeps invalid UTF-8 binary bytes distinct in snapshot and evidence hashes", async () => {
@@ -51,7 +54,31 @@ describe("getWorktreeSnapshot",()=>{
       expect(snapshot.diff).toContain(`binary-size: ${bytes.length}`);
       expect(snapshot.diff).toContain(`binary-sha256: ${createHash("sha256").update(bytes).digest("hex")}`);
       expect(snapshot.diff).not.toContain("\uFFFD");
+      expect(snapshot.changedFiles).toContainEqual({
+        path: "payload.bin", status: "added", kind: "binary",
+        size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex")
+      });
     }
+  });
+
+  it("returns complete modified content and an explicit deleted marker", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "workflow-changed-files-")); dirs.push(dir);
+    await exec("git", ["init", dir]);
+    await exec("git", ["-C", dir, "config", "user.email", "test@example.com"]);
+    await exec("git", ["-C", dir, "config", "user.name", "Test"]);
+    await writeFile(join(dir, "modified.txt"), "before\n");
+    await writeFile(join(dir, "deleted.txt"), "remove\n");
+    await exec("git", ["-C", dir, "add", "--all"]);
+    await exec("git", ["-C", dir, "commit", "-m", "base"]);
+    await writeFile(join(dir, "modified.txt"), "after\n");
+    await rm(join(dir, "deleted.txt"));
+
+    const snapshot = await getWorktreeSnapshot(dir);
+
+    expect(snapshot.changedFiles).toContainEqual({
+      path: "modified.txt", status: "modified", kind: "text", content: "after\n"
+    });
+    expect(snapshot.changedFiles).toContainEqual({ path: "deleted.txt", status: "deleted" });
   });
 
   it("treats NUL-containing untracked content as binary", async () => {

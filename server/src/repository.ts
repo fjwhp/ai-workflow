@@ -462,7 +462,7 @@ export async function getWorktreeSnapshot(worktreePath: string) {
     "-C", worktreePath, "diff", "--no-ext-diff", "--no-textconv", "--", "."
   ], { maxBuffer: 10 * 1024 * 1024, env });
   const { stdout: status } = await execFileAsync("git", [
-    "-C", worktreePath, "status", "--porcelain", "-z"
+    "-C", worktreePath, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"
   ], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any, env });
   const entries = Buffer.from(status as any).toString("utf8").split("\0").filter(Boolean);
   const { stdout: untrackedOutput } = await execFileAsync("git", [
@@ -471,6 +471,7 @@ export async function getWorktreeSnapshot(worktreePath: string) {
   const untracked = Buffer.from(untrackedOutput as any).toString("utf8").split("\0").filter(Boolean);
   const trackedFiles = entries.filter((entry) => !entry.startsWith("?? ")).map((entry) => entry.slice(3)).filter(Boolean);
   const files = [...new Set([...trackedFiles, ...untracked])];
+  const statuses = new Map(entries.map((entry) => [entry.slice(3), entry.slice(0, 2)]));
   const patches: string[] = [tracked];
   for (const file of untracked) {
     const content = await safeReadWorktreeFileBuffer(worktreePath, file);
@@ -490,5 +491,20 @@ export async function getWorktreeSnapshot(worktreePath: string) {
   const diff = patches.filter(Boolean).join("\n");
   const additions = diff.split("\n").filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
   const deletions = diff.split("\n").filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
-  return { diff, files, additions, deletions };
+  const changedFiles = await Promise.all(files.map(async (file) => {
+    const statusCode = statuses.get(file) ?? "??";
+    if (statusCode.includes("D")) return { path: file, status: "deleted" as const };
+    const content = await safeReadWorktreeFileBuffer(worktreePath, file);
+    const status = statusCode === "??" || statusCode.includes("A") ? "added" as const : "modified" as const;
+    let text: string | undefined;
+    if (!content.includes(0)) {
+      try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(content); } catch {}
+    }
+    if (text !== undefined) return { path: file, status, kind: "text" as const, content: text };
+    return {
+      path: file, status, kind: "binary" as const, size: content.length,
+      sha256: createHash("sha256").update(content).digest("hex")
+    };
+  }));
+  return { diff, files, changedFiles, additions, deletions };
 }

@@ -46,7 +46,7 @@ beforeEach(() => {
     baseCommit: "version-head",
     reused: false
   });
-  snapshot.mockResolvedValue({ diff: "", files: [], additions: 0, deletions: 0 });
+  snapshot.mockResolvedValue({ diff: "", files: [], changedFiles: [], additions: 0, deletions: 0 });
   diff.mockResolvedValue("diff --git a/src/App.ts b/src/App.ts");
   mocks.runCommand.mockResolvedValue({ code: 0, stdout: "ok", stderr: "" });
 });

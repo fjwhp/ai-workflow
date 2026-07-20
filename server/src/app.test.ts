@@ -19,7 +19,7 @@ import { publishRequirementKnowledge } from "./project-memory-service.js";
 import { buildAgentPrompt, runAgent } from "./ai.js";
 
 const execFileAsync=promisify(execFile);const tempDirs:string[]=[];
-const codingResult={runId:crypto.randomUUID(),branch:"ai/REQ-0001",worktreePath:"/tmp/requirements/REQ-0001",baseCommit:"version-head",reused:false,diff:"diff --git a/a.ts b/a.ts\n+change",files:["a.ts"],additions:1,deletions:0,codexThreadId:"thread-1",events:[],diagnostics:[],summary:"implemented"};
+const codingResult={runId:crypto.randomUUID(),branch:"ai/REQ-0001",worktreePath:"/tmp/requirements/REQ-0001",baseCommit:"version-head",reused:false,diff:"diff --git a/a.ts b/a.ts\n+change",files:["a.ts"],changedFiles:[{path:"a.ts",status:"modified" as const,kind:"text" as const,content:"change"}],additions:1,deletions:0,codexThreadId:"thread-1",events:[],diagnostics:[],summary:"implemented"};
 const genericResult={conclusion:"pass",confidence:0.99,summary:"ready",facts:[],assumptions:[],openQuestions:[],risks:[],findings:[]};
 const definitionResult={...genericResult,underlyingGoal:"ship",targetUsers:["buyer"],productDecisions:[],assumptions:[],scope:{mvp:["checkout"],nonGoals:[]},flows:{primary:["order"],exceptions:[]},acceptanceCriteria:["order succeeds"],evidence:[],blockingQuestions:[]};
 const solutionResult=(projectIds:string[])=>({...genericResult,deliveryPlan:{units:projectIds.map(projectId=>({projectId,moduleIds:[],acceptanceCriteria:[`${projectId} acceptance`]})),dependencies:projectIds.length>1?[{upstreamProjectId:projectIds[0]!,downstreamProjectId:projectIds[1]!,releaseCondition:"automated_testing_passed" as const}]:[]},contracts:[]});

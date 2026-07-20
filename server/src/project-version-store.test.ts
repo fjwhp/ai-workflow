@@ -85,6 +85,7 @@ describe("project versions fresh schema", () => {
       "idx_automation_jobs_pending_lease",
       "idx_coding_evidence_delivery_unit_version",
       "idx_delivery_dependency_edge",
+      "idx_delivery_quality_evidence_unit_version",
       "idx_delivery_unit_active_run",
       "idx_delivery_unit_project",
       "idx_executions_delivery_unit_version",
@@ -94,6 +95,8 @@ describe("project versions fresh schema", () => {
       "idx_requirement_projects_active_project"
     ]);
     expect(schemaObjectNames(database, "trigger")).toEqual([
+      "delivery_quality_evidence_immutable_delete",
+      "delivery_quality_evidence_immutable_update",
       "validate_artifact_owner_insert",
       "validate_artifact_owner_update",
       "validate_automation_job_owner_insert",
@@ -102,6 +105,9 @@ describe("project versions fresh schema", () => {
       "validate_coding_evidence_owner_update",
       "validate_delivery_dependency_owner_insert",
       "validate_delivery_dependency_owner_update",
+      "validate_delivery_quality_evidence_insert",
+      "validate_delivery_quality_run_identity_update",
+      "validate_delivery_quality_run_insert",
       "validate_delivery_unit_snapshot_owner_insert",
       "validate_delivery_unit_snapshot_owner_update",
       "validate_execution_owner_insert",

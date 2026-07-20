@@ -17,6 +17,10 @@ import {
   type DeliveryExecutionPersistence
 } from "./delivery-execution-repository.js";
 import {
+  DeliveryQualityRepository,
+  type DeliveryQualityPersistence
+} from "./delivery-quality-repository.js";
+import {
   AutomationJobRepository,
   type AutomationJobPersistence
 } from "./automation-job-repository.js";
@@ -70,9 +74,11 @@ export class WorkflowStore {
   private db: DatabaseSync;
   private readonly deliveryUnitRepository: DeliveryUnitRepository;
   private readonly deliveryExecutionRepository: DeliveryExecutionRepository;
+  private readonly deliveryQualityRepository: DeliveryQualityRepository;
   private readonly executionRepository: ExecutionRepository;
   public readonly deliveryUnits: DeliveryUnitPersistence;
   public readonly deliveryExecutions: DeliveryExecutionPersistence;
+  public readonly deliveryQuality: DeliveryQualityPersistence;
   public readonly automationJobs: AutomationJobPersistence;
 
   constructor(path: string) {
@@ -81,6 +87,7 @@ export class WorkflowStore {
     createPhase2Schema(this.db);
     this.deliveryUnitRepository = new DeliveryUnitRepository(this.db);
     this.deliveryExecutionRepository = new DeliveryExecutionRepository(this.db);
+    this.deliveryQualityRepository = new DeliveryQualityRepository(this.db);
     this.executionRepository = new ExecutionRepository(this.db);
     const automationJobRepository = new AutomationJobRepository(this.db);
     this.deliveryUnits = {
@@ -95,7 +102,20 @@ export class WorkflowStore {
         () => this.deliveryExecutionRepository.claimImplementationInTransaction(unitId, model)
       ),
       completeImplementation: (claim, result) => this.withImmediateTransaction(
-        () => this.deliveryExecutionRepository.completeImplementationInTransaction(claim, result)
+        () => {
+          const unit = this.deliveryExecutionRepository.completeImplementationInTransaction(claim, result);
+          for (const action of ["review", "test"] as const) {
+            automationJobRepository.enqueue({
+              ownerType: "delivery_unit",
+              ownerId: unit.id,
+              evidenceVersion: unit.evidenceVersion,
+              action,
+              payload: {},
+              maxAttempts: 3
+            });
+          }
+          return unit;
+        }
       ),
       failImplementation: (claim, error) => this.withImmediateTransaction(
         () => this.deliveryExecutionRepository.failImplementationInTransaction(claim, error)
@@ -117,6 +137,15 @@ export class WorkflowStore {
       get: (jobId) => automationJobRepository.get(jobId),
       byDedupe: (dedupeKey) => automationJobRepository.byDedupe(dedupeKey),
       listPending: () => automationJobRepository.listPending()
+    };
+    this.deliveryQuality = {
+      claim: (unitId, evidenceVersion, kind, claimToken) => this.withImmediateTransaction(
+        () => this.deliveryQualityRepository.claimInTransaction(unitId, evidenceVersion, kind, claimToken)
+      ),
+      complete: (claim, completion) => this.withImmediateTransaction(
+        () => this.deliveryQualityRepository.completeInTransaction(claim, completion)
+      ),
+      latest: (unitId, kind) => this.deliveryQualityRepository.latest(unitId, kind)
     };
   }
 

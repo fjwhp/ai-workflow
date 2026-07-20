@@ -2,7 +2,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DeliveryExecutionService, type CodingAgent } from "./delivery-execution-service.js";
+import {
+  DeliveryExecutionService,
+  createDeliveryQualityAutomationHandlers,
+  qualityGitEnvironment,
+  qualityGate,
+  type CodingAgent
+} from "./delivery-execution-service.js";
 import { WorkflowStore } from "./store.js";
 
 const stores: WorkflowStore[] = [];
@@ -114,6 +120,25 @@ function claimOnNextTurn(store: WorkflowStore, unitId: string) {
 }
 
 describe("DeliveryExecutionService", () => {
+  it("sanitizes inherited Git controls for target identity probes", () => {
+    const env = qualityGitEnvironment({
+      PATH: "/usr/bin", GIT_DIR: "/attacker", GIT_WORK_TREE: "/attacker-tree",
+      GIT_CONFIG_GLOBAL: "/attacker-config", GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: "alias.rev-parse", GIT_CONFIG_VALUE_0: "!evil",
+      SSH_AUTH_SOCK: "secret", GITHUB_TOKEN: "secret", HTTPS_PROXY: "http://proxy"
+    });
+    expect(env).toEqual({
+      PATH: "/usr/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.fsmonitor", GIT_CONFIG_VALUE_0: "false", GIT_TERMINAL_PROMPT: "0"
+    });
+  });
+
+  it("does not pass quality when only testing passes", () => {
+    expect(qualityGate({ review: "running", testing: "passed" })).toEqual({ status: "running" });
+    expect(qualityGate({ review: "passed", testing: "passed" })).toEqual({ status: "passed" });
+    expect(qualityGate({ review: "failed", testing: "passed" })).toEqual({ status: "failed" });
+  });
+
   it("allows only one claim across two file-backed store connections", async () => {
     const databasePath = fileBackedDatabase();
     const fixture = createFixture(databasePath);
@@ -167,6 +192,24 @@ describe("DeliveryExecutionService", () => {
     expect(fixture.store.deliveryExecutions.listExecutions(fixture.unit.id)[0]).toMatchObject({ status: "running", error: null });
     expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toBeNull();
     expect(fixture.store.getStageRun(claim.runId)?.events.map((event: any) => event.type)).toEqual(["run.started"]);
+  });
+
+  it("rolls back implementation and the first quality job when the second enqueue fails", () => {
+    const fixture = createFixture();
+    const claim = fixture.store.deliveryExecutions.claimImplementation(fixture.unit.id, "test-model");
+    (fixture.store as any).db.exec(`CREATE TRIGGER fail_testing_enqueue
+      BEFORE INSERT ON automation_jobs WHEN NEW.action = 'test'
+      BEGIN SELECT RAISE(ABORT, 'forced testing enqueue failure'); END;`);
+
+    expect(() => fixture.store.deliveryExecutions.completeImplementation(claim, persistenceResult()))
+      .toThrow("forced testing enqueue failure");
+
+    expect(fixture.store.deliveryUnits.listForRequirement(fixture.requirement.id)[0]).toMatchObject({ status: "running" });
+    expect(fixture.store.getStageRun(claim.runId)).toMatchObject({ status: "running" });
+    expect(fixture.store.deliveryExecutions.listExecutions(fixture.unit.id)[0]).toMatchObject({ status: "running" });
+    expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toBeNull();
+    expect(fixture.store.automationJobs.byDedupe(`review:${fixture.unit.id}:v1`)).toBeNull();
+    expect(fixture.store.automationJobs.byDedupe(`test:${fixture.unit.id}:v1`)).toBeNull();
   });
 
   it("rolls back every failure mutation when the terminal event insertion fails", () => {
@@ -251,6 +294,12 @@ describe("DeliveryExecutionService", () => {
       files: ["src/orders/index.ts"],
       additions: 1,
       deletions: 0
+    });
+    expect(fixture.store.automationJobs.byDedupe(`review:${fixture.unit.id}:v1`)).toMatchObject({
+      ownerType: "delivery_unit", ownerId: fixture.unit.id, evidenceVersion: 1, action: "review"
+    });
+    expect(fixture.store.automationJobs.byDedupe(`test:${fixture.unit.id}:v1`)).toMatchObject({
+      ownerType: "delivery_unit", ownerId: fixture.unit.id, evidenceVersion: 1, action: "test"
     });
   });
 
@@ -338,5 +387,193 @@ describe("DeliveryExecutionService", () => {
 
     expect(settlementFailure.cause).toBe(codingFailure);
     expect(failImplementation).toHaveBeenCalledOnce();
+  });
+
+  it("runs review and testing against the same immutable implementation evidence", async () => {
+    const fixture = createFixture();
+    const implementation = codingResult();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(implementation))
+      .implement(fixture.unit.id);
+    const snapshot = {
+      diff: implementation.diff, files: implementation.files, additions: 1, deletions: 0,
+      changedFiles: [{ path: "src/orders/index.ts", status: "modified" as const, kind: "text" as const, content: "export const ready = true;" }]
+    };
+    const review = vi.fn().mockResolvedValue({
+      conclusion: "pass", confidence: 0.9, summary: "review passed", facts: [], assumptions: [],
+      openQuestions: [], risks: [], findings: []
+    });
+    const testing = vi.fn().mockResolvedValue({
+      result: "passed", commandResults: [{ id: "verify-1", exitCode: 0 }],
+      acceptanceTrace: [{ criterion: "Order contract tests pass", commandIds: ["verify-1"], passed: true }]
+    });
+    const targetState = { head: fixture.version.headCommit, refsHash: "refs", diffHash: "target-diff", gitCommonDir: "/repo/.git" };
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality,
+      { getSnapshot: vi.fn().mockResolvedValue(snapshot), review, testing, inspectTarget: vi.fn().mockResolvedValue(targetState) }
+    );
+
+    await Promise.all([service.review(fixture.unit.id), service.test(fixture.unit.id)]);
+
+    const reviewEvidence = fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")!;
+    const testingEvidence = fixture.store.deliveryQuality.latest(fixture.unit.id, "automated_testing")!;
+    expect(reviewEvidence).toMatchObject({ inputEvidenceVersion: 1, result: "passed", content: { summary: "review passed" } });
+    expect(testingEvidence).toMatchObject({ inputEvidenceVersion: 1, result: "passed" });
+    expect(reviewEvidence.inputCodingEvidenceId).toBe(testingEvidence.inputCodingEvidenceId);
+    expect(reviewEvidence.inputDiffHash).toBe(testingEvidence.inputDiffHash);
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({
+      implementation: { diff: implementation.diff, changedFiles: snapshot.changedFiles }
+    }));
+    expect(testing).toHaveBeenCalledWith(expect.objectContaining({
+      sourceWorktree: "/tmp/frozen-project-run",
+      allowedCommands: [{ command: "npm", argsPrefix: ["test"] }],
+      acceptanceCriteria: ["Order contract tests pass"]
+    }));
+  });
+
+  it("fails closed before review when the full implementation diff is stale", async () => {
+    const fixture = createFixture();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult()))
+      .implement(fixture.unit.id);
+    const review = vi.fn();
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality,
+      { getSnapshot: vi.fn().mockResolvedValue({ diff: "different", files: [], changedFiles: [], additions: 0, deletions: 0 }), review }
+    );
+
+    await expect(service.review(fixture.unit.id)).resolves.toMatchObject({ result: "failed" });
+    expect(review).not.toHaveBeenCalled();
+    expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")).toMatchObject({
+      result: "failed", content: { error: "IMPLEMENTATION_EVIDENCE_STALE" }
+    });
+  });
+
+  it("fails testing when the real target changes during disposable verification", async () => {
+    const fixture = createFixture();
+    const implementation = codingResult();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(implementation))
+      .implement(fixture.unit.id);
+    const snapshot = {
+      diff: implementation.diff, files: implementation.files, additions: 1, deletions: 0,
+      changedFiles: [{ path: "src/orders/index.ts", status: "modified" as const, kind: "text" as const, content: "ready" }]
+    };
+    const inspectTarget = vi.fn()
+      .mockResolvedValueOnce({ head: fixture.version.headCommit, refsHash: "before", diffHash: "clean", gitCommonDir: "/repo/.git" })
+      .mockResolvedValueOnce({ head: fixture.version.headCommit, refsHash: "after", diffHash: "clean", gitCommonDir: "/repo/.git" });
+    const testing = vi.fn().mockResolvedValue({ result: "passed", commandResults: [], acceptanceTrace: [] });
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality,
+      { getSnapshot: vi.fn().mockResolvedValue(snapshot), inspectTarget, testing }
+    );
+
+    await expect(service.test(fixture.unit.id)).resolves.toMatchObject({ result: "failed" });
+    expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "automated_testing")).toMatchObject({
+      result: "failed", content: { error: "AUTOMATED_TEST_TARGET_MUTATED" }
+    });
+  });
+
+  it("does not disclose a frozen sensitive path to review", async () => {
+    const fixture = createFixture();
+    const implementation = codingResult();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(implementation))
+      .implement(fixture.unit.id);
+    const review = vi.fn();
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality,
+      { getSnapshot: vi.fn().mockResolvedValue({
+        diff: implementation.diff, files: [".env.local"], additions: 1, deletions: 0,
+        changedFiles: [{ path: ".env.local", status: "modified", kind: "text", content: "SECRET=value" }]
+      }), review }
+    );
+
+    await expect(service.review(fixture.unit.id)).resolves.toMatchObject({ result: "failed" });
+    expect(review).not.toHaveBeenCalled();
+    expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")).toMatchObject({
+      content: { error: "IMPLEMENTATION_EVIDENCE_SENSITIVE_PATH" }
+    });
+  });
+
+  it("does not start testing when the target HEAD differs from the frozen snapshot", async () => {
+    const fixture = createFixture();
+    const implementation = codingResult();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(implementation))
+      .implement(fixture.unit.id);
+    const testing = vi.fn();
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality,
+      {
+        getSnapshot: vi.fn().mockResolvedValue({
+          diff: implementation.diff, files: implementation.files, changedFiles: [], additions: 1, deletions: 0
+        }),
+        inspectTarget: vi.fn().mockResolvedValue({
+          head: "advanced-head", refsHash: "refs", diffHash: "clean", gitCommonDir: "/repo/.git"
+        }),
+        testing
+      }
+    );
+
+    await expect(service.test(fixture.unit.id)).resolves.toMatchObject({ result: "failed" });
+    expect(testing).not.toHaveBeenCalled();
+    expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "automated_testing")).toMatchObject({
+      content: { error: "AUTOMATED_TEST_TARGET_HEAD_STALE" }
+    });
+  });
+
+  it("does not retry a failed evidence settlement as a second completion", async () => {
+    const fixture = createFixture();
+    const implementation = codingResult();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(implementation))
+      .implement(fixture.unit.id);
+    const settlementError = new Error("database unavailable");
+    const complete = vi.fn(() => { throw settlementError; });
+    const quality = { ...fixture.store.deliveryQuality, complete };
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", quality,
+      {
+        getSnapshot: vi.fn().mockResolvedValue({
+          diff: implementation.diff, files: implementation.files, changedFiles: [], additions: 1, deletions: 0
+        }),
+        review: vi.fn().mockResolvedValue({
+          conclusion: "pass", confidence: 0.9, summary: "ok", facts: [], assumptions: [],
+          openQuestions: [], risks: [], findings: []
+        })
+      }
+    );
+
+    await expect(service.review(fixture.unit.id)).rejects.toBe(settlementError);
+    expect(complete).toHaveBeenCalledOnce();
+  });
+
+  it("returns terminal evidence without rerunning review for the same automation job", async () => {
+    const fixture = createFixture();
+    const implementation = codingResult();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(implementation))
+      .implement(fixture.unit.id);
+    const review = vi.fn().mockResolvedValue({
+      conclusion: "pass", confidence: 0.9, summary: "ok", facts: [], assumptions: [],
+      openQuestions: [], risks: [], findings: []
+    });
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality,
+      { getSnapshot: vi.fn().mockResolvedValue({
+        diff: implementation.diff, files: implementation.files, changedFiles: [], additions: 1, deletions: 0
+      }), review }
+    );
+
+    const first = await service.review(fixture.unit.id, 1, "review-job-1");
+    const resumed = await service.review(fixture.unit.id, 1, "review-job-1");
+
+    expect(resumed.id).toBe(first.id);
+    expect(review).toHaveBeenCalledOnce();
+  });
+
+  it("rejects quality jobs with mismatched ownership, action, or version", async () => {
+    const fixture = createFixture();
+    const service = { review: vi.fn(), test: vi.fn() } as any;
+    const handlers = createDeliveryQualityAutomationHandlers(service);
+    const baseJob = { ownerType: "delivery_unit", ownerId: fixture.unit.id, evidenceVersion: 1 } as any;
+    await expect(handlers.review!({ ...baseJob, action: "test" })).rejects.toThrow("AUTOMATION_INPUT_INVALID");
+    await expect(handlers.test!({ ...baseJob, action: "test", evidenceVersion: 0 })).rejects.toThrow("AUTOMATION_INPUT_INVALID");
+    await handlers.review!({ ...baseJob, action: "review" });
+    expect(service.review).toHaveBeenCalledWith(fixture.unit.id, 1, undefined);
   });
 });
