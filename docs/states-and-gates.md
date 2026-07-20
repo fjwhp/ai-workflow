@@ -18,6 +18,7 @@
 - `solution_design` 必须由人工批准；批准操作冻结项目关联并创建 delivery plan。
 - `implementation` 的实现证据是质量阶段的输入，不是质量放行结论。
 - `quality_verification` 必须分别满足独立 Review 和自动化测试。任一缺失、失败或证据过期都不得进入验收。
+- 质量执行在产出业务证据前终止时记录为 `aborted`；它不是通过或失败证据，不能放行。同一 automation job token 恢复时只返回原终止原因并收敛该 job，不重新运行 Review 或测试；不同 token 不能接管该终态。
 - `acceptance_delivery` 的总体业务验收必须由人工完成。安全节点可以自动化，但不能替代人工业务判断。
 
 任何门禁都不得在目标项目自动 commit、push、tag 或创建 PR。
@@ -47,4 +48,4 @@ Phase 2 才能推进实现、独立 Review 和自动化测试相关状态。Phas
 
 ## 数据状态边界
 
-`phase-2-evidence-tree-v7` 是唯一 live schema marker。`phase-2-delivery-quality-v6`、`phase-2-delivery-execution-v5` 或其他旧数据库先备份后 fresh reset；旧历史只在 backup。系统不做 row migration、dual read/write、fallback 或跨 schema 状态兼容。用户已授权旧数据以新跑为准。
+`phase-2-evidence-tree-v8` 是唯一 live schema marker。`phase-2-evidence-tree-v7`、`phase-2-delivery-quality-v6`、`phase-2-delivery-execution-v5` 或其他旧数据库先备份后 fresh reset；旧历史只在 backup。系统不做 row migration、dual read/write、fallback 或跨 schema 状态兼容。用户已授权旧数据以新跑为准。

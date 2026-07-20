@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { prepareCleanDatabase, writeDatabaseVersionMarker } from "./database-reset.js";
 
 const directories: string[] = [];
-const currentSchemaVersion = "phase-2-evidence-tree-v7";
+const currentSchemaVersion = "phase-2-evidence-tree-v8";
 
 afterEach(async () => {
   const { rm } = await import("node:fs/promises");
@@ -20,6 +20,19 @@ async function databasePath() {
 }
 
 describe("prepareCleanDatabase", () => {
+  it("backs up an evidence-tree v7 database before creating the v8 schema", async () => {
+    const path = await databasePath();
+    await writeFile(path, "evidence tree v7 database");
+    await writeFile(`${path}.schema-version`, "phase-2-evidence-tree-v7");
+
+    const result = await prepareCleanDatabase(path, currentSchemaVersion, {
+      now: () => new Date("2026-07-21T00:00:00.000Z")
+    });
+
+    expect(result).toMatchObject({ reset: true, backupPath: `${path}.backup-2026-07-21T00-00-00-000Z` });
+    await expect(readFile(result.backupPath!, "utf8")).resolves.toBe("evidence tree v7 database");
+  });
+
   it("resets a deployed delivery execution v5 database for the v6 marker", async () => {
     const path = await databasePath();
     await writeFile(path, "deployed delivery execution v5 database");

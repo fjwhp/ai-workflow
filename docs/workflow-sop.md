@@ -46,11 +46,12 @@
 
 ## 数据重建 SOP
 
-升级到 `phase-2-evidence-tree-v7` 前停止服务。服务识别 `phase-2-delivery-quality-v6`、`phase-2-delivery-execution-v5` 或其他旧 live DB 后，先备份主文件及现有 WAL/SHM，再创建空的新库。旧 history 只保存在 backup；没有 row migration、dual read/write 或 fallback。重新登记项目、版本和需求，以新跑结果作为当前事实；用户已授权旧数据以新跑为准。
+升级到 `phase-2-evidence-tree-v8` 前停止服务。服务识别 `phase-2-evidence-tree-v7`、`phase-2-delivery-quality-v6`、`phase-2-delivery-execution-v5` 或其他旧 live DB 后，先备份主文件及现有 WAL/SHM，再创建空的新库。旧 history 只保存在 backup；没有 row migration、dual read/write 或 fallback。重新登记项目、版本和需求，以新跑结果作为当前事实；用户已授权旧数据以新跑为准。
 
 ## 异常处理
 
 - 输入缺失、证据冲突、风险不可接受或置信度不足时转 `blocked` 或打回责任阶段。
 - Review 与自动化测试必须分别重跑和分别关闭问题。
+- 未产出业务质量证据的终止运行记录为 `aborted`。同一 job token 的 lease 恢复只复用该终止结果并结束 job，不重跑质量；`aborted` 不得充当通过或失败 evidence。
 - 依赖未释放时，下游交付单元保持 `waiting_dependency`。
 - 任何代码路径若尝试自动 commit、push、tag 或创建 PR，必须立即停止并作为安全缺陷处理。

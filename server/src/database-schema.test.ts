@@ -174,6 +174,12 @@ describe("Phase 2 database schema", () => {
     expect(columns(db, "delivery_unit_snapshots")).toContain("acceptance_criteria_json");
     expect(columns(db, "executions")).toEqual(expect.arrayContaining(["delivery_unit_id", "evidence_version"]));
     expect(columns(db, "coding_evidence")).toEqual(expect.arrayContaining(["delivery_unit_id", "evidence_version"]));
+    expect(tableSql(db, "delivery_quality_runs")).toMatch(
+      /status TEXT NOT NULL CHECK\(status IN \('running', 'completed', 'failed', 'aborted'\)\)/i
+    );
+    expect(tableSql(db, "delivery_quality_runs")).toMatch(
+      /status = 'aborted' AND error IS NOT NULL AND completed_at IS NOT NULL/i
+    );
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_stage_runs_running'").get()).toBeUndefined();
     db.close();
   });

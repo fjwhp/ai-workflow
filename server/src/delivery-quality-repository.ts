@@ -21,11 +21,15 @@ export interface DeliveryQualityInput {
   };
 }
 
-export interface DeliveryQualityClaim {
+interface DeliveryQualityClaimBase {
   id: string; requirementId: string; deliveryUnitId: string; evidenceVersion: number;
   kind: DeliveryQualityKind; input: DeliveryQualityInput;
-  settledEvidence?: DeliveryQualityEvidence;
 }
+
+export type DeliveryQualityClaim =
+  | (DeliveryQualityClaimBase & { status: "running" })
+  | (DeliveryQualityClaimBase & { status: "completed" | "failed"; evidence: DeliveryQualityEvidence })
+  | (DeliveryQualityClaimBase & { status: "aborted"; error: string });
 
 export interface DeliveryQualityCompletion {
   result: DeliveryQualityResult;
@@ -68,21 +72,26 @@ export class DeliveryQualityRepository {
       evidenceVersion = row.evidence_version;
     }
     const input = this.loadInput(unitId, evidenceVersion);
-    const existing = this.db.prepare(`SELECT id, status, claim_token FROM delivery_quality_runs
+    const existing = this.db.prepare(`SELECT id, status, claim_token, error FROM delivery_quality_runs
       WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ?`).get(unitId, evidenceVersion, kind) as
-      { id: string; status: string; claim_token: string } | undefined;
+      { id: string; status: string; claim_token: string; error: string | null } | undefined;
     if (existing) {
       if (claimToken !== undefined && existing.claim_token === claimToken) {
-        const resumed: DeliveryQualityClaim = {
+        const resumed = {
           id: existing.id, requirementId: input.codingEvidence.requirementId,
           deliveryUnitId: unitId, evidenceVersion, kind, input
         };
-        if (existing.status !== "running") {
-          const settledEvidence = this.getEvidenceByRun(existing.id);
-          if (!settledEvidence) throw new Error("DELIVERY_QUALITY_EVIDENCE_NOT_FOUND");
-          resumed.settledEvidence = settledEvidence;
+        if (existing.status === "running") return { ...resumed, status: "running" };
+        if (existing.status === "aborted") {
+          if (!existing.error) throw new Error("DELIVERY_QUALITY_ABORT_NOT_FOUND");
+          return { ...resumed, status: "aborted", error: existing.error };
         }
-        return resumed;
+        if (existing.status === "completed" || existing.status === "failed") {
+          const evidence = this.getEvidenceByRun(existing.id);
+          if (!evidence) throw new Error("DELIVERY_QUALITY_EVIDENCE_NOT_FOUND");
+          return { ...resumed, status: existing.status, evidence };
+        }
+        throw new Error("DELIVERY_QUALITY_RUN_STATUS_INVALID");
       }
       throw new Error(existing.status === "running" ? "DELIVERY_QUALITY_RUN_ACTIVE" : "DELIVERY_QUALITY_RUN_SETTLED");
     }
@@ -93,12 +102,15 @@ export class DeliveryQualityRepository {
       VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, ?, NULL)`)
       .run(id, input.codingEvidence.requirementId, unitId, evidenceVersion, kind,
         persistedClaimToken, new Date().toISOString());
-    return { id, requirementId: input.codingEvidence.requirementId, deliveryUnitId: unitId, evidenceVersion, kind, input };
+    return {
+      id, requirementId: input.codingEvidence.requirementId, deliveryUnitId: unitId,
+      evidenceVersion, kind, input, status: "running"
+    };
   }
 
   completeInTransaction(claim: DeliveryQualityClaim, completion: DeliveryQualityCompletion): DeliveryQualityEvidence {
     validateKind(claim.kind);
-    if (claim.settledEvidence) throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
+    if (claim.status !== "running") throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
     if (completion.result !== "passed" && completion.result !== "failed") throw new Error("DELIVERY_QUALITY_RESULT_INVALID");
     const current = this.loadInput(claim.deliveryUnitId, claim.evidenceVersion).codingEvidence;
     const expected = claim.input.codingEvidence;
@@ -126,9 +138,10 @@ export class DeliveryQualityRepository {
 
   abortInTransaction(claim: DeliveryQualityClaim, error: string) {
     validateKind(claim.kind);
+    if (claim.status !== "running") throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
     if (!/^[A-Z][A-Z0-9_]*$/.test(error)) throw new Error("DELIVERY_QUALITY_ABORT_INVALID");
     const now = new Date().toISOString();
-    const settled = this.db.prepare(`UPDATE delivery_quality_runs SET status = 'failed', error = ?, completed_at = ?
+    const settled = this.db.prepare(`UPDATE delivery_quality_runs SET status = 'aborted', error = ?, completed_at = ?
       WHERE id = ? AND delivery_unit_id = ? AND evidence_version = ? AND kind = ? AND status = 'running'`)
       .run(error, now, claim.id, claim.deliveryUnitId, claim.evidenceVersion, claim.kind);
     if (settled.changes !== 1) throw new Error("DELIVERY_QUALITY_RUN_STALE");

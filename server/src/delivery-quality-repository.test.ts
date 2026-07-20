@@ -83,13 +83,56 @@ describe("delivery quality evidence schema", () => {
         .toThrow("DELIVERY_QUALITY_RUN_ACTIVE");
       const evidence = store.deliveryQuality.complete(resumed, { result: "passed", content: { summary: "ok" } });
       const settled = store.deliveryQuality.claim(unit.id, 1, "code_review", "job-review-1");
-      expect(settled).toMatchObject({ id: first.id, settledEvidence: { id: evidence.id, result: "passed" } });
+      expect(settled).toMatchObject({
+        id: first.id, status: "completed", evidence: { id: evidence.id, result: "passed" }
+      });
       expect(() => store.deliveryQuality.claim(unit.id, 1, "code_review", "other-job"))
         .toThrow("DELIVERY_QUALITY_RUN_SETTLED");
     } finally {
       store.close();
     }
   });
+
+  it("idempotently reclaims an aborted run only for the same automation job token", () => {
+    const { store, unit } = fixture();
+    try {
+      const first = store.deliveryQuality.claim(unit.id, 1, "code_review", "job-review-aborted");
+      store.deliveryQuality.abort(first, "IMPLEMENTATION_EVIDENCE_STALE");
+
+      expect((store as any).db.prepare("SELECT status, error FROM delivery_quality_runs WHERE id = ?")
+        .get(first.id)).toEqual({ status: "aborted", error: "IMPLEMENTATION_EVIDENCE_STALE" });
+
+      expect(store.deliveryQuality.claim(unit.id, 1, "code_review", "job-review-aborted"))
+        .toMatchObject({
+          id: first.id, status: "aborted", error: "IMPLEMENTATION_EVIDENCE_STALE"
+        });
+      expect(store.deliveryQuality.latest(unit.id, "code_review")).toBeNull();
+      expect(() => store.deliveryQuality.claim(unit.id, 1, "code_review", "other-job"))
+        .toThrow("DELIVERY_QUALITY_RUN_SETTLED");
+    } finally {
+      store.close();
+    }
+  });
+
+  it.each(["passed", "failed"] as const)(
+    "idempotently reclaims a %s run with its real quality evidence",
+    (result) => {
+      const { store, unit } = fixture();
+      try {
+        const first = store.deliveryQuality.claim(unit.id, 1, "code_review", `job-review-${result}`);
+        const evidence = store.deliveryQuality.complete(first, { result, content: { summary: result } });
+
+        expect(store.deliveryQuality.claim(unit.id, 1, "code_review", `job-review-${result}`))
+          .toMatchObject({
+            id: first.id,
+            status: result === "passed" ? "completed" : "failed",
+            evidence: { id: evidence.id, result }
+          });
+      } finally {
+        store.close();
+      }
+    }
+  );
 
   it("persists separate terminal evidence and makes it immutable", () => {
     const { store, unit } = fixture();

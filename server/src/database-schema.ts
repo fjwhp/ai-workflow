@@ -305,10 +305,15 @@ export function createPhase2Schema(db: DatabaseSync) {
       ),
       kind TEXT NOT NULL CHECK(kind IN ('code_review', 'automated_testing')),
       claim_token TEXT NOT NULL CHECK(instr(claim_token, char(0)) = 0 AND length(claim_token) BETWEEN 1 AND 256),
-      status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
+      status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'aborted')),
       error TEXT,
       created_at TEXT NOT NULL,
       completed_at TEXT,
+      CHECK(
+        (status = 'running' AND error IS NULL AND completed_at IS NULL)
+        OR (status IN ('completed', 'failed') AND error IS NULL AND completed_at IS NOT NULL)
+        OR (status = 'aborted' AND error IS NOT NULL AND completed_at IS NOT NULL)
+      ),
       FOREIGN KEY(requirement_id) REFERENCES requirements(id),
       FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
       UNIQUE(delivery_unit_id, evidence_version, kind)

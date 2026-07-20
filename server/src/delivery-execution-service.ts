@@ -109,7 +109,8 @@ export class DeliveryExecutionService {
   async review(unitId: string, evidenceVersion?: number, claimToken?: string) {
     const quality = this.requireQualityPersistence();
     const claim = quality.claim(unitId, evidenceVersion, "code_review", claimToken);
-    if (claim.settledEvidence) return claim.settledEvidence;
+    if (claim.status === "aborted") return { status: "aborted" as const, error: claim.error };
+    if (claim.status !== "running") return claim.evidence;
     let snapshot: ReturnType<DeliveryExecutionService["loadImmutableSnapshot"]>;
     try {
       snapshot = this.loadImmutableSnapshot(claim.input.codingEvidence);
@@ -138,7 +139,8 @@ export class DeliveryExecutionService {
   async test(unitId: string, evidenceVersion?: number, claimToken?: string) {
     const quality = this.requireQualityPersistence();
     const claim = quality.claim(unitId, evidenceVersion, "automated_testing", claimToken);
-    if (claim.settledEvidence) return claim.settledEvidence;
+    if (claim.status === "aborted") return { status: "aborted" as const, error: claim.error };
+    if (claim.status !== "running") return claim.evidence;
     let snapshot: ReturnType<DeliveryExecutionService["loadImmutableSnapshot"]>;
     try {
       snapshot = this.loadImmutableSnapshot(claim.input.codingEvidence);

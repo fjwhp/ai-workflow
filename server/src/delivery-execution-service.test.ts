@@ -12,6 +12,7 @@ import {
 } from "./delivery-execution-service.js";
 import { WorkflowStore } from "./store.js";
 import { evidenceFingerprint, evidenceManifestHash } from "./evidence-tree.js";
+import { createAutomationWorker } from "./automation-worker.js";
 
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
@@ -807,6 +808,38 @@ describe("DeliveryExecutionService", () => {
 
     expect(resumed.id).toBe(first.id);
     expect(review).toHaveBeenCalledOnce();
+  });
+
+  it("completes a recovered automation job without rerunning an aborted quality claim", async () => {
+    const fixture = createFixture();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult()))
+      .implement(fixture.unit.id);
+    const reviewJob = fixture.store.automationJobs.byDedupe(`review:${fixture.unit.id}:v1`)!;
+    const aborted = fixture.store.deliveryQuality.claim(
+      fixture.unit.id, 1, "code_review", reviewJob.id
+    );
+    fixture.store.deliveryQuality.abort(aborted, "IMPLEMENTATION_EVIDENCE_STALE");
+    const review = vi.fn();
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality, { review }
+    );
+    const handlers = createDeliveryQualityAutomationHandlers(service);
+    const worker = createAutomationWorker({
+      jobs: fixture.store.automationJobs,
+      handlers: { ...handlers, test: async () => {} },
+      workerId: "worker-recovery"
+    });
+
+    for (let drain = 0; drain < 3; drain += 1) {
+      if (fixture.store.automationJobs.get(reviewJob.id)?.status === "completed") break;
+      await worker.drainOnce();
+    }
+
+    expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({
+      status: "completed", attempt: 1, lastError: null
+    });
+    expect(review).not.toHaveBeenCalled();
+    expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")).toBeNull();
   });
 
   it("rejects quality jobs with mismatched ownership, action, or version", async () => {
