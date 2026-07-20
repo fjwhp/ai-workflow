@@ -1,10 +1,51 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const protectedBranches=new Set(["prod","production","main","master"]);
+
+function codingGitEnvironment() {
+  const env = { ...process.env };
+  const exact = new Set([
+    "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_SYSTEM", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS"
+  ]);
+  for (const key of Object.keys(env)) {
+    if (exact.has(key) || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) delete env[key];
+  }
+  env.GIT_ATTR_NOSYSTEM = "1";
+  env.GIT_LFS_SKIP_SMUDGE = "1";
+  return env;
+}
+
+async function codingFilterOverrides(repoPath: string) {
+  let stdout = "";
+  try {
+    stdout = (await execFileAsync("git", ["-C", repoPath, "config", "--name-only", "--get-regexp",
+      "^filter\\..*\\.(smudge|process|required)$"], { env: codingGitEnvironment() })).stdout;
+  } catch (error) {
+    if ((error as { code?: unknown }).code !== 1) throw error;
+  }
+  const names = new Set<string>();
+  for (const key of stdout.split("\n").map((item) => item.trim()).filter(Boolean)) {
+    const match = /^filter\.(.+)\.(smudge|process|required)$/i.exec(key);
+    if (match?.[1]) names.add(match[1]);
+  }
+  return [...names].flatMap((name) => [
+    "-c", `filter.${name}.smudge=`,
+    "-c", `filter.${name}.process=`,
+    "-c", `filter.${name}.required=false`
+  ]);
+}
+
+function codingGitPrefix() {
+  return ["-c", "core.fsmonitor=false"];
+}
 
 export type ActualWorktreeIdentity =
   | { valid: true; path: string; branch: string; headCommit: string }
@@ -220,6 +261,13 @@ async function validateRequirementBaseCommit(repoPath:string,branch:string,baseC
   return baseCommit;
 }
 
+async function validateSnapshotCommit(repoPath:string,baseCommit:string){
+  if(!/^[0-9a-f]{40,64}$/i.test(baseCommit))throw new Error("REQUIREMENT_BASE_COMMIT_UNAVAILABLE");
+  try{await execFileAsync("git",["-C",repoPath,"cat-file","-e",`${baseCommit}^{commit}`]);}
+  catch{throw new Error("REQUIREMENT_BASE_COMMIT_UNAVAILABLE");}
+  return baseCommit;
+}
+
 async function recoverRequirementBaseCommit(repoPath:string,branch:string){
   try{
     const {stdout}=await execFileAsync("git",["-C",repoPath,"reflog","show","--format=%H",`refs/heads/${branch}`]);
@@ -316,13 +364,15 @@ export async function createOrReuseRequirementWorktree(
   const branch = `ai/${requirementCode}`;
   return withRepoWorktreeMutationLock(repoPath, async () => {
     await validateLocalBranch(repoPath, baseBranch, "REQUIREMENT_BASE_BRANCH_INVALID", "REQUIREMENT_BASE_BRANCH_NOT_FOUND");
-    if (expectedBaseCommit) await validateRequirementBaseCommit(repoPath, baseBranch, expectedBaseCommit);
+    if (expectedBaseCommit) await validateSnapshotCommit(repoPath, expectedBaseCommit);
     const root = resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "requirements");
     const worktreePath = resolve(root, requirementCode);
     const existing = await findRegisteredWorktree(repoPath, branch, root);
     if (existing) {
       const baseCommit = await readOrRecoverRequirementBaseCommit(repoPath, existing.path, branch);
-      if (expectedBaseCommit && baseCommit !== expectedBaseCommit) throw new Error("DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH");
+      if (expectedBaseCommit && (baseCommit !== expectedBaseCommit || existing.baseCommit !== expectedBaseCommit)) {
+        throw new Error("DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH");
+      }
       return { branch, worktreePath: existing.path, baseCommit, reused: true };
     }
 
@@ -339,6 +389,10 @@ export async function createOrReuseRequirementWorktree(
     }
 
     const branchExists = await localBranchExists(repoPath, branch);
+    if (expectedBaseCommit && branchExists) {
+      const branchHead = (await execFileAsync("git", ["-C", repoPath, "rev-parse", `refs/heads/${branch}`])).stdout.trim();
+      if (branchHead !== expectedBaseCommit) throw new Error("DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH");
+    }
     let ownedHead: string | undefined;
     let targetReserved = false;
     let worktreeAddAttempted = false;
@@ -352,19 +406,32 @@ export async function createOrReuseRequirementWorktree(
       await mkdir(worktreePath);
       targetReserved = true;
       worktreeAddAttempted = true;
-      await execFileAsync("git", ["-C", repoPath, "worktree", "add", worktreePath, branch]);
+      const hooksPath = await mkdtemp(join(tmpdir(), "ai-workflow-empty-hooks-"));
+      try {
+        const filterOverrides = await codingFilterOverrides(repoPath);
+        await execFileAsync("git", [
+          "-c", `core.hooksPath=${hooksPath}`,
+          ...codingGitPrefix(),
+          ...filterOverrides,
+          "-C", repoPath, "worktree", "add", worktreePath, branch
+        ], { env: codingGitEnvironment() });
+      } finally {
+        await rm(hooksPath, { recursive: true, force: true });
+      }
       worktreeAdded = true;
       const created = await findRegisteredWorktree(repoPath, branch, root);
       if (!created || created.path !== worktreePath) throw new Error("REQUIREMENT_WORKTREE_POSTCONDITION_FAILED");
       const baseCommit=ownedHead??await recoverRequirementBaseCommit(repoPath,branch);
-      if (expectedBaseCommit && baseCommit !== expectedBaseCommit) throw new Error("DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH");
+      if (expectedBaseCommit && (baseCommit !== expectedBaseCommit || created.baseCommit !== expectedBaseCommit)) {
+        throw new Error("DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH");
+      }
       await writeRequirementBaseCommit(worktreePath,baseCommit);
       return { branch, worktreePath, baseCommit, reused: false };
     } catch (cause) {
       await cleanupFailedManagedWorktreeCreation({
         repoPath, worktreePath, branch, ownedHead, targetReserved, worktreeAddAttempted, worktreeAdded
       });
-      if(cause instanceof Error&&cause.message==="REQUIREMENT_BASE_COMMIT_UNAVAILABLE")throw cause;
+      if(cause instanceof Error&&(cause.message==="REQUIREMENT_BASE_COMMIT_UNAVAILABLE"||cause.message==="DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH"))throw cause;
       throw new Error("REQUIREMENT_WORKTREE_CREATE_FAILED", { cause });
     }
   });
@@ -375,15 +442,24 @@ export async function createIsolatedWorktree(repoPath: string, defaultBranch: st
 }
 
 export async function getWorktreeDiff(worktreePath: string) {
-  const { stdout } = await execFileAsync("git", ["-C", worktreePath, "diff", "--", "."], { maxBuffer: 10 * 1024 * 1024 });
+  const { stdout } = await execFileAsync("git", [
+    ...codingGitPrefix(), "-C", worktreePath, "diff", "--no-ext-diff", "--no-textconv", "--", "."
+  ], { maxBuffer: 10 * 1024 * 1024, env: codingGitEnvironment() });
   return stdout;
 }
 
 export async function getWorktreeSnapshot(worktreePath: string) {
-  const { stdout: tracked } = await execFileAsync("git", ["-C", worktreePath, "diff", "--", "."], { maxBuffer: 10 * 1024 * 1024 });
-  const { stdout: status } = await execFileAsync("git", ["-C", worktreePath, "status", "--porcelain", "-z"], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any });
+  const env = codingGitEnvironment();
+  const { stdout: tracked } = await execFileAsync("git", [
+    ...codingGitPrefix(), "-C", worktreePath, "diff", "--no-ext-diff", "--no-textconv", "--", "."
+  ], { maxBuffer: 10 * 1024 * 1024, env });
+  const { stdout: status } = await execFileAsync("git", [
+    ...codingGitPrefix(), "-C", worktreePath, "status", "--porcelain", "-z"
+  ], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any, env });
   const entries = Buffer.from(status as any).toString("utf8").split("\0").filter(Boolean);
-  const { stdout: untrackedOutput } = await execFileAsync("git", ["-C", worktreePath, "ls-files", "--others", "--exclude-standard", "-z"], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any });
+  const { stdout: untrackedOutput } = await execFileAsync("git", [
+    ...codingGitPrefix(), "-C", worktreePath, "ls-files", "--others", "--exclude-standard", "-z"
+  ], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any, env });
   const untracked = Buffer.from(untrackedOutput as any).toString("utf8").split("\0").filter(Boolean);
   const trackedFiles = entries.filter((entry) => !entry.startsWith("?? ")).map((entry) => entry.slice(3)).filter(Boolean);
   const files = [...new Set([...trackedFiles, ...untracked])];

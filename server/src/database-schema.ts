@@ -358,7 +358,9 @@ export function createPhase2Schema(db: DatabaseSync) {
       ON executions(delivery_unit_id, evidence_version);
     CREATE INDEX IF NOT EXISTS idx_coding_evidence_delivery_unit_version
       ON coding_evidence(delivery_unit_id, evidence_version);
-    CREATE TRIGGER IF NOT EXISTS validate_stage_run_owner_insert
+    DROP TRIGGER IF EXISTS validate_stage_run_owner_insert;
+    DROP TRIGGER IF EXISTS validate_stage_run_owner_update;
+    CREATE TRIGGER validate_stage_run_owner_insert
     BEFORE INSERT ON stage_runs
     BEGIN
       SELECT RAISE(ABORT, 'OWNER_NOT_FOUND')
@@ -372,21 +374,20 @@ export function createPhase2Schema(db: DatabaseSync) {
         OR (NEW.owner_type = 'delivery_unit' AND EXISTS (
           SELECT 1 FROM delivery_units WHERE id = NEW.owner_id AND requirement_id <> NEW.requirement_id
         ));
+      SELECT RAISE(ABORT, 'OWNER_EVIDENCE_VERSION_MISMATCH')
+      WHERE NEW.owner_type = 'delivery_unit' AND EXISTS (
+        SELECT 1 FROM delivery_units
+        WHERE id = NEW.owner_id AND evidence_version <> NEW.evidence_version
+      );
     END;
-    CREATE TRIGGER IF NOT EXISTS validate_stage_run_owner_update
-    BEFORE UPDATE OF owner_type, owner_id, requirement_id ON stage_runs
+    CREATE TRIGGER validate_stage_run_owner_update
+    BEFORE UPDATE OF owner_type, owner_id, requirement_id, evidence_version ON stage_runs
     BEGIN
-      SELECT RAISE(ABORT, 'OWNER_NOT_FOUND')
-      WHERE NEW.owner_id IS NOT NULL AND ((NEW.owner_type = 'requirement' AND NOT EXISTS (
-        SELECT 1 FROM requirements WHERE id = NEW.owner_id
-      )) OR (NEW.owner_type = 'delivery_unit' AND NOT EXISTS (
-        SELECT 1 FROM delivery_units WHERE id = NEW.owner_id
-      )));
-      SELECT RAISE(ABORT, 'OWNER_REQUIREMENT_MISMATCH')
-      WHERE (NEW.owner_type = 'requirement' AND NEW.owner_id <> NEW.requirement_id)
-        OR (NEW.owner_type = 'delivery_unit' AND EXISTS (
-          SELECT 1 FROM delivery_units WHERE id = NEW.owner_id AND requirement_id <> NEW.requirement_id
-        ));
+      SELECT RAISE(ABORT, 'STAGE_RUN_IDENTITY_IMMUTABLE')
+      WHERE NEW.owner_type IS NOT OLD.owner_type
+        OR NEW.owner_id IS NOT OLD.owner_id
+        OR NEW.requirement_id IS NOT OLD.requirement_id
+        OR NEW.evidence_version IS NOT OLD.evidence_version;
     END;
     CREATE TRIGGER IF NOT EXISTS validate_artifact_owner_insert
     BEFORE INSERT ON artifacts

@@ -53,7 +53,7 @@ export interface DeliveryExecutionSuccess {
   branch: string;
   worktreePath: string;
   baseCommit: string;
-  commands: unknown[];
+  commands: readonly [];
   diff: string;
   diffHash: string;
   originalChars: number;

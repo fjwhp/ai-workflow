@@ -1,7 +1,9 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { dirname, join, resolve } from "node:path";
+import { promisify } from "node:util";
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   chatCreate: vi.fn(),
@@ -25,12 +27,13 @@ vi.mock("./command-policy.js", () => ({
 }));
 
 import { createOrReuseRequirementWorktree, getWorktreeDiff, getWorktreeSnapshot } from "./repository.js";
-import { prepareCodingWorktree, resolveWorktreePath, runCodingAgent } from "./coding-agent.js";
+import { prepareCodingWorktree, resolveWorktreePath, runCodingAgent, type CodingAgentResult } from "./coding-agent.js";
 
 const createWorktree = vi.mocked(createOrReuseRequirementWorktree);
 const diff = vi.mocked(getWorktreeDiff);
 const snapshot = vi.mocked(getWorktreeSnapshot);
 const temporaryWorktrees: string[] = [];
+const exec = promisify(execFile);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -93,6 +96,27 @@ async function temporaryWorktree() {
   return worktree;
 }
 
+async function temporaryWorktreeWithOutside() {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-boundary-"));
+  temporaryWorktrees.push(root);
+  const worktree = join(root, "worktree");
+  const outside = join(root, "outside");
+  await Promise.all([mkdir(worktree), mkdir(outside)]);
+  createWorktree.mockResolvedValue({
+    branch: "ai/REQ-0001",
+    worktreePath: worktree,
+    baseCommit: "version-head",
+    reused: false
+  });
+  return { root, worktree, outside };
+}
+
+function toolResult(callId = "call-1") {
+  const toolMessage = mocks.chatCreate.mock.calls[1]![0].messages
+    .find((message: any) => message.tool_call_id === callId);
+  return JSON.parse(toolMessage.content);
+}
+
 describe("resolveWorktreePath", () => {
   it("resolves a repository-relative file inside the worktree", () => {
     expect(resolveWorktreePath("/tmp/worktree", "src/App.java")).toBe("/tmp/worktree/src/App.java");
@@ -140,6 +164,10 @@ describe("prepareCodingWorktree", () => {
 });
 
 describe("runCodingAgent tool boundary", () => {
+  it("types command evidence as an exact empty tuple", () => {
+    expectTypeOf<CodingAgentResult["commands"]>().toEqualTypeOf<readonly []>();
+  });
+
   it("exposes only implementation file tools to the model", async () => {
     mocks.chatCreate.mockResolvedValueOnce({ choices: [{ message: { role: "assistant", content: "done" } }] });
 
@@ -209,6 +237,75 @@ describe("runCodingAgent tool boundary", () => {
     expect(JSON.parse(toolMessage.content)).toEqual({ written: path });
     expect(await readFile(join(worktree, path), "utf8")).toBe("allowed");
     expect(result.commands).toEqual([]);
+  });
+
+  it("rejects read_file when the final file is a symlink outside the worktree", async () => {
+    const { worktree, outside } = await temporaryWorktreeWithOutside();
+    const externalFile = join(outside, "secret.txt");
+    await writeFile(externalFile, "external-secret", "utf8");
+    await symlink(externalFile, join(worktree, "linked-secret.txt"));
+    respondWithToolCalls([{ name: "read_file", arguments: { path: "linked-secret.txt" } }]);
+
+    await runCodingAgent(codingInput([]));
+
+    expect(toolResult()).toEqual({ error: "CODING_FILE_PATH_UNSAFE" });
+  });
+
+  it("rejects write_file when the final file is a symlink outside the worktree", async () => {
+    const { worktree, outside } = await temporaryWorktreeWithOutside();
+    const externalFile = join(outside, "target.txt");
+    await writeFile(externalFile, "external-original", "utf8");
+    await symlink(externalFile, join(worktree, "linked-target.txt"));
+    respondWithToolCalls([{ name: "write_file", arguments: { path: "linked-target.txt", content: "overwritten" } }]);
+
+    await runCodingAgent(codingInput([]));
+
+    expect(toolResult()).toEqual({ error: "CODING_FILE_PATH_UNSAFE" });
+    expect(await readFile(externalFile, "utf8")).toBe("external-original");
+  });
+
+  it.each(["read_file", "write_file"])("rejects %s through a parent directory symlink outside the worktree", async (name) => {
+    const { worktree, outside } = await temporaryWorktreeWithOutside();
+    const externalFile = join(outside, "nested.txt");
+    await writeFile(externalFile, "outside-original", "utf8");
+    await symlink(outside, join(worktree, "linked-directory"));
+    respondWithToolCalls([{
+      name,
+      arguments: name === "read_file"
+        ? { path: "linked-directory/nested.txt" }
+        : { path: "linked-directory/nested.txt", content: "overwritten" }
+    }]);
+
+    await runCodingAgent(codingInput([]));
+
+    expect(toolResult()).toEqual({ error: "CODING_FILE_PATH_UNSAFE" });
+    expect(await readFile(externalFile, "utf8")).toBe("outside-original");
+  });
+
+  it("rejects write_file through a symlink to a linked worktree Git common directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "coding-agent-git-link-"));
+    temporaryWorktrees.push(root);
+    const repo = join(root, "repo");
+    const worktree = join(root, "linked-worktree");
+    await exec("git", ["init", "-b", "main", repo]);
+    await exec("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+    await exec("git", ["-C", repo, "config", "user.name", "Test"]);
+    await writeFile(join(repo, "README.md"), "base\n", "utf8");
+    await exec("git", ["-C", repo, "add", "--all"]);
+    await exec("git", ["-C", repo, "commit", "-m", "base"]);
+    await exec("git", ["-C", repo, "branch", "ai/REQ-0001"]);
+    await exec("git", ["-C", repo, "worktree", "add", worktree, "ai/REQ-0001"]);
+    const commonDirOutput = await exec("git", ["-C", worktree, "rev-parse", "--git-common-dir"]);
+    const commonDir = resolve(worktree, commonDirOutput.stdout.trim());
+    const marker = join(commonDir, "coding-agent-marker");
+    await symlink(commonDir, join(worktree, "metadata-link"));
+    createWorktree.mockResolvedValue({ branch: "ai/REQ-0001", worktreePath: worktree, baseCommit: "version-head", reused: false });
+    respondWithToolCalls([{ name: "write_file", arguments: { path: "metadata-link/coding-agent-marker", content: "unsafe" } }]);
+
+    await runCodingAgent(codingInput([]));
+
+    expect(toolResult()).toEqual({ error: "CODING_FILE_PATH_UNSAFE" });
+    await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("keeps search, read, write, and diff tools available", async () => {

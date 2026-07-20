@@ -1,15 +1,20 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DeliveryExecutionService, type CodingAgent } from "./delivery-execution-service.js";
 import { WorkflowStore } from "./store.js";
 
 const stores: WorkflowStore[] = [];
+const directories: string[] = [];
 
 afterEach(() => {
   stores.splice(0).forEach((store) => store.close());
+  directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true }));
 });
 
-function createFixture() {
-  const store = new WorkflowStore(":memory:");
+function createFixture(databasePath = ":memory:") {
+  const store = new WorkflowStore(databasePath);
   stores.push(store);
   const project = store.createProject({
     name: "Frozen project",
@@ -60,6 +65,12 @@ function createFixture() {
   return { store, project, version, requirement, unit: plan.units[0]! };
 }
 
+function fileBackedDatabase() {
+  const directory = mkdtempSync(join(tmpdir(), "delivery-execution-service-"));
+  directories.push(directory);
+  return join(directory, "workflow.db");
+}
+
 function codingResult() {
   return {
     runId: "agent-run-1",
@@ -69,7 +80,7 @@ function codingResult() {
     reused: false,
     summary: "implemented",
     diff: "diff --git a/src/orders/index.ts b/src/orders/index.ts\n+export const ready = true;",
-    commands: [{ command: "legacy-runner", args: ["test"], code: 0 }],
+    commands: [] as const,
     files: ["src/orders/index.ts"],
     additions: 1,
     deletions: 0,
@@ -77,7 +88,104 @@ function codingResult() {
   };
 }
 
+function persistenceResult() {
+  return {
+    branch: "ai/REQ-0001",
+    worktreePath: "/tmp/frozen-project-run",
+    baseCommit: "0123456789abcdef0123456789abcdef01234567",
+    commands: [] as const,
+    diff: "diff --git a/src/orders/index.ts b/src/orders/index.ts\n+export const ready = true;",
+    diffHash: "diff-hash",
+    originalChars: 82,
+    truncated: false,
+    files: ["src/orders/index.ts"],
+    additions: 1,
+    deletions: 0,
+    diagnostics: "",
+    output: { summary: "implemented" }
+  };
+}
+
+function claimOnNextTurn(store: WorkflowStore, unitId: string) {
+  return new Promise((resolve, reject) => setImmediate(() => {
+    try { resolve(store.deliveryExecutions.claimImplementation(unitId, "test-model")); }
+    catch (error) { reject(error); }
+  }));
+}
+
 describe("DeliveryExecutionService", () => {
+  it("allows only one claim across two file-backed store connections", async () => {
+    const databasePath = fileBackedDatabase();
+    const fixture = createFixture(databasePath);
+    const secondStore = new WorkflowStore(databasePath);
+    stores.push(secondStore);
+
+    const attempts = await Promise.allSettled([
+      claimOnNextTurn(fixture.store, fixture.unit.id),
+      claimOnNextTurn(secondStore, fixture.unit.id)
+    ]);
+
+    expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+    const rejected = attempts.find((attempt): attempt is PromiseRejectedResult => attempt.status === "rejected");
+    expect(rejected?.reason).toMatchObject({ message: "DELIVERY_UNIT_RUN_ACTIVE" });
+    expect(fixture.store.listStageRuns(fixture.requirement.id)).toHaveLength(1);
+    expect(fixture.store.deliveryExecutions.listExecutions(fixture.unit.id)).toHaveLength(1);
+  });
+
+  it.each([
+    ["module ids", "module_ids_json", "{}"],
+    ["acceptance criteria", "acceptance_criteria_json", "{"],
+    ["sensitive patterns", "sensitive_patterns_json", "[1]"],
+    ["allowed commands", "allowed_commands_json", "[{\"command\":1}]" ]
+  ])("fails closed for malformed snapshot %s", async (_label, column, value) => {
+    const fixture = createFixture();
+    (fixture.store as any).db.prepare(`UPDATE delivery_unit_snapshots SET ${column} = ? WHERE delivery_unit_id = ?`)
+      .run(value, fixture.unit.id);
+    const codingAgent: CodingAgent = vi.fn();
+    const service = new DeliveryExecutionService(fixture.store.deliveryExecutions, codingAgent);
+
+    await expect(service.implement(fixture.unit.id)).rejects.toThrow("DELIVERY_UNIT_SNAPSHOT_INVALID");
+
+    expect(codingAgent).not.toHaveBeenCalled();
+    expect(fixture.store.deliveryUnits.listForRequirement(fixture.requirement.id)[0]).toMatchObject({ status: "ready" });
+    expect(fixture.store.listStageRuns(fixture.requirement.id)).toEqual([]);
+    expect(fixture.store.deliveryExecutions.listExecutions(fixture.unit.id)).toEqual([]);
+  });
+
+  it("rolls back every complete mutation when coding evidence insertion fails", () => {
+    const fixture = createFixture();
+    const claim = fixture.store.deliveryExecutions.claimImplementation(fixture.unit.id, "test-model");
+    (fixture.store as any).db.exec(`CREATE TRIGGER fail_coding_evidence_insert
+      BEFORE INSERT ON coding_evidence
+      BEGIN SELECT RAISE(ABORT, 'forced evidence failure'); END;`);
+
+    expect(() => fixture.store.deliveryExecutions.completeImplementation(claim, persistenceResult()))
+      .toThrow("forced evidence failure");
+
+    expect(fixture.store.deliveryUnits.listForRequirement(fixture.requirement.id)[0]).toMatchObject({ status: "running" });
+    expect(fixture.store.getStageRun(claim.runId)).toMatchObject({ status: "running", error: null });
+    expect(fixture.store.deliveryExecutions.listExecutions(fixture.unit.id)[0]).toMatchObject({ status: "running", error: null });
+    expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toBeNull();
+    expect(fixture.store.getStageRun(claim.runId)?.events.map((event: any) => event.type)).toEqual(["run.started"]);
+  });
+
+  it("rolls back every failure mutation when the terminal event insertion fails", () => {
+    const fixture = createFixture();
+    const claim = fixture.store.deliveryExecutions.claimImplementation(fixture.unit.id, "test-model");
+    (fixture.store as any).db.exec(`CREATE TRIGGER fail_terminal_event_insert
+      BEFORE INSERT ON stage_run_events WHEN NEW.type = 'run.failed'
+      BEGIN SELECT RAISE(ABORT, 'forced terminal event failure'); END;`);
+
+    expect(() => fixture.store.deliveryExecutions.failImplementation(claim, "coding failed"))
+      .toThrow("forced terminal event failure");
+
+    expect(fixture.store.deliveryUnits.listForRequirement(fixture.requirement.id)[0]).toMatchObject({ status: "running" });
+    expect(fixture.store.getStageRun(claim.runId)).toMatchObject({ status: "running", error: null });
+    expect(fixture.store.deliveryExecutions.listExecutions(fixture.unit.id)[0]).toMatchObject({ status: "running", error: null });
+    expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toBeNull();
+    expect(fixture.store.getStageRun(claim.runId)?.events.map((event: any) => event.type)).toEqual(["run.started"]);
+  });
+
   it("uses the unit snapshot even when the live project changes and rejects a concurrent claim", async () => {
     const fixture = createFixture();
     fixture.store.updateProject(fixture.project.id, {

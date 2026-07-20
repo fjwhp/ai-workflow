@@ -113,11 +113,12 @@ function insertArtifact(db: DatabaseSync, input: { id: string; ownerType: string
     .run(input.id, input.ownerType, input.ownerId, input.stage ?? "implementation");
 }
 
-function insertStageRun(db: DatabaseSync, input: { id: string; requirementId?: string; ownerType: string | null; ownerId: string | null; stage?: string; status?: string }) {
+function insertStageRun(db: DatabaseSync, input: { id: string; requirementId?: string; ownerType: string | null; ownerId: string | null; evidenceVersion?: number; stage?: string; status?: string }) {
   db.prepare(`INSERT INTO stage_runs
-    (id, requirement_id, owner_type, owner_id, stage, status, input_json, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, '{}', '2026-07-20T00:00:00.000Z')`)
-    .run(input.id, input.requirementId ?? "r1", input.ownerType, input.ownerId, input.stage ?? "implementation", input.status ?? "running");
+    (id, requirement_id, owner_type, owner_id, evidence_version, stage, status, input_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, '{}', '2026-07-20T00:00:00.000Z')`)
+    .run(input.id, input.requirementId ?? "r1", input.ownerType, input.ownerId, input.evidenceVersion ?? 1,
+      input.stage ?? "implementation", input.status ?? "running");
 }
 
 function insertAutomationJob(db: DatabaseSync, input: {
@@ -435,8 +436,27 @@ describe("Phase 2 database schema", () => {
     insertAutomationJob(db, { id: "job-1", ownerType: "delivery_unit", ownerId: "u1" });
 
     expect(() => db.prepare("UPDATE artifacts SET requirement_id = 'r2' WHERE id = 'artifact-1'").run()).toThrow("OWNER_REQUIREMENT_MISMATCH");
-    expect(() => db.prepare("UPDATE stage_runs SET requirement_id = 'r2' WHERE id = 'run-1'").run()).toThrow("OWNER_REQUIREMENT_MISMATCH");
+    expect(() => db.prepare("UPDATE stage_runs SET requirement_id = 'r2' WHERE id = 'run-1'").run()).toThrow("STAGE_RUN_IDENTITY_IMMUTABLE");
     expect(() => db.prepare("UPDATE automation_jobs SET owner_id = 'missing' WHERE id = 'job-1'").run()).toThrow("OWNER_NOT_FOUND");
+    db.close();
+  });
+
+  it("matches delivery unit stage runs to the current evidence version and keeps their identity immutable", () => {
+    const db = openFreshStoreDatabase();
+    insertDeliveryFixture(db);
+
+    expect(() => insertStageRun(db, {
+      id: "run-version-mismatch", ownerType: "delivery_unit", ownerId: "u1", evidenceVersion: 2
+    })).toThrow("OWNER_EVIDENCE_VERSION_MISMATCH");
+    insertStageRun(db, { id: "run-valid", ownerType: "delivery_unit", ownerId: "u1", evidenceVersion: 1 });
+    expect(() => db.prepare("UPDATE stage_runs SET evidence_version = 2 WHERE id = 'run-valid'").run())
+      .toThrow("STAGE_RUN_IDENTITY_IMMUTABLE");
+    expect(() => db.prepare("UPDATE stage_runs SET owner_id = 'u2' WHERE id = 'run-valid'").run())
+      .toThrow("STAGE_RUN_IDENTITY_IMMUTABLE");
+    expect(() => db.prepare(`UPDATE stage_runs SET status = 'completed', output_json = '{}',
+      completed_at = '2026-07-20T00:01:00.000Z' WHERE id = 'run-valid'`).run()).not.toThrow();
+    expect(db.prepare("SELECT status, evidence_version FROM stage_runs WHERE id = 'run-valid'").get())
+      .toEqual({ status: "completed", evidence_version: 1 });
     db.close();
   });
 

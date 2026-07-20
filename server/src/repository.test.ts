@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -9,6 +9,7 @@ import {
   cleanupFailedManagedWorktreeCreation,
   createOrReuseRequirementWorktree,
   getLocalBranches,
+  getWorktreeDiff,
   getWorktreeSnapshot,
   isProtectedBranch
 } from "./repository.js";
@@ -91,6 +92,11 @@ async function setupVersionRepository() {
   return { root, repoPath };
 }
 
+async function executableMarkerScript(path: string, marker: string, body = "exit 0") {
+  await writeFile(path, `#!/bin/sh\nprintf marker > "${marker}"\n${body}\n`, "utf8");
+  await chmod(path, 0o755);
+}
+
 async function mainState(repoPath: string) {
   return {
     branch: await git(repoPath, "branch", "--show-current"),
@@ -100,6 +106,146 @@ async function mainState(repoPath: string) {
 }
 
 describe("requirement worktree lifecycle", () => {
+  it("does not execute a repository post-checkout hook while creating a coding worktree", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const marker = join(root, "post-checkout-marker");
+    const hook = resolve(repoPath, await git(repoPath, "rev-parse", "--git-path", "hooks/post-checkout"));
+    await executableMarkerScript(hook, marker);
+
+    await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0030");
+
+    expect(await pathExists(marker)).toBe(false);
+  });
+
+  it("does not execute a configured smudge filter while creating a coding worktree", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const marker = join(root, "smudge-marker");
+    const script = join(root, "smudge-filter.sh");
+    await executableMarkerScript(script, marker, "cat");
+    await writeFile(join(repoPath, ".gitattributes"), "payload.txt filter=marker-smudge\n");
+    await writeFile(join(repoPath, "payload.txt"), "payload\n");
+    await git(repoPath, "config", "filter.marker-smudge.clean", "cat");
+    await git(repoPath, "config", "filter.marker-smudge.smudge", script);
+    await git(repoPath, "config", "filter.marker-smudge.required", "true");
+    await git(repoPath, "add", "--all"); await git(repoPath, "commit", "-m", "add smudge payload");
+    await git(repoPath, "branch", "-f", "feature/2.2.1", "prod");
+
+    await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0031");
+
+    expect(await pathExists(marker)).toBe(false);
+  });
+
+  it("does not execute a configured process filter while creating a coding worktree", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const marker = join(root, "process-marker");
+    const script = join(root, "process-filter.sh");
+    await executableMarkerScript(script, marker, "exit 1");
+    await writeFile(join(repoPath, ".gitattributes"), "payload.txt filter=marker-process\n");
+    await writeFile(join(repoPath, "payload.txt"), "payload\n");
+    await git(repoPath, "add", "--all"); await git(repoPath, "commit", "-m", "add process payload");
+    await git(repoPath, "branch", "-f", "feature/2.2.1", "prod");
+    await git(repoPath, "config", "filter.marker-process.process", script);
+    await git(repoPath, "config", "filter.marker-process.required", "false");
+
+    let failure: unknown;
+    try { await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0032"); }
+    catch (error) { failure = error; }
+    expect(await pathExists(marker)).toBe(false);
+    expect(failure).toBeUndefined();
+  });
+
+  it("does not execute diff.external while reading a coding worktree diff", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const marker = join(root, "external-diff-marker");
+    const script = join(root, "external-diff.sh");
+    await executableMarkerScript(script, marker);
+    await git(repoPath, "config", "diff.external", script);
+    await writeFile(join(repoPath, "README.md"), "changed\n");
+
+    await getWorktreeDiff(repoPath);
+
+    expect(await pathExists(marker)).toBe(false);
+  });
+
+  it("does not execute a textconv driver while reading a coding worktree diff", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const marker = join(root, "textconv-marker");
+    const script = join(root, "textconv.sh");
+    await executableMarkerScript(script, marker, "cat \"$1\"");
+    await writeFile(join(repoPath, ".gitattributes"), "*.txt diff=marker-textconv\n");
+    await writeFile(join(repoPath, "tracked.txt"), "before\n");
+    await git(repoPath, "config", "diff.marker-textconv.textconv", script);
+    await git(repoPath, "add", "--all"); await git(repoPath, "commit", "-m", "add textconv payload");
+    await writeFile(join(repoPath, "tracked.txt"), "after\n");
+
+    await getWorktreeDiff(repoPath);
+
+    expect(await pathExists(marker)).toBe(false);
+  });
+
+  it("does not execute core.fsmonitor while reading a coding worktree snapshot", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const marker = join(root, "fsmonitor-marker");
+    const script = join(root, "fsmonitor.sh");
+    await executableMarkerScript(script, marker, "exit 1");
+    await git(repoPath, "config", "core.fsmonitor", script);
+
+    await getWorktreeSnapshot(repoPath);
+
+    expect(await pathExists(marker)).toBe(false);
+  });
+
+  it("rejects a mounted snapshot worktree whose actual HEAD advanced past the frozen commit", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const frozenHead = await git(repoPath, "rev-parse", "feature/2.2.1");
+    const created = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0020", frozenHead);
+    await writeFile(join(created.worktreePath, "progress.txt"), "progress\n");
+    await git(created.worktreePath, "add", "--all");
+    await git(created.worktreePath, "commit", "-m", "advance requirement");
+
+    await expect(createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0020", frozenHead))
+      .rejects.toThrow("DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH");
+  });
+
+  it("rejects an unmounted snapshot branch whose ref advanced past the frozen commit", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const frozenHead = await git(repoPath, "rev-parse", "feature/2.2.1");
+    const tree = await git(repoPath, "rev-parse", `${frozenHead}^{tree}`);
+    const advancedHead = await git(repoPath, "commit-tree", tree, "-p", frozenHead, "-m", "advance unmounted requirement");
+    await git(repoPath, "update-ref", "refs/heads/ai/REQ-0021", advancedHead, "");
+
+    await expect(createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0021", frozenHead))
+      .rejects.toThrow("DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH");
+  });
+
+  it("creates from a frozen commit object after the live source branch is force-moved away", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const frozenHead = await git(repoPath, "rev-parse", "feature/2.2.1");
+    const tree = await git(repoPath, "rev-parse", `${frozenHead}^{tree}`);
+    const replacementHead = await git(repoPath, "commit-tree", tree, "-m", "replacement source root");
+    await git(repoPath, "update-ref", "refs/heads/feature/2.2.1", replacementHead, frozenHead);
+
+    const created = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0022", frozenHead);
+
+    expect(created.baseCommit).toBe(frozenHead);
+    expect(await git(created.worktreePath, "rev-parse", "HEAD")).toBe(frozenHead);
+    expect(await git(repoPath, "rev-parse", "feature/2.2.1")).toBe(replacementHead);
+  });
+
+  it("serializes concurrent creation from the same frozen snapshot commit", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const frozenHead = await git(repoPath, "rev-parse", "feature/2.2.1");
+
+    const results = await Promise.all([
+      createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0023", frozenHead),
+      createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0023", frozenHead)
+    ]);
+
+    expect(results.map((item) => item.reused).sort()).toEqual([false, true]);
+    expect(new Set(results.map((item) => item.worktreePath)).size).toBe(1);
+    expect(await git(results[0]!.worktreePath, "rev-parse", "HEAD")).toBe(frozenHead);
+  });
+
   it("creates a delivery worktree from the frozen head after its source branch advances", async () => {
     const { repoPath } = await setupVersionRepository();
     const frozenHead = await git(repoPath, "rev-parse", "feature/2.2.1");
@@ -250,19 +396,17 @@ describe("requirement worktree lifecycle", () => {
       .rejects.toThrow("REQUIREMENT_WORKTREE_PATH_MISMATCH");
   });
 
-  it("rolls back a created requirement branch and target after checkout failure", async () => {
+  it("neutralizes a required failing smudge filter during coding worktree checkout", async () => {
     const { repoPath } = await setupVersionRepository();
     await configureFailingSmudge(repoPath);
     const before = await mainState(repoPath);
     const target = resolve(await realpath(repoPath), "..", ".ai-workflow-worktrees", basename(repoPath), "requirements", "REQ-9001");
-    let failure: unknown;
-    try { await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-9001"); }
-    catch (error) { failure = error; }
+    const created = await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-9001");
 
-    expect(failure).toMatchObject({ message: "REQUIREMENT_WORKTREE_CREATE_FAILED" });
-    expect(await localBranchExistsForTest(repoPath, "ai/REQ-9001")).toBe(false);
-    expect(await pathExists(target)).toBe(false);
-    expect(await registeredPaths(repoPath, "ai/REQ-9001")).toEqual([]);
+    expect(created.worktreePath).toBe(target);
+    expect(await localBranchExistsForTest(repoPath, "ai/REQ-9001")).toBe(true);
+    expect(await pathExists(target)).toBe(true);
+    expect(await registeredPaths(repoPath, "ai/REQ-9001")).toEqual([target]);
     expect(await mainState(repoPath)).toEqual(before);
   });
 
