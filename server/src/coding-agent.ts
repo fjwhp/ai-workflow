@@ -12,7 +12,9 @@ export function resolveWorktreePath(worktree: string, requested: string) {
   const target = resolve(worktree, requested);
   const rel = relative(resolve(worktree), target);
   if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new Error("文件路径必须位于工作区内");
-  if (rel === ".git" || rel.startsWith(`.git${sep}`)) throw new Error("禁止访问工作区 Git 元数据");
+  const containsGitMetadata = rel.split(sep).some((segment) =>
+    segment.replace(/[A-Z]/g, (letter) => letter.toLowerCase()) === ".git");
+  if (containsGitMetadata) throw new Error("禁止访问工作区 Git 元数据");
   return target;
 }
 

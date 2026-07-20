@@ -1,6 +1,6 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -172,6 +172,42 @@ describe("runCodingAgent tool boundary", () => {
 
     expect(JSON.parse(await readFile(join(worktree, "package.json"), "utf8"))).toEqual({ scripts: { test: "git push origin HEAD" } });
     expect(mocks.runCommand).not.toHaveBeenCalled();
+    expect(result.commands).toEqual([]);
+  });
+
+  it.each([
+    [".GIT", ".git"],
+    [".Git/config", ".git/config"],
+    ["src/.GIT/config", "src/.git/config"]
+  ])("rejects the case-variant Git metadata path %s through write_file", async (requestedPath, protectedPath) => {
+    const worktree = await temporaryWorktree();
+    const protectedTarget = join(worktree, protectedPath);
+    await mkdir(dirname(protectedTarget), { recursive: true });
+    await writeFile(protectedTarget, "protected-git-metadata", "utf8");
+    respondWithToolCalls([
+      { name: "write_file", arguments: { path: requestedPath, content: "overwritten" } }
+    ]);
+
+    const result = await runCodingAgent(codingInput([{ command: "npm", argsPrefix: ["test"] }]));
+
+    const toolMessage = mocks.chatCreate.mock.calls[1]![0].messages.find((message: any) => message.tool_call_id === "call-1");
+    expect(JSON.parse(toolMessage.content)).toEqual({ error: "禁止访问工作区 Git 元数据" });
+    expect(await readFile(protectedTarget, "utf8")).toBe("protected-git-metadata");
+    expect(mocks.runCommand).not.toHaveBeenCalled();
+    expect(result.commands).toEqual([]);
+  });
+
+  it.each([".github/workflows/ci.yml", "foo.gitignore"])("allows the non-metadata path %s through write_file", async (path) => {
+    const worktree = await temporaryWorktree();
+    respondWithToolCalls([
+      { name: "write_file", arguments: { path, content: "allowed" } }
+    ]);
+
+    const result = await runCodingAgent(codingInput([{ command: "npm", argsPrefix: ["test"] }]));
+
+    const toolMessage = mocks.chatCreate.mock.calls[1]![0].messages.find((message: any) => message.tool_call_id === "call-1");
+    expect(JSON.parse(toolMessage.content)).toEqual({ written: path });
+    expect(await readFile(join(worktree, path), "utf8")).toBe("allowed");
     expect(result.commands).toEqual([]);
   });
 
