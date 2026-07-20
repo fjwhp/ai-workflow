@@ -1,104 +1,12 @@
 import OpenAI from "openai";
 import { execFile } from "node:child_process";
-import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { createOrReuseRequirementWorktree, getWorktreeDiff, getWorktreeSnapshot } from "./repository.js";
+import { resolveWorktreePath, safeReadWorktreeFile, safeWriteWorktreeFile } from "./worktree-file-safety.js";
+
+export { resolveWorktreePath } from "./worktree-file-safety.js";
 
 const execFileAsync = promisify(execFile);
-
-export function resolveWorktreePath(worktree: string, requested: string) {
-  if (isAbsolute(requested)) throw new Error("文件路径必须位于工作区内");
-  const target = resolve(worktree, requested);
-  const rel = relative(resolve(worktree), target);
-  if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new Error("文件路径必须位于工作区内");
-  const containsGitMetadata = rel.split(sep).some((segment) =>
-    segment.replace(/[A-Z]/g, (letter) => letter.toLowerCase()) === ".git");
-  if (containsGitMetadata) throw new Error("禁止访问工作区 Git 元数据");
-  return target;
-}
-
-function isContainedPath(root: string, candidate: string) {
-  const rel = relative(root, candidate);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
-}
-
-async function safeParentPath(root: string, target: string, createMissing: boolean) {
-  const parentRelative = relative(root, resolve(target, ".."));
-  const segments = parentRelative ? parentRelative.split(sep) : [];
-  let current = root;
-  for (const segment of segments) {
-    current = resolve(current, segment);
-    let entry;
-    try { entry = await lstat(current); }
-    catch (error) {
-      if (!createMissing || (error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("CODING_FILE_PATH_UNSAFE");
-      try { await mkdir(current); }
-      catch (mkdirError) {
-        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("CODING_FILE_PATH_UNSAFE");
-      }
-      try { entry = await lstat(current); }
-      catch { throw new Error("CODING_FILE_PATH_UNSAFE"); }
-    }
-    if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error("CODING_FILE_PATH_UNSAFE");
-    const canonical = await realpath(current).catch(() => "");
-    if (!canonical || !isContainedPath(root, canonical)) throw new Error("CODING_FILE_PATH_UNSAFE");
-  }
-}
-
-async function verifyOpenRegularFile(root: string, target: string, handle: Awaited<ReturnType<typeof open>>) {
-  await safeParentPath(root, target, false);
-  const [entry, opened, canonicalTarget] = await Promise.all([
-    lstat(target).catch(() => null),
-    handle.stat().catch(() => null),
-    realpath(target).catch(() => "")
-  ]);
-  if (!entry || !opened || entry.isSymbolicLink() || !entry.isFile() || !opened.isFile()
-    || entry.dev !== opened.dev || entry.ino !== opened.ino
-    || !canonicalTarget || !isContainedPath(root, canonicalTarget)) {
-    throw new Error("CODING_FILE_PATH_UNSAFE");
-  }
-}
-
-async function safeReadWorktreeFile(worktree: string, requested: string) {
-  const root = await realpath(resolve(worktree));
-  const target = resolveWorktreePath(root, requested);
-  await safeParentPath(root, target, false);
-  const handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-    .catch(() => { throw new Error("CODING_FILE_PATH_UNSAFE"); });
-  try {
-    await verifyOpenRegularFile(root, target, handle);
-    return await handle.readFile("utf8");
-  } finally {
-    await handle.close();
-  }
-}
-
-async function safeWriteWorktreeFile(worktree: string, requested: string, content: string) {
-  const root = await realpath(resolve(worktree));
-  const target = resolveWorktreePath(root, requested);
-  await safeParentPath(root, target, true);
-  let exists = true;
-  try {
-    const entry = await lstat(target);
-    if (entry.isSymbolicLink() || !entry.isFile()) throw new Error("CODING_FILE_PATH_UNSAFE");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") exists = false;
-    else throw error instanceof Error && error.message === "CODING_FILE_PATH_UNSAFE"
-      ? error : new Error("CODING_FILE_PATH_UNSAFE");
-  }
-  const flags = constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0)
-    | (exists ? 0 : constants.O_CREAT | constants.O_EXCL);
-  const handle = await open(target, flags, 0o666).catch(() => { throw new Error("CODING_FILE_PATH_UNSAFE"); });
-  try {
-    await verifyOpenRegularFile(root, target, handle);
-    await handle.truncate(0);
-    await handle.writeFile(content, "utf8");
-  } finally {
-    await handle.close();
-  }
-}
 
 export type CodingProject = { id: string; repoPath: string; defaultBranch: string; allowedCommands: { command: string; argsPrefix?: string[] }[] };
 export type CodingVersion = { id: string; projectId: string; branch: string; worktreePath: string; status: "active" | "closed"; headCommit?: string };

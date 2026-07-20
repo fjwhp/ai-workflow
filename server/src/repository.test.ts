@@ -1,6 +1,6 @@
 import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, isAbsolute, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
@@ -27,6 +27,51 @@ describe("getWorktreeSnapshot",()=>{
     expect(snapshot.files).toContain("src/test/new.txt");
     expect(snapshot.diff).toContain("+hello");
   });
+
+  it("includes an untracked regular binary file without following another path", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "workflow-git-")); dirs.push(dir);
+    await exec("git", ["init", dir]);
+    await writeFile(join(dir, "payload.bin"), Buffer.from([0, 1, 2, 255]));
+
+    const snapshot = await getWorktreeSnapshot(dir);
+
+    expect(snapshot.files).toContain("payload.bin");
+    expect(snapshot.diff).toContain("diff --git a/payload.bin b/payload.bin");
+  });
+
+  it("rejects an untracked final symlink instead of reading its outside target", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-snapshot-link-")); dirs.push(root);
+    const repoPath = join(root, "repo");
+    const secretPath = join(root, "outside-secret.txt");
+    await exec("git", ["init", repoPath]);
+    await writeFile(secretPath, "OUTSIDE_SECRET\n");
+    await symlink(secretPath, join(repoPath, "linked-secret.txt"));
+
+    await expect(getWorktreeSnapshot(repoPath)).rejects.toThrow("CODING_FILE_PATH_UNSAFE");
+  });
+
+  it("rejects an untracked symlink to an outside parent directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-snapshot-parent-link-")); dirs.push(root);
+    const repoPath = join(root, "repo");
+    const outside = join(root, "outside");
+    await exec("git", ["init", repoPath]);
+    await mkdir(outside);
+    await writeFile(join(outside, "nested-secret.txt"), "OUTSIDE_PARENT_SECRET\n");
+    await symlink(outside, join(repoPath, "linked-directory"));
+
+    await expect(getWorktreeSnapshot(repoPath)).rejects.toThrow("CODING_FILE_PATH_UNSAFE");
+  });
+
+  it("rejects an untracked symlink to the repository Git common directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-snapshot-git-link-")); dirs.push(root);
+    const repoPath = join(root, "repo");
+    await exec("git", ["init", repoPath]);
+    const commonDir = resolve(repoPath, await git(repoPath, "rev-parse", "--git-common-dir"));
+    await symlink(commonDir, join(repoPath, "metadata-link"));
+
+    await expect(getWorktreeSnapshot(repoPath)).rejects.toThrow("CODING_FILE_PATH_UNSAFE");
+  });
+
 });
 
 describe("local integration branches",()=>{
@@ -152,6 +197,137 @@ describe("requirement worktree lifecycle", () => {
     catch (error) { failure = error; }
     expect(await pathExists(marker)).toBe(false);
     expect(failure).toBeUndefined();
+  });
+
+  it("does not execute a smudge filter whose configured name contains an equals sign", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const marker = join(root, "equals-smudge-marker");
+    const script = join(root, "equals-smudge-filter.sh");
+    await executableMarkerScript(script, marker, "cat");
+    await writeFile(join(repoPath, ".gitattributes"), "payload.txt filter=has=equals\n");
+    await writeFile(join(repoPath, "payload.txt"), "payload\n");
+    await git(repoPath, "add", "--all"); await git(repoPath, "commit", "-m", "add equals smudge payload");
+    await git(repoPath, "branch", "-f", "feature/2.2.1", "prod");
+    await git(repoPath, "config", "filter.has=equals.smudge", script);
+    await git(repoPath, "config", "filter.has=equals.required", "true");
+
+    await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0033");
+
+    expect(await pathExists(marker)).toBe(false);
+  });
+
+  it("does not execute a process filter whose configured name contains an equals sign", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const marker = join(root, "equals-process-marker");
+    const script = join(root, "equals-process-filter.sh");
+    await executableMarkerScript(script, marker, "exit 1");
+    await writeFile(join(repoPath, ".gitattributes"), "payload.txt filter=has=equals\n");
+    await writeFile(join(repoPath, "payload.txt"), "payload\n");
+    await git(repoPath, "add", "--all"); await git(repoPath, "commit", "-m", "add equals process payload");
+    await git(repoPath, "branch", "-f", "feature/2.2.1", "prod");
+    await git(repoPath, "config", "filter.has=equals.process", script);
+    await git(repoPath, "config", "filter.has=equals.required", "false");
+
+    let failure: unknown;
+    try { await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0034"); }
+    catch (error) { failure = error; }
+
+    expect(await pathExists(marker)).toBe(false);
+    expect(failure).toBeUndefined();
+  });
+
+  it("transports filter names containing spaces and backslashes as exact config keys", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const spaceKey = "filter.has space.smudge";
+    const backslashKey = "filter.has\\backslash.smudge";
+    await git(repoPath, "config", spaceKey, "cat");
+    await git(repoPath, "config", backslashKey, "cat");
+    expect(await git(repoPath, "config", "--get", spaceKey)).toBe("cat");
+    expect(await git(repoPath, "config", "--get", backslashKey)).toBe("cat");
+
+    const wrapperDir = join(root, "git-wrapper");
+    const wrapper = join(wrapperDir, "git");
+    const environmentMarker = join(root, "filter-environment");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    await mkdir(wrapperDir);
+    await writeFile(wrapper, `#!/bin/sh
+has_worktree=
+has_add=
+for argument in "$@"; do
+  if [ "$argument" = "worktree" ]; then has_worktree=1; fi
+  if [ "$argument" = "add" ]; then has_add=1; fi
+done
+if [ "$has_worktree" = "1" ] && [ "$has_add" = "1" ]; then
+  env > "$FILTER_ENVIRONMENT_MARKER"
+fi
+exec "$FILTER_REAL_GIT" "$@"
+`, "utf8");
+    await chmod(wrapper, 0o755);
+    const previousPath = process.env.PATH;
+    const previousConfigCount = process.env.GIT_CONFIG_COUNT;
+    const previousConfigKey = process.env.GIT_CONFIG_KEY_0;
+    const previousConfigValue = process.env.GIT_CONFIG_VALUE_0;
+    process.env.PATH = `${wrapperDir}${delimiter}${previousPath ?? ""}`;
+    process.env.FILTER_REAL_GIT = realGit;
+    process.env.FILTER_ENVIRONMENT_MARKER = environmentMarker;
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "filter.injected.smudge";
+    process.env.GIT_CONFIG_VALUE_0 = "unsafe-driver";
+    try {
+      await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0035");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousConfigCount === undefined) delete process.env.GIT_CONFIG_COUNT;
+      else process.env.GIT_CONFIG_COUNT = previousConfigCount;
+      if (previousConfigKey === undefined) delete process.env.GIT_CONFIG_KEY_0;
+      else process.env.GIT_CONFIG_KEY_0 = previousConfigKey;
+      if (previousConfigValue === undefined) delete process.env.GIT_CONFIG_VALUE_0;
+      else process.env.GIT_CONFIG_VALUE_0 = previousConfigValue;
+      delete process.env.FILTER_REAL_GIT;
+      delete process.env.FILTER_ENVIRONMENT_MARKER;
+    }
+
+    const environment = await readFile(environmentMarker, "utf8");
+    const variables = Object.fromEntries(environment.split("\n").filter(Boolean).map((line) => {
+      const separator = line.indexOf("=");
+      return [line.slice(0, separator), line.slice(separator + 1)];
+    }));
+    const configKeys = Object.entries(variables)
+      .filter(([name]) => /^GIT_CONFIG_KEY_\d+$/.test(name))
+      .map(([, value]) => value);
+    expect(Number(variables.GIT_CONFIG_COUNT)).toBe(configKeys.length);
+    expect(configKeys).toContain(spaceKey);
+    expect(configKeys).toContain(backslashKey);
+    expect(configKeys).toContain("core.fsmonitor");
+    expect(configKeys).toContain("core.hooksPath");
+    expect(configKeys).not.toContain("filter.injected.smudge");
+    for (const key of [spaceKey, backslashKey]) {
+      const index = Object.entries(variables).find(([, value]) => value === key)?.[0].slice("GIT_CONFIG_KEY_".length);
+      expect(variables[`GIT_CONFIG_VALUE_${index}`]).toBe("");
+    }
+  });
+
+  it("does not execute fake git-lfs process or smudge drivers", async () => {
+    const { root, repoPath } = await setupVersionRepository();
+    const processMarker = join(root, "git-lfs-process-marker");
+    const smudgeMarker = join(root, "git-lfs-smudge-marker");
+    const processScript = join(root, "git-lfs-process.sh");
+    const smudgeScript = join(root, "git-lfs-smudge.sh");
+    await executableMarkerScript(processScript, processMarker, "exit 1");
+    await executableMarkerScript(smudgeScript, smudgeMarker, "cat");
+    await writeFile(join(repoPath, ".gitattributes"), "payload.bin filter=lfs\n");
+    await writeFile(join(repoPath, "payload.bin"), "payload\n");
+    await git(repoPath, "add", "--all"); await git(repoPath, "commit", "-m", "add fake lfs payload");
+    await git(repoPath, "branch", "-f", "feature/2.2.1", "prod");
+    await git(repoPath, "config", "filter.lfs.process", processScript);
+    await git(repoPath, "config", "filter.lfs.smudge", smudgeScript);
+    await git(repoPath, "config", "filter.lfs.required", "false");
+
+    await createOrReuseRequirementWorktree(repoPath, "feature/2.2.1", "REQ-0036");
+
+    expect(await pathExists(processMarker)).toBe(false);
+    expect(await pathExists(smudgeMarker)).toBe(false);
   });
 
   it("does not execute diff.external while reading a coding worktree diff", async () => {

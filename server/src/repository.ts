@@ -3,11 +3,13 @@ import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } fro
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import { safeReadWorktreeFile } from "./worktree-file-safety.js";
 
 const execFileAsync = promisify(execFile);
 const protectedBranches=new Set(["prod","production","main","master"]);
+type GitConfigEntry = readonly [key: string, value: string];
 
-function codingGitEnvironment() {
+function codingGitEnvironment(config: readonly GitConfigEntry[] = []) {
   const env = { ...process.env };
   const exact = new Set([
     "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
@@ -20,10 +22,15 @@ function codingGitEnvironment() {
   }
   env.GIT_ATTR_NOSYSTEM = "1";
   env.GIT_LFS_SKIP_SMUDGE = "1";
+  env.GIT_CONFIG_COUNT = String(config.length);
+  config.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${index}`] = key;
+    env[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
   return env;
 }
 
-async function codingFilterOverrides(repoPath: string) {
+async function codingFilterOverrides(repoPath: string): Promise<GitConfigEntry[]> {
   let stdout = "";
   try {
     stdout = (await execFileAsync("git", ["-C", repoPath, "config", "--name-only", "--get-regexp",
@@ -36,15 +43,15 @@ async function codingFilterOverrides(repoPath: string) {
     const match = /^filter\.(.+)\.(smudge|process|required)$/i.exec(key);
     if (match?.[1]) names.add(match[1]);
   }
-  return [...names].flatMap((name) => [
-    "-c", `filter.${name}.smudge=`,
-    "-c", `filter.${name}.process=`,
-    "-c", `filter.${name}.required=false`
+  return [...names].flatMap<GitConfigEntry>((name) => [
+    [`filter.${name}.smudge`, ""],
+    [`filter.${name}.process`, ""],
+    [`filter.${name}.required`, "false"]
   ]);
 }
 
-function codingGitPrefix() {
-  return ["-c", "core.fsmonitor=false"];
+function codingGitEnvironmentWithFsmonitor(config: readonly GitConfigEntry[] = []) {
+  return codingGitEnvironment([["core.fsmonitor", "false"], ...config]);
 }
 
 export type ActualWorktreeIdentity =
@@ -410,11 +417,11 @@ export async function createOrReuseRequirementWorktree(
       try {
         const filterOverrides = await codingFilterOverrides(repoPath);
         await execFileAsync("git", [
-          "-c", `core.hooksPath=${hooksPath}`,
-          ...codingGitPrefix(),
-          ...filterOverrides,
           "-C", repoPath, "worktree", "add", worktreePath, branch
-        ], { env: codingGitEnvironment() });
+        ], { env: codingGitEnvironmentWithFsmonitor([
+          ["core.hooksPath", hooksPath],
+          ...filterOverrides
+        ]) });
       } finally {
         await rm(hooksPath, { recursive: true, force: true });
       }
@@ -443,29 +450,29 @@ export async function createIsolatedWorktree(repoPath: string, defaultBranch: st
 
 export async function getWorktreeDiff(worktreePath: string) {
   const { stdout } = await execFileAsync("git", [
-    ...codingGitPrefix(), "-C", worktreePath, "diff", "--no-ext-diff", "--no-textconv", "--", "."
-  ], { maxBuffer: 10 * 1024 * 1024, env: codingGitEnvironment() });
+    "-C", worktreePath, "diff", "--no-ext-diff", "--no-textconv", "--", "."
+  ], { maxBuffer: 10 * 1024 * 1024, env: codingGitEnvironmentWithFsmonitor() });
   return stdout;
 }
 
 export async function getWorktreeSnapshot(worktreePath: string) {
-  const env = codingGitEnvironment();
+  const env = codingGitEnvironmentWithFsmonitor();
   const { stdout: tracked } = await execFileAsync("git", [
-    ...codingGitPrefix(), "-C", worktreePath, "diff", "--no-ext-diff", "--no-textconv", "--", "."
+    "-C", worktreePath, "diff", "--no-ext-diff", "--no-textconv", "--", "."
   ], { maxBuffer: 10 * 1024 * 1024, env });
   const { stdout: status } = await execFileAsync("git", [
-    ...codingGitPrefix(), "-C", worktreePath, "status", "--porcelain", "-z"
+    "-C", worktreePath, "status", "--porcelain", "-z"
   ], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any, env });
   const entries = Buffer.from(status as any).toString("utf8").split("\0").filter(Boolean);
   const { stdout: untrackedOutput } = await execFileAsync("git", [
-    ...codingGitPrefix(), "-C", worktreePath, "ls-files", "--others", "--exclude-standard", "-z"
+    "-C", worktreePath, "ls-files", "--others", "--exclude-standard", "-z"
   ], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any, env });
   const untracked = Buffer.from(untrackedOutput as any).toString("utf8").split("\0").filter(Boolean);
   const trackedFiles = entries.filter((entry) => !entry.startsWith("?? ")).map((entry) => entry.slice(3)).filter(Boolean);
   const files = [...new Set([...trackedFiles, ...untracked])];
   const patches: string[] = [tracked];
   for (const file of untracked) {
-    const content = await readFile(resolve(worktreePath, file), "utf8");
+    const content = await safeReadWorktreeFile(worktreePath, file);
     const lines = content.split("\n");
     patches.push(`diff --git a/${file} b/${file}\nnew file mode 100644\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((line) => `+${line}`).join("\n")}\n`);
   }
