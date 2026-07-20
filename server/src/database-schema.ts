@@ -693,12 +693,15 @@ export function createPhase2Schema(db: DatabaseSync) {
          AND quality.requirement_id = du.requirement_id
          AND quality.evidence_version = NEW.evidence_version
          AND quality.kind = NEW.kind
+         AND quality.result = 'failed'
          AND quality.input_coding_evidence_id = ce.id
          AND quality.input_evidence_version = NEW.evidence_version
          AND quality.input_diff_hash = ce.diff_hash
         WHERE du.id = NEW.delivery_unit_id
           AND du.requirement_id = NEW.requirement_id
           AND du.evidence_version = NEW.evidence_version
+          AND du.phase = 'quality_verification'
+          AND du.status IN ('awaiting_gate', 'returned', 'failed')
       ) OR NOT EXISTS (
         SELECT 1 FROM json_each(NEW.evidence_ids_json) ids
         WHERE ids.value = NEW.quality_evidence_id

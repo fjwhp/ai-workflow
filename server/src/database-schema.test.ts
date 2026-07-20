@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -542,5 +542,17 @@ describe("Phase 2 database schema", () => {
     expect(tableNames(second)).toEqual(expect.arrayContaining(["delivery_units", "automation_jobs"]));
     expect(indexSql(second, "idx_delivery_unit_active_run")).toContain("owner_type");
     second.close();
+  });
+
+  it("defines the final v10 quality override trigger without in-place refresh DDL", () => {
+    const database = openFreshStoreDatabase();
+    const sql = (database.prepare(`SELECT sql FROM sqlite_master
+      WHERE type = 'trigger' AND name = 'validate_delivery_quality_override_insert'`).get() as { sql: string }).sql;
+    expect(sql).toContain("quality.result = 'failed'");
+    expect(sql).toContain("du.phase = 'quality_verification'");
+    expect(sql).toContain("du.status IN ('awaiting_gate', 'returned', 'failed')");
+    expect(readFileSync(new URL("./database-schema.ts", import.meta.url), "utf8"))
+      .not.toContain("DROP TRIGGER IF EXISTS validate_delivery_quality_override_insert");
+    database.close();
   });
 });

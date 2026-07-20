@@ -166,7 +166,7 @@ describe("DeliveryCoordinator", () => {
     expect(fixture.store.automationJobs.byDedupe(`implement:${frontend!.id}:v1`)).toBeNull();
   });
 
-  it("fails closed for stale versions and mismatched coding evidence identity", () => {
+  it("fails closed for stale evidence versions", () => {
     const fixture = createFixture();
     const [backend, frontend] = fixture.units;
     const stale = fixture.store.deliveryQuality.claim(backend!.id, 1, "code_review", "stale-review");
@@ -179,14 +179,6 @@ describe("DeliveryCoordinator", () => {
     expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)[0]!.releasedAt).toBeNull();
     expect(fixture.store.automationJobs.byDedupe(`implement:${frontend!.id}:v1`)).toBeNull();
 
-    (fixture.store as any).db.prepare("UPDATE delivery_units SET evidence_version = 1 WHERE id = ?").run(backend!.id);
-    const mismatched = {
-      ...stale,
-      input: { ...stale.input, codingEvidence: { ...stale.input.codingEvidence, id: "wrong", diffHash: "wrong" } }
-    };
-    expect(() => fixture.store.deliveryQuality.complete(mismatched, { result: "passed", content: {} }))
-      .toThrow("DELIVERY_QUALITY_INPUT_STALE");
-    expect(fixture.store.deliveryQuality.latest(backend!.id, "code_review")).toBeNull();
   });
 
   it("keeps duplicate callbacks idempotent and conflicting terminal callbacks fail closed", () => {
@@ -294,6 +286,70 @@ describe("DeliveryCoordinator", () => {
       .toThrow("DELIVERY_QUALITY_OVERRIDE_OWNER_MISMATCH");
   });
 
+  it("rejects a new override for passed evidence in the application and database", () => {
+    const fixture = createFixture();
+    const backend = fixture.units[0]!;
+    const passed = settle(fixture.store, backend.id, "code_review", "passed");
+    const input = {
+      unitId: backend.id, evidenceVersion: 1, kind: "code_review" as const,
+      actor: "release-manager", reason: "not a failure", acceptedRisk: "no failed risk"
+    };
+
+    expect(() => fixture.store.deliveryCoordination.overrideQuality(input))
+      .toThrow("DELIVERY_QUALITY_OVERRIDE_EVIDENCE_NOT_FAILED");
+    const coding = fixture.store.deliveryExecutions.getCodingEvidence(backend.id, 1) as {
+      id: string; diffHash: string;
+    };
+    expect(() => (fixture.store as any).db.prepare(`INSERT INTO delivery_quality_overrides
+      (id, requirement_id, delivery_unit_id, evidence_version, kind, actor, reason, accepted_risk,
+       coding_evidence_id, input_diff_hash, quality_evidence_id, evidence_ids_json, created_at)
+      VALUES ('passed-override', ?, ?, 1, 'code_review', 'actor', 'reason', 'risk', ?, ?, ?, ?, ?)`)
+      .run(passed.requirementId, backend.id, coding.id, coding.diffHash, passed.id,
+        JSON.stringify([passed.id]), new Date().toISOString()))
+      .toThrow("DELIVERY_QUALITY_OVERRIDE_OWNER_MISMATCH");
+    expect(fixture.store.deliveryCoordination.listQualityOverrides(backend.id)).toEqual([]);
+  });
+
+  it("rejects a new override after acceptance readiness and dependency release", () => {
+    const fixture = createFixture();
+    const [backend, frontend] = fixture.units;
+    const failed = settle(fixture.store, backend!.id, "code_review", "failed");
+    const database = (fixture.store as any).db;
+    const now = new Date().toISOString();
+    database.prepare(`UPDATE delivery_units SET phase = 'acceptance_delivery', status = 'ready_for_acceptance'
+      WHERE id = ?`).run(backend!.id);
+    database.prepare(`UPDATE delivery_dependencies SET released_by_evidence_version = 1, released_at = ?
+      WHERE upstream_unit_id = ?`).run(now, backend!.id);
+    database.prepare("UPDATE delivery_units SET status = 'ready' WHERE id = ?").run(frontend!.id);
+    fixture.store.automationJobs.enqueue({
+      ownerType: "delivery_unit", ownerId: frontend!.id, evidenceVersion: 1,
+      action: "implement", payload: {}, maxAttempts: 3
+    });
+    const input = {
+      unitId: backend!.id, evidenceVersion: 1, kind: "code_review" as const,
+      actor: "release-manager", reason: "too late", acceptedRisk: "already released"
+    };
+
+    expect(() => fixture.store.deliveryCoordination.overrideQuality(input))
+      .toThrow("DELIVERY_QUALITY_OVERRIDE_NOT_ELIGIBLE");
+    const coding = fixture.store.deliveryExecutions.getCodingEvidence(backend!.id, 1) as {
+      id: string; diffHash: string;
+    };
+    expect(() => database.prepare(`INSERT INTO delivery_quality_overrides
+      (id, requirement_id, delivery_unit_id, evidence_version, kind, actor, reason, accepted_risk,
+       coding_evidence_id, input_diff_hash, quality_evidence_id, evidence_ids_json, created_at)
+      VALUES ('late-override', ?, ?, 1, 'code_review', 'actor', 'reason', 'risk', ?, ?, ?, ?, ?)`)
+      .run(failed.requirementId, backend!.id, coding.id, coding.diffHash, failed.id,
+        JSON.stringify([failed.id]), now))
+      .toThrow("DELIVERY_QUALITY_OVERRIDE_OWNER_MISMATCH");
+    expect(fixture.store.deliveryCoordination.listQualityOverrides(backend!.id)).toEqual([]);
+    expect(fixture.store.deliveryQuality.latest(backend!.id, "code_review")).toEqual(failed);
+    expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)[0]).toMatchObject({
+      releasedByEvidenceVersion: 1
+    });
+    expect(fixture.store.automationJobs.byDedupe(`implement:${frontend!.id}:v1`)).not.toBeNull();
+  });
+
   it.each(["actor", "reason", "acceptedRisk"] as const)("rejects an override with empty %s", (field) => {
     const fixture = createFixture();
     const backend = fixture.units[0]!;
@@ -390,11 +446,12 @@ describe("DeliveryCoordinator", () => {
         databasePath: fixture.databasePath,
         claim: review, completion: { result: "passed", content: {} }, barrier
       });
+      const reviewReady = await reviewRound.ready;
       const testingRound = raceRound(secondWorker, iteration, {
         databasePath: fixture.databasePath,
         claim: testing, completion: { result: "passed", content: {} }, barrier
       });
-      const ready = await Promise.all([reviewRound.ready, testingRound.ready]);
+      const ready = [reviewReady, await testingRound.ready];
       expect(Atomics.load(new Int32Array(barrier), 0)).toBe(2);
       ready.forEach(({ threadId }) => observedThreadIds.add(threadId));
       Atomics.store(new Int32Array(barrier), 1, 1);

@@ -4,11 +4,11 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { WorkflowStore } from "./store.js";
 
-function fixture(path = ":memory:") {
+function fixture(path = ":memory:", sensitivePatterns: string[] = []) {
   const store = new WorkflowStore(path);
   const project = store.createProject({
     name: "Quality", repoPath: "/tmp/quality", defaultBranch: "main",
-    allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], sensitivePatterns: []
+    allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], sensitivePatterns
   });
   const version = store.createProjectVersion({
     projectId: project.id, name: "v1", branch: "feature/v1", baseBranch: "main",
@@ -222,6 +222,65 @@ describe("delivery quality evidence schema", () => {
       expect(() => store.deliveryQuality.complete(claim, { result: "passed", content: {} }))
         .toThrow("DELIVERY_QUALITY_RUN_SETTLED");
       expect(store.deliveryQuality.latest(unit.id, "code_review")).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("uses the frozen snapshot policy and coding identity after a running claim is mutated", () => {
+    const { store, unit } = fixture(":memory:", ["CUSTOM_SECRET"]);
+    try {
+      const claim = store.deliveryQuality.claim(unit.id, 1, "code_review", "mutable-running");
+      if (claim.status !== "running") throw new Error("expected running claim");
+      claim.input.snapshot.sensitivePatterns.splice(0);
+      claim.input.codingEvidence.id = "mutated-id";
+      claim.input.codingEvidence.diffHash = "mutated-hash";
+      claim.input.artifacts.push({ provider: { nested: "CUSTOM_SECRET" } });
+
+      const evidence = store.deliveryQuality.complete(claim, {
+        result: "failed",
+        content: { summary: "contains CUSTOM_SECRET" },
+        commandResults: [{ stdout: "CUSTOM_SECRET" }],
+        acceptanceTrace: [{ detail: "CUSTOM_SECRET" }]
+      });
+
+      expect(evidence).toMatchObject({
+        inputCodingEvidenceId: expect.not.stringContaining("mutated"),
+        inputDiffHash: "abc123"
+      });
+      const raw = (store as any).db.prepare(`SELECT content_json, command_results_json, acceptance_trace_json
+        FROM delivery_quality_evidence WHERE id = ?`).get(evidence.id);
+      expect(JSON.stringify(raw)).not.toContain("CUSTOM_SECRET");
+      expect(JSON.stringify(raw)).toContain("[REDACTED]");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("uses frozen policy for terminal replay after claim and live unit mutation", () => {
+    const { store, unit } = fixture(":memory:", ["CUSTOM_SECRET"]);
+    try {
+      const claim = store.deliveryQuality.claim(unit.id, 1, "code_review", "mutable-replay");
+      if (claim.status !== "running") throw new Error("expected running claim");
+      const completion = {
+        result: "failed" as const,
+        content: { summary: "contains CUSTOM_SECRET" },
+        commandResults: [{ stdout: "CUSTOM_SECRET" }],
+        acceptanceTrace: [{ detail: "CUSTOM_SECRET" }]
+      };
+      const first = store.deliveryQuality.complete(claim, completion);
+      claim.input.snapshot.sensitivePatterns.splice(0);
+      claim.input.codingEvidence.id = "mutated-id";
+      claim.input.codingEvidence.diffHash = "mutated-hash";
+      claim.input.requirement = { provider: { nested: "CUSTOM_SECRET" } };
+      (store as any).db.prepare(`UPDATE delivery_units
+        SET phase = 'acceptance_delivery', status = 'ready_for_acceptance', evidence_version = 2 WHERE id = ?`)
+        .run(unit.id);
+
+      expect(store.deliveryQuality.complete(claim, completion)).toEqual(first);
+      const raw = (store as any).db.prepare(`SELECT content_json, command_results_json, acceptance_trace_json
+        FROM delivery_quality_evidence WHERE id = ?`).get(first.id);
+      expect(JSON.stringify(raw)).not.toContain("CUSTOM_SECRET");
     } finally {
       store.close();
     }

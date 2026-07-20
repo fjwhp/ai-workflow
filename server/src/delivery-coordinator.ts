@@ -38,6 +38,7 @@ interface UnitIdentityRow {
   id: string;
   requirement_id: string;
   evidence_version: number;
+  phase: string;
   status: string;
   coding_evidence_id: string;
   diff_hash: string;
@@ -93,6 +94,23 @@ export class DeliveryCoordinator {
     const target = qualityRows.find((row) => row.kind === input.kind);
     if (!target) throw new Error("DELIVERY_QUALITY_OVERRIDE_EVIDENCE_REQUIRED");
     const evidenceIds = qualityRows.map((row) => row.id).sort();
+    const existing = this.getOverride(unit.id, unit.evidence_version, input.kind);
+    if (existing) {
+      if (existing.actor !== input.actor.trim()
+        || existing.reason !== input.reason.trim()
+        || existing.acceptedRisk !== input.acceptedRisk.trim()
+        || existing.codingEvidenceId !== unit.coding_evidence_id
+        || existing.inputDiffHash !== unit.diff_hash
+        || existing.qualityEvidenceId !== target.id) {
+        throw new Error("DELIVERY_QUALITY_OVERRIDE_CONFLICT");
+      }
+      return existing;
+    }
+    if (target.result !== "failed") throw new Error("DELIVERY_QUALITY_OVERRIDE_EVIDENCE_NOT_FAILED");
+    if (unit.phase !== "quality_verification"
+      || !["awaiting_gate", "returned", "failed"].includes(unit.status)) {
+      throw new Error("DELIVERY_QUALITY_OVERRIDE_NOT_ELIGIBLE");
+    }
     const now = new Date().toISOString();
     const id = randomUUID();
     this.db.prepare(`INSERT INTO delivery_quality_overrides
@@ -185,7 +203,7 @@ export class DeliveryCoordinator {
   }
 
   private loadCurrentIdentity(unitId: string, evidenceVersion: number): UnitIdentityRow {
-    const row = this.db.prepare(`SELECT du.id, du.requirement_id, du.evidence_version, du.status,
+    const row = this.db.prepare(`SELECT du.id, du.requirement_id, du.evidence_version, du.phase, du.status,
         ce.id AS coding_evidence_id, ce.diff_hash
       FROM delivery_units du
       JOIN coding_evidence ce ON ce.delivery_unit_id = du.id AND ce.evidence_version = du.evidence_version
@@ -212,6 +230,7 @@ export class DeliveryCoordinator {
         AND quality.delivery_unit_id = override.delivery_unit_id
         AND quality.evidence_version = override.evidence_version
         AND quality.kind = override.kind
+        AND quality.result = 'failed'
         AND quality.input_coding_evidence_id = override.coding_evidence_id
         AND quality.input_diff_hash = override.input_diff_hash
         AND length(trim(override.actor)) > 0 AND length(trim(override.reason)) > 0

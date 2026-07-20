@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { prepareCleanDatabase, writeDatabaseVersionMarker } from "./database-reset.js";
 
 const directories: string[] = [];
-const currentSchemaVersion = "phase-2-quality-coordination-v9";
+const currentSchemaVersion = "phase-2-quality-coordination-v10";
 
 afterEach(async () => {
   const { rm } = await import("node:fs/promises");
@@ -20,7 +20,20 @@ async function databasePath() {
 }
 
 describe("prepareCleanDatabase", () => {
-  it("backs up an evidence-tree v7 database before creating the v8 schema", async () => {
+  it("backs up a quality coordination v9 database before creating the v10 schema", async () => {
+    const path = await databasePath();
+    await writeFile(path, "quality coordination v9 database");
+    await writeFile(`${path}.schema-version`, "phase-2-quality-coordination-v9");
+
+    const result = await prepareCleanDatabase(path, currentSchemaVersion, {
+      now: () => new Date("2026-07-22T00:00:00.000Z")
+    });
+
+    expect(result).toMatchObject({ reset: true, backupPath: `${path}.backup-2026-07-22T00-00-00-000Z` });
+    await expect(readFile(result.backupPath!, "utf8")).resolves.toBe("quality coordination v9 database");
+  });
+
+  it("backs up an evidence-tree v7 database before creating the quality coordination v10 schema", async () => {
     const path = await databasePath();
     await writeFile(path, "evidence tree v7 database");
     await writeFile(`${path}.schema-version`, "phase-2-evidence-tree-v7");
@@ -33,7 +46,7 @@ describe("prepareCleanDatabase", () => {
     await expect(readFile(result.backupPath!, "utf8")).resolves.toBe("evidence tree v7 database");
   });
 
-  it("resets a deployed delivery execution v5 database for the v6 marker", async () => {
+  it("resets a deployed delivery execution v5 database for the quality coordination v10 marker", async () => {
     const path = await databasePath();
     await writeFile(path, "deployed delivery execution v5 database");
     await writeFile(`${path}.schema-version`, "phase-2-delivery-execution-v5");

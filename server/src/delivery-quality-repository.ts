@@ -140,12 +140,8 @@ export class DeliveryQualityRepository {
     if (run.status === "completed" || run.status === "failed") {
       const evidence = this.getEvidenceByRun(claim.id);
       if (!evidence) throw new Error("DELIVERY_QUALITY_EVIDENCE_NOT_FOUND");
-      const sanitized = sanitizeQualityCompletion(completion, claim.input.snapshot.sensitivePatterns);
-      const expected = claim.input.codingEvidence;
+      const sanitized = sanitizeQualityCompletion(completion, this.loadFrozenSensitivePatterns(run.delivery_unit_id));
       if (evidence.result !== completion.result
-        || evidence.inputCodingEvidenceId !== expected.id
-        || evidence.inputEvidenceVersion !== expected.evidenceVersion
-        || evidence.inputDiffHash !== expected.diffHash
         || canonicalPersistedJson(evidence.content) !== canonicalPersistedJson(sanitized.content)
         || canonicalPersistedJson(evidence.commandResults) !== canonicalPersistedJson(sanitized.commandResults)
         || canonicalPersistedJson(evidence.acceptanceTrace) !== canonicalPersistedJson(sanitized.acceptanceTrace)) {
@@ -154,12 +150,9 @@ export class DeliveryQualityRepository {
       return { evidence, replayed: true };
     }
     if (run.status !== "running") throw new Error("DELIVERY_QUALITY_RUN_STATUS_INVALID");
-    const current = this.loadInput(claim.deliveryUnitId, claim.evidenceVersion).codingEvidence;
-    const expected = claim.input.codingEvidence;
-    if (current.id !== expected.id || current.diffHash !== expected.diffHash || current.evidenceVersion !== expected.evidenceVersion) {
-      throw new Error("DELIVERY_QUALITY_INPUT_STALE");
-    }
-    const sanitized = sanitizeQualityCompletion(completion, claim.input.snapshot.sensitivePatterns);
+    const current = this.loadInput(run.delivery_unit_id, run.evidence_version);
+    const expected = current.codingEvidence;
+    const sanitized = sanitizeQualityCompletion(completion, current.snapshot.sensitivePatterns);
     const now = new Date().toISOString();
     const evidenceId = randomUUID();
     this.db.prepare(`INSERT INTO delivery_quality_evidence
@@ -224,6 +217,13 @@ export class DeliveryQualityRepository {
   private getEvidenceByRun(runId: string): DeliveryQualityEvidence | null {
     const row = this.db.prepare("SELECT * FROM delivery_quality_evidence WHERE run_id = ?").get(runId);
     return row ? mapEvidence(row as any) : null;
+  }
+
+  private loadFrozenSensitivePatterns(unitId: string): string[] {
+    const row = this.db.prepare(`SELECT sensitive_patterns_json FROM delivery_unit_snapshots
+      WHERE delivery_unit_id = ?`).get(unitId) as { sensitive_patterns_json: string } | undefined;
+    if (!row) throw new Error("DELIVERY_UNIT_SNAPSHOT_NOT_FOUND");
+    return parseStringArray(row.sensitive_patterns_json);
   }
 
   private loadInput(unitId: string, evidenceVersion: number): DeliveryQualityInput {
