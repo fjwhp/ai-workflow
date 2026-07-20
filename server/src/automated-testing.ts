@@ -1,11 +1,17 @@
 import { constants } from "node:fs";
-import { access, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { MAX_AUTOMATED_TEST_COMMANDS } from "@ai-workflow/shared";
-import { materializeEvidenceManifest, type EvidenceManifest } from "./evidence-tree.js";
+import { type EvidenceManifest } from "./evidence-tree.js";
 import { redactSensitive } from "./redaction.js";
 import { runManagedProcess } from "./process-execution.js";
+import {
+  snapshotVerificationToolchainBounded,
+  type VerificationToolchainSnapshot
+} from "./verification-toolchain.js";
+import { materializeVerificationManifest } from "./verification-fs-helper.js";
+import { cleanupVerificationDirectory } from "./verification-cleanup.js";
 
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 const COMMAND_TIMEOUT_MS = 300_000;
@@ -33,11 +39,19 @@ export function buildSandboxProfile(input: {
   verificationRoot: string;
   targetWorktree: string;
   gitCommonDir: string;
+  toolchainRoot?: string;
+  verificationWorktree?: string;
+  home?: string;
+  temporaryDirectory?: string;
 }) {
   return `(version 1)
 (import "dyld-support.sb")
 (deny default)
 (allow process*)
+(allow sysctl-read)
+(allow file-read-metadata
+${verificationRootAncestors(input.verificationRoot)
+    .map((path) => `  (literal ${sandboxLiteral(path)})`).join("\n")})
 (allow file-read*
   (subpath ${sandboxLiteral(input.verificationRoot)})
   (subpath "/System")
@@ -48,10 +62,23 @@ export function buildSandboxProfile(input: {
   (subpath "/private/etc")
   (literal "/dev/null")
   (literal "/dev/urandom"))
-(allow file-write* (subpath ${sandboxLiteral(input.verificationRoot)}))
+${[input.verificationWorktree, input.home, input.temporaryDirectory].filter(Boolean)
+    .map((path) => `(allow file-write* (subpath ${sandboxLiteral(path!)}))`).join("\n")}
+${input.toolchainRoot ? `(deny file-write* (subpath ${sandboxLiteral(input.toolchainRoot)}))` : ""}
 (deny file-write* (subpath ${sandboxLiteral(input.targetWorktree)}))
 (deny file-write* (subpath ${sandboxLiteral(input.gitCommonDir)}))
 (deny network*)`;
+}
+
+function verificationRootAncestors(verificationRoot: string) {
+  const ancestors: string[] = [];
+  let current = dirname(verificationRoot);
+  while (true) {
+    ancestors.push(current);
+    const parent = dirname(current);
+    if (parent === current) return ancestors;
+    current = parent;
+  }
 }
 
 export function sanitizedVerificationEnvironment(
@@ -114,6 +141,13 @@ export interface AutomatedTestingResult {
   error?: string;
   commandResults: CommandResult[];
   acceptanceTrace: Array<{ criterion: string; commandIds: string[]; passed: boolean }>;
+  toolchain?: {
+    fingerprint: string;
+    manifest: VerificationToolchainSnapshot["manifest"];
+    commands: Array<{
+      id: string; configuredCommand: string; executable: string; args: string[];
+    }>;
+  };
 }
 
 export interface AutomatedTestingDependencies {
@@ -121,6 +155,9 @@ export interface AutomatedTestingDependencies {
   sandboxExecutableAvailable?: () => Promise<boolean>;
   execFile?: (file: string, args: string[], options: Record<string, unknown>) => Promise<{ stdout?: unknown; stderr?: unknown }>;
   runManagedProcess?: typeof runManagedProcess;
+  snapshotToolchain?: typeof snapshotVerificationToolchainBounded;
+  materializeManifest?: typeof materializeVerificationManifest;
+  cleanupDirectory?: typeof cleanupVerificationDirectory;
   now?: () => number;
 }
 
@@ -156,14 +193,24 @@ export async function runAutomatedTesting(
   const verificationRoot = join(parent, "worktree");
   try {
     try {
-      await materializeEvidenceManifest(verificationRoot, input.sourceManifest, {
-        sensitivePatterns: input.sensitivePatterns
-      });
+      const remaining = Math.ceil(deadline - now());
+      if (remaining <= 0) return automatedDeadlineResult(plan);
+      await (dependencies.materializeManifest ?? materializeVerificationManifest)(
+        verificationRoot, input.sourceManifest,
+        { sensitivePatterns: input.sensitivePatterns, timeoutMs: remaining }
+      );
     } catch (error) {
+      if (error instanceof Error && error.message === "AUTOMATED_TEST_DEADLINE_EXCEEDED") {
+        return automatedDeadlineResult(plan);
+      }
       if (error instanceof Error && (error.message === "CODING_EVIDENCE_MANIFEST_INVALID"
-        || error.message === "CODING_EVIDENCE_MANIFEST_SENSITIVE")) {
+        || error.message === "CODING_EVIDENCE_MANIFEST_SENSITIVE"
+        || error.message === "AUTOMATED_TEST_MATERIALIZATION_LIMIT_EXCEEDED")) {
         return {
-          result: "failed", error: "AUTOMATED_TEST_MATERIALIZATION_UNSAFE", commandResults: [],
+          result: "failed",
+          error: error.message === "AUTOMATED_TEST_MATERIALIZATION_LIMIT_EXCEEDED"
+            ? error.message : "AUTOMATED_TEST_MATERIALIZATION_UNSAFE",
+          commandResults: [],
           acceptanceTrace: plan.acceptanceTrace.map((trace) => ({ ...trace, passed: false }))
         };
       }
@@ -175,16 +222,39 @@ export async function runAutomatedTesting(
     await mkdir(home, { recursive: true });
     await mkdir(temporaryDirectory, { recursive: true });
     if (now() >= deadline) return automatedDeadlineResult(plan);
-    const [canonicalParent, canonicalTargetWorktree, canonicalGitCommonDir] = await Promise.all([
-      realpath(parent), realpath(input.targetWorktree), realpath(input.gitCommonDir)
+    const [canonicalParent, canonicalTargetWorktree, canonicalGitCommonDir, canonicalHome, canonicalTemporaryDirectory]
+      = await Promise.all([
+        realpath(parent), realpath(input.targetWorktree), realpath(input.gitCommonDir),
+        realpath(home), realpath(temporaryDirectory)
     ]);
     if (now() >= deadline) return automatedDeadlineResult(plan);
+    let toolchain: VerificationToolchainSnapshot | undefined;
+    if (!dependencies.execFile) {
+      try {
+        const toolchainRemaining = Math.ceil(deadline - now());
+        if (toolchainRemaining <= 0) return automatedDeadlineResult(plan);
+        toolchain = await (dependencies.snapshotToolchain ?? snapshotVerificationToolchainBounded)(
+          plan.commands, canonicalParent, { env: process.env, timeoutMs: toolchainRemaining }
+        );
+      } catch (error) {
+        if (error instanceof Error && error.message === "AUTOMATED_TEST_DEADLINE_EXCEEDED") {
+          return automatedDeadlineResult(plan);
+        }
+        throw error;
+      }
+    }
+    if (now() >= deadline) return automatedDeadlineResult(plan, toolchain);
     const profile = buildSandboxProfile({
       verificationRoot: canonicalParent,
       targetWorktree: canonicalTargetWorktree,
-      gitCommonDir: canonicalGitCommonDir
+      gitCommonDir: canonicalGitCommonDir,
+      verificationWorktree: join(canonicalParent, "worktree"),
+      home: canonicalHome,
+      temporaryDirectory: canonicalTemporaryDirectory,
+      ...(toolchain ? { toolchainRoot: toolchain.root } : {})
     });
-    const env = sanitizedVerificationEnvironment(home, temporaryDirectory);
+    const env = sanitizedVerificationEnvironment(canonicalHome, canonicalTemporaryDirectory);
+    if (toolchain) env.PATH = `${toolchain.binDirectory}:/usr/bin:/bin:/usr/sbin:/sbin`;
     const commandResults: CommandResult[] = [];
     let deadlineExceeded = false;
     for (let index = 0; index < plan.commands.length; index += 1) {
@@ -196,10 +266,12 @@ export async function runAutomatedTesting(
         break;
       }
       if (!dependencies.execFile) {
+        const frozenCommand = toolchain?.commands[index];
+        if (!frozenCommand || frozenCommand.id !== command.id) throw new Error("AUTOMATED_TEST_TOOLCHAIN_INVALID");
         let output: Awaited<ReturnType<typeof runManagedProcess>>;
         try {
           output = await (dependencies.runManagedProcess ?? runManagedProcess)(
-            SANDBOX_EXEC, ["-p", profile, command.command, ...command.args], {
+            SANDBOX_EXEC, ["-p", profile, frozenCommand.file, ...frozenCommand.args], {
               cwd: join(canonicalParent, "worktree"), env,
               timeoutMs: remaining, maxOutputBytes: COMMAND_OUTPUT_BYTES
             }
@@ -277,10 +349,11 @@ export async function runAutomatedTesting(
       result: passed ? "passed" : "failed",
       ...(deadlineExceeded ? { error: "AUTOMATED_TEST_DEADLINE_EXCEEDED" } : {}),
       commandResults,
-      acceptanceTrace: plan.acceptanceTrace.map((trace) => ({ ...trace, passed }))
+      acceptanceTrace: plan.acceptanceTrace.map((trace) => ({ ...trace, passed })),
+      ...(toolchain ? { toolchain: toolchainEvidence(toolchain) } : {})
     };
   } finally {
-    await rm(parent, { recursive: true, force: true });
+    await (dependencies.cleanupDirectory ?? cleanupVerificationDirectory)(parent);
   }
 }
 
@@ -291,12 +364,47 @@ function deadlineCommandResult(command: VerificationCommand): CommandResult {
   };
 }
 
-function automatedDeadlineResult(plan: ReturnType<typeof buildVerificationPlan>): AutomatedTestingResult {
+function automatedDeadlineResult(
+  plan: ReturnType<typeof buildVerificationPlan>,
+  toolchain?: VerificationToolchainSnapshot
+): AutomatedTestingResult {
   return {
     result: "failed", error: "AUTOMATED_TEST_DEADLINE_EXCEEDED",
     commandResults: plan.commands.map(deadlineCommandResult),
-    acceptanceTrace: plan.acceptanceTrace.map((trace) => ({ ...trace, passed: false }))
+    acceptanceTrace: plan.acceptanceTrace.map((trace) => ({ ...trace, passed: false })),
+    ...(toolchain ? { toolchain: toolchainEvidence(toolchain) } : {})
   };
+}
+
+function toolchainEvidence(toolchain: VerificationToolchainSnapshot) {
+  return {
+    fingerprint: toolchain.fingerprint,
+    manifest: toolchain.manifest,
+    commands: toolchain.commands.map((command) => ({
+      id: command.id,
+      configuredCommand: command.configuredCommand,
+      executable: relativeToolchainPath(command.file, toolchain.root),
+      args: command.args.map((argument) => {
+        const path = relativeToolchainPath(argument, toolchain.root, false);
+        return path === undefined ? argument : `toolchain:${path}`;
+      })
+    }))
+  };
+}
+
+function relativeToolchainPath(path: string, root: string): string;
+function relativeToolchainPath(path: string, root: string, required: false): string | undefined;
+function relativeToolchainPath(path: string, root: string, required = true): string | undefined {
+  if (!isAbsolute(path)) {
+    if (required) throw new Error("AUTOMATED_TEST_TOOLCHAIN_INVALID");
+    return undefined;
+  }
+  const value = relative(root, path);
+  if (!value || value === ".." || value.startsWith(`..${sep}`) || isAbsolute(value)) {
+    if (required) throw new Error("AUTOMATED_TEST_TOOLCHAIN_INVALID");
+    return undefined;
+  }
+  return value.split(sep).join("/");
 }
 
 async function defaultSandboxAvailable() {

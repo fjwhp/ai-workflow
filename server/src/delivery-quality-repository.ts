@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { EvidenceChangedFile, EvidenceManifest } from "./evidence-tree.js";
+import { redactSensitive } from "./redaction.js";
 
 export type DeliveryQualityKind = "code_review" | "automated_testing";
 export type DeliveryQualityResult = "passed" | "failed";
@@ -119,6 +120,7 @@ export class DeliveryQualityRepository {
     if (current.id !== expected.id || current.diffHash !== expected.diffHash || current.evidenceVersion !== expected.evidenceVersion) {
       throw new Error("DELIVERY_QUALITY_INPUT_STALE");
     }
+    const sanitized = sanitizeQualityCompletion(completion, claim.input.snapshot.sensitivePatterns);
     const now = new Date().toISOString();
     const evidenceId = randomUUID();
     this.db.prepare(`INSERT INTO delivery_quality_evidence
@@ -128,8 +130,8 @@ export class DeliveryQualityRepository {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(evidenceId, claim.id, claim.requirementId, claim.deliveryUnitId, claim.evidenceVersion,
         claim.kind, completion.result, expected.id, expected.evidenceVersion, expected.diffHash,
-        stringifyJson(completion.content), stringifyJson(completion.commandResults ?? []),
-        stringifyJson(completion.acceptanceTrace ?? []), now, now);
+        stringifyJson(sanitized.content), stringifyJson(sanitized.commandResults),
+        stringifyJson(sanitized.acceptanceTrace), now, now);
     const settled = this.db.prepare(`UPDATE delivery_quality_runs SET status = ?, error = NULL, completed_at = ?
       WHERE id = ? AND delivery_unit_id = ? AND evidence_version = ? AND kind = ? AND status = 'running'`)
       .run(completion.result === "passed" ? "completed" : "failed", now, claim.id,
@@ -147,6 +149,25 @@ export class DeliveryQualityRepository {
       WHERE id = ? AND delivery_unit_id = ? AND evidence_version = ? AND kind = ? AND status = 'running'`)
       .run(error, now, claim.id, claim.deliveryUnitId, claim.evidenceVersion, claim.kind);
     if (settled.changes !== 1) throw new Error("DELIVERY_QUALITY_RUN_STALE");
+  }
+
+  abortTerminalAutomationClaimsInTransaction() {
+    const now = new Date().toISOString();
+    const settled = this.db.prepare(`UPDATE delivery_quality_runs AS quality
+      SET status = 'aborted', error = 'DELIVERY_QUALITY_AUTOMATION_FAILED', completed_at = ?
+      WHERE quality.status = 'running' AND EXISTS (
+        SELECT 1 FROM automation_jobs AS job
+        WHERE job.id = quality.claim_token
+          AND job.status = 'failed'
+          AND job.owner_type = 'delivery_unit'
+          AND job.owner_id = quality.delivery_unit_id
+          AND job.evidence_version = quality.evidence_version
+          AND (
+            (job.action = 'review' AND quality.kind = 'code_review')
+            OR (job.action = 'test' AND quality.kind = 'automated_testing')
+          )
+      )`).run(now);
+    return Number(settled.changes);
   }
 
   latest(unitId: string, kind: DeliveryQualityKind): DeliveryQualityEvidence | null {
@@ -205,6 +226,29 @@ export class DeliveryQualityRepository {
         manifest: parseManifest(row.manifest_json)
       }
     };
+  }
+}
+
+const QUALITY_REDACTION_LIMITS = {
+  maxDepth: 24,
+  maxNodes: 20_000,
+  maxStringCodePoints: 1_048_576,
+  maxCollectionItems: 10_000,
+  maxBytes: 1_500_000
+} as const;
+
+function sanitizeQualityCompletion(
+  completion: DeliveryQualityCompletion,
+  sensitivePatterns: string[]
+): { content: unknown; commandResults: unknown[]; acceptanceTrace: unknown[] } {
+  try {
+    return redactSensitive({
+      content: completion.content,
+      commandResults: completion.commandResults ?? [],
+      acceptanceTrace: completion.acceptanceTrace ?? []
+    }, sensitivePatterns, QUALITY_REDACTION_LIMITS);
+  } catch (error) {
+    throw new Error("DELIVERY_QUALITY_PERSISTENCE_LIMIT", { cause: error });
   }
 }
 

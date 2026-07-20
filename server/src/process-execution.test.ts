@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -52,6 +52,47 @@ function processIsRunning(pid: number) {
 }
 
 describe("runManagedProcess", () => {
+  it.skipIf(process.platform !== "darwin")(
+    "records direct command completion without waiting for a detached descendant",
+    () => {
+      const wrapperSource = (processExecution as any).managedProcessWrapperSource;
+      expect(wrapperSource).toBeTypeOf("string");
+      const directory = mkdtempSync(join(tmpdir(), "managed-process-wrapper-")); directories.push(directory);
+      const configPath = join(directory, "command.json");
+      const resultPath = join(directory, "result.json");
+      writeFileSync(configPath, JSON.stringify({
+        version: 1,
+        profile: "(version 1) (allow default)",
+        file: process.execPath,
+        args: ["-e", `
+          const { spawn } = require("node:child_process");
+          const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"],
+            { detached: true, stdio: "ignore" });
+          child.unref();
+          process.stdout.write(String(child.pid));
+        `],
+        cwd: directory,
+        env: { PATH: process.env.PATH }
+      }), { mode: 0o600 });
+
+      let pid = 0;
+      try {
+        const startedAt = Date.now();
+        const stdout = execFileSync(process.execPath, [
+          "--input-type=commonjs", "--eval", wrapperSource, configPath, resultPath
+        ], { encoding: "utf8", timeout: 2_000 });
+        expect(Date.now() - startedAt).toBeLessThan(2_000);
+        pid = Number(stdout);
+        expect(JSON.parse(readFileSync(resultPath, "utf8"))).toEqual({
+          version: 1, exitCode: 0, signal: null
+        });
+        expect(processIsRunning(pid)).toBe(true);
+      } finally {
+        if (pid && processIsRunning(pid)) process.kill(pid, "SIGKILL");
+      }
+    }
+  );
+
   it.skipIf(process.platform !== "darwin")(
     "removes a new-session descendant that drops the inherited marker after the command succeeds",
     async () => {
@@ -512,6 +553,10 @@ describe("Darwin coalition containment", () => {
     const coalition = "resource coalition = {\n ID = 77\n }";
     expect(parse(`state = xpcproxy\npid = 123\nlast exit code = (never exited)\n${coalition}`))
       .toEqual({ coalitionId: 77, state: "running" });
+    expect(parse(`state = not running\n${coalition}`))
+      .toEqual({ coalitionId: 77, state: "running" });
+    expect(parse(`state = not running\nruns = 1\nlast exit reason = OS_REASON_CODESIGNING\n${coalition}`))
+      .toEqual({ coalitionId: 77, state: "exited" });
     expect(parse(`state = not running\nlast exit code = 9\n${coalition}`))
       .toEqual({ coalitionId: 77, state: "exited", exitCode: 9 });
     expect(() => parse(`state = mystery\n${coalition}`)).toThrow("MANAGED_PROCESS_SERVICE_INVALID");

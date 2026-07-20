@@ -184,6 +184,29 @@ describe("DeliveryExecutionService", () => {
     expect(persisted).toContain("[REDACTED]");
   });
 
+  it("does not persist secrets returned by the code review provider", async () => {
+    const fixture = createFixture();
+    await new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult())
+    ).implement(fixture.unit.id);
+    const probes = ["provider-basic-probe", "provider-openai-probe", "provider-url-probe"];
+    const review = vi.fn().mockResolvedValue({
+      conclusion: "pass", confidence: 0.9,
+      summary: "Authorization: Basic provider-basic-probe",
+      facts: ["OPENAI_API_KEY=sk-proj-provider-openai-probe"],
+      assumptions: [], openQuestions: [], risks: ["https://user:provider-url-probe@example.com"], findings: []
+    });
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality, { review }
+    );
+
+    await service.review(fixture.unit.id, 1, "review-provider-redaction");
+
+    const persisted = JSON.stringify(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review"));
+    for (const probe of probes) expect(persisted).not.toContain(probe);
+    expect(persisted).toContain("[REDACTED]");
+  });
+
   it("persists an identity-bound tree once and never reloads the live source for review", async () => {
     const fixture = createFixture();
     const implementation = codingResult();
@@ -668,6 +691,130 @@ describe("DeliveryExecutionService", () => {
     expect(review).toHaveBeenCalledTimes(2);
   });
 
+  it("atomically aborts a quality claim when its automation job exhausts three attempts", async () => {
+    const fixture = createFixture();
+    await new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult())
+    ).implement(fixture.unit.id);
+    const reviewJob = fixture.store.automationJobs.byDedupe(`review:${fixture.unit.id}:v1`)!;
+    const review = vi.fn().mockRejectedValue(new Error("provider unavailable"));
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality, { review }
+    );
+    const handlers = createDeliveryQualityAutomationHandlers(service);
+    const worker = createAutomationWorker({
+      jobs: fixture.store.automationJobs,
+      handlers: { ...handlers, test: async () => {} },
+      workerId: "worker-exhaustion"
+    });
+
+    for (let drain = 0; drain < 4 && fixture.store.automationJobs.get(reviewJob.id)?.status !== "failed"; drain += 1) {
+      await worker.drainOnce();
+    }
+
+    expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "failed", attempt: 3 });
+    expect((fixture.store as any).db.prepare(
+      "SELECT status, error FROM delivery_quality_runs WHERE claim_token = ?"
+    ).get(reviewJob.id)).toEqual({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" });
+    expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")).toBeNull();
+    expect(fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", reviewJob.id))
+      .toMatchObject({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" });
+    expect(() => fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", "different-job"))
+      .toThrow("DELIVERY_QUALITY_RUN_SETTLED");
+    expect(fixture.store.automationJobs.enqueue({
+      ownerType: "delivery_unit", ownerId: fixture.unit.id, evidenceVersion: 1,
+      action: "review", payload: {}, maxAttempts: 3
+    }).id).toBe(reviewJob.id);
+
+    (fixture.store as any).db.prepare(
+      "UPDATE delivery_units SET status = 'ready', evidence_version = 2 WHERE id = ?"
+    ).run(fixture.unit.id);
+    await new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult())
+    ).implement(fixture.unit.id);
+    const nextJob = fixture.store.automationJobs.byDedupe(`review:${fixture.unit.id}:v2`)!;
+    expect(nextJob.id).not.toBe(reviewJob.id);
+    expect(fixture.store.deliveryQuality.claim(fixture.unit.id, 2, "code_review", nextJob.id))
+      .toMatchObject({ status: "running", evidenceVersion: 2 });
+  });
+
+  it("rolls back final job failure when the matching quality abort cannot commit", async () => {
+    const fixture = createFixture();
+    await new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult())
+    ).implement(fixture.unit.id);
+    const reviewJob = fixture.store.automationJobs.byDedupe(`review:${fixture.unit.id}:v1`)!;
+    (fixture.store as any).db.prepare(
+      "UPDATE automation_jobs SET status = 'canceled' WHERE dedupe_key = ?"
+    ).run(`test:${fixture.unit.id}:v1`);
+    fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", reviewJob.id);
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      fixture.store.automationJobs.leaseNext(`worker-${attempt}`, new Date(), 30_000);
+      expect(fixture.store.automationJobs.fail(reviewJob.id, `worker-${attempt}`, "provider unavailable", true)).toBe(true);
+    }
+    fixture.store.automationJobs.leaseNext("worker-3", new Date(), 30_000);
+    (fixture.store as any).db.exec(`CREATE TRIGGER reject_quality_automation_abort
+      BEFORE UPDATE OF status ON delivery_quality_runs
+      WHEN NEW.status = 'aborted'
+      BEGIN SELECT RAISE(ABORT, 'QUALITY_ABORT_WRITE_FAILED'); END;`);
+
+    expect(() => fixture.store.automationJobs.fail(
+      reviewJob.id, "worker-3", "provider unavailable", true
+    )).toThrow("QUALITY_ABORT_WRITE_FAILED");
+
+    expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "leased", attempt: 3 });
+    expect((fixture.store as any).db.prepare(
+      "SELECT status FROM delivery_quality_runs WHERE claim_token = ?"
+    ).get(reviewJob.id)).toEqual({ status: "running" });
+  });
+
+  it("aborts an exhausted leased quality claim during restart recovery", async () => {
+    const path = fileBackedDatabase();
+    const fixture = createFixture(path);
+    await new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult())
+    ).implement(fixture.unit.id);
+    const reviewJob = fixture.store.automationJobs.byDedupe(`review:${fixture.unit.id}:v1`)!;
+    (fixture.store as any).db.prepare(
+      "UPDATE automation_jobs SET status = 'canceled' WHERE dedupe_key = ?"
+    ).run(`test:${fixture.unit.id}:v1`);
+    fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", reviewJob.id);
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      fixture.store.automationJobs.leaseNext(`worker-${attempt}`, new Date(), 30_000);
+      fixture.store.automationJobs.fail(reviewJob.id, `worker-${attempt}`, "provider unavailable", true);
+    }
+    fixture.store.automationJobs.leaseNext("worker-3", new Date(), 30_000);
+    fixture.store.close();
+    stores.splice(stores.indexOf(fixture.store), 1);
+    const restarted = new WorkflowStore(path);
+    stores.push(restarted);
+
+    restarted.automationJobs.recoverExpired(new Date(Date.now() + 60_000));
+
+    expect(restarted.automationJobs.get(reviewJob.id)).toMatchObject({ status: "failed", attempt: 3 });
+    expect((restarted as any).db.prepare(
+      "SELECT status, error FROM delivery_quality_runs WHERE claim_token = ?"
+    ).get(reviewJob.id)).toEqual({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" });
+  });
+
+  it("repairs a legacy failed-job running-claim orphan during startup recovery", async () => {
+    const fixture = createFixture();
+    await new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult())
+    ).implement(fixture.unit.id);
+    const reviewJob = fixture.store.automationJobs.byDedupe(`review:${fixture.unit.id}:v1`)!;
+    fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", reviewJob.id);
+    (fixture.store as any).db.prepare(`UPDATE automation_jobs
+      SET status = 'failed', attempt = max_attempts, lease_owner = NULL, lease_expires_at = NULL
+      WHERE id = ?`).run(reviewJob.id);
+
+    fixture.store.automationJobs.recoverExpired(new Date());
+
+    expect((fixture.store as any).db.prepare(
+      "SELECT status, error FROM delivery_quality_runs WHERE claim_token = ?"
+    ).get(reviewJob.id)).toEqual({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" });
+  });
+
   it("fails testing when the real target changes during disposable verification", async () => {
     const fixture = createFixture();
     const implementation = codingResult();
@@ -692,7 +839,7 @@ describe("DeliveryExecutionService", () => {
     expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "automated_testing")).toBeNull();
   });
 
-  it("retries testing infrastructure failures with the same claim and no failed evidence", async () => {
+  it("retries cleanup infrastructure failures with the same claim and no failed evidence", async () => {
     const fixture = createFixture();
     await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult()))
       .implement(fixture.unit.id);
@@ -700,7 +847,7 @@ describe("DeliveryExecutionService", () => {
       head: fixture.version.headCommit, refsHash: "refs", diffHash: "clean", gitCommonDir: "/repo/.git"
     };
     const testing = vi.fn()
-      .mockRejectedValueOnce(Object.assign(new Error("sandbox startup failed"), { code: "EIO" }))
+      .mockRejectedValueOnce(new Error("AUTOMATED_TEST_CLEANUP_FAILED"))
       .mockResolvedValueOnce({ result: "passed", commandResults: [], acceptanceTrace: [] });
     const service = new DeliveryExecutionService(
       fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality,

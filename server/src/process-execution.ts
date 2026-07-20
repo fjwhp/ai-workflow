@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { open, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { open, lstat, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -105,6 +105,8 @@ export async function runManagedProcess(
   const label = `ai.workflow.process.${process.pid}.${randomUUID().replaceAll("-", "")}`;
   const serviceTarget = `gui/${uid}/${label}`;
   const plistPath = join(controlRoot, "job.plist");
+  const configPath = join(controlRoot, "command.json");
+  const resultPath = join(controlRoot, "result.json");
   const stdoutPath = join(controlRoot, "stdout");
   const stderrPath = join(controlRoot, "stderr");
   let jobMayExist = false;
@@ -176,8 +178,13 @@ export async function runManagedProcess(
     await Promise.all([
       writeFile(stdoutPath, "", { mode: 0o600 }),
       writeFile(stderrPath, "", { mode: 0o600 }),
+      writeFile(configPath, JSON.stringify({
+        version: 1, file, args, cwd: options.cwd, env: options.env
+      }), { mode: 0o600 }),
       writeFile(plistPath, buildLaunchdProcessPlist({
-        label, file, args, cwd: options.cwd, env: options.env, stdoutPath, stderrPath
+        label, file: process.execPath,
+        args: ["--input-type=commonjs", "--eval", managedProcessWrapperSource, configPath, resultPath],
+        cwd: controlRoot, env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" }, stdoutPath, stderrPath
       }), { mode: 0o600 })
     ]);
     const bootstrapTimeoutMs = executionRemaining();
@@ -211,7 +218,7 @@ export async function runManagedProcess(
         timedOut = true;
         break;
       }
-      const service = parseLaunchctlService(serviceOutput);
+      const completion = await readManagedProcessCompletion(resultPath);
       const sizes = await outputSizes(stdoutPath, stderrPath);
       if (now() > executionDeadline) {
         timedOut = true;
@@ -221,10 +228,13 @@ export async function runManagedProcess(
         outputOverflow = true;
         break;
       }
-      if (service.state === "exited") {
-        exitCode = service.exitCode ?? -1;
+      if (completion) {
+        if (completion.error) throw new Error("MANAGED_PROCESS_WRAPPER_FAILED");
+        exitCode = completion.exitCode ?? -1;
         break;
       }
+      const service = parseLaunchctlService(serviceOutput);
+      if (service.state === "exited") throw new Error("MANAGED_PROCESS_WRAPPER_FAILED");
       await sleep(Math.min(POLL_MS, Math.max(0, executionDeadline - now())));
     }
 
@@ -293,9 +303,14 @@ export function parseLaunchctlPidCoalition(stdout: string): DarwinPidCoalition {
 export function parseLaunchctlService(stdout: string): DarwinServiceState {
   const coalition = parseLaunchctlPidCoalition(stdout);
   if (coalition.status !== "member") throw new Error("MANAGED_PROCESS_SERVICE_INVALID");
+  const state = /(?:^|\n)\s*state\s*=\s*([^\n]+)\s*(?:\n|$)/.exec(stdout)?.[1]?.trim();
   const pid = /(?:^|\n)\s*pid\s*=\s*(\d+)\s*(?:\n|$)/.exec(stdout)?.[1];
   const rawExitCode = /(?:^|\n)\s*last exit code\s*=\s*([^\n]+)\s*(?:\n|$)/.exec(stdout)?.[1]?.trim();
-  if (pid || rawExitCode === "(never exited)") {
+  const lastExitReason = /(?:^|\n)\s*last exit reason\s*=\s*([^\n]+)\s*(?:\n|$)/.exec(stdout)?.[1]?.trim();
+  if (state === "not running" && lastExitReason) {
+    return { coalitionId: coalition.coalitionId, state: "exited" };
+  }
+  if (pid || rawExitCode === "(never exited)" || (state === "not running" && rawExitCode === undefined)) {
     return { coalitionId: coalition.coalitionId, state: "running" };
   }
   if (rawExitCode && /^-?\d+$/.test(rawExitCode)) {
@@ -339,6 +354,29 @@ ${environment}
   </dict>
 </plist>
 `;
+}
+
+async function readManagedProcessCompletion(resultPath: string) {
+  let status;
+  try {
+    status = await lstat(resultPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error("MANAGED_PROCESS_WRAPPER_FAILED", { cause: error });
+  }
+  if (!status.isFile() || status.isSymbolicLink() || status.size < 1 || status.size > 4096
+    || (status.mode & 0o077) !== 0) throw new Error("MANAGED_PROCESS_WRAPPER_FAILED");
+  let value: unknown;
+  try { value = JSON.parse(await readFile(resultPath, "utf8")); }
+  catch (error) { throw new Error("MANAGED_PROCESS_WRAPPER_FAILED", { cause: error }); }
+  if (!value || typeof value !== "object" || (value as any).version !== 1
+    || !((Number.isSafeInteger((value as any).exitCode) && (value as any).exitCode >= 0)
+      || (value as any).exitCode === null)
+    || !((value as any).signal === null || typeof (value as any).signal === "string")
+    || ((value as any).error !== undefined && (value as any).error !== "spawn")) {
+    throw new Error("MANAGED_PROCESS_WRAPPER_FAILED");
+  }
+  return value as { version: 1; exitCode: number | null; signal: string | null; error?: "spawn" };
 }
 
 export async function terminateDarwinCoalition(
@@ -544,6 +582,55 @@ function validateManagedProcessInput(file: string, args: string[], options: Mana
     throw new Error("MANAGED_PROCESS_INPUT_INVALID");
   }
 }
+
+function managedProcessWrapperMain() {
+  const childProcess = require("node:child_process");
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const configPath = process.argv[1];
+  const resultPath = process.argv[2];
+  const invalid = () => { throw new Error("MANAGED_PROCESS_WRAPPER_INVALID"); };
+  if (typeof configPath !== "string" || typeof resultPath !== "string"
+    || !path.isAbsolute(configPath) || !path.isAbsolute(resultPath)
+    || path.dirname(configPath) !== path.dirname(resultPath)
+    || path.basename(configPath) !== "command.json" || path.basename(resultPath) !== "result.json") invalid();
+  const status = fs.lstatSync(configPath);
+  if (!status.isFile() || status.isSymbolicLink() || status.size < 1 || status.size > 1024 * 1024
+    || (status.mode & 0o077) !== 0) invalid();
+  let config: any;
+  try { config = JSON.parse(fs.readFileSync(configPath, "utf8")); } catch { invalid(); }
+  const validString = (value: unknown, maxBytes: number) => typeof value === "string"
+    && value.length > 0 && !value.includes("\0") && Buffer.byteLength(value) <= maxBytes;
+  if (!config || config.version !== 1
+    || !validString(config.file, 16 * 1024) || !path.isAbsolute(config.file)
+    || !validString(config.cwd, 16 * 1024) || !path.isAbsolute(config.cwd)
+    || !Array.isArray(config.args) || config.args.length > 4096
+    || config.args.some((argument: unknown) => !validString(argument, 64 * 1024))
+    || !config.env || typeof config.env !== "object" || Array.isArray(config.env)
+    || Object.entries(config.env).length > 4096
+    || Object.entries(config.env).some(([key, value]) => !validString(key, 4096)
+      || typeof value !== "string" || value.includes("\0") || Buffer.byteLength(value) > 64 * 1024)) invalid();
+  const temporaryResult = `${resultPath}.tmp`;
+  let finished = false;
+  const writeResult = (result: object) => {
+    if (finished) return;
+    finished = true;
+    fs.writeFileSync(temporaryResult, JSON.stringify(result), { mode: 0o600, flag: "wx" });
+    fs.renameSync(temporaryResult, resultPath);
+  };
+  const child = childProcess.spawn(
+    config.file, config.args,
+    { cwd: config.cwd, env: config.env, shell: false, stdio: ["ignore", "inherit", "inherit"] }
+  );
+  child.once("error", () => {
+    writeResult({ version: 1, exitCode: null, signal: null, error: "spawn" });
+  });
+  child.once("close", (exitCode: number | null, signal: string | null) => {
+    writeResult({ version: 1, exitCode, signal });
+  });
+}
+
+export const managedProcessWrapperSource = `(${managedProcessWrapperMain.toString()})()`;
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));

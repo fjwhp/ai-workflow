@@ -215,7 +215,11 @@ export class DeliveryExecutionService {
     }
     return quality.complete(claim, {
       result: testResult.result,
-      content: { ...(testResult.error ? { error: testResult.error } : {}), summary: "automated testing completed" },
+      content: {
+        ...(testResult.error ? { error: testResult.error } : {}),
+        summary: "automated testing completed",
+        ...(testResult.toolchain ? { toolchain: testResult.toolchain } : {})
+      },
       commandResults: testResult.commandResults,
       acceptanceTrace: testResult.acceptanceTrace
     });

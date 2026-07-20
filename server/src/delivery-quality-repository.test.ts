@@ -207,6 +207,61 @@ describe("delivery quality evidence schema", () => {
     }
   });
 
+  it("deep-redacts every untrusted quality completion field at the persistence boundary", () => {
+    const { store, unit } = fixture();
+    try {
+      const claim = store.deliveryQuality.claim(unit.id, 1, "automated_testing");
+      if (claim.status !== "running") throw new Error("expected running claim");
+      const probes = [
+        "basic-persist-probe", "bearer-persist-probe", "aws-persist-probe",
+        "openai-persist-probe", "github-persist-probe", "url-persist-probe",
+        "database-persist-probe", "structured-persist-probe"
+      ];
+      store.deliveryQuality.complete(claim, {
+        result: "failed",
+        content: {
+          clientSecret: "structured-persist-probe",
+          error: "Authorization: Basic basic-persist-probe"
+        },
+        commandResults: [{
+          stdout: "Authorization: Bearer bearer-persist-probe\nAWS_SECRET_ACCESS_KEY=aws-persist-probe",
+          stderr: "OPENAI_API_KEY=sk-proj-openai-persist-probe GITHUB_TOKEN=ghp_github-persist-probe"
+        }],
+        acceptanceTrace: [{
+          criterion: "https://user:url-persist-probe@example.com",
+          detail: "postgres://user:database-persist-probe@localhost/app"
+        }]
+      });
+
+      const row = (store as any).db.prepare(`SELECT content_json, command_results_json, acceptance_trace_json
+        FROM delivery_quality_evidence WHERE run_id = ?`).get(claim.id);
+      const persisted = JSON.stringify(row);
+      for (const probe of probes) expect(persisted).not.toContain(probe);
+      expect(persisted).toContain("[REDACTED]");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rolls back quality completion when bounded sanitization overflows", () => {
+    const { store, unit } = fixture();
+    try {
+      const claim = store.deliveryQuality.claim(unit.id, 1, "code_review");
+      if (claim.status !== "running") throw new Error("expected running claim");
+
+      expect(() => store.deliveryQuality.complete(claim, {
+        result: "passed", content: { summary: "x".repeat(2_000_000) }
+      })).toThrow("DELIVERY_QUALITY_PERSISTENCE_LIMIT");
+
+      expect((store as any).db.prepare("SELECT COUNT(*) AS count FROM delivery_quality_evidence WHERE run_id = ?")
+        .get(claim.id)).toEqual({ count: 0 });
+      expect((store as any).db.prepare("SELECT status FROM delivery_quality_runs WHERE id = ?")
+        .get(claim.id)).toEqual({ status: "running" });
+    } finally {
+      store.close();
+    }
+  });
+
   it("makes the persisted coding evidence tree immutable", () => {
     const { store, unit } = fixture();
     try {

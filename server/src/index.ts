@@ -15,6 +15,7 @@ import {
   createDeliveryQualityAutomationHandlers,
   DeliveryExecutionService
 } from "./delivery-execution-service.js";
+import { cleanupVerificationQuarantines } from "./verification-cleanup.js";
 
 const schemaVersion = "phase-2-evidence-tree-v8";
 
@@ -38,6 +39,10 @@ export interface StartupOptions {
   onWorkerEvent?: (event: AutomationWorkerEvent) => void;
   installSignalHandlers?: boolean;
   writeListening?: (listeningUrl: string) => void;
+  cleanupVerificationQuarantines?: typeof cleanupVerificationQuarantines;
+  reportVerificationCleanup?: (
+    result: Awaited<ReturnType<typeof cleanupVerificationQuarantines>>
+  ) => void;
 }
 
 export async function startServer(options: StartupOptions = {}) {
@@ -91,6 +96,12 @@ export async function startServer(options: StartupOptions = {}) {
     store.recoverInterruptedRequirements();
     const clock = options.clock ?? (() => new Date());
     store.automationJobs.recoverExpired(clock());
+    const cleanupResult = await (options.cleanupVerificationQuarantines ?? cleanupVerificationQuarantines)({
+      maxEntries: 4, maxScannedEntries: 4096
+    });
+    if (cleanupResult.failed > 0 || cleanupResult.remaining > 0 || cleanupResult.scanTruncated) {
+      (options.reportVerificationCleanup ?? reportVerificationCleanup)(cleanupResult);
+    }
     const deliveryService = (options.createDeliveryService ?? ((workflowStore) => new DeliveryExecutionService(
       workflowStore.deliveryExecutions, undefined, undefined, workflowStore.deliveryQuality
     )))(store);
@@ -141,6 +152,12 @@ function automationWorkerEnabled(value: string | undefined) {
 function reportWorkerEvent(event: AutomationWorkerEvent) {
   const error = "error" in event ? formatError(event.error) : undefined;
   process.stderr.write(`FLOWGATE_AUTOMATION_WORKER ${JSON.stringify({ ...event, error })}\n`);
+}
+
+function reportVerificationCleanup(
+  result: Awaited<ReturnType<typeof cleanupVerificationQuarantines>>
+) {
+  process.stderr.write(`FLOWGATE_VERIFICATION_CLEANUP ${JSON.stringify(result)}\n`);
 }
 
 function formatError(error: unknown) {

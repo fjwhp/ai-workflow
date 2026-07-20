@@ -130,10 +130,18 @@ export class WorkflowStore {
       leaseNext: (workerId, now, leaseMs) => automationJobRepository.leaseNext(workerId, now, leaseMs),
       renew: (jobId, workerId, now, leaseMs) => automationJobRepository.renew(jobId, workerId, now, leaseMs),
       complete: (jobId, workerId) => automationJobRepository.complete(jobId, workerId),
-      fail: (jobId, workerId, error, retryable) => automationJobRepository.fail(jobId, workerId, error, retryable),
+      fail: (jobId, workerId, error, retryable) => this.withImmediateTransaction(() => {
+        const settled = automationJobRepository.fail(jobId, workerId, error, retryable);
+        if (settled) this.deliveryQualityRepository.abortTerminalAutomationClaimsInTransaction();
+        return settled;
+      }),
       cancelByOwnerVersion: (ownerId, evidenceVersion, ownerType) =>
         automationJobRepository.cancelByOwnerVersion(ownerId, evidenceVersion, ownerType),
-      recoverExpired: (now) => automationJobRepository.recoverExpired(now),
+      recoverExpired: (now) => this.withImmediateTransaction(() => {
+        const recovered = automationJobRepository.recoverExpired(now);
+        this.deliveryQualityRepository.abortTerminalAutomationClaimsInTransaction();
+        return recovered;
+      }),
       get: (jobId) => automationJobRepository.get(jobId),
       byDedupe: (dedupeKey) => automationJobRepository.byDedupe(dedupeKey),
       listPending: () => automationJobRepository.listPending()

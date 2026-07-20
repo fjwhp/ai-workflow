@@ -1,6 +1,6 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { MAX_AUTOMATED_TEST_COMMANDS } from "@ai-workflow/shared";
@@ -43,6 +43,23 @@ function automatedInput(target: string, allowedCommands: AutomatedTestingInput["
     sourceManifest: { version: 1, entries: [] }, sensitivePatterns: [],
     targetWorktree: target, gitCommonDir: join(target, ".git"), allowedCommands,
     acceptanceCriteria: ["all frozen commands finish before the deadline"], untrustedEvidence
+  };
+}
+
+async function fakeToolchain(commands: Array<{ id: string; command: string; args: string[] }>, root: string) {
+  const toolchainRoot = join(root, ".toolchain", "a".repeat(64));
+  mkdirSync(join(toolchainRoot, "bin"), { recursive: true });
+  mkdirSync(join(toolchainRoot, "packages", "npm", "bin"), { recursive: true });
+  return {
+    root: toolchainRoot, fingerprint: "a".repeat(64), binDirectory: join(toolchainRoot, "bin"),
+    commands: commands.map((command) => ({
+      id: command.id, configuredCommand: command.command, file: join(toolchainRoot, "bin", "node"),
+      args: [join(toolchainRoot, "packages", "npm", "bin", "npm-cli.js"), ...command.args]
+    })),
+    manifest: [{
+      path: "bin/node", type: "file" as const, mode: 0o555, size: 4,
+      sha256: "b".repeat(64)
+    }]
   };
 }
 
@@ -193,6 +210,26 @@ describe("automated testing safety", () => {
     });
   });
 
+  it("does not start a command when the frozen toolchain exceeds the plan deadline", async () => {
+    const target = initializeTarget();
+    const runProcess = vi.fn();
+    const snapshotToolchain = vi.fn(async () => {
+      throw new Error("AUTOMATED_TEST_DEADLINE_EXCEEDED");
+    });
+
+    const result = await runAutomatedTesting(automatedInput(target, [{ command: "first" }]), {
+      platform: "darwin", sandboxExecutableAvailable: async () => true,
+      runManagedProcess: runProcess, snapshotToolchain
+    } as any);
+
+    expect(runProcess).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      result: "failed", error: "AUTOMATED_TEST_DEADLINE_EXCEEDED",
+      commandResults: [{ id: "verify-1", command: "first", timedOut: true }],
+      acceptanceTrace: [{ passed: false }]
+    });
+  });
+
   it("records current and remaining commands when process setup consumes the deadline", async () => {
     const target = initializeTarget();
     const runProcess = vi.fn(async () => {
@@ -203,7 +240,7 @@ describe("automated testing safety", () => {
       { command: "first" }, { command: "second" }
     ]), {
       platform: "darwin", sandboxExecutableAvailable: async () => true,
-      runManagedProcess: runProcess
+      runManagedProcess: runProcess, snapshotToolchain: fakeToolchain
     });
 
     expect(runProcess).toHaveBeenCalledTimes(1);
@@ -221,12 +258,67 @@ describe("automated testing safety", () => {
     const profile = buildSandboxProfile({
       verificationRoot: "/tmp/verify", targetWorktree: "/repo/worktree", gitCommonDir: "/repo/.git"
     });
+    expect(profile).toContain("(allow sysctl-read)");
     expect(profile).toContain("(deny network*)");
     expect(profile).toContain("/repo/worktree");
     expect(profile).toContain("/repo/.git");
     expect(profile).toContain("/tmp/verify");
     expect(profile).toContain('(import "dyld-support.sb")');
     expect(profile).not.toContain("(allow file-read*)");
+  });
+
+  it("allows metadata traversal only through canonical verification root ancestors", () => {
+    const profile = buildSandboxProfile({
+      verificationRoot: "/private/var/folders/job/verification",
+      targetWorktree: "/sensitive/repo/worktree",
+      gitCommonDir: "/sensitive/repo/.git"
+    });
+
+    expect(profile).toContain("(allow file-read-metadata");
+    for (const ancestor of ["/", "/private", "/private/var", "/private/var/folders", "/private/var/folders/job"]) {
+      expect(profile).toContain(`(literal "${ancestor}")`);
+    }
+    expect(profile).not.toContain('(subpath "/private")');
+    expect(profile).not.toContain('(literal "/sensitive")');
+    expect(profile).not.toContain('(literal "/sensitive/repo")');
+  });
+
+  it("executes only a frozen toolchain entrypoint and binds its manifest to the result", async () => {
+    const target = initializeTarget();
+    const calls: Array<{ file: string; args: string[]; options: any }> = [];
+    const runProcess = vi.fn(async (file: string, args: string[], options: any) => {
+      calls.push({ file, args, options });
+      return { exitCode: 0, stdout: "ok", stderr: "", timedOut: false, outputOverflow: false };
+    });
+
+    const result = await runAutomatedTesting(automatedInput(target, [{ command: "npm", argsPrefix: ["test"] }]), {
+      platform: "darwin", sandboxExecutableAvailable: async () => true,
+      runManagedProcess: runProcess, snapshotToolchain: fakeToolchain
+    } as any);
+
+    expect(result).toMatchObject({
+      result: "passed",
+      toolchain: {
+        fingerprint: "a".repeat(64),
+        manifest: [expect.objectContaining({ path: "bin/node" })],
+        commands: [{
+          id: "verify-1", configuredCommand: "npm", executable: "bin/node",
+          args: ["toolchain:packages/npm/bin/npm-cli.js", "test"]
+        }]
+      }
+    });
+    expect(result.toolchain).not.toHaveProperty("root");
+    expect(result.toolchain).not.toHaveProperty("binDirectory");
+    const invocation = calls[0]!;
+    expect(invocation.file).toBe("/usr/bin/sandbox-exec");
+    expect(invocation.args.slice(2)).toEqual([
+      expect.stringMatching(/\.toolchain\/.+\/bin\/node$/),
+      expect.stringMatching(/\.toolchain\/.+\/packages\/npm\/bin\/npm-cli\.js$/),
+      "test"
+    ]);
+    const runtimeToolchainRoot = dirname(dirname(invocation.args[2]!));
+    expect(invocation.args[1]).toContain(`(deny file-write* (subpath "${runtimeToolchainRoot}"))`);
+    expect(invocation.options.env.PATH).toBe(`${join(runtimeToolchainRoot, "bin")}:/usr/bin:/bin:/usr/sbin:/sbin`);
   });
 
   it("constructs a minimal environment without credentials or proxies", () => {
@@ -291,9 +383,9 @@ describe("automated testing safety", () => {
     initializeSource(source);
     execFileSync("git", ["-C", target, "init"]);
     let canonicalVerificationRoot = "";
-    const calls: Array<{ file: string; args: string[] }> = [];
+    const calls: Array<{ file: string; args: string[]; options: any }> = [];
     const execFile = vi.fn(async (file: string, args: string[], options: any) => {
-      calls.push({ file, args });
+      calls.push({ file, args, options });
       canonicalVerificationRoot = dirname(realpathSync(options.cwd));
       return { stdout: "ok\n", stderr: "" };
     });
@@ -303,10 +395,15 @@ describe("automated testing safety", () => {
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], acceptanceCriteria: ["tests pass"], untrustedEvidence
     }, { platform: "darwin", sandboxExecutableAvailable: async () => true, execFile });
 
-    const profile = calls.find((call) => call.file === "/usr/bin/sandbox-exec")!.args[1]!;
+    const invocation = calls.find((call) => call.file === "/usr/bin/sandbox-exec")!;
+    const profile = invocation.args[1]!;
     expect(profile).toContain(`(subpath "${canonicalVerificationRoot}")`);
     expect(profile).toContain(`(subpath "${realpathSync(target)}")`);
     expect(profile).toContain(`(subpath "${realpathSync(join(target, ".git"))}")`);
+    expect(invocation.options.env.HOME).toBe(join(canonicalVerificationRoot, "home"));
+    expect(invocation.options.env.TMPDIR).toBe(join(canonicalVerificationRoot, "tmp"));
+    expect(profile).toContain(`(subpath "${join(canonicalVerificationRoot, "home")}")`);
+    expect(profile).toContain(`(subpath "${join(canonicalVerificationRoot, "tmp")}")`);
   });
 
   it("rejects a source-tree symlink before running any command", async () => {
@@ -423,6 +520,78 @@ describe("automated testing safety", () => {
   });
 
   it.skipIf(process.platform !== "darwin" || process.env.RUN_MACOS_SANDBOX_ACCEPTANCE !== "1")(
+    "requires sysctl-read to start an isolated Node binary",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "automated-test-node-startup-")); directories.push(root);
+      const node = join(root, "node");
+      const worktree = join(root, "worktree");
+      const home = join(root, "home");
+      const temporaryDirectory = join(root, "tmp");
+      copyFileSync(process.execPath, node);
+      chmodSync(node, 0o555);
+      mkdirSync(worktree); mkdirSync(home); mkdirSync(temporaryDirectory);
+      const canonicalRoot = realpathSync(root);
+      const profile = buildSandboxProfile({
+        verificationRoot: canonicalRoot,
+        verificationWorktree: join(canonicalRoot, "worktree"),
+        home: join(canonicalRoot, "home"),
+        temporaryDirectory: join(canonicalRoot, "tmp"),
+        targetWorktree: "/sensitive/repo/worktree",
+        gitCommonDir: "/sensitive/repo/.git"
+      });
+      const runNode = (sandboxProfile: string) => spawnSync(
+        "/usr/bin/sandbox-exec",
+        ["-p", sandboxProfile, join(canonicalRoot, "node"), "-e", "process.stdout.write('node-started')"],
+        {
+          cwd: join(canonicalRoot, "worktree"), encoding: "utf8",
+          env: sanitizedVerificationEnvironment(join(canonicalRoot, "home"), join(canonicalRoot, "tmp"))
+        }
+      );
+
+      const denied = runNode(profile.replace("(allow sysctl-read)\n", ""));
+      expect(denied.status === null || denied.status !== 0).toBe(true);
+      expect(denied.stderr).toContain("LowLevelAlloc arithmetic overflow");
+      const allowed = runNode(profile);
+      expect(allowed).toMatchObject({ status: 0, signal: null, stdout: "node-started" });
+    }
+  );
+
+  it.skipIf(process.platform !== "darwin" || process.env.RUN_MACOS_SANDBOX_ACCEPTANCE !== "1")(
+    "runs a dependency-free package with the real npm from its frozen toolchain layer",
+    async () => {
+      const source = mkdtempSync(join(tmpdir(), "automated-test-real-npm-")); directories.push(source);
+      writeFileSync(join(source, "package.json"), JSON.stringify({
+        name: "sandbox-toolchain-acceptance", private: true,
+        scripts: { test: "node test.js" }
+      }));
+      writeFileSync(join(source, "test.js"), "console.log('snapshot npm ok')\n");
+      initializeSource(source);
+      const target = initializeTarget();
+
+      const result = await runAutomatedTesting({
+        ...(await frozenSource(source)), targetWorktree: target, gitCommonDir: join(target, ".git"),
+        allowedCommands: [{ command: "npm", argsPrefix: ["test"] }],
+        acceptanceCriteria: ["real npm starts without project node_modules"], untrustedEvidence
+      });
+
+      expect(result).toMatchObject({
+        result: "passed",
+        commandResults: [{ exitCode: 0, stdout: expect.stringContaining("snapshot npm ok") }],
+        toolchain: {
+          fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+          manifest: expect.arrayContaining([
+            expect.objectContaining({ path: "bin/node" }),
+            expect.objectContaining({ path: expect.stringMatching(/packages\/.+\/bin\/npm-cli\.js$/) })
+          ])
+        }
+      });
+      const serializedToolchain = JSON.stringify(result.toolchain);
+      expect(Buffer.byteLength(serializedToolchain)).toBeLessThan(1_500_000);
+      expect(serializedToolchain).not.toContain("ai-workflow-verification-");
+    }
+  );
+
+  it.skipIf(process.platform !== "darwin" || process.env.RUN_MACOS_SANDBOX_ACCEPTANCE !== "1")(
     "contains real target Git, publication, and network mutation attempts",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "automated-test-sandbox-marker-")); directories.push(root);
@@ -447,24 +616,36 @@ echo fake-gh-invoked
 exit $?
 `);
       chmodSync(fakeGh, 0o755);
-      const script = join(source, "probe.sh");
-      writeFileSync(script, `set +e
-printf hacked > '${marker}'; echo git_write:$?
-git -C '${target}' commit --allow-empty -m hacked >/dev/null 2>&1; echo commit:$?
-git -C '${target}' tag hacked >/dev/null 2>&1; echo tag:$?
-curl --max-time 2 https://example.com >/dev/null 2>&1; echo network:$?
-PATH="$PWD/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-echo gh_path:$(command -v gh)
-gh api user; echo gh:$?
-env -i PATH=/usr/bin:/bin /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec "/bin/sleep", "1000"' </dev/null >/dev/null 2>&1 &
-echo daemon:$!
-exit 0
+      const script = join(source, "probe.js");
+      writeFileSync(script, `
+const { spawn, spawnSync } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const { join } = require("node:path");
+const cwd = process.cwd();
+const run = (name, file, args, env = process.env) => {
+  const result = spawnSync(file, args, { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  if (result.stdout) process.stdout.write(result.stdout);
+  console.log(name + ":" + (result.status === 0 ? 0 : (result.status || 1)));
+};
+try { writeFileSync(${JSON.stringify(marker)}, "hacked"); console.log("git_write:0"); }
+catch { console.log("git_write:1"); }
+run("commit", "/usr/bin/git", ["-C", ${JSON.stringify(target)}, "commit", "--allow-empty", "-m", "hacked"]);
+run("tag", "/usr/bin/git", ["-C", ${JSON.stringify(target)}, "tag", "hacked"]);
+run("network", "/usr/bin/curl", ["--max-time", "2", "https://example.com"]);
+const gh = join(cwd, "bin", "gh");
+console.log("gh_path:" + gh);
+run("gh", gh, ["api", "user"], { PATH: cwd + "/bin:/usr/bin:/bin:/usr/sbin:/sbin" });
+const daemon = spawn("/bin/sleep", ["1000"], {
+  stdio: "inherit", env: { PATH: "/usr/bin:/bin" }
+});
+daemon.unref();
+console.log("daemon:" + daemon.pid);
 `);
       initializeSource(source);
 
       const result = await runAutomatedTesting({
         ...(await frozenSource(source)), targetWorktree: target, gitCommonDir: join(target, ".git"),
-        allowedCommands: [{ command: "/bin/sh", argsPrefix: ["probe.sh"] }],
+        allowedCommands: [{ command: "node", argsPrefix: ["probe.js"] }],
         acceptanceCriteria: ["sandbox contains mutations"], untrustedEvidence
       });
 

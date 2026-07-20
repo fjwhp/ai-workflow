@@ -26,6 +26,15 @@ describe("server entry point", () => {
     const { jobId } = await seedExpiredJob(directory);
     const events: string[] = [];
     let recoveredStatus: string | undefined;
+    const cleanupVerification = vi.fn(async (options: { maxEntries?: number; maxScannedEntries?: number }) => {
+      events.push("cleanup:verification");
+      expect(options).toEqual({ maxEntries: 4, maxScannedEntries: 4096 });
+      return {
+        scanned: 5, scanTruncated: true, attempted: 4, removed: 3, failed: 1, remaining: 2,
+        failures: [{ path: "/tmp/quarantine", error: "AUTOMATED_TEST_CLEANUP_FAILED" }]
+      };
+    });
+    const cleanupReports: unknown[] = [];
     const worker = {
       drainOnce: vi.fn(async () => false),
       start: vi.fn(() => { events.push("worker:start"); }),
@@ -35,6 +44,8 @@ describe("server entry point", () => {
     const runtime = await startServer({
       env: { DATA_DIR: directory, PORT: "0", AUTOMATION_WORKER_ENABLED: "true" },
       createStore: (databasePath) => observedStore(databasePath, events),
+      cleanupVerificationQuarantines: cleanupVerification as any,
+      reportVerificationCleanup: (result: unknown) => { cleanupReports.push(result); },
       createWorker: (input) => {
         events.push("worker:create");
         recoveredStatus = input.jobs.get(jobId)?.status;
@@ -47,7 +58,14 @@ describe("server entry point", () => {
     expect(recoveredStatus).toBe("pending");
     expect(events).toEqual([
       "recover:stage", "recover:knowledge", "recover:requirements", "recover:jobs",
-      "worker:create", "app:build", "app:onClose", "worker:start", "app:listen"
+      "cleanup:verification", "worker:create", "app:build", "app:onClose", "worker:start", "app:listen"
+    ]);
+    expect(cleanupVerification).toHaveBeenCalledOnce();
+    expect(cleanupReports).toEqual([
+      {
+        scanned: 5, scanTruncated: true, attempted: 4, removed: 3, failed: 1, remaining: 2,
+        failures: [{ path: "/tmp/quarantine", error: "AUTOMATED_TEST_CLEANUP_FAILED" }]
+      }
     ]);
     await runtime.close();
     expect(events.slice(-3)).toEqual(["app:close", "worker:stop", "store:close"]);
