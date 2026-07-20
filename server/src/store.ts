@@ -98,9 +98,11 @@ export class WorkflowStore {
       renew: (jobId, workerId, now, leaseMs) => automationJobRepository.renew(jobId, workerId, now, leaseMs),
       complete: (jobId, workerId) => automationJobRepository.complete(jobId, workerId),
       fail: (jobId, workerId, error, retryable) => automationJobRepository.fail(jobId, workerId, error, retryable),
-      cancelByOwnerVersion: (ownerId, evidenceVersion) => automationJobRepository.cancelByOwnerVersion(ownerId, evidenceVersion),
+      cancelByOwnerVersion: (ownerId, evidenceVersion, ownerType) =>
+        automationJobRepository.cancelByOwnerVersion(ownerId, evidenceVersion, ownerType),
       recoverExpired: (now) => automationJobRepository.recoverExpired(now),
       get: (jobId) => automationJobRepository.get(jobId),
+      byDedupe: (dedupeKey) => automationJobRepository.byDedupe(dedupeKey),
       listPending: () => automationJobRepository.listPending()
     };
   }

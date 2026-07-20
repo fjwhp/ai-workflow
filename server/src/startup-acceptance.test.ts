@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 describe("real server startup acceptance", () => {
-  it("backs up deployed foundation v3 before creating the automation schema", { timeout: 15_000 }, async () => {
+  it("backs up deployed automation v1 before creating the v2 schema", { timeout: 15_000 }, async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "workflow-startup-acceptance-"));
     tempDirectories.push(dataDir);
     const databasePath = join(dataDir, "workflow.db");
@@ -32,7 +32,8 @@ describe("real server startup acceptance", () => {
       CREATE UNIQUE INDEX idx_integration_runs_active ON integration_runs(requirement_id) WHERE status = 'running';
       CREATE TABLE automation_jobs (
         id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, owner_type TEXT NOT NULL,
-        owner_id TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL,
+        owner_id TEXT NOT NULL, evidence_version INTEGER NOT NULL, action TEXT NOT NULL,
+        status TEXT NOT NULL, attempt INTEGER NOT NULL, max_attempts INTEGER NOT NULL,
         lease_owner TEXT, lease_expires_at TEXT, payload_json TEXT NOT NULL, last_error TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
@@ -44,7 +45,7 @@ describe("real server startup acceptance", () => {
       INSERT INTO integration_runs VALUES ('run-old', 'requirement-old', 'running');
     `);
     oldDatabase.close();
-    await writeFile(`${databasePath}.schema-version`, "phase-2-foundation-v3");
+    await writeFile(`${databasePath}.schema-version`, "phase-2-automation-v1");
     const stdout = boundedLogs();
     const allLogs = boundedLogs();
     const child = spawn(process.execPath, [resolve("node_modules/tsx/dist/cli.mjs"), resolve("server/src/index.ts")], {
@@ -83,9 +84,10 @@ describe("real server startup acceptance", () => {
       expect(columns(backup, "approvals")).toContain(["override", "json"].join("_"));
       expect(object(backup, "table", ["integration", "runs"].join("_"))).toBeDefined();
       expect(object(backup, "index", ["idx", "integration", "runs", "active"].join("_"))).toBeDefined();
-      expect(columns(backup, "automation_jobs")).not.toContain("evidence_version");
+      expect(columns(backup, "automation_jobs")).toEqual(expect.arrayContaining(["evidence_version", "max_attempts"]));
+      expect(object(backup, "index", "idx_automation_jobs_pending_lease")).toBeUndefined();
       backup.close();
-      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-automation-v1");
+      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-automation-v2");
     } finally {
       await stopChild(child);
     }

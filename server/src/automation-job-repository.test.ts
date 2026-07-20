@@ -2,6 +2,8 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it } from "vitest";
 import { AutomationJobRepository, type AutomationJobInput } from "./automation-job-repository.js";
 import { WorkflowStore } from "./store.js";
@@ -16,7 +18,7 @@ afterEach(() => {
   directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true }));
 });
 
-function createFixture() {
+function createFixture(clock: () => Date = () => now) {
   const directory = mkdtempSync(join(tmpdir(), "automation-jobs-"));
   directories.push(directory);
   const path = join(directory, "workflow.db");
@@ -42,10 +44,24 @@ function createFixture() {
     database.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
   }
   return {
-    store, requirement, firstDatabase, secondDatabase,
-    first: new AutomationJobRepository(firstDatabase),
-    second: new AutomationJobRepository(secondDatabase)
+    store, project, version, requirement, firstDatabase, secondDatabase,
+    first: new AutomationJobRepository(firstDatabase, clock),
+    second: new AutomationJobRepository(secondDatabase, clock)
   };
+}
+
+function insertCollidingDeliveryOwner(fixture: ReturnType<typeof createFixture>) {
+  const snapshot = fixture.store.createRequirementProjectSnapshot(fixture.requirement.id);
+  const timestamp = now.toISOString();
+  fixture.secondDatabase.prepare(`INSERT INTO delivery_units
+    (id, requirement_id, association_snapshot_id, project_id, project_version_id, required, position,
+      phase, status, evidence_version, created_at, updated_at, completed_at)
+    VALUES (?, ?, ?, ?, ?, 1, 0, 'implementation', 'ready', 1, ?, ?, NULL)`)
+    .run(
+      fixture.requirement.id, fixture.requirement.id, snapshot.id, fixture.project.id,
+      fixture.version.id, timestamp, timestamp
+    );
+  return fixture.requirement.id;
 }
 
 function job(ownerId: string, overrides: Partial<AutomationJobInput> = {}): AutomationJobInput {
@@ -61,6 +77,75 @@ function addMs(date: Date, milliseconds: number) {
   return new Date(date.getTime() + milliseconds);
 }
 
+function concurrentEnqueueWorker(input: AutomationJobInput, databasePath: string) {
+  const worker = new Worker(`
+    const { parentPort, workerData } = require("node:worker_threads");
+    const { DatabaseSync } = require("node:sqlite");
+    try {
+      const { AutomationJobRepository } = require(workerData.repositoryPath);
+      const database = new DatabaseSync(workerData.databasePath);
+      database.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
+      const repository = new AutomationJobRepository(database, () => new Date(workerData.now));
+      parentPort.postMessage({ type: "ready" });
+      parentPort.once("message", (message) => {
+        if (message?.type !== "go") throw new Error("INVALID_BARRIER_MESSAGE");
+        try {
+          parentPort.postMessage({ type: "result", job: repository.enqueue(workerData.input) });
+        } catch (error) {
+          parentPort.postMessage({
+            type: "error", message: error instanceof Error ? error.message : String(error),
+            code: error && typeof error === "object" && "code" in error ? error.code : undefined
+          });
+        } finally {
+          database.close();
+        }
+      });
+    } catch (error) {
+      parentPort.postMessage({ type: "error", message: error instanceof Error ? error.message : String(error) });
+    }
+  `, {
+    eval: true,
+    execArgv: ["--require", "tsx/cjs"],
+    workerData: {
+      databasePath,
+      repositoryPath: fileURLToPath(new URL("./automation-job-repository.ts", import.meta.url)),
+      input,
+      now: now.toISOString()
+    }
+  });
+  let readyResolve!: () => void;
+  let readyReject!: (error: Error) => void;
+  let resultReject!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+  const result = new Promise<ReturnType<AutomationJobRepository["enqueue"]>>((resolve, reject) => {
+    resultReject = reject;
+    worker.on("message", (message: { type?: string; job?: ReturnType<AutomationJobRepository["enqueue"]>; message?: string; code?: string }) => {
+      if (message.type === "ready") readyResolve();
+      if (message.type === "result" && message.job) resolve(message.job);
+      if (message.type === "error") {
+        const error = Object.assign(new Error(message.message ?? "WORKER_FAILED"), { code: message.code });
+        readyReject(error);
+        reject(error);
+      }
+    });
+    worker.on("error", (error) => {
+      readyReject(error);
+      reject(error);
+    });
+    worker.on("exit", (code) => {
+      if (code !== 0) {
+        const error = new Error(`ENQUEUE_WORKER_EXIT_${code}`);
+        readyReject(error);
+        resultReject(error);
+      }
+    });
+  });
+  return { worker, ready, result };
+}
+
 describe("AutomationJobRepository", () => {
   it("exports the persistent queue repository", () => {
     expect(AutomationJobRepository).toBeTypeOf("function");
@@ -74,11 +159,30 @@ describe("AutomationJobRepository", () => {
 
     expect(duplicate).toEqual(first);
     expect(first).toMatchObject({
-      dedupeKey: `implement:${fixture.requirement.id}:v1`, ownerType: "requirement",
+      dedupeKey: `implement:requirement:${fixture.requirement.id}:v1`, ownerType: "requirement",
       ownerId: fixture.requirement.id, evidenceVersion: 1, action: "implement",
       status: "pending", attempt: 0, maxAttempts: 3, payload: { command: "npm test" }
     });
     expect(fixture.first.listPending()).toEqual([first]);
+  });
+
+  it("atomically deduplicates simultaneous enqueue from independent repository workers", { timeout: 15_000 }, async () => {
+    const fixture = createFixture();
+    const databasePath = fixture.firstDatabase.prepare("PRAGMA database_list").get() as { file: string };
+    const input = job(fixture.requirement.id);
+    const first = concurrentEnqueueWorker(input, databasePath.file);
+    const second = concurrentEnqueueWorker(input, databasePath.file);
+    try {
+      await Promise.all([first.ready, second.ready]);
+      first.worker.postMessage({ type: "go" });
+      second.worker.postMessage({ type: "go" });
+      const [firstJob, secondJob] = await Promise.all([first.result, second.result]);
+
+      expect(secondJob.id).toBe(firstJob.id);
+      expect(fixture.first.listPending()).toEqual([firstJob]);
+    } finally {
+      await Promise.all([first.worker.terminate(), second.worker.terminate()]);
+    }
   });
 
   it("keeps distinct actions and evidence versions as distinct jobs", () => {
@@ -92,12 +196,51 @@ describe("AutomationJobRepository", () => {
     expect(fixture.first.listPending()).toHaveLength(3);
   });
 
-  it("fails closed when a canonical dedupe row does not match its job identity", () => {
+  it("scopes canonical dedupe keys by polymorphic owner and reads them directly", () => {
+    const fixture = createFixture();
+    const ownerId = insertCollidingDeliveryOwner(fixture);
+
+    const requirementJob = fixture.first.enqueue(job(ownerId));
+    const deliveryJob = fixture.second.enqueue(job(ownerId, { ownerType: "delivery_unit" }));
+
+    expect(requirementJob.dedupeKey).toBe(`implement:requirement:${ownerId}:v1`);
+    expect(deliveryJob.dedupeKey).toBe(`implement:${ownerId}:v1`);
+    expect(deliveryJob.id).not.toBe(requirementJob.id);
+    expect(fixture.first.byDedupe(requirementJob.dedupeKey)).toEqual(requirementJob);
+    expect(fixture.second.byDedupe(deliveryJob.dedupeKey)).toEqual(deliveryJob);
+    expect(fixture.store.automationJobs.byDedupe(deliveryJob.dedupeKey)).toEqual(deliveryJob);
+  });
+
+  it("defaults cancellation to delivery units and can explicitly cancel requirements", () => {
+    const fixture = createFixture();
+    const ownerId = insertCollidingDeliveryOwner(fixture);
+    const requirementJob = fixture.first.enqueue(job(ownerId, { action: "review" }));
+    const deliveryJob = fixture.first.enqueue(job(ownerId, { ownerType: "delivery_unit", action: "implement" }));
+
+    expect(fixture.first.cancelByOwnerVersion(ownerId, 1)).toBe(1);
+    expect(fixture.first.get(deliveryJob.id)?.status).toBe("canceled");
+    expect(fixture.first.get(requirementJob.id)?.status).toBe("pending");
+    expect(fixture.first.cancelByOwnerVersion(ownerId, 1, "requirement")).toBe(1);
+    expect(fixture.first.get(requirementJob.id)?.status).toBe("canceled");
+  });
+
+  it("uses the injected clock when canceling a delivery job", () => {
+    const future = new Date("2099-01-01T00:00:00.000Z");
+    const fixture = createFixture(() => future);
+    const ownerId = insertCollidingDeliveryOwner(fixture);
+    const queued = fixture.first.enqueue(job(ownerId, { ownerType: "delivery_unit" }));
+
+    expect(fixture.first.cancelByOwnerVersion(ownerId, 1)).toBe(1);
+    expect(fixture.first.get(queued.id)).toMatchObject({ status: "canceled", updatedAt: future.toISOString() });
+  });
+
+  it("rejects direct corruption of a canonical job identity", () => {
     const fixture = createFixture();
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
-    fixture.secondDatabase.prepare("UPDATE automation_jobs SET action = 'review' WHERE id = ?").run(queued.id);
 
-    expect(() => fixture.first.enqueue(job(fixture.requirement.id))).toThrow("AUTOMATION_JOB_DEDUPE_CONFLICT");
+    expect(() => fixture.secondDatabase.prepare("UPDATE automation_jobs SET action = 'review' WHERE id = ?").run(queued.id))
+      .toThrow(/CHECK constraint failed/);
+    expect(fixture.first.enqueue(job(fixture.requirement.id))).toEqual(queued);
     expect(fixture.first.listPending()).toHaveLength(1);
   });
 
@@ -170,6 +313,23 @@ describe("AutomationJobRepository", () => {
     expect(fixture.first.renew(queued.id, "worker-a", addMs(now, 1_000), 60_000)).toBe(true);
     expect(fixture.first.get(queued.id)?.leaseExpiresAt).toBe(addMs(now, 61_000).toISOString());
     expect(fixture.first.renew(queued.id, "worker-a", addMs(now, 61_000), 60_000)).toBe(false);
+  });
+
+  it("rejects renew, complete, and fail after expiry even before recovery", () => {
+    let clock = now;
+    const fixture = createFixture(() => clock);
+    const renewJob = fixture.first.enqueue(job(fixture.requirement.id, { action: "implement" }));
+    const completeJob = fixture.first.enqueue(job(fixture.requirement.id, { action: "review" }));
+    const failJob = fixture.first.enqueue(job(fixture.requirement.id, { action: "test" }));
+    for (let index = 0; index < 3; index += 1) fixture.first.leaseNext("worker-a", now, 10);
+    clock = addMs(now, 10);
+
+    expect(fixture.first.renew(renewJob.id, "worker-a", clock, 10)).toBe(false);
+    expect(fixture.first.complete(completeJob.id, "worker-a")).toBe(false);
+    expect(fixture.first.fail(failJob.id, "worker-a", "late failure", true)).toBe(false);
+    for (const queued of [renewJob, completeJob, failJob]) {
+      expect(fixture.first.get(queued.id)).toMatchObject({ status: "leased", leaseOwner: "worker-a", attempt: 1 });
+    }
   });
 
   it("blocks late settlement after an expired lease is reassigned", () => {
@@ -259,13 +419,28 @@ describe("AutomationJobRepository", () => {
     expect(fixture.first.get(queued.id)?.lastError).toBe("x".repeat(4096));
   });
 
+  it("truncates persisted failure text without splitting a Unicode code point", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    fixture.first.leaseNext("worker-a", now, 30_000);
+
+    expect(fixture.first.fail(queued.id, "worker-a", `${"x".repeat(4095)}😀tail`, false)).toBe(true);
+
+    const persisted = fixture.first.get(queued.id)?.lastError;
+    expect(persisted).toBe(`${"x".repeat(4095)}😀`);
+    expect(persisted).not.toContain("�");
+    expect(Array.from(persisted ?? "")).toHaveLength(4096);
+  });
+
   it("recovers only expired leases and fails an expired final attempt", () => {
     const fixture = createFixture();
     const first = fixture.first.enqueue(job(fixture.requirement.id, { action: "implement", maxAttempts: 2 }));
     const final = fixture.first.enqueue(job(fixture.requirement.id, { action: "review", maxAttempts: 1 }));
-    const setCreatedAt = fixture.secondDatabase.prepare("UPDATE automation_jobs SET created_at = ? WHERE id = ?");
-    setCreatedAt.run(now.toISOString(), first.id);
-    setCreatedAt.run(addMs(now, 1).toISOString(), final.id);
+    const setCreatedAt = fixture.secondDatabase.prepare(
+      "UPDATE automation_jobs SET created_at = ?, updated_at = ? WHERE id = ?"
+    );
+    setCreatedAt.run(addMs(now, -1).toISOString(), addMs(now, -1).toISOString(), first.id);
+    setCreatedAt.run(now.toISOString(), now.toISOString(), final.id);
     fixture.first.leaseNext("worker-a", now, 20);
     fixture.first.leaseNext("worker-b", now, 10);
 
@@ -283,16 +458,18 @@ describe("AutomationJobRepository", () => {
     const leased = fixture.first.enqueue(job(fixture.requirement.id, { action: "review" }));
     const completed = fixture.first.enqueue(job(fixture.requirement.id, { action: "test" }));
     const otherVersion = fixture.first.enqueue(job(fixture.requirement.id, { action: "implement", evidenceVersion: 2 }));
-    const setCreatedAt = fixture.secondDatabase.prepare("UPDATE automation_jobs SET created_at = ? WHERE id = ?");
-    setCreatedAt.run(addMs(now, 100).toISOString(), pending.id);
-    setCreatedAt.run(now.toISOString(), leased.id);
-    setCreatedAt.run(addMs(now, 1).toISOString(), completed.id);
-    setCreatedAt.run(addMs(now, 200).toISOString(), otherVersion.id);
+    const setCreatedAt = fixture.secondDatabase.prepare(
+      "UPDATE automation_jobs SET created_at = ?, updated_at = ? WHERE id = ?"
+    );
+    setCreatedAt.run(addMs(now, -1).toISOString(), addMs(now, -1).toISOString(), pending.id);
+    setCreatedAt.run(addMs(now, -3).toISOString(), addMs(now, -3).toISOString(), leased.id);
+    setCreatedAt.run(addMs(now, -2).toISOString(), addMs(now, -2).toISOString(), completed.id);
+    setCreatedAt.run(now.toISOString(), now.toISOString(), otherVersion.id);
     fixture.first.leaseNext("worker-a", now, 30_000);
     fixture.first.leaseNext("worker-b", now, 30_000);
     fixture.first.complete(completed.id, "worker-b");
 
-    expect(fixture.second.cancelByOwnerVersion(fixture.requirement.id, 1)).toBe(2);
+    expect(fixture.second.cancelByOwnerVersion(fixture.requirement.id, 1, "requirement")).toBe(2);
 
     expect(fixture.first.get(pending.id)?.status).toBe("canceled");
     expect(fixture.first.get(leased.id)).toMatchObject({ status: "canceled", leaseOwner: null, leaseExpiresAt: null });

@@ -38,9 +38,10 @@ export interface AutomationJobPersistence {
   renew(jobId: string, workerId: string, now: Date, leaseMs: number): boolean;
   complete(jobId: string, workerId: string): boolean;
   fail(jobId: string, workerId: string, error: string, retryable: boolean): boolean;
-  cancelByOwnerVersion(ownerId: string, evidenceVersion: number): number;
+  cancelByOwnerVersion(ownerId: string, evidenceVersion: number, ownerType?: AutomationJobOwnerType): number;
   recoverExpired(now: Date): number;
   get(jobId: string): AutomationJob | null;
+  byDedupe(dedupeKey: string): AutomationJob | null;
   listPending(): AutomationJob[];
 }
 
@@ -70,12 +71,15 @@ const MAX_LEASE_MS = 86_400_000;
 const MAX_ERROR_LENGTH = 4096;
 
 export class AutomationJobRepository {
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly clock: () => Date = () => new Date()
+  ) {}
 
   enqueue(input: AutomationJobInput): AutomationJob {
     const payloadJson = validateEnqueueInput(input);
-    const dedupeKey = `${input.action}:${input.ownerId}:v${input.evidenceVersion}`;
-    const now = new Date().toISOString();
+    const dedupeKey = canonicalDedupeKey(input);
+    const now = validateDate(this.clock());
     this.db.prepare(`INSERT INTO automation_jobs
       (id, dedupe_key, owner_type, owner_id, evidence_version, action, status, attempt, max_attempts,
        lease_owner, lease_expires_at, payload_json, last_error, created_at, updated_at)
@@ -138,11 +142,12 @@ export class AutomationJobRepository {
   complete(jobId: string, workerId: string): boolean {
     validateBoundedId(jobId, "AUTOMATION_JOB_ID_INVALID");
     validateWorkerId(workerId);
+    const settleNow = validateDate(this.clock());
     const result = this.db.prepare(`UPDATE automation_jobs
       SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
       WHERE id = ? AND status = 'leased' AND lease_owner = ?
-        AND lease_expires_at IS NOT NULL`)
-      .run(new Date().toISOString(), jobId, workerId);
+        AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`)
+      .run(settleNow, jobId, workerId, settleNow);
     return Number(result.changes) === 1;
   }
 
@@ -153,25 +158,34 @@ export class AutomationJobRepository {
       throw new Error("AUTOMATION_JOB_ERROR_INVALID");
     }
     if (typeof retryable !== "boolean") throw new Error("AUTOMATION_JOB_RETRYABLE_INVALID");
-    const lastError = error.slice(0, MAX_ERROR_LENGTH);
+    const lastError = truncateCodePoints(error, MAX_ERROR_LENGTH);
+    const settleNow = validateDate(this.clock());
     const result = this.db.prepare(`UPDATE automation_jobs
       SET status = CASE WHEN ? = 1 AND attempt < max_attempts THEN 'pending' ELSE 'failed' END,
         lease_owner = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ?
       WHERE id = ? AND status = 'leased' AND lease_owner = ?
-        AND lease_expires_at IS NOT NULL`)
-      .run(retryable ? 1 : 0, lastError, new Date().toISOString(), jobId, workerId);
+        AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`)
+      .run(retryable ? 1 : 0, lastError, settleNow, jobId, workerId, settleNow);
     return Number(result.changes) === 1;
   }
 
-  cancelByOwnerVersion(ownerId: string, evidenceVersion: number): number {
+  cancelByOwnerVersion(
+    ownerId: string,
+    evidenceVersion: number,
+    ownerType: AutomationJobOwnerType = "delivery_unit"
+  ): number {
     validateBoundedId(ownerId, "AUTOMATION_JOB_OWNER_ID_INVALID");
+    if (ownerType !== "requirement" && ownerType !== "delivery_unit") {
+      throw new Error("AUTOMATION_JOB_OWNER_TYPE_INVALID");
+    }
     if (!Number.isSafeInteger(evidenceVersion) || evidenceVersion < 1) {
       throw new Error("AUTOMATION_JOB_EVIDENCE_VERSION_INVALID");
     }
+    const cancelNow = validateDate(this.clock());
     const result = this.db.prepare(`UPDATE automation_jobs
       SET status = 'canceled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-      WHERE owner_id = ? AND evidence_version = ? AND status IN ('pending', 'leased')`)
-      .run(new Date().toISOString(), ownerId, evidenceVersion);
+      WHERE owner_type = ? AND owner_id = ? AND evidence_version = ? AND status IN ('pending', 'leased')`)
+      .run(cancelNow, ownerType, ownerId, evidenceVersion);
     return Number(result.changes);
   }
 
@@ -190,6 +204,12 @@ export class AutomationJobRepository {
   get(jobId: string): AutomationJob | null {
     validateBoundedId(jobId, "AUTOMATION_JOB_ID_INVALID");
     const row = this.db.prepare("SELECT * FROM automation_jobs WHERE id = ?").get(jobId) as AutomationJobRow | undefined;
+    return row ? mapAutomationJob(row) : null;
+  }
+
+  byDedupe(dedupeKey: string): AutomationJob | null {
+    validateBoundedString(dedupeKey, 512, "AUTOMATION_JOB_DEDUPE_KEY_INVALID");
+    const row = this.db.prepare("SELECT * FROM automation_jobs WHERE dedupe_key = ?").get(dedupeKey) as AutomationJobRow | undefined;
     return row ? mapAutomationJob(row) : null;
   }
 
@@ -223,9 +243,29 @@ function validateEnqueueInput(input: AutomationJobInput): string {
 }
 
 function validateBoundedId(value: unknown, errorCode: string) {
-  if (typeof value !== "string" || value.length < 1 || value.length > MAX_OWNER_ID_LENGTH || value.trim() !== value) {
+  validateBoundedString(value, MAX_OWNER_ID_LENGTH, errorCode);
+}
+
+function validateBoundedString(value: unknown, maxLength: number, errorCode: string) {
+  if (typeof value !== "string" || value.length < 1 || value.length > maxLength || value.trim() !== value) {
     throw new Error(errorCode);
   }
+}
+
+function canonicalDedupeKey(input: Pick<AutomationJobInput, "ownerType" | "ownerId" | "evidenceVersion" | "action">) {
+  const owner = input.ownerType === "delivery_unit" ? input.ownerId : `requirement:${input.ownerId}`;
+  return `${input.action}:${owner}:v${input.evidenceVersion}`;
+}
+
+function truncateCodePoints(value: string, maxCodePoints: number) {
+  let end = 0;
+  let count = 0;
+  for (const codePoint of value) {
+    if (count === maxCodePoints) break;
+    end += codePoint.length;
+    count += 1;
+  }
+  return value.slice(0, end);
 }
 
 function validateLeaseInput(workerId: string, now: Date, leaseMs: number) {

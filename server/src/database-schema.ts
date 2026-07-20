@@ -177,23 +177,57 @@ export function createPhase2Schema(db: DatabaseSync) {
       key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS automation_jobs (
-      id TEXT PRIMARY KEY CHECK(length(id) BETWEEN 1 AND 256),
+      id TEXT PRIMARY KEY CHECK(
+        length(id) BETWEEN 1 AND 256
+        AND id = trim(id, char(9) || char(10) || char(11) || char(12) || char(13) || ' ')
+      ),
       dedupe_key TEXT NOT NULL CHECK(length(dedupe_key) BETWEEN 1 AND 512),
       owner_type TEXT NOT NULL CHECK(owner_type IN ('requirement', 'delivery_unit')),
-      owner_id TEXT NOT NULL CHECK(length(owner_id) BETWEEN 1 AND 256),
-      evidence_version INTEGER NOT NULL CHECK(evidence_version > 0),
+      owner_id TEXT NOT NULL CHECK(
+        length(owner_id) BETWEEN 1 AND 256
+        AND owner_id = trim(owner_id, char(9) || char(10) || char(11) || char(12) || char(13) || ' ')
+      ),
+      evidence_version INTEGER NOT NULL CHECK(
+        typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND 2147483647
+      ),
       action TEXT NOT NULL CHECK(action IN ('implement', 'review', 'test', 'apply')),
       status TEXT NOT NULL CHECK(status IN ('pending', 'leased', 'completed', 'failed', 'canceled')),
-      attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
-      max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts > 0 AND max_attempts <= 100),
-      lease_owner TEXT CHECK(lease_owner IS NULL OR length(lease_owner) BETWEEN 1 AND 128),
+      attempt INTEGER NOT NULL DEFAULT 0 CHECK(typeof(attempt) = 'integer' AND attempt >= 0),
+      max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(
+        typeof(max_attempts) = 'integer' AND max_attempts BETWEEN 1 AND 100
+      ),
+      lease_owner TEXT CHECK(
+        lease_owner IS NULL OR (
+          length(lease_owner) BETWEEN 1 AND 128
+          AND lease_owner = trim(lease_owner, char(9) || char(10) || char(11) || char(12) || char(13) || ' ')
+        )
+      ),
       lease_expires_at TEXT,
       payload_json TEXT NOT NULL DEFAULT '{}'
         CHECK(json_valid(payload_json) AND length(CAST(payload_json AS BLOB)) <= 65536),
       last_error TEXT CHECK(last_error IS NULL OR length(last_error) <= 4096),
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL CHECK(
+        strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT NULL
+        AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) = created_at
+      ),
+      updated_at TEXT NOT NULL CHECK(
+        strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) IS NOT NULL
+        AND strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) = updated_at
+        AND updated_at >= created_at
+      ),
+      CHECK(
+        dedupe_key = action || ':' ||
+          CASE WHEN owner_type = 'delivery_unit' THEN owner_id ELSE 'requirement:' || owner_id END ||
+          ':v' || CAST(evidence_version AS TEXT)
+      ),
       CHECK(attempt <= max_attempts),
+      CHECK(
+        lease_expires_at IS NULL OR (
+          strftime('%Y-%m-%dT%H:%M:%fZ', lease_expires_at) IS NOT NULL
+          AND strftime('%Y-%m-%dT%H:%M:%fZ', lease_expires_at) = lease_expires_at
+          AND lease_expires_at > updated_at
+        )
+      ),
       CHECK(
         (status = 'leased' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
         OR (status <> 'leased' AND lease_owner IS NULL AND lease_expires_at IS NULL)
@@ -263,6 +297,14 @@ export function createPhase2Schema(db: DatabaseSync) {
       WHERE owner_type IS NULL AND owner_id IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_automation_job_dedupe
       ON automation_jobs(dedupe_key);
+    CREATE INDEX IF NOT EXISTS idx_automation_jobs_pending_lease
+      ON automation_jobs(status, created_at, id)
+      WHERE status = 'pending' AND attempt < max_attempts;
+    CREATE INDEX IF NOT EXISTS idx_automation_jobs_expired_lease
+      ON automation_jobs(status, lease_expires_at)
+      WHERE status = 'leased';
+    CREATE INDEX IF NOT EXISTS idx_automation_jobs_owner_version_status
+      ON automation_jobs(owner_type, owner_id, evidence_version, status);
     CREATE TRIGGER IF NOT EXISTS validate_stage_run_owner_insert
     BEFORE INSERT ON stage_runs
     BEGIN

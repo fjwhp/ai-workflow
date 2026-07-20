@@ -132,15 +132,24 @@ function insertAutomationJob(db: DatabaseSync, input: {
   maxAttempts?: number;
   lastError?: string | null;
   payloadJson?: string;
+  dedupeKey?: string;
+  createdAt?: string;
+  updatedAt?: string;
 }) {
+  const ownerType = input.ownerType ?? "requirement";
+  const ownerId = input.ownerId ?? "r1";
+  const evidenceVersion = input.evidenceVersion ?? 1;
+  const action = input.action ?? "implement";
+  const ownerKey = ownerType === "delivery_unit" ? ownerId : `requirement:${ownerId}`;
   db.prepare(`INSERT INTO automation_jobs
     (id, dedupe_key, owner_type, owner_id, evidence_version, action, status, attempt, max_attempts,
       lease_owner, lease_expires_at, payload_json, last_error, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.000Z')`)
-    .run(input.id, `dedupe-${input.id}`, input.ownerType ?? "requirement", input.ownerId ?? "r1",
-      input.evidenceVersion ?? 1, input.action ?? "implement", input.status ?? "pending",
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(input.id, input.dedupeKey ?? `${action}:${ownerKey}:v${evidenceVersion}`, ownerType, ownerId,
+      evidenceVersion, action, input.status ?? "pending",
       input.attempt ?? 0, input.maxAttempts ?? 3, input.leaseOwner ?? null, input.leaseExpiresAt ?? null,
-      input.payloadJson ?? "{}", input.lastError ?? null);
+      input.payloadJson ?? "{}", input.lastError ?? null,
+      input.createdAt ?? "2026-07-20T00:00:00.000Z", input.updatedAt ?? "2026-07-20T00:00:00.000Z");
 }
 
 describe("Phase 2 database schema", () => {
@@ -204,6 +213,15 @@ describe("Phase 2 database schema", () => {
     expect(indexSql(db, "idx_delivery_dependency_edge")).toMatch(/UNIQUE[\s\S]*delivery_dependencies\s*\(requirement_id,\s*upstream_unit_id,\s*downstream_unit_id\)/i);
     expect(indexSql(db, "idx_delivery_unit_active_run")).toMatch(/UNIQUE[\s\S]*stage_runs\s*\(owner_type,\s*owner_id,\s*stage\)[\s\S]*WHERE status = 'running'/i);
     expect(indexSql(db, "idx_automation_job_dedupe")).toMatch(/UNIQUE[\s\S]*automation_jobs\s*\(dedupe_key\)/i);
+    expect(indexSql(db, "idx_automation_jobs_pending_lease")).toMatch(
+      /automation_jobs\s*\(status,\s*created_at,\s*id\)[\s\S]*WHERE status = 'pending' AND attempt < max_attempts/i
+    );
+    expect(indexSql(db, "idx_automation_jobs_expired_lease")).toMatch(
+      /automation_jobs\s*\(status,\s*lease_expires_at\)[\s\S]*WHERE status = 'leased'/i
+    );
+    expect(indexSql(db, "idx_automation_jobs_owner_version_status")).toMatch(
+      /automation_jobs\s*\(owner_type,\s*owner_id,\s*evidence_version,\s*status\)/i
+    );
     expect(triggerNames(db)).toEqual(expect.arrayContaining([
       "validate_delivery_dependency_owner_insert",
       "validate_delivery_dependency_owner_update",
@@ -287,6 +305,41 @@ describe("Phase 2 database schema", () => {
     expect(() => insertAutomationJob(db, {
       id: "job-multibyte-payload", payloadJson: JSON.stringify({ value: "界".repeat(22_000) })
     })).toThrow(/CHECK constraint failed/);
+    db.close();
+  });
+
+  it("rejects directly forged automation job identity, counters, JSON, and timestamps", () => {
+    const db = openFreshStoreDatabase();
+    insertRequirement(db);
+    const rejects = (input: Parameters<typeof insertAutomationJob>[1]) => {
+      expect(() => insertAutomationJob(db, input)).toThrow();
+    };
+
+    rejects({ id: " job-space" });
+    rejects({ id: "job-owner-space", ownerId: "r1 " });
+    rejects({
+      id: "job-worker-space", status: "leased", leaseOwner: " worker",
+      leaseExpiresAt: "2026-07-20T00:05:00.000Z"
+    });
+    rejects({ id: "job-real-evidence", evidenceVersion: 1.5 });
+    rejects({ id: "job-real-attempt", attempt: 0.5 });
+    rejects({ id: "job-real-max", maxAttempts: 1.5 });
+    rejects({ id: "job-bad-json", payloadJson: "{" });
+    rejects({ id: "job-forged-key", dedupeKey: "caller-controlled" });
+    rejects({ id: "job-bad-created", createdAt: "2026-07-20 00:00:00" });
+    rejects({ id: "job-bad-updated", updatedAt: "2026-07-20T00:00:00Z" });
+    rejects({
+      id: "job-bad-lease-date", status: "leased", leaseOwner: "worker",
+      leaseExpiresAt: "2026-07-20T00:05:00Z"
+    });
+    rejects({
+      id: "job-time-reversal", createdAt: "2026-07-20T00:00:01.000Z",
+      updatedAt: "2026-07-20T00:00:00.000Z"
+    });
+    rejects({
+      id: "job-lease-before-update", status: "leased", leaseOwner: "worker",
+      leaseExpiresAt: "2026-07-20T00:00:00.000Z"
+    });
     db.close();
   });
 
