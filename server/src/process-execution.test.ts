@@ -171,6 +171,172 @@ describe("runManagedProcess", () => {
     }, { platform: "linux" } as any)).rejects.toThrow("MANAGED_PROCESS_CONTAINMENT_UNAVAILABLE");
   });
 
+  it("does not bootstrap when baseline enumeration consumes the execution deadline", async () => {
+    let now = 0;
+    const listProcesses = vi.fn(async (timeoutMs: number) => {
+      expect(timeoutMs).toBe(1);
+      now = 1;
+      return [];
+    });
+    const launchctl = vi.fn();
+
+    await expect(runManagedProcess("/bin/echo", [], {
+      cwd: "/tmp", env: {}, timeoutMs: 1, maxOutputBytes: 64
+    }, { platform: "darwin", uid: 501, now: () => now, listProcesses, launchctl } as any))
+      .rejects.toThrow("MANAGED_PROCESS_DEADLINE_EXCEEDED");
+    expect(launchctl).not.toHaveBeenCalled();
+  });
+
+  it("uses the independent cleanup budget when bootstrap returns after the deadline", async () => {
+    let now = 0;
+    let bootedOut = false;
+    const service = "pid = 123\nlast exit code = (never exited)\nresource coalition = {\n ID = 77\n }\n";
+    const launchctlCalls: Array<{ args: string[]; timeoutMs: number }> = [];
+    const launchctl = vi.fn(async (args: string[], timeoutMs: number) => {
+      launchctlCalls.push({ args, timeoutMs });
+      if (args[0] === "bootstrap") {
+        now = 120;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "bootout") {
+        bootedOut = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "print" && bootedOut) {
+        throw Object.assign(new Error("absent"), { stderr: "Could not find service" });
+      }
+      return { stdout: service, stderr: "" };
+    });
+    const cleanupList = vi.fn(async () => []);
+
+    await expect(runManagedProcess("/bin/echo", [], {
+      cwd: "/tmp", env: {}, timeoutMs: 1, maxOutputBytes: 64, termGraceMs: 0
+    }, {
+      platform: "darwin", uid: 501, now: () => now,
+      listProcesses: async () => [], launchctl,
+      coalitionDependencies: {
+        listProcesses: cleanupList, coalitionForPid: vi.fn(), processExists: vi.fn(), signal: vi.fn(),
+        sleep: async () => {}, now: () => now
+      }
+    } as any)).resolves.toMatchObject({ exitCode: -1, timedOut: true, outputOverflow: false });
+
+    expect(launchctlCalls[0]).toMatchObject({ args: ["bootstrap", "gui/501", expect.any(String)], timeoutMs: 1 });
+    expect(launchctlCalls[1]).toMatchObject({ args: ["print", expect.any(String)], timeoutMs: 10_000 });
+    expect(launchctlCalls.some(({ args }) => args[0] === "bootout")).toBe(true);
+    expect(launchctlCalls.every(({ timeoutMs }) => timeoutMs > 0 && timeoutMs <= 10_000)).toBe(true);
+    expect(cleanupList).toHaveBeenCalled();
+  });
+
+  it("fails closed without starting another cleanup call after the cleanup budget expires", async () => {
+    let now = 0;
+    const service = "pid = 123\nlast exit code = (never exited)\nresource coalition = {\n ID = 77\n }\n";
+    const launchctlCalls: Array<{ args: string[]; timeoutMs: number }> = [];
+    const launchctl = vi.fn(async (args: string[], timeoutMs: number) => {
+      launchctlCalls.push({ args, timeoutMs });
+      if (args[0] === "bootstrap") {
+        now = 120;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "print") {
+        now = 10_120;
+        return { stdout: service, stderr: "" };
+      }
+      return { stdout: "", stderr: "" };
+    });
+
+    await expect(runManagedProcess("/bin/echo", [], {
+      cwd: "/tmp", env: {}, timeoutMs: 1, maxOutputBytes: 64, termGraceMs: 0
+    }, {
+      platform: "darwin", uid: 501, now: () => now,
+      listProcesses: async () => [], launchctl,
+      coalitionDependencies: {
+        listProcesses: async () => [], coalitionForPid: vi.fn(), processExists: vi.fn(), signal: vi.fn(),
+        sleep: async () => {}, now: () => now
+      }
+    } as any)).rejects.toThrow("MANAGED_PROCESS_CLEANUP_FAILED");
+
+    expect(launchctlCalls).toHaveLength(2);
+    expect(launchctlCalls.every(({ timeoutMs }) => timeoutMs > 0)).toBe(true);
+  });
+
+  it("treats an execution status timeout as timed out and still cleans the registered job", async () => {
+    let now = 0;
+    let bootedOut = false;
+    let servicePrints = 0;
+    const service = "pid = 123\nlast exit code = (never exited)\nresource coalition = {\n ID = 77\n }\n";
+    const launchctl = vi.fn(async (args: string[]) => {
+      if (args[0] === "bootstrap") return { stdout: "", stderr: "" };
+      if (args[0] === "bootout") {
+        bootedOut = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "print" && bootedOut) {
+        throw Object.assign(new Error("absent"), { stderr: "Could not find service" });
+      }
+      servicePrints += 1;
+      if (servicePrints === 1) {
+        now = 1;
+        throw Object.assign(new Error("status deadline"), {
+          killed: true, signal: "SIGTERM", stdout: "", stderr: ""
+        });
+      }
+      return { stdout: service, stderr: "" };
+    });
+    const cleanupList = vi.fn(async () => []);
+
+    await expect(runManagedProcess("/bin/echo", [], {
+      cwd: "/tmp", env: {}, timeoutMs: 1, maxOutputBytes: 64, termGraceMs: 0
+    }, {
+      platform: "darwin", uid: 501, now: () => now,
+      listProcesses: async () => [], launchctl,
+      coalitionDependencies: {
+        listProcesses: cleanupList, coalitionForPid: vi.fn(), processExists: vi.fn(), signal: vi.fn(),
+        sleep: async () => {}, now: () => now
+      }
+    } as any)).resolves.toMatchObject({ exitCode: -1, timedOut: true, outputOverflow: false });
+
+    expect(servicePrints).toBe(2);
+    expect(cleanupList).toHaveBeenCalled();
+    expect(launchctl.mock.calls.some(([args]) => args[0] === "bootout")).toBe(true);
+  });
+
+  it("fails closed on a status signal before the deadline while still cleaning the job", async () => {
+    let bootedOut = false;
+    let servicePrints = 0;
+    const service = "pid = 123\nlast exit code = (never exited)\nresource coalition = {\n ID = 77\n }\n";
+    const launchctl = vi.fn(async (args: string[]) => {
+      if (args[0] === "bootstrap") return { stdout: "", stderr: "" };
+      if (args[0] === "bootout") {
+        bootedOut = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "print" && bootedOut) {
+        throw Object.assign(new Error("absent"), { stderr: "Could not find service" });
+      }
+      servicePrints += 1;
+      if (servicePrints === 1) {
+        throw Object.assign(new Error("status externally signaled"), {
+          killed: false, signal: "SIGTERM", stdout: "", stderr: ""
+        });
+      }
+      return { stdout: service, stderr: "" };
+    });
+
+    await expect(runManagedProcess("/bin/echo", [], {
+      cwd: "/tmp", env: {}, timeoutMs: 100, maxOutputBytes: 64, termGraceMs: 0
+    }, {
+      platform: "darwin", uid: 501, now: () => 0,
+      listProcesses: async () => [], launchctl,
+      coalitionDependencies: {
+        listProcesses: async () => [], coalitionForPid: vi.fn(), processExists: vi.fn(), signal: vi.fn(),
+        sleep: async () => {}, now: () => 0
+      }
+    } as any)).rejects.toThrow("status externally signaled");
+
+    expect(servicePrints).toBe(2);
+    expect(launchctl.mock.calls.some(([args]) => args[0] === "bootout")).toBe(true);
+  });
+
   it.skipIf(process.platform !== "darwin")(
     "bounds fixed-locale process and launchctl queries",
     async () => {
@@ -380,6 +546,25 @@ describe("Darwin coalition containment", () => {
       now: () => 0
     })).rejects.toThrow("MANAGED_PROCESS_COALITION_QUERY_FAILED");
     expect(signal).not.toHaveBeenCalled();
+  });
+
+  it("fails when the stable zero-member proof completes at the cleanup deadline", async () => {
+    const terminate = (processExecution as any).terminateDarwinCoalition;
+    let now = 0;
+    let scans = 0;
+    await expect(terminate(new Map(), 77, { graceMs: 0, deadlineMs: 1_000 }, {
+      listProcesses: async () => {
+        scans += 1;
+        if (scans === 3) now = 1_000;
+        return [];
+      },
+      coalitionForPid: vi.fn(),
+      processExists: vi.fn(),
+      signal: vi.fn(),
+      sleep: async () => {},
+      now: () => now
+    })).rejects.toThrow("MANAGED_PROCESS_CLEANUP_FAILED");
+    expect(scans).toBe(3);
   });
 
   it("signals only the exact coalition and requires stable stopped scans before kill", async () => {

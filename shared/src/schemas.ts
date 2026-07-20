@@ -5,6 +5,7 @@ import { moduleModes, projectRoles, projectUsages } from "./project-association.
 import { projectVersionStatuses } from "./project-version.js";
 
 export const prioritySchema = z.enum(["low", "medium", "high", "urgent"]);
+export const MAX_AUTOMATED_TEST_COMMANDS = 16;
 
 const nonEmptyIdSchema = z.string().trim().min(1);
 export const projectCategorySchema = z.string().trim().min(1);
@@ -17,7 +18,7 @@ export const projectInputSchema = z.object({
   name: z.string().trim().min(1),
   repoPath: z.string().trim().min(1),
   defaultBranch: z.string().trim().min(1),
-  allowedCommands: z.array(allowedCommandSchema),
+  allowedCommands: z.array(allowedCommandSchema).max(MAX_AUTOMATED_TEST_COMMANDS),
   sensitivePatterns: z.array(z.string()),
   category: projectCategorySchema.optional()
 });

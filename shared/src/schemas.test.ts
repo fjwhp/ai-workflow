@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_AUTOMATED_TEST_COMMANDS,
   productArtifactSchema,
   projectInputSchema,
   projectUpdateSchema,
@@ -281,6 +282,14 @@ describe("project schemas", () => {
       name: "Repository", repoPath: "/tmp/repository", defaultBranch: "main",
       allowedCommands: [{ command: "npm" }], sensitivePatterns: []
     }).allowedCommands).toEqual([{ command: "npm", argsPrefix: [] }]);
+  });
+
+  it("rejects more than sixteen frozen verification commands", () => {
+    expect(projectInputSchema.safeParse({
+      name: "Repository", repoPath: "/tmp/repository", defaultBranch: "main",
+      allowedCommands: Array.from({ length: MAX_AUTOMATED_TEST_COMMANDS + 1 }, (_, index) => ({ command: `verify-${index}` })),
+      sensitivePatterns: []
+    }).success).toBe(false);
   });
 
   it("rejects an empty project update", () => {

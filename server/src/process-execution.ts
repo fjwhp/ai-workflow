@@ -10,6 +10,7 @@ const PROCESS_LIST_BYTES = 8 * 1024 * 1024;
 const LAUNCHCTL_OUTPUT_BYTES = 1024 * 1024;
 const PROCESS_QUERY_TIMEOUT_MS = 1_000;
 const LAUNCHCTL_TIMEOUT_MS = 2_000;
+const MANAGED_PROCESS_CLEANUP_TIMEOUT_MS = 10_000;
 const POLL_MS = 10;
 
 export interface ManagedProcessOptions {
@@ -33,12 +34,12 @@ interface ManagedProcessDependencies {
   uid?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
-  listProcesses?: () => Promise<DarwinProcessRow[]>;
+  listProcesses?: (timeoutMs: number) => Promise<DarwinProcessRow[]>;
   launchctl?: Launchctl;
   coalitionDependencies?: DarwinCoalitionDependencies;
 }
 
-type Launchctl = (args: string[]) => Promise<{ stdout: string; stderr: string }>;
+type Launchctl = (args: string[], timeoutMs: number) => Promise<{ stdout: string; stderr: string }>;
 
 export interface DarwinProcessRow {
   pid: number;
@@ -51,9 +52,9 @@ export type DarwinPidCoalition =
   | { status: "exited" };
 
 interface DarwinCoalitionDependencies {
-  listProcesses: () => Promise<DarwinProcessRow[]>;
-  coalitionForPid: (row: DarwinProcessRow) => Promise<DarwinPidCoalition>;
-  processExists: (row: DarwinProcessRow) => Promise<boolean>;
+  listProcesses: (timeoutMs: number) => Promise<DarwinProcessRow[]>;
+  coalitionForPid: (row: DarwinProcessRow, timeoutMs: number) => Promise<DarwinPidCoalition>;
+  processExists: (row: DarwinProcessRow, timeoutMs: number) => Promise<boolean>;
   signal: (pid: number, signal: NodeJS.Signals) => void;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
@@ -91,9 +92,14 @@ export async function runManagedProcess(
   }
   const now = dependencies.now ?? Date.now;
   const sleep = dependencies.sleep ?? delay;
-  const listProcesses = dependencies.listProcesses ?? (() => listDarwinProcesses(uid));
+  const executionDeadline = now() + options.timeoutMs;
+  const executionRemaining = () => deadlineRemaining(
+    executionDeadline, now, "MANAGED_PROCESS_DEADLINE_EXCEEDED"
+  );
+  const listProcesses = dependencies.listProcesses ?? ((timeoutMs) => listDarwinProcesses(uid, timeoutMs));
   const launchctlCommand = dependencies.launchctl ?? defaultLaunchctl;
-  const baselineRows = await listProcesses();
+  const baselineRows = await listProcesses(executionRemaining());
+  executionRemaining();
   const baseline = new Map(baselineRows.map((row) => [row.pid, row.startedAt]));
   const controlRoot = await mkdtemp(join(tmpdir(), "ai-workflow-process-"));
   const label = `ai.workflow.process.${process.pid}.${randomUUID().replaceAll("-", "")}`;
@@ -101,12 +107,70 @@ export async function runManagedProcess(
   const plistPath = join(controlRoot, "job.plist");
   const stdoutPath = join(controlRoot, "stdout");
   const stderrPath = join(controlRoot, "stderr");
-  const executionDeadline = now() + options.timeoutMs;
-  let bootstrapped = false;
+  let jobMayExist = false;
+  let cleanupAttempted = false;
   let coalitionId: number | undefined;
   let result: ManagedProcessResult | undefined;
   let primaryError: unknown;
   let cleanupError: unknown;
+
+  const cleanupManagedJob = async () => {
+    if (!jobMayExist || cleanupAttempted) return;
+    cleanupAttempted = true;
+    const cleanupDeadline = now() + MANAGED_PROCESS_CLEANUP_TIMEOUT_MS;
+    const cleanupRemaining = () => deadlineRemaining(
+      cleanupDeadline, now, "MANAGED_PROCESS_CLEANUP_FAILED"
+    );
+    const cleanupLaunchctl = async (values: string[]) => {
+      try {
+        const output = await launchctlCommand(values, cleanupRemaining());
+        cleanupRemaining();
+        return output;
+      } catch (error) {
+        cleanupRemaining();
+        throw error;
+      }
+    };
+    let containmentError: unknown;
+    let bootoutError: unknown;
+    if (coalitionId === undefined) {
+      try {
+        const serviceOutput = (await cleanupLaunchctl(["print", serviceTarget])).stdout;
+        const coalition = parseLaunchctlPidCoalition(serviceOutput);
+        if (coalition.status === "member") coalitionId = coalition.coalitionId;
+      } catch (error) {
+        if (launchctlServiceIsAbsent(error)) {
+          jobMayExist = false;
+          return;
+        }
+        containmentError = error instanceof Error && error.message === "MANAGED_PROCESS_CLEANUP_FAILED"
+          ? error
+          : new Error("MANAGED_PROCESS_CLEANUP_DISCOVERY_FAILED", { cause: error });
+      }
+    }
+    if (!containmentError && coalitionId !== undefined) {
+      try {
+        await terminateDarwinCoalition(
+          baseline,
+          coalitionId,
+          { graceMs: options.termGraceMs ?? 500, deadlineMs: cleanupRemaining() },
+          dependencies.coalitionDependencies
+            ?? defaultCoalitionDependencies(listProcesses, launchctlCommand, sleep, now)
+        );
+        coalitionId = undefined;
+      } catch (error) {
+        containmentError = error;
+      }
+    }
+    try {
+      await bootoutAndVerify(serviceTarget, cleanupLaunchctl);
+      jobMayExist = false;
+    } catch (error) {
+      bootoutError = error;
+    }
+    if (containmentError) throw containmentError;
+    if (bootoutError) throw bootoutError;
+  };
 
   try {
     await Promise.all([
@@ -116,33 +180,43 @@ export async function runManagedProcess(
         label, file, args, cwd: options.cwd, env: options.env, stdoutPath, stderrPath
       }), { mode: 0o600 })
     ]);
-    try {
-      await launchctlCommand(["bootstrap", `gui/${uid}`, plistPath]);
-      bootstrapped = true;
-    } catch (bootstrapError) {
-      try {
-        const serviceOutput = (await launchctlCommand(["print", serviceTarget])).stdout;
-        bootstrapped = true;
-        const coalition = parseLaunchctlPidCoalition(serviceOutput);
-        if (coalition.status === "member") coalitionId = coalition.coalitionId;
-      } catch (probeError) {
-        if (launchctlServiceIsAbsent(probeError)) throw bootstrapError;
-        bootstrapped = true;
-        throw new Error("MANAGED_PROCESS_BOOTSTRAP_STATE_UNKNOWN", { cause: probeError });
-      }
-      throw bootstrapError;
-    }
+    const bootstrapTimeoutMs = executionRemaining();
+    jobMayExist = true;
+    await launchctlCommand(["bootstrap", `gui/${uid}`, plistPath], bootstrapTimeoutMs);
 
     let exitCode = -1;
     let timedOut = false;
     let outputOverflow = false;
     while (true) {
-      const serviceOutput = (await launchctlCommand(["print", serviceTarget])).stdout;
+      if (now() >= executionDeadline) {
+        timedOut = true;
+        break;
+      }
+      let serviceOutput: string;
+      try {
+        serviceOutput = (await launchctlCommand(
+          ["print", serviceTarget], executionRemaining()
+        )).stdout;
+      } catch (error) {
+        if (now() >= executionDeadline || processCallTimedOut(error)) {
+          timedOut = true;
+          break;
+        }
+        throw error;
+      }
       const coalition = parseLaunchctlPidCoalition(serviceOutput);
       if (coalition.status !== "member") throw new Error("MANAGED_PROCESS_SERVICE_INVALID");
       coalitionId = coalition.coalitionId;
+      if (now() > executionDeadline) {
+        timedOut = true;
+        break;
+      }
       const service = parseLaunchctlService(serviceOutput);
       const sizes = await outputSizes(stdoutPath, stderrPath);
+      if (now() > executionDeadline) {
+        timedOut = true;
+        break;
+      }
       if (sizes.stdout + sizes.stderr > options.maxOutputBytes) {
         outputOverflow = true;
         break;
@@ -151,22 +225,10 @@ export async function runManagedProcess(
         exitCode = service.exitCode ?? -1;
         break;
       }
-      if (now() >= executionDeadline) {
-        timedOut = true;
-        break;
-      }
       await sleep(Math.min(POLL_MS, Math.max(0, executionDeadline - now())));
     }
 
-    if (coalitionId === undefined) throw new Error("MANAGED_PROCESS_COALITION_INVALID");
-    await terminateDarwinCoalition(
-      baseline,
-      coalitionId,
-      { graceMs: options.termGraceMs ?? 500, deadlineMs: Math.max(2_000, (options.termGraceMs ?? 500) + 1_000) },
-      dependencies.coalitionDependencies
-        ?? defaultCoalitionDependencies(listProcesses, launchctlCommand, sleep, now)
-    );
-    coalitionId = undefined;
+    await cleanupManagedJob();
     const finalSizes = await outputSizes(stdoutPath, stderrPath);
     outputOverflow ||= finalSizes.stdout + finalSizes.stderr > options.maxOutputBytes;
     const output = await readCappedOutput(stdoutPath, stderrPath, options.maxOutputBytes);
@@ -174,24 +236,11 @@ export async function runManagedProcess(
   } catch (error) {
     primaryError = error;
   } finally {
-    if (coalitionId !== undefined) {
+    if (jobMayExist && !cleanupAttempted) {
       try {
-        await terminateDarwinCoalition(
-          baseline,
-          coalitionId,
-          { graceMs: options.termGraceMs ?? 500, deadlineMs: Math.max(2_000, (options.termGraceMs ?? 500) + 1_000) },
-          dependencies.coalitionDependencies
-            ?? defaultCoalitionDependencies(listProcesses, launchctlCommand, sleep, now)
-        );
+        await cleanupManagedJob();
       } catch (error) {
         cleanupError = error;
-      }
-    }
-    if (bootstrapped) {
-      try {
-        await bootoutAndVerify(serviceTarget, launchctlCommand);
-      } catch (error) {
-        cleanupError ??= error;
       }
     }
     try {
@@ -299,18 +348,22 @@ export async function terminateDarwinCoalition(
   dependencies: DarwinCoalitionDependencies
 ) {
   const deadline = dependencies.now() + options.deadlineMs;
-  const assertBeforeDeadline = () => {
-    if (dependencies.now() > deadline) throw new Error("MANAGED_PROCESS_CLEANUP_FAILED");
-  };
+  const remaining = () => deadlineRemaining(
+    deadline, dependencies.now, "MANAGED_PROCESS_CLEANUP_FAILED"
+  );
   const members = async () => {
-    assertBeforeDeadline();
     const matched: DarwinProcessRow[] = [];
-    for (const row of darwinProcessCandidates(baseline, await dependencies.listProcesses())) {
+    const rows = await dependencies.listProcesses(remaining());
+    remaining();
+    for (const row of darwinProcessCandidates(baseline, rows)) {
       let membership: DarwinPidCoalition;
       try {
-        membership = await dependencies.coalitionForPid(row);
+        membership = await dependencies.coalitionForPid(row, remaining());
+        remaining();
       } catch (error) {
-        if (!(await dependencies.processExists(row))) continue;
+        const exists = await dependencies.processExists(row, remaining());
+        remaining();
+        if (!exists) continue;
         throw new Error("MANAGED_PROCESS_COALITION_QUERY_FAILED", { cause: error });
       }
       if (membership.status === "member" && membership.coalitionId === coalitionId) matched.push(row);
@@ -319,7 +372,9 @@ export async function terminateDarwinCoalition(
   };
   const signal = async (rows: DarwinProcessRow[], value: NodeJS.Signals) => {
     for (const row of rows) {
-      if (!(await dependencies.processExists(row))) continue;
+      const exists = await dependencies.processExists(row, remaining());
+      remaining();
+      if (!exists) continue;
       try {
         dependencies.signal(row.pid, value);
       } catch (error) {
@@ -329,18 +384,18 @@ export async function terminateDarwinCoalition(
   };
 
   await signal(await members(), "SIGTERM");
-  if (options.graceMs > 0) await dependencies.sleep(options.graceMs);
+  if (options.graceMs > 0) await dependencies.sleep(Math.min(options.graceMs, remaining()));
 
   let stableStoppedScans = 0;
   let priorStoppedSet = "";
   let zeroScans = 0;
   while (true) {
-    assertBeforeDeadline();
+    remaining();
     const current = await members();
     if (current.length === 0) {
       zeroScans += 1;
       if (zeroScans >= 2) return;
-      await dependencies.sleep(POLL_MS);
+      await dependencies.sleep(Math.min(POLL_MS, remaining()));
       continue;
     }
     zeroScans = 0;
@@ -355,15 +410,15 @@ export async function terminateDarwinCoalition(
       stableStoppedScans = 0;
       priorStoppedSet = "";
     }
-    await dependencies.sleep(POLL_MS);
+    await dependencies.sleep(Math.min(POLL_MS, remaining()));
   }
 }
 
-async function listDarwinProcesses(uid: number) {
+async function listDarwinProcesses(uid: number, timeoutMs: number) {
   try {
     const output = await execFileAsync("/bin/ps", ["-axo", "uid=,pid=,stat=,lstart="], {
       encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, maxBuffer: PROCESS_LIST_BYTES,
-      timeout: PROCESS_QUERY_TIMEOUT_MS
+      timeout: Math.min(PROCESS_QUERY_TIMEOUT_MS, timeoutMs)
     });
     return parseDarwinProcessRows(output.stdout, uid);
   } catch (error) {
@@ -373,17 +428,17 @@ async function listDarwinProcesses(uid: number) {
 }
 
 function defaultCoalitionDependencies(
-  listProcesses: () => Promise<DarwinProcessRow[]>,
+  listProcesses: (timeoutMs: number) => Promise<DarwinProcessRow[]>,
   launchctlCommand: Launchctl,
   sleep: (ms: number) => Promise<void>,
   now: () => number
 ): DarwinCoalitionDependencies {
   return {
     listProcesses,
-    coalitionForPid: async (row) => parseLaunchctlPidCoalition(
-      (await launchctlCommand(["print", `pid/${row.pid}`])).stdout
+    coalitionForPid: async (row, timeoutMs) => parseLaunchctlPidCoalition(
+      (await launchctlCommand(["print", `pid/${row.pid}`], timeoutMs)).stdout
     ),
-    processExists: async (row) => (await listProcesses())
+    processExists: async (row, timeoutMs) => (await listProcesses(timeoutMs))
       .some((current) => current.pid === row.pid && current.startedAt === row.startedAt),
     signal: (pid, value) => process.kill(pid, value),
     sleep,
@@ -391,14 +446,17 @@ function defaultCoalitionDependencies(
   };
 }
 
-async function defaultLaunchctl(args: string[]) {
+async function defaultLaunchctl(args: string[], timeoutMs: number) {
   return execFileAsync("/bin/launchctl", args, {
     encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, maxBuffer: LAUNCHCTL_OUTPUT_BYTES,
-    timeout: LAUNCHCTL_TIMEOUT_MS
+    timeout: Math.min(LAUNCHCTL_TIMEOUT_MS, timeoutMs)
   });
 }
 
-async function bootoutAndVerify(serviceTarget: string, launchctlCommand: Launchctl) {
+async function bootoutAndVerify(
+  serviceTarget: string,
+  launchctlCommand: (args: string[]) => Promise<{ stdout: string; stderr: string }>
+) {
   try {
     await launchctlCommand(["bootout", "--wait", serviceTarget]);
   } catch (error) {
@@ -409,7 +467,10 @@ async function bootoutAndVerify(serviceTarget: string, launchctlCommand: Launchc
   await requireLaunchctlServiceAbsent(serviceTarget, launchctlCommand);
 }
 
-async function requireLaunchctlServiceAbsent(serviceTarget: string, launchctlCommand: Launchctl) {
+async function requireLaunchctlServiceAbsent(
+  serviceTarget: string,
+  launchctlCommand: (args: string[]) => Promise<{ stdout: string; stderr: string }>
+) {
   try {
     await launchctlCommand(["print", serviceTarget]);
   } catch (error) {
@@ -426,6 +487,16 @@ function launchctlErrorText(error: unknown) {
 
 function launchctlServiceIsAbsent(error: unknown) {
   return launchctlErrorText(error).includes("Could not find service");
+}
+
+function processCallTimedOut(error: unknown) {
+  return (error as { killed?: unknown }).killed === true;
+}
+
+function deadlineRemaining(deadline: number, now: () => number, errorCode: string) {
+  const remaining = Math.ceil(deadline - now());
+  if (remaining <= 0) throw new Error(errorCode);
+  return remaining;
 }
 
 async function outputSizes(stdoutPath: string, stderrPath: string) {

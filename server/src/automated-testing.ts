@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { access, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { MAX_AUTOMATED_TEST_COMMANDS } from "@ai-workflow/shared";
 import { materializeEvidenceManifest, type EvidenceManifest } from "./evidence-tree.js";
 import { redactSensitive } from "./redaction.js";
 import { runManagedProcess } from "./process-execution.js";
@@ -14,6 +15,9 @@ export interface FrozenCommand { command: string; argsPrefix?: string[] }
 export interface VerificationCommand { id: string; command: string; args: string[] }
 
 export function buildVerificationPlan(commands: FrozenCommand[], acceptanceCriteria: string[]) {
+  if (commands.length > MAX_AUTOMATED_TEST_COMMANDS) {
+    throw new Error("AUTOMATED_TEST_COMMANDS_LIMIT_EXCEEDED");
+  }
   const planned = commands.map((rule, index) => {
     validateCommand(rule);
     return { id: `verify-${index + 1}`, command: rule.command, args: [...(rule.argsPrefix ?? [])] };
@@ -102,6 +106,7 @@ export interface CommandResult {
   stderr: string;
   timedOut: boolean;
   outputOverflow: boolean;
+  error?: string;
 }
 
 export interface AutomatedTestingResult {
@@ -115,23 +120,38 @@ export interface AutomatedTestingDependencies {
   platform?: NodeJS.Platform;
   sandboxExecutableAvailable?: () => Promise<boolean>;
   execFile?: (file: string, args: string[], options: Record<string, unknown>) => Promise<{ stdout?: unknown; stderr?: unknown }>;
+  runManagedProcess?: typeof runManagedProcess;
+  now?: () => number;
 }
 
 export async function runAutomatedTesting(
   input: AutomatedTestingInput,
   dependencies: AutomatedTestingDependencies = {}
 ): Promise<AutomatedTestingResult> {
+  const now = dependencies.now ?? Date.now;
+  const deadline = now() + COMMAND_TIMEOUT_MS;
+  let plan: ReturnType<typeof buildVerificationPlan>;
+  try {
+    plan = buildVerificationPlan(input.allowedCommands, input.acceptanceCriteria);
+  } catch (error) {
+    if (error instanceof Error && error.message === "AUTOMATED_TEST_COMMANDS_LIMIT_EXCEEDED") {
+      return {
+        result: "failed", error: error.message, commandResults: [], acceptanceTrace: []
+      };
+    }
+    throw error;
+  }
   if ((dependencies.platform ?? process.platform) !== "darwin"
     || !(await (dependencies.sandboxExecutableAvailable ?? defaultSandboxAvailable)())) {
     return { result: "failed", error: "AUTOMATED_TEST_SANDBOX_UNAVAILABLE", commandResults: [], acceptanceTrace: [] };
   }
-  const plan = buildVerificationPlan(input.allowedCommands, input.acceptanceCriteria);
   if (plan.commands.length === 0) {
     return {
       result: "failed", error: "AUTOMATED_TEST_COMMANDS_UNAVAILABLE", commandResults: [],
       acceptanceTrace: plan.acceptanceTrace.map((trace) => ({ ...trace, passed: false }))
     };
   }
+  if (now() >= deadline) return automatedDeadlineResult(plan);
   const parent = await mkdtemp(join(tmpdir(), "ai-workflow-verification-"));
   const verificationRoot = join(parent, "worktree");
   try {
@@ -149,13 +169,16 @@ export async function runAutomatedTesting(
       }
       throw error;
     }
+    if (now() >= deadline) return automatedDeadlineResult(plan);
     const home = join(parent, "home");
     const temporaryDirectory = join(parent, "tmp");
     await mkdir(home, { recursive: true });
     await mkdir(temporaryDirectory, { recursive: true });
+    if (now() >= deadline) return automatedDeadlineResult(plan);
     const [canonicalParent, canonicalTargetWorktree, canonicalGitCommonDir] = await Promise.all([
       realpath(parent), realpath(input.targetWorktree), realpath(input.gitCommonDir)
     ]);
+    if (now() >= deadline) return automatedDeadlineResult(plan);
     const profile = buildSandboxProfile({
       verificationRoot: canonicalParent,
       targetWorktree: canonicalTargetWorktree,
@@ -163,19 +186,47 @@ export async function runAutomatedTesting(
     });
     const env = sanitizedVerificationEnvironment(home, temporaryDirectory);
     const commandResults: CommandResult[] = [];
-    const deadline = Date.now() + COMMAND_TIMEOUT_MS;
-    for (const command of plan.commands) {
+    let deadlineExceeded = false;
+    for (let index = 0; index < plan.commands.length; index += 1) {
+      const command = plan.commands[index]!;
+      const remaining = deadline - now();
+      if (remaining <= 0) {
+        deadlineExceeded = true;
+        commandResults.push(...plan.commands.slice(index).map(deadlineCommandResult));
+        break;
+      }
       if (!dependencies.execFile) {
-        const output = await runManagedProcess(SANDBOX_EXEC, ["-p", profile, command.command, ...command.args], {
-          cwd: join(canonicalParent, "worktree"), env,
-          timeoutMs: Math.max(1, deadline - Date.now()), maxOutputBytes: COMMAND_OUTPUT_BYTES
-        });
-        commandResults.push({
+        let output: Awaited<ReturnType<typeof runManagedProcess>>;
+        try {
+          output = await (dependencies.runManagedProcess ?? runManagedProcess)(
+            SANDBOX_EXEC, ["-p", profile, command.command, ...command.args], {
+              cwd: join(canonicalParent, "worktree"), env,
+              timeoutMs: remaining, maxOutputBytes: COMMAND_OUTPUT_BYTES
+            }
+          );
+        } catch (error) {
+          if (error instanceof Error && error.message === "MANAGED_PROCESS_DEADLINE_EXCEEDED") {
+            deadlineExceeded = true;
+            commandResults.push(...plan.commands.slice(index).map(deadlineCommandResult));
+            break;
+          }
+          throw error;
+        }
+        const result: CommandResult = {
           ...command, exitCode: output.exitCode,
           stdout: redactSensitive(output.stdout, input.sensitivePatterns),
           stderr: redactSensitive(output.stderr, input.sensitivePatterns),
           timedOut: output.timedOut, outputOverflow: output.outputOverflow
-        });
+        };
+        if (output.timedOut || now() > deadline) {
+          deadlineExceeded = true;
+          commandResults.push({
+            ...result, exitCode: -1, timedOut: true, error: "AUTOMATED_TEST_DEADLINE_EXCEEDED"
+          });
+          commandResults.push(...plan.commands.slice(index + 1).map(deadlineCommandResult));
+          break;
+        }
+        commandResults.push(result);
         continue;
       }
       try {
@@ -183,36 +234,69 @@ export async function runAutomatedTesting(
           cwd: join(canonicalParent, "worktree"),
           env,
           shell: false,
-          timeout: COMMAND_TIMEOUT_MS,
+          timeout: remaining,
           maxBuffer: COMMAND_OUTPUT_BYTES,
           windowsHide: true
         });
-        commandResults.push({
+        const result: CommandResult = {
           ...command, exitCode: 0,
           stdout: redactSensitive(String(output.stdout ?? ""), input.sensitivePatterns),
           stderr: redactSensitive(String(output.stderr ?? ""), input.sensitivePatterns),
           timedOut: false, outputOverflow: false
-        });
+        };
+        if (now() > deadline) {
+          deadlineExceeded = true;
+          commandResults.push({
+            ...result, exitCode: -1, timedOut: true, error: "AUTOMATED_TEST_DEADLINE_EXCEEDED"
+          });
+          commandResults.push(...plan.commands.slice(index + 1).map(deadlineCommandResult));
+          break;
+        }
+        commandResults.push(result);
       } catch (error) {
         const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown; killed?: unknown; signal?: unknown };
+        const timedOut = failure.killed === true || failure.signal === "SIGTERM";
         commandResults.push({
           ...command,
           exitCode: typeof failure.code === "number" ? failure.code : -1,
           stdout: redactSensitive(String(failure.stdout ?? ""), input.sensitivePatterns),
           stderr: redactSensitive(String(failure.stderr ?? ""), input.sensitivePatterns),
-          timedOut: failure.killed === true || failure.signal === "SIGTERM", outputOverflow: false
+          timedOut, outputOverflow: false,
+          ...(timedOut ? { error: "AUTOMATED_TEST_DEADLINE_EXCEEDED" } : {})
         });
+        if (timedOut) {
+          deadlineExceeded = true;
+          commandResults.push(...plan.commands.slice(index + 1).map(deadlineCommandResult));
+          break;
+        }
       }
     }
-    const passed = commandResults.every((result) => result.exitCode === 0 && !result.timedOut && !result.outputOverflow);
+    const passed = !deadlineExceeded
+      && commandResults.every((result) => result.exitCode === 0 && !result.timedOut && !result.outputOverflow);
     return {
       result: passed ? "passed" : "failed",
+      ...(deadlineExceeded ? { error: "AUTOMATED_TEST_DEADLINE_EXCEEDED" } : {}),
       commandResults,
       acceptanceTrace: plan.acceptanceTrace.map((trace) => ({ ...trace, passed }))
     };
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
+}
+
+function deadlineCommandResult(command: VerificationCommand): CommandResult {
+  return {
+    ...command, exitCode: -1, stdout: "", stderr: "", timedOut: true, outputOverflow: false,
+    error: "AUTOMATED_TEST_DEADLINE_EXCEEDED"
+  };
+}
+
+function automatedDeadlineResult(plan: ReturnType<typeof buildVerificationPlan>): AutomatedTestingResult {
+  return {
+    result: "failed", error: "AUTOMATED_TEST_DEADLINE_EXCEEDED",
+    commandResults: plan.commands.map(deadlineCommandResult),
+    acceptanceTrace: plan.acceptanceTrace.map((trace) => ({ ...trace, passed: false }))
+  };
 }
 
 async function defaultSandboxAvailable() {

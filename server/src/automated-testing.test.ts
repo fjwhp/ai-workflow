@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { MAX_AUTOMATED_TEST_COMMANDS } from "@ai-workflow/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildSandboxProfile,
@@ -35,6 +36,14 @@ function initializeSource(source: string) {
 
 async function frozenSource(source: string) {
   return { sourceManifest: (await getWorktreeSnapshot(source)).manifest, sensitivePatterns: [] as string[] };
+}
+
+function automatedInput(target: string, allowedCommands: AutomatedTestingInput["allowedCommands"]): AutomatedTestingInput {
+  return {
+    sourceManifest: { version: 1, entries: [] }, sensitivePatterns: [],
+    targetWorktree: target, gitCommonDir: join(target, ".git"), allowedCommands,
+    acceptanceCriteria: ["all frozen commands finish before the deadline"], untrustedEvidence
+  };
 }
 
 function initializeTarget() {
@@ -113,6 +122,101 @@ describe("automated testing safety", () => {
     ]);
   });
 
+  it("rejects an oversized frozen verification plan instead of truncating it", () => {
+    expect(() => buildVerificationPlan(
+      Array.from({ length: MAX_AUTOMATED_TEST_COMMANDS + 1 }, (_, index) => ({ command: `verify-${index}` })),
+      ["bounded plan"]
+    )).toThrow("AUTOMATED_TEST_COMMANDS_LIMIT_EXCEEDED");
+  });
+
+  it("rejects oversized fresh input before checking sandbox availability", async () => {
+    const sandboxExecutableAvailable = vi.fn(async () => true);
+    await expect(runAutomatedTesting({
+      ...automatedInput("/tmp/not-used", Array.from(
+        { length: MAX_AUTOMATED_TEST_COMMANDS + 1 },
+        (_, index) => ({ command: `verify-${index}` })
+      ))
+    }, { platform: "linux", sandboxExecutableAvailable })).resolves.toMatchObject({
+      result: "failed", error: "AUTOMATED_TEST_COMMANDS_LIMIT_EXCEEDED", commandResults: [], acceptanceTrace: []
+    });
+    expect(sandboxExecutableAvailable).not.toHaveBeenCalled();
+  });
+
+  it("does not start a second command after the single plan deadline", async () => {
+    const target = initializeTarget();
+    let now = 0;
+    const execFile = vi.fn(async () => {
+      now = Number.MAX_SAFE_INTEGER;
+      return { stdout: "first complete", stderr: "" };
+    });
+
+    const result = await runAutomatedTesting(automatedInput(target, [
+      { command: "first", argsPrefix: [] }, { command: "second", argsPrefix: [] }
+    ]), {
+      platform: "darwin", sandboxExecutableAvailable: async () => true, execFile, now: () => now
+    } as any);
+
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      result: "failed", error: "AUTOMATED_TEST_DEADLINE_EXCEEDED",
+      commandResults: [
+        {
+          id: "verify-1", command: "first", exitCode: -1, timedOut: true,
+          error: "AUTOMATED_TEST_DEADLINE_EXCEEDED"
+        },
+        {
+          id: "verify-2", command: "second", exitCode: -1, timedOut: true,
+          error: "AUTOMATED_TEST_DEADLINE_EXCEEDED"
+        }
+      ],
+      acceptanceTrace: [{ criterion: "all frozen commands finish before the deadline", passed: false }]
+    });
+  });
+
+  it("does not start the first command when entry work consumes the deadline", async () => {
+    const target = initializeTarget();
+    const execFile = vi.fn();
+    let reads = 0;
+    const now = () => reads++ === 0 ? 0 : Number.MAX_SAFE_INTEGER;
+
+    const result = await runAutomatedTesting(automatedInput(target, [{ command: "first" }]), {
+      platform: "darwin", sandboxExecutableAvailable: async () => true, execFile, now
+    } as any);
+
+    expect(execFile).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      result: "failed", error: "AUTOMATED_TEST_DEADLINE_EXCEEDED",
+      commandResults: [{
+        id: "verify-1", command: "first", exitCode: -1, timedOut: true,
+        error: "AUTOMATED_TEST_DEADLINE_EXCEEDED"
+      }]
+    });
+  });
+
+  it("records current and remaining commands when process setup consumes the deadline", async () => {
+    const target = initializeTarget();
+    const runProcess = vi.fn(async () => {
+      throw new Error("MANAGED_PROCESS_DEADLINE_EXCEEDED");
+    });
+
+    const result = await runAutomatedTesting(automatedInput(target, [
+      { command: "first" }, { command: "second" }
+    ]), {
+      platform: "darwin", sandboxExecutableAvailable: async () => true,
+      runManagedProcess: runProcess
+    });
+
+    expect(runProcess).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      result: "failed", error: "AUTOMATED_TEST_DEADLINE_EXCEEDED",
+      commandResults: [
+        { id: "verify-1", exitCode: -1, timedOut: true, error: "AUTOMATED_TEST_DEADLINE_EXCEEDED" },
+        { id: "verify-2", exitCode: -1, timedOut: true, error: "AUTOMATED_TEST_DEADLINE_EXCEEDED" }
+      ],
+      acceptanceTrace: [{ passed: false }]
+    });
+  });
+
   it("denies network and writes to real worktree and Git metadata", () => {
     const profile = buildSandboxProfile({
       verificationRoot: "/tmp/verify", targetWorktree: "/repo/worktree", gitCommonDir: "/repo/.git"
@@ -171,7 +275,9 @@ describe("automated testing safety", () => {
     });
     const command = calls.find((call) => call.file === "/usr/bin/sandbox-exec")!;
     expect(command.args.slice(-2)).toEqual(["npm", "test"]);
-    expect(command.options).toMatchObject({ shell: false, timeout: 300_000, maxBuffer: 1_048_576 });
+    expect(command.options).toMatchObject({ shell: false, timeout: expect.any(Number), maxBuffer: 1_048_576 });
+    expect(command.options.timeout).toBeGreaterThan(0);
+    expect(command.options.timeout).toBeLessThanOrEqual(300_000);
     expect(command.options.cwd).not.toBe(source);
     expect(command.options.cwd).not.toBe(target);
   });
