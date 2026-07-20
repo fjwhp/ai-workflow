@@ -12,6 +12,10 @@ import {
   type DeliveryPlanResult,
   type DeliveryUnitPersistence
 } from "./delivery-unit-repository.js";
+import {
+  AutomationJobRepository,
+  type AutomationJobPersistence
+} from "./automation-job-repository.js";
 
 export type RequirementProjectWithVersionMetadata = RequirementProject & {
   projectVersionWorktreePath?: string;
@@ -73,18 +77,31 @@ export class WorkflowStore {
   private db: DatabaseSync;
   private readonly deliveryUnitRepository: DeliveryUnitRepository;
   public readonly deliveryUnits: DeliveryUnitPersistence;
+  public readonly automationJobs: AutomationJobPersistence;
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     createPhase2Schema(this.db);
     this.deliveryUnitRepository = new DeliveryUnitRepository(this.db);
+    const automationJobRepository = new AutomationJobRepository(this.db);
     this.deliveryUnits = {
       createPlan: (input) => this.withImmediateTransaction(
         () => this.deliveryUnitRepository.createPlanInTransaction(input)
       ),
       listForRequirement: (requirementId) => this.deliveryUnitRepository.listForRequirement(requirementId),
       listDependencies: (requirementId) => this.deliveryUnitRepository.listDependencies(requirementId)
+    };
+    this.automationJobs = {
+      enqueue: (input) => automationJobRepository.enqueue(input),
+      leaseNext: (workerId, now, leaseMs) => automationJobRepository.leaseNext(workerId, now, leaseMs),
+      renew: (jobId, workerId, now, leaseMs) => automationJobRepository.renew(jobId, workerId, now, leaseMs),
+      complete: (jobId, workerId) => automationJobRepository.complete(jobId, workerId),
+      fail: (jobId, workerId, error, retryable) => automationJobRepository.fail(jobId, workerId, error, retryable),
+      cancelByOwnerVersion: (ownerId, evidenceVersion) => automationJobRepository.cancelByOwnerVersion(ownerId, evidenceVersion),
+      recoverExpired: (now) => automationJobRepository.recoverExpired(now),
+      get: (jobId) => automationJobRepository.get(jobId),
+      listPending: () => automationJobRepository.listPending()
     };
   }
 

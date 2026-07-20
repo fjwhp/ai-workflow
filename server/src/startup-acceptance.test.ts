@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 describe("real server startup acceptance", () => {
-  it("backs up the deployed v2 schema before creating the Phase 2 foundation schema", { timeout: 15_000 }, async () => {
+  it("backs up deployed foundation v3 before creating the automation schema", { timeout: 15_000 }, async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "workflow-startup-acceptance-"));
     tempDirectories.push(dataDir);
     const databasePath = join(dataDir, "workflow.db");
@@ -30,6 +30,12 @@ describe("real server startup acceptance", () => {
       CREATE TABLE approvals (id TEXT PRIMARY KEY, override_json TEXT);
       CREATE TABLE integration_runs (id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, status TEXT NOT NULL);
       CREATE UNIQUE INDEX idx_integration_runs_active ON integration_runs(requirement_id) WHERE status = 'running';
+      CREATE TABLE automation_jobs (
+        id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, owner_type TEXT NOT NULL,
+        owner_id TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL,
+        lease_owner TEXT, lease_expires_at TEXT, payload_json TEXT NOT NULL, last_error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
       INSERT INTO project_versions VALUES (
         'version-old', 'project-old', 'v2', 'feature/v2', 'main', '/tmp/old-v2', 'active', 'abc123',
         'requirement-old', 'run-old', '2026-07-19T00:00:00.000Z', '2026-07-19T00:00:00.000Z', NULL
@@ -38,7 +44,7 @@ describe("real server startup acceptance", () => {
       INSERT INTO integration_runs VALUES ('run-old', 'requirement-old', 'running');
     `);
     oldDatabase.close();
-    await writeFile(`${databasePath}.schema-version`, "phase-2-five-stage-v2");
+    await writeFile(`${databasePath}.schema-version`, "phase-2-foundation-v3");
     const stdout = boundedLogs();
     const allLogs = boundedLogs();
     const child = spawn(process.execPath, [resolve("node_modules/tsx/dist/cli.mjs"), resolve("server/src/index.ts")], {
@@ -66,6 +72,7 @@ describe("real server startup acceptance", () => {
       expect(columns(live, "approvals")).not.toContain(["override", "json"].join("_"));
       expect(object(live, "table", ["integration", "runs"].join("_"))).toBeUndefined();
       expect(object(live, "index", ["idx", "integration", "runs", "active"].join("_"))).toBeUndefined();
+      expect(columns(live, "automation_jobs")).toEqual(expect.arrayContaining(["evidence_version", "max_attempts"]));
       live.close();
       const backupNames = (await readdir(dataDir)).filter((name) => /^workflow\.db\.backup-\d{4}-\d{2}-\d{2}T/.test(name) && !name.endsWith("-wal") && !name.endsWith("-shm"));
       expect(backupNames).toHaveLength(1);
@@ -76,8 +83,9 @@ describe("real server startup acceptance", () => {
       expect(columns(backup, "approvals")).toContain(["override", "json"].join("_"));
       expect(object(backup, "table", ["integration", "runs"].join("_"))).toBeDefined();
       expect(object(backup, "index", ["idx", "integration", "runs", "active"].join("_"))).toBeDefined();
+      expect(columns(backup, "automation_jobs")).not.toContain("evidence_version");
       backup.close();
-      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-foundation-v3");
+      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-automation-v1");
     } finally {
       await stopChild(child);
     }

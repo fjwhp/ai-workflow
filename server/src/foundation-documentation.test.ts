@@ -7,9 +7,9 @@ describe("Phase 2 foundation documentation contract", () => {
   const documentationFiles = ["README.md", "docs/states-and-gates.md", "docs/workflow-sop.md", "docs/getting-started.md"];
   const documentation = documentationFiles.map((file) => readFileSync(join(root, file), "utf8")).join("\n");
 
-  it("documents the v3 fresh reset and the staged delivery roadmap", () => {
+  it("documents the automation fresh reset and the staged delivery roadmap", () => {
     for (const file of documentationFiles) {
-      expect(readFileSync(join(root, file), "utf8"), file).toContain("phase-2-foundation-v3");
+      expect(readFileSync(join(root, file), "utf8"), file).toContain("phase-2-automation-v1");
     }
     expect(documentation).toContain("definition");
     expect(documentation).toContain("solution_design");

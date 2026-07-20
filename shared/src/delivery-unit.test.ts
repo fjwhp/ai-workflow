@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { validateDeliveryGraph } from "./delivery-unit.js";
+import { automationActions, validateDeliveryGraph, type AutomationAction } from "./delivery-unit.js";
+
+describe("automation action contract", () => {
+  it("exposes only the planned delivery execution actions", () => {
+    const actions: readonly AutomationAction[] = automationActions;
+    expect(actions).toEqual(["implement", "review", "test", "apply"]);
+  });
+});
 
 describe("validateDeliveryGraph", () => {
   it("orders an acyclic backend-to-frontend graph", () => {

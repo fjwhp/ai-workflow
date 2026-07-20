@@ -7,6 +7,9 @@ export const deliveryUnitStatuses = [
 ] as const;
 
 export const deliveryReleaseConditions = ["automated_testing_passed"] as const;
+export const automationActions = ["implement", "review", "test", "apply"] as const;
+
+export type AutomationAction = typeof automationActions[number];
 
 export type DeliveryDependencyInput = {
   upstreamProjectId: string;

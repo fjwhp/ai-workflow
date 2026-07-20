@@ -18,7 +18,7 @@ npm run dev
 
 ## 首次启动 v3
 
-当前 schema marker 是 `phase-2-foundation-v3`。升级前停止所有服务，并确认没有正在运行的任务。首次以本版本打开 v2 或其他旧 live 数据目录时：
+当前 schema marker 是 `phase-2-automation-v1`。升级前停止所有服务，并确认没有正在运行的任务。首次以本版本打开 `phase-2-foundation-v3` 或其他旧 live 数据目录时：
 
 1. 服务复制旧 SQLite 主文件以及当时存在的 WAL/SHM，形成同一时间戳的备份集。
 2. 只有备份集全部写入成功后，服务才移走旧 live 文件。

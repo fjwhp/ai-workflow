@@ -127,12 +127,20 @@ function insertAutomationJob(db: DatabaseSync, input: {
   attempt?: number;
   leaseOwner?: string | null;
   leaseExpiresAt?: string | null;
+  action?: string;
+  evidenceVersion?: number;
+  maxAttempts?: number;
+  lastError?: string | null;
+  payloadJson?: string;
 }) {
   db.prepare(`INSERT INTO automation_jobs
-    (id, dedupe_key, owner_type, owner_id, action, status, attempt, lease_owner, lease_expires_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, 'run', ?, ?, ?, ?, '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.000Z')`)
-    .run(input.id, `dedupe-${input.id}`, input.ownerType ?? "requirement", input.ownerId ?? "r1", input.status ?? "pending",
-      input.attempt ?? 0, input.leaseOwner ?? null, input.leaseExpiresAt ?? null);
+    (id, dedupe_key, owner_type, owner_id, evidence_version, action, status, attempt, max_attempts,
+      lease_owner, lease_expires_at, payload_json, last_error, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.000Z')`)
+    .run(input.id, `dedupe-${input.id}`, input.ownerType ?? "requirement", input.ownerId ?? "r1",
+      input.evidenceVersion ?? 1, input.action ?? "implement", input.status ?? "pending",
+      input.attempt ?? 0, input.maxAttempts ?? 3, input.leaseOwner ?? null, input.leaseExpiresAt ?? null,
+      input.payloadJson ?? "{}", input.lastError ?? null);
 }
 
 describe("Phase 2 database schema", () => {
@@ -167,7 +175,9 @@ describe("Phase 2 database schema", () => {
       expect(tableSql(db, "delivery_units")).toContain(`'${status}'`);
     }
     expect(tableSql(db, "automation_jobs")).toMatch(/owner_type TEXT NOT NULL CHECK\s*\(owner_type IN \('requirement', 'delivery_unit'\)\)/i);
+    expect(tableSql(db, "automation_jobs")).toMatch(/action TEXT NOT NULL CHECK\s*\(action IN \('implement', 'review', 'test', 'apply'\)\)/i);
     expect(tableSql(db, "automation_jobs")).toMatch(/status TEXT NOT NULL CHECK\s*\(status IN \('pending', 'leased', 'completed', 'failed', 'canceled'\)\)/i);
+    expect(columns(db, "automation_jobs")).toEqual(expect.arrayContaining(["evidence_version", "max_attempts"]));
     db.close();
   });
 
@@ -258,6 +268,10 @@ describe("Phase 2 database schema", () => {
     insertRequirement(db);
 
     expect(() => insertAutomationJob(db, { id: "job-negative", attempt: -1 })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "job-invalid-action", action: "invented" })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "job-invalid-evidence", evidenceVersion: 0 })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "job-invalid-max", maxAttempts: 0 })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "job-attempt-cap", attempt: 4, maxAttempts: 3 })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-leased-empty", status: "leased" })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-half-lease", leaseOwner: "worker-1" })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-half-expiry", leaseExpiresAt: "2026-07-20T00:05:00.000Z" })).toThrow(/CHECK constraint failed/);
@@ -266,7 +280,13 @@ describe("Phase 2 database schema", () => {
     })).not.toThrow();
     expect(() => insertAutomationJob(db, {
       id: "job-pending-leased", leaseOwner: "worker-1", leaseExpiresAt: "2026-07-20T00:05:00.000Z"
-    })).not.toThrow();
+    })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "", lastError: "failure" })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, { id: "job-long-error", lastError: "x".repeat(4097) }))
+      .toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, {
+      id: "job-multibyte-payload", payloadJson: JSON.stringify({ value: "界".repeat(22_000) })
+    })).toThrow(/CHECK constraint failed/);
     db.close();
   });
 

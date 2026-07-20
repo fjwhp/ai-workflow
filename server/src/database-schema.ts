@@ -177,24 +177,27 @@ export function createPhase2Schema(db: DatabaseSync) {
       key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS automation_jobs (
-      id TEXT PRIMARY KEY,
-      dedupe_key TEXT NOT NULL,
+      id TEXT PRIMARY KEY CHECK(length(id) BETWEEN 1 AND 256),
+      dedupe_key TEXT NOT NULL CHECK(length(dedupe_key) BETWEEN 1 AND 512),
       owner_type TEXT NOT NULL CHECK(owner_type IN ('requirement', 'delivery_unit')),
-      owner_id TEXT NOT NULL,
-      action TEXT NOT NULL,
+      owner_id TEXT NOT NULL CHECK(length(owner_id) BETWEEN 1 AND 256),
+      evidence_version INTEGER NOT NULL CHECK(evidence_version > 0),
+      action TEXT NOT NULL CHECK(action IN ('implement', 'review', 'test', 'apply')),
       status TEXT NOT NULL CHECK(status IN ('pending', 'leased', 'completed', 'failed', 'canceled')),
       attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
-      lease_owner TEXT,
+      max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts > 0 AND max_attempts <= 100),
+      lease_owner TEXT CHECK(lease_owner IS NULL OR length(lease_owner) BETWEEN 1 AND 128),
       lease_expires_at TEXT,
-      payload_json TEXT NOT NULL DEFAULT '{}',
-      last_error TEXT,
+      payload_json TEXT NOT NULL DEFAULT '{}'
+        CHECK(json_valid(payload_json) AND length(CAST(payload_json AS BLOB)) <= 65536),
+      last_error TEXT CHECK(last_error IS NULL OR length(last_error) <= 4096),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      CHECK(attempt <= max_attempts),
       CHECK(
-        (lease_owner IS NULL AND lease_expires_at IS NULL)
-        OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
-      ),
-      CHECK(status <> 'leased' OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL))
+        (status = 'leased' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (status <> 'leased' AND lease_owner IS NULL AND lease_expires_at IS NULL)
+      )
     );
     CREATE TABLE IF NOT EXISTS coding_evidence (
       id TEXT PRIMARY KEY, execution_id TEXT NOT NULL UNIQUE, requirement_id TEXT NOT NULL, project_id TEXT NOT NULL,
