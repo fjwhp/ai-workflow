@@ -598,14 +598,16 @@ describe("AutomationJobRepository", () => {
     const accepted = fixture.first.enqueue(job(fixture.requirement.id, { action: "implement" }));
     const pending = fixture.first.enqueue(job(fixture.requirement.id, { action: "review" }));
     const maximumWorker = "w".repeat(128);
+    const leaseCandidate = accepted.id < pending.id ? accepted : pending;
+    const stillPending = leaseCandidate.id === accepted.id ? pending : accepted;
 
     expect(fixture.first.leaseNext(maximumWorker, now, 30_000)).toMatchObject({
-      id: accepted.id, leaseOwner: maximumWorker
+      id: leaseCandidate.id, leaseOwner: maximumWorker
     });
-    expect(fixture.first.get(accepted.id)?.leaseOwner).toBe(maximumWorker);
+    expect(fixture.first.get(leaseCandidate.id)?.leaseOwner).toBe(maximumWorker);
     expect(() => fixture.first.leaseNext("w".repeat(129), now, 30_000))
       .toThrow("AUTOMATION_JOB_WORKER_ID_INVALID");
-    expect(fixture.first.get(pending.id)).toMatchObject({ status: "pending", attempt: 0 });
+    expect(fixture.first.get(stillPending.id)).toMatchObject({ status: "pending", attempt: 0 });
   });
 
   it.each([
