@@ -74,6 +74,40 @@ describe("server entry point", () => {
     expect(worker.stop).toHaveBeenCalledOnce();
   });
 
+  it("registers Store-backed quality handlers and preserves explicit handler overrides", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "automation-startup-handlers-"));
+    directories.push(directory);
+    const review = vi.fn(async () => ({} as any));
+    const test = vi.fn(async () => ({} as any));
+    const overrideTest = vi.fn(async () => {});
+    let workerOptions: any;
+    let serviceStore: WorkflowStore | undefined;
+    const worker = {
+      drainOnce: vi.fn(async () => false), start: vi.fn(), stop: vi.fn(async () => {})
+    };
+
+    const runtime = await startServer({
+      env: { DATA_DIR: directory, PORT: "0" },
+      createDeliveryService: (store) => { serviceStore = store; return { review, test }; },
+      automationHandlers: { test: overrideTest },
+      createWorker: (options) => { workerOptions = options; return worker; },
+      buildApplication: async () => fakeApp([]),
+      writeListening: () => {}
+    });
+    const reviewJob = {
+      id: "review-job", ownerType: "delivery_unit", ownerId: "unit-1",
+      evidenceVersion: 3, action: "review"
+    } as any;
+
+    expect(serviceStore).toBe(runtime.store);
+    await workerOptions.handlers.review(reviewJob);
+    await workerOptions.handlers.test({ ...reviewJob, id: "test-job", action: "test" });
+    expect(review).toHaveBeenCalledWith("unit-1", 3, "review-job");
+    expect(test).not.toHaveBeenCalled();
+    expect(overrideTest).toHaveBeenCalledOnce();
+    await runtime.close();
+  });
+
   it("closes the worker and store when hook registration and app close both fail", async () => {
     const directory = mkdtempSync(join(tmpdir(), "automation-startup-failure-"));
     directories.push(directory);

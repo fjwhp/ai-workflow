@@ -11,6 +11,10 @@ import {
   type AutomationWorkerEvent,
   type AutomationWorkerOptions
 } from "./automation-worker.js";
+import {
+  createDeliveryQualityAutomationHandlers,
+  DeliveryExecutionService
+} from "./delivery-execution-service.js";
 
 const schemaVersion = "phase-2-delivery-quality-v6";
 
@@ -28,6 +32,7 @@ export interface StartupOptions {
   writeVersionMarker?: typeof writeDatabaseVersionMarker;
   buildApplication?: (store: WorkflowStore) => Promise<StartupApp>;
   createWorker?: (options: AutomationWorkerOptions) => AutomationWorker;
+  createDeliveryService?: (store: WorkflowStore) => Pick<DeliveryExecutionService, "review" | "test">;
   automationHandlers?: Partial<AutomationHandlers>;
   clock?: () => Date;
   onWorkerEvent?: (event: AutomationWorkerEvent) => void;
@@ -86,9 +91,15 @@ export async function startServer(options: StartupOptions = {}) {
     store.recoverInterruptedRequirements();
     const clock = options.clock ?? (() => new Date());
     store.automationJobs.recoverExpired(clock());
+    const deliveryService = (options.createDeliveryService ?? ((workflowStore) => new DeliveryExecutionService(
+      workflowStore.deliveryExecutions, undefined, undefined, workflowStore.deliveryQuality
+    )))(store);
     const workerOptions: AutomationWorkerOptions = {
       jobs: store.automationJobs,
-      handlers: options.automationHandlers ?? {},
+      handlers: {
+        ...createDeliveryQualityAutomationHandlers(deliveryService),
+        ...options.automationHandlers
+      },
       clock,
       onEvent: options.onWorkerEvent ?? reportWorkerEvent
     };

@@ -458,9 +458,7 @@ export async function getWorktreeDiff(worktreePath: string) {
 
 export async function getWorktreeSnapshot(worktreePath: string) {
   const env = codingGitEnvironmentWithFsmonitor();
-  const { stdout: tracked } = await execFileAsync("git", [
-    "-C", worktreePath, "diff", "--no-ext-diff", "--no-textconv", "--", "."
-  ], { maxBuffer: 10 * 1024 * 1024, env });
+  const tracked = await getCompleteTrackedDiff(worktreePath, env);
   const { stdout: status } = await execFileAsync("git", [
     "-C", worktreePath, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"
   ], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any, env });
@@ -507,4 +505,26 @@ export async function getWorktreeSnapshot(worktreePath: string) {
     };
   }));
   return { diff, files, changedFiles, additions, deletions };
+}
+
+async function getCompleteTrackedDiff(worktreePath: string, env: NodeJS.ProcessEnv) {
+  const options = { maxBuffer: 10 * 1024 * 1024, env };
+  const args = ["--binary", "--full-index", "--no-ext-diff", "--no-textconv"];
+  let hasHead = true;
+  try {
+    await execFileAsync("git", ["-C", worktreePath, "rev-parse", "--verify", "--quiet", "HEAD"], options);
+  } catch (error) {
+    const failure = error as { code?: unknown; signal?: unknown };
+    if (failure.code !== 1 || failure.signal) throw error;
+    hasHead = false;
+  }
+  if (hasHead) {
+    const { stdout } = await execFileAsync("git", ["-C", worktreePath, "diff", ...args, "HEAD", "--", "."], options);
+    return stdout;
+  }
+  const [{ stdout: staged }, { stdout: unstaged }] = await Promise.all([
+    execFileAsync("git", ["-C", worktreePath, "diff", ...args, "--cached", "--", "."], options),
+    execFileAsync("git", ["-C", worktreePath, "diff", ...args, "--", "."], options)
+  ]);
+  return [staged, unstaged].filter(Boolean).join("\n");
 }

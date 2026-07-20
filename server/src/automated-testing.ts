@@ -72,6 +72,24 @@ export interface AutomatedTestingInput {
   gitCommonDir: string;
   allowedCommands: FrozenCommand[];
   acceptanceCriteria: string[];
+  untrustedEvidence: {
+    requirement: unknown;
+    approvedArtifacts: unknown[];
+    implementation: {
+      diff: string;
+      changedFiles: Array<
+        | { path: string; status: "deleted" }
+        | { path: string; status: "added" | "modified"; kind: "text"; content: string }
+        | { path: string; status: "added" | "modified"; kind: "binary"; size: number; sha256: string }
+      >;
+    };
+    codingEvidence: { id: string; evidenceVersion: number; diffHash: string };
+    deliverySnapshot: {
+      repoPath: string; branch: string; baseBranch: string; worktreePath: string; headCommit: string;
+      moduleIds: string[]; acceptanceCriteria: string[]; sensitivePatterns: string[];
+      allowedCommands: FrozenCommand[];
+    };
+  };
 }
 
 export interface CommandResult {
@@ -185,29 +203,33 @@ async function materializeVerificationTree(sourceWorktree: string, verificationR
     verbatimSymlinks: true,
     filter: async (source) => {
       const rel = relative(sourceRoot, source);
-      const segments = rel ? rel.split(sep) : [];
-      if (segments.some((segment) => segment.toLowerCase() === ".git")) return false;
-      const gitPath = segments.join("/");
-      if ([...ignored].some((ignoredPath) => gitPath === ignoredPath || gitPath.startsWith(`${ignoredPath}/`))) {
-        return false;
-      }
+      const gitPath = rel.split(sep).filter(Boolean).join("/");
+      if (isExcludedSourcePath(gitPath, ignored)) return false;
       const entry = await lstat(source).catch(materializationUnsafe);
       if (entry.isDirectory() || entry.isFile()) return true;
       if (!entry.isSymbolicLink()) materializationUnsafe();
       const link = await readlink(source).catch(materializationUnsafe);
       if (isAbsolute(link)) materializationUnsafe();
       const lexicalTarget = resolve(dirname(source), link);
-      if (!isInside(sourceRoot, lexicalTarget)
-        || relative(sourceRoot, lexicalTarget).split(sep).some((segment) => segment.toLowerCase() === ".git")) {
+      const lexicalTargetPath = relative(sourceRoot, lexicalTarget).split(sep).filter(Boolean).join("/");
+      if (!isInside(sourceRoot, lexicalTarget) || isExcludedSourcePath(lexicalTargetPath, ignored)) {
         materializationUnsafe();
       }
       const canonicalTarget = await realpath(lexicalTarget).catch(materializationUnsafe);
-      if (!isInside(sourceRoot, canonicalTarget)) materializationUnsafe();
+      const canonicalTargetPath = relative(sourceRoot, canonicalTarget).split(sep).filter(Boolean).join("/");
+      if (!isInside(sourceRoot, canonicalTarget) || isExcludedSourcePath(canonicalTargetPath, ignored)) {
+        materializationUnsafe();
+      }
       const targetEntry = await lstat(canonicalTarget).catch(materializationUnsafe);
       if (!targetEntry.isDirectory() && !targetEntry.isFile()) materializationUnsafe();
       return true;
     }
   });
+}
+
+function isExcludedSourcePath(gitPath: string, ignored: Set<string>) {
+  if (gitPath.split("/").some((segment) => segment.toLowerCase() === ".git")) return true;
+  return [...ignored].some((ignoredPath) => gitPath === ignoredPath || gitPath.startsWith(`${ignoredPath}/`));
 }
 
 async function ignoredSourcePaths(sourceRoot: string) {

@@ -131,7 +131,7 @@ export class DeliveryExecutionService {
     let testResult: AutomatedTestingResult | undefined;
     let completion: DeliveryQualityCompletion;
     try {
-      await this.loadImmutableSnapshot(claim.input.codingEvidence.worktreePath,
+      const snapshot = await this.loadImmutableSnapshot(claim.input.codingEvidence.worktreePath,
         claim.input.codingEvidence.diffHash, claim.input.snapshot.sensitivePatterns);
       const inspectTarget = this.qualityDependencies.inspectTarget ?? inspectTargetState;
       const before = await inspectTarget(claim.input.snapshot.worktreePath);
@@ -140,8 +140,31 @@ export class DeliveryExecutionService {
         sourceWorktree: claim.input.codingEvidence.worktreePath,
         targetWorktree: claim.input.snapshot.worktreePath,
         gitCommonDir: before.gitCommonDir,
-        allowedCommands: claim.input.snapshot.allowedCommands,
-        acceptanceCriteria: claim.input.snapshot.acceptanceCriteria
+        allowedCommands: claim.input.snapshot.allowedCommands.map((command) => ({
+          command: command.command,
+          ...(command.argsPrefix ? { argsPrefix: [...command.argsPrefix] } : {})
+        })),
+        acceptanceCriteria: [...claim.input.snapshot.acceptanceCriteria],
+        untrustedEvidence: {
+          requirement: claim.input.requirement,
+          approvedArtifacts: [...claim.input.artifacts],
+          implementation: { diff: snapshot.diff, changedFiles: snapshot.changedFiles },
+          codingEvidence: {
+            id: claim.input.codingEvidence.id,
+            evidenceVersion: claim.input.codingEvidence.evidenceVersion,
+            diffHash: claim.input.codingEvidence.diffHash
+          },
+          deliverySnapshot: {
+            ...claim.input.snapshot,
+            moduleIds: [...claim.input.snapshot.moduleIds],
+            acceptanceCriteria: [...claim.input.snapshot.acceptanceCriteria],
+            sensitivePatterns: [...claim.input.snapshot.sensitivePatterns],
+            allowedCommands: claim.input.snapshot.allowedCommands.map((command) => ({
+              command: command.command,
+              ...(command.argsPrefix ? { argsPrefix: [...command.argsPrefix] } : {})
+            }))
+          }
+        }
       });
       await this.loadImmutableSnapshot(claim.input.codingEvidence.worktreePath,
         claim.input.codingEvidence.diffHash, claim.input.snapshot.sensitivePatterns);

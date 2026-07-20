@@ -61,6 +61,44 @@ describe("getWorktreeSnapshot",()=>{
     }
   });
 
+  it("binds staged text and binary content into the same snapshot hash as changedFiles", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "workflow-staged-snapshot-")); dirs.push(dir);
+    await exec("git", ["init", dir]);
+    await exec("git", ["-C", dir, "config", "user.email", "test@example.com"]);
+    await exec("git", ["-C", dir, "config", "user.name", "Test"]);
+    await writeFile(join(dir, "value.txt"), "base\n");
+    await writeFile(join(dir, "payload.bin"), Buffer.from([0]));
+    await exec("git", ["-C", dir, "add", "--all"]);
+    await exec("git", ["-C", dir, "commit", "-m", "base"]);
+
+    await writeFile(join(dir, "value.txt"), "stage-a\n");
+    await writeFile(join(dir, "payload.bin"), Buffer.from([0x80]));
+    await exec("git", ["-C", dir, "add", "--all"]);
+    const first = await getWorktreeSnapshot(dir);
+    await writeFile(join(dir, "value.txt"), "stage-b\n");
+    await writeFile(join(dir, "payload.bin"), Buffer.from([0x81]));
+    await exec("git", ["-C", dir, "add", "--all"]);
+    const second = await getWorktreeSnapshot(dir);
+
+    expect(first.diff).toContain("+stage-a");
+    expect(second.diff).toContain("+stage-b");
+    expect(buildCodingEvidence({ diff: first.diff }).diffHash)
+      .not.toBe(buildCodingEvidence({ diff: second.diff }).diffHash);
+    expect(first.changedFiles).toContainEqual({
+      path: "value.txt", status: "modified", kind: "text", content: "stage-a\n"
+    });
+    expect(second.changedFiles).toContainEqual({
+      path: "value.txt", status: "modified", kind: "text", content: "stage-b\n"
+    });
+    for (const [snapshot, byte] of [[first, 0x80], [second, 0x81]] as const) {
+      expect(snapshot.diff).toContain("GIT binary patch");
+      expect(snapshot.changedFiles).toContainEqual({
+        path: "payload.bin", status: "modified", kind: "binary", size: 1,
+        sha256: createHash("sha256").update(Buffer.from([byte])).digest("hex")
+      });
+    }
+  });
+
   it("returns complete modified content and an explicit deleted marker", async () => {
     const dir = await mkdtemp(join(tmpdir(), "workflow-changed-files-")); dirs.push(dir);
     await exec("git", ["init", dir]);

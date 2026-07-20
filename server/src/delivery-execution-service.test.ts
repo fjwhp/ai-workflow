@@ -391,9 +391,18 @@ describe("DeliveryExecutionService", () => {
 
   it("runs review and testing against the same immutable implementation evidence", async () => {
     const fixture = createFixture();
+    const definition = fixture.store.addArtifact(
+      fixture.requirement.id, "definition", "Approved definition", { summary: "frozen definition" }
+    );
+    const design = fixture.store.addArtifact(
+      fixture.requirement.id, "solution_design", "Approved design", { summary: "frozen design" }
+    );
     const implementation = codingResult();
     await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(implementation))
       .implement(fixture.unit.id);
+    const codingEvidence = fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1) as {
+      id: string; diffHash: string;
+    };
     const snapshot = {
       diff: implementation.diff, files: implementation.files, additions: 1, deletions: 0,
       changedFiles: [{ path: "src/orders/index.ts", status: "modified" as const, kind: "text" as const, content: "export const ready = true;" }]
@@ -417,7 +426,10 @@ describe("DeliveryExecutionService", () => {
     const reviewEvidence = fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")!;
     const testingEvidence = fixture.store.deliveryQuality.latest(fixture.unit.id, "automated_testing")!;
     expect(reviewEvidence).toMatchObject({ inputEvidenceVersion: 1, result: "passed", content: { summary: "review passed" } });
-    expect(testingEvidence).toMatchObject({ inputEvidenceVersion: 1, result: "passed" });
+    expect(testingEvidence, JSON.stringify(testingEvidence)).toMatchObject({
+      inputCodingEvidenceId: codingEvidence.id, inputEvidenceVersion: 1,
+      inputDiffHash: codingEvidence.diffHash, result: "passed"
+    });
     expect(reviewEvidence.inputCodingEvidenceId).toBe(testingEvidence.inputCodingEvidenceId);
     expect(reviewEvidence.inputDiffHash).toBe(testingEvidence.inputDiffHash);
     expect(review).toHaveBeenCalledWith(expect.objectContaining({
@@ -426,7 +438,30 @@ describe("DeliveryExecutionService", () => {
     expect(testing).toHaveBeenCalledWith(expect.objectContaining({
       sourceWorktree: "/tmp/frozen-project-run",
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }],
-      acceptanceCriteria: ["Order contract tests pass"]
+      acceptanceCriteria: ["Order contract tests pass"],
+      untrustedEvidence: {
+        requirement: expect.objectContaining({ id: fixture.requirement.id, title: "Frozen implementation" }),
+        approvedArtifacts: [
+          expect.objectContaining({
+            id: definition.id, stage: "definition", version: 1,
+            title: "Approved definition", content: { summary: "frozen definition" }
+          }),
+          expect.objectContaining({
+            id: design.id, stage: "solution_design", version: 1,
+            title: "Approved design", content: { summary: "frozen design" }
+          })
+        ],
+        implementation: { diff: implementation.diff, changedFiles: snapshot.changedFiles },
+        codingEvidence: {
+          id: codingEvidence.id, evidenceVersion: 1, diffHash: codingEvidence.diffHash
+        },
+        deliverySnapshot: expect.objectContaining({
+          repoPath: "/tmp/frozen-project-old", branch: "feature/2.2.1",
+          worktreePath: "/tmp/frozen-project-version", headCommit: fixture.version.headCommit,
+          moduleIds: ["src/orders"], acceptanceCriteria: ["Order contract tests pass"],
+          allowedCommands: [{ command: "npm", argsPrefix: ["test"] }]
+        })
+      }
     }));
   });
 

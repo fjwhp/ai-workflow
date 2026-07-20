@@ -33,7 +33,10 @@ async function git(cwd: string, args: string[]) {
 
 async function getCommitEvidence(worktreePath: string, commit: string) {
   const parent = `${commit}^`;
-  const tracked = (await git(worktreePath, ["diff", "--diff-filter=MD", parent, commit, "--", "."])).stdout;
+  const tracked = (await git(worktreePath, [
+    "diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv",
+    "--diff-filter=MD", parent, commit, "--", "."
+  ])).stdout;
   const addedOutput = await execFileAsync("git", ["-C", worktreePath, "diff", "--name-only", "--diff-filter=A", "-z", parent, commit, "--", "."], { maxBuffer: 2 * 1024 * 1024, encoding: "buffer" as any });
   const added = Buffer.from(addedOutput.stdout as any).toString("utf8").split("\0").filter(Boolean);
   const patches: string[] = [tracked];
