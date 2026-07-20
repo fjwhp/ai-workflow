@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import { isAllowedCommand, runCommand } from "./command-policy.js";
+import { runCommand } from "./command-policy.js";
 import { createOrReuseRequirementWorktree, getWorktreeDiff, getWorktreeSnapshot } from "./repository.js";
 
 const execFileAsync = promisify(execFile);
@@ -72,7 +72,7 @@ export async function runCodingAgent(input: CodingAgentInput): Promise<CodingAge
     tool("run_command", "运行项目白名单中的验证命令", { command: { type: "string" }, args: { type: "array", items: { type: "string" } } }, ["command", "args"]),
     tool("git_diff", "读取当前未提交差异", {}, [])
   ];
-  const messages: any[] = [{ role: "system", content: "你是谨慎的 Java 编码代理。先搜索和读取相关代码，再做最小修改并运行允许的测试。不得修改需求范围，不得提交、合并或推送。完成后总结变更、测试和残余风险。" }, {
+  const messages: any[] = [{ role: "system", content: "你是谨慎的 Java 编码代理。先搜索和读取相关代码，再做最小修改并运行允许的测试。run_command 只能选择人工登记并冻结的完整验证命令，不得追加、替换或拼接参数。不得修改需求范围，不得提交、合并或推送。完成后总结变更、测试和残余风险。" }, {
     role: "user", content: JSON.stringify({
       requirement: input.requirement,
       approvedArtifacts: input.artifacts,
@@ -117,8 +117,9 @@ async function executeTool(name: string, args: any, worktree: string, allowed: C
   }
   if (name === "run_command") {
     const command = String(args.command), commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-    if (isForbiddenCodingExecutable(command)) throw new Error("CODING_COMMAND_FORBIDDEN");
-    if (!isAllowedCommand(command, commandArgs, allowed)) throw new Error("命令不在项目白名单中");
+    // Trust boundary: the model may select only an exact human-registered command frozen in the unit snapshot.
+    if (!isSafeCodingVerificationCommand(command, commandArgs)) throw new Error("CODING_COMMAND_FORBIDDEN");
+    if (!matchesFrozenCommand(command, commandArgs, allowed)) throw new Error("CODING_COMMAND_NOT_FROZEN");
     const result = await runCommand(worktree, command, commandArgs);
     commands.push({ command, args: commandArgs, ...result });
     return { ...result, stdout: result.stdout.slice(-20000), stderr: result.stderr.slice(-20000) };
@@ -127,9 +128,30 @@ async function executeTool(name: string, args: any, worktree: string, allowed: C
   throw new Error("未知工具");
 }
 
-function isForbiddenCodingExecutable(command: string) {
-  const normalized = command.trim().replaceAll("\\", "/");
-  const basename = normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
-  const executable = basename.endsWith(".exe") ? basename.slice(0, -4) : basename;
-  return executable === "git" || executable === "gh";
+const safeCodingExecutables = new Set([
+  "mvn", "mvnw", "./mvnw", "npm", "pnpm", "yarn",
+  "gradle", "gradlew", "./gradlew", "cargo", "go", "pytest"
+]);
+const forbiddenArgumentTokens = new Set([
+  "git", "gh", "commit", "push", "tag", "pr", "publish", "deploy", "release"
+]);
+const packageManagerForwardingTokens = new Set(["exec", "dlx", "x"]);
+const packageManagers = new Set(["npm", "pnpm", "yarn"]);
+
+function isSafeCodingVerificationCommand(command: string, args: string[]) {
+  if (!safeCodingExecutables.has(command)) return false;
+  if (args.some((arg) => /[;&|`$<>\0\n\r]/.test(arg))) return false;
+  const tokens = args.flatMap((arg) => arg.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+  if (tokens.some((token) => forbiddenArgumentTokens.has(token))) return false;
+  return !packageManagers.has(command)
+    || !tokens.some((token) => packageManagerForwardingTokens.has(token));
+}
+
+function matchesFrozenCommand(command: string, args: string[], allowed: CodingProject["allowedCommands"]) {
+  return allowed.some((rule) => {
+    const frozenArgs = rule.argsPrefix ?? [];
+    return rule.command === command
+      && frozenArgs.length === args.length
+      && frozenArgs.every((arg, index) => arg === args[index]);
+  });
 }

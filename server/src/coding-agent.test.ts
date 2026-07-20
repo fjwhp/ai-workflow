@@ -120,20 +120,38 @@ describe("runCodingAgent command boundary", () => {
     ["git tag", "git", ["tag", "v1.0.0"]],
     ["gh pr create", "gh", ["pr", "create"]],
     ["absolute git path", "/usr/bin/git", ["commit", "-m", "forbidden"]],
-    ["Windows git path", "C:\\Program Files\\Git\\bin\\git.exe", ["push"]]
+    ["Windows git path", "C:\\Program Files\\Git\\bin\\git.exe", ["push"]],
+    ["env git commit", "/usr/bin/env", ["git", "commit", "-m", "forbidden"]],
+    ["env gh pr create", "env", ["gh", "pr", "create"]],
+    ["git.cmd", "git.cmd", ["push"]],
+    ["gh.bat", "gh.bat", ["pr", "create"]],
+    ["npm exec git", "npm", ["exec", "git", "commit"]],
+    ["pnpm dlx gh", "pnpm", ["dlx", "gh", "pr", "create"]],
+    ["node child_process git", "node", ["-e", "require('node:child_process').spawnSync('git',['commit'])"]]
   ])("blocks %s before invoking the process runner", async (_name, command, args) => {
     respondWithCommand(command, args);
 
-    await runCodingAgent(codingInput([{ command }]));
+    await runCodingAgent(codingInput([{ command, argsPrefix: args }]));
 
     expect(mocks.runCommand).not.toHaveBeenCalled();
   });
 
-  it("runs an ordinary frozen allowlisted test command", async () => {
-    respondWithCommand("npm", ["test"]);
+  it("rejects model arguments appended to a frozen command", async () => {
+    respondWithCommand("npm", ["test", "--", "--watch"]);
 
     await runCodingAgent(codingInput([{ command: "npm", argsPrefix: ["test"] }]));
 
-    expect(mocks.runCommand).toHaveBeenCalledWith("/tmp/requirements/REQ-0001", "npm", ["test"]);
+    expect(mocks.runCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["npm test", "npm", ["test"]],
+    ["mvn module test", "mvn", ["test", "-pl", "module"]]
+  ])("runs the exact frozen verification command %s", async (_name, command, args) => {
+    respondWithCommand(command, args);
+
+    await runCodingAgent(codingInput([{ command, argsPrefix: args }]));
+
+    expect(mocks.runCommand).toHaveBeenCalledWith("/tmp/requirements/REQ-0001", command, args);
   });
 });
