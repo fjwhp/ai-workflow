@@ -59,7 +59,10 @@ describe("automation worker handler lifecycle", () => {
 
     await expect(worker.drainOnce()).resolves.toBe(true);
 
-    expect(review).toHaveBeenCalledWith(expect.objectContaining({ id: job.id, action: "review" }));
+    expect(review).toHaveBeenCalledWith(
+      expect.objectContaining({ id: job.id, action: "review" }),
+      { signal: expect.any(AbortSignal) }
+    );
     expect(store.automationJobs.get(job.id)).toMatchObject({ status: "completed", attempt: 1 });
     await expect(worker.drainOnce()).resolves.toBe(false);
   });
@@ -283,6 +286,67 @@ describe("automation worker lease ownership", () => {
 });
 
 describe("automation worker polling lifecycle", () => {
+  it("aborts the active handler and waits for its settlement before stopping", async () => {
+    const { store, job } = createFixture("review");
+    let receivedSignal: AbortSignal | undefined;
+    const review = vi.fn(async (_job: unknown, context: { signal: AbortSignal }) => {
+      receivedSignal = context.signal;
+      await new Promise<void>((_resolve, reject) => {
+        context.signal.addEventListener("abort", () => reject(retryable("AUTOMATION_HANDLER_ABORTED")), {
+          once: true
+        });
+      });
+    });
+    const worker = createAutomationWorker({
+      jobs: store.automationJobs, handlers: { review }, workerId: "worker-a"
+    });
+
+    const drain = worker.drainOnce();
+    await Promise.resolve();
+    await expect(worker.stop()).resolves.toBeUndefined();
+    await expect(drain).resolves.toBe(true);
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(store.automationJobs.get(job.id)).toMatchObject({
+      status: "pending", attempt: 1, lastError: "AUTOMATION_HANDLER_ABORTED"
+    });
+  });
+
+  it("bounds stop for an abort-ignoring handler and lets a later stop await the same drain", async () => {
+    vi.useFakeTimers();
+    const { store, job } = createFixture("test");
+    const handler = deferred();
+    const complete = vi.fn(store.automationJobs.complete);
+    let receivedSignal: AbortSignal | undefined;
+    const worker = createAutomationWorker({
+      jobs: { ...store.automationJobs, complete },
+      handlers: { test: async (_job, context) => { receivedSignal = context.signal; await handler.promise; } },
+      workerId: "worker-a", stopTimeoutMs: 100
+    });
+
+    const drain = worker.drainOnce();
+    const firstStop = worker.stop().then(
+      () => ({ status: "resolved" as const }),
+      (error: unknown) => ({ status: "rejected" as const, error })
+    );
+    await vi.advanceTimersByTimeAsync(100);
+    const firstOutcome = await Promise.race([
+      firstStop,
+      Promise.resolve({ status: "pending" as const })
+    ]);
+    handler.resolve();
+    await expect(drain).resolves.toBe(true);
+    await expect(worker.stop()).resolves.toBeUndefined();
+
+    expect(firstOutcome).toEqual({
+      status: "rejected",
+      error: expect.objectContaining({ message: "AUTOMATION_WORKER_STOP_TIMEOUT" })
+    });
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(complete).toHaveBeenCalledOnce();
+    expect(store.automationJobs.get(job.id)).toMatchObject({ status: "completed", attempt: 1 });
+  });
+
   it("polls at the configured interval without overlapping drains or busy-looping when empty", async () => {
     vi.useFakeTimers({ now: new Date("2026-07-20T08:00:00.000Z") });
     const store = new WorkflowStore(":memory:");
@@ -344,7 +408,7 @@ describe("automation worker polling lifecycle", () => {
 
     expect(secondStop).toBe(firstStop);
     expect(stopped).toBe(false);
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(1);
     handler.resolve();
     await expect(firstStop).resolves.toBeUndefined();
     expect(store.automationJobs.get(job.id)?.status).toBe("completed");
@@ -361,7 +425,10 @@ describe("automation worker polling lifecycle", () => {
     ["excessive lease", { leaseMs: 86_400_001 }],
     ["zero poll", { pollMs: 0 }],
     ["fractional poll", { pollMs: 1.5 }],
-    ["excessive poll", { pollMs: 86_400_001 }]
+    ["excessive poll", { pollMs: 86_400_001 }],
+    ["zero stop timeout", { stopTimeoutMs: 0 }],
+    ["fractional stop timeout", { stopTimeoutMs: 1.5 }],
+    ["excessive stop timeout", { stopTimeoutMs: 86_400_001 }]
   ])("rejects %s at construction", (_label, invalid) => {
     const store = new WorkflowStore(":memory:");
     stores.push(store);

@@ -71,6 +71,20 @@ describe("trusted verification filesystem helper", () => {
     );
   });
 
+  it("forwards cancellation to the materialization child and reports a stable abort", async () => {
+    const controller = new AbortController();
+    const runSubprocess = vi.fn(async (_file, _args, options) => {
+      expect(options.signal).toBe(controller.signal);
+      controller.abort();
+      throw new Error("TRUSTED_SUBPROCESS_ABORTED");
+    });
+
+    await expect(materializeVerificationManifest(root(), {
+      version: 1, entries: [file("value.txt", "frozen")]
+    }, { timeoutMs: 2_000, sensitivePatterns: [], signal: controller.signal }, { runSubprocess } as any))
+      .rejects.toThrow("AUTOMATED_TEST_ABORTED");
+  });
+
   it("rejects sensitive entries and invalid hashes without leaving a partial tree", async () => {
     const sensitiveTarget = root();
     await expect(materializeVerificationManifest(sensitiveTarget, {

@@ -248,11 +248,18 @@ describe("delivery quality evidence schema", () => {
     try {
       const claim = store.deliveryQuality.claim(unit.id, 1, "code_review");
       if (claim.status !== "running") throw new Error("expected running claim");
+      let trailingReads = 0;
+      const content = ["x".repeat(600_000), "y".repeat(600_000), "z".repeat(600_000), "unused"];
+      Object.defineProperty(content, 3, {
+        enumerable: true,
+        get() { trailingReads += 1; return "must not be visited"; }
+      });
 
       expect(() => store.deliveryQuality.complete(claim, {
-        result: "passed", content: { summary: "x".repeat(2_000_000) }
+        result: "passed", content
       })).toThrow("DELIVERY_QUALITY_PERSISTENCE_LIMIT");
 
+      expect(trailingReads).toBe(0);
       expect((store as any).db.prepare("SELECT COUNT(*) AS count FROM delivery_quality_evidence WHERE run_id = ?")
         .get(claim.id)).toEqual({ count: 0 });
       expect((store as any).db.prepare("SELECT status FROM delivery_quality_runs WHERE id = ?")

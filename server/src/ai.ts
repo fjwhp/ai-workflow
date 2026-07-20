@@ -110,7 +110,8 @@ export function codeReviewDecision(value: unknown): { result: "passed" | "failed
 
 export async function runCodeReview(
   input: unknown,
-  onEvent: AgentEventHandler = () => {}
+  onEvent: AgentEventHandler = () => {},
+  signal?: AbortSignal
 ): Promise<CodeReviewResult> {
   if (!process.env.OPENAI_API_KEY) throw new Error("未配置 OPENAI_API_KEY");
   const client = new OpenAI({
@@ -128,7 +129,7 @@ export async function runCodeReview(
       messages: [{ role: "user", content: prompt }],
       response_format: { type: "json_object" },
       stream: true
-    });
+    }, signal ? { signal } : undefined);
     for await (const chunk of stream) {
       const text = chunk.choices[0]?.delta.content || "";
       if (text) { outputText += text; onEvent("output.delta", { text }); }
@@ -138,7 +139,7 @@ export async function runCodeReview(
       model,
       input: prompt,
       text: { format: { type: "json_object" } }
-    });
+    }, signal ? { signal } : undefined);
     outputText = response.output_text;
     if (outputText) onEvent("output.delta", { text: outputText });
   }

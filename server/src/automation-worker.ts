@@ -2,7 +2,14 @@ import { randomUUID } from "node:crypto";
 import type { AutomationAction } from "@ai-workflow/shared";
 import type { AutomationJob, AutomationJobPersistence } from "./automation-job-repository.js";
 
-export type AutomationHandlers = Record<AutomationAction, (job: AutomationJob) => Promise<void>>;
+export interface AutomationHandlerContext {
+  signal: AbortSignal;
+}
+
+export type AutomationHandlers = Record<
+  AutomationAction,
+  (job: AutomationJob, context: AutomationHandlerContext) => Promise<void>
+>;
 
 export type AutomationWorkerEvent =
   | { type: "handler_missing"; jobId: string; action: AutomationAction }
@@ -17,6 +24,7 @@ export interface AutomationWorkerOptions {
   workerId?: string;
   leaseMs?: number;
   pollMs?: number;
+  stopTimeoutMs?: number;
   clock?: () => Date;
   timers?: AutomationWorkerTimers;
   onEvent?: (event: AutomationWorkerEvent) => void;
@@ -62,15 +70,18 @@ export function createAutomationWorker(options: AutomationWorkerOptions): Automa
   const workerId = options.workerId ?? `worker-${process.pid}-${randomUUID()}`;
   const leaseMs = options.leaseMs ?? 30_000;
   const pollMs = options.pollMs ?? 1_000;
+  const stopTimeoutMs = options.stopTimeoutMs ?? 15_000;
   validateWorkerId(workerId);
   validateDuration(leaseMs, "AUTOMATION_WORKER_LEASE_MS_INVALID");
   validateDuration(pollMs, "AUTOMATION_WORKER_POLL_MS_INVALID");
+  validateDuration(stopTimeoutMs, "AUTOMATION_WORKER_STOP_TIMEOUT_MS_INVALID");
   const clock = options.clock ?? (() => new Date());
   const timers = options.timers ?? defaultTimers;
   const heartbeatMs = Math.max(1, Math.floor(leaseMs / 3));
   let inFlight: Promise<boolean> | undefined;
   let pollTimer: unknown;
   let activeHeartbeat: { cancel(): void } | undefined;
+  let activeController: AbortController | undefined;
   let state: "idle" | "running" | "stopped" = "idle";
   let stopPromise: Promise<void> | undefined;
 
@@ -98,6 +109,8 @@ export function createAutomationWorker(options: AutomationWorkerOptions): Automa
       return true;
     }
     let ownershipLost = false;
+    const controller = new AbortController();
+    activeController = controller;
     let heartbeatTimer: unknown;
     let heartbeatActive = true;
     const cancelHeartbeat = () => {
@@ -130,13 +143,14 @@ export function createAutomationWorker(options: AutomationWorkerOptions): Automa
     let handlerFailed = false;
     let handlerError: unknown;
     try {
-      await handler(job);
+      await handler(job, { signal: controller.signal });
     } catch (error) {
       handlerFailed = true;
       handlerError = error;
     } finally {
       cancelHeartbeat();
       activeHeartbeat = undefined;
+      if (activeController === controller) activeController = undefined;
     }
     if (ownershipLost) return true;
     if (handlerFailed) {
@@ -190,10 +204,32 @@ export function createAutomationWorker(options: AutomationWorkerOptions): Automa
         pollTimer = undefined;
       }
       activeHeartbeat?.cancel();
+      activeController?.abort();
       const current = inFlight;
-      stopPromise = current
-        ? current.then(() => undefined, () => undefined)
-        : Promise.resolve();
+      if (!current) {
+        stopPromise = Promise.resolve();
+        return stopPromise;
+      }
+      const waiting = new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (operation: () => void) => {
+          if (settled) return;
+          settled = true;
+          timers.clearTimeout(timeout);
+          operation();
+        };
+        const timeout = timers.setTimeout(() => {
+          finish(() => reject(new Error("AUTOMATION_WORKER_STOP_TIMEOUT")));
+        }, stopTimeoutMs);
+        current.then(
+          () => finish(resolve),
+          () => finish(resolve)
+        );
+      });
+      stopPromise = waiting.catch((error) => {
+        stopPromise = undefined;
+        throw error;
+      });
       return stopPromise;
     }
   };

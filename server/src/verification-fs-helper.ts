@@ -15,6 +15,7 @@ interface MaterializationOptions {
   timeoutMs: number;
   sensitivePatterns: string[];
   limits?: Partial<MaterializationLimits>;
+  signal?: AbortSignal;
 }
 
 interface MaterializationDependencies {
@@ -39,6 +40,7 @@ export async function materializeVerificationManifest(
   options: MaterializationOptions,
   dependencies: MaterializationDependencies = {}
 ) {
+  if (options.signal?.aborted) throw new Error("AUTOMATED_TEST_ABORTED");
   const limits = materializationLimits(options.limits);
   if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1) {
     throw new Error("AUTOMATED_TEST_DEADLINE_EXCEEDED");
@@ -50,14 +52,24 @@ export async function materializeVerificationManifest(
     limits,
     deadline: Date.now() + options.timeoutMs
   });
-  const result = await (dependencies.runSubprocess ?? runTrustedSubprocess)(process.execPath, [
-    "--input-type=commonjs", "--eval", verificationFsHelperSource
-  ], {
-    timeoutMs: options.timeoutMs,
-    termGraceMs: 250,
-    maxOutputBytes: HELPER_OUTPUT_BYTES,
-    input: config
-  });
+  let result: Awaited<ReturnType<typeof runTrustedSubprocess>>;
+  try {
+    result = await (dependencies.runSubprocess ?? runTrustedSubprocess)(process.execPath, [
+      "--input-type=commonjs", "--eval", verificationFsHelperSource
+    ], {
+      timeoutMs: options.timeoutMs,
+      termGraceMs: 250,
+      maxOutputBytes: HELPER_OUTPUT_BYTES,
+      input: config,
+      signal: options.signal
+    });
+  } catch (error) {
+    if (options.signal?.aborted
+      || (error instanceof Error && error.message === "TRUSTED_SUBPROCESS_ABORTED")) {
+      throw new Error("AUTOMATED_TEST_ABORTED", { cause: error });
+    }
+    throw error;
+  }
   if (result.timedOut) throw new Error("AUTOMATED_TEST_DEADLINE_EXCEEDED");
   if (result.outputOverflow) throw new Error("AUTOMATED_TEST_MATERIALIZATION_FAILED");
   if (result.exitCode === 0) return;

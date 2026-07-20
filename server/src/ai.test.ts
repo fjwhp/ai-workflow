@@ -14,10 +14,13 @@ import {
   schemaFor
 } from "./ai.js";
 
-const provider = vi.hoisted(() => ({ outputText: "" }));
+const provider = vi.hoisted(() => ({ outputText: "", requestOptions: undefined as unknown }));
 vi.mock("openai", () => ({
   default: class {
-    responses = { create: async () => ({ output_text: provider.outputText }) };
+    responses = { create: async (_body: unknown, options: unknown) => {
+      provider.requestOptions = options;
+      return { output_text: provider.outputText };
+    } };
   }
 }));
 
@@ -30,6 +33,7 @@ afterEach(() => {
   if (initialApiMode === undefined) delete process.env.OPENAI_API_MODE;
   else process.env.OPENAI_API_MODE = initialApiMode;
   provider.outputText = "";
+  provider.requestOptions = undefined;
 });
 
 function genericResult(overrides: Record<string, unknown> = {}) {
@@ -266,5 +270,16 @@ describe("independent code review contract", () => {
     await expect(runCodeReview(input)).resolves.toMatchObject({ conclusion: "pass", summary: "可执行结果" });
     provider.outputText = "not json";
     await expect(runCodeReview(input)).rejects.toThrow();
+  });
+
+  it("passes the review cancellation signal to the provider request", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    delete process.env.OPENAI_API_MODE;
+    provider.outputText = JSON.stringify(genericResult());
+    const controller = new AbortController();
+
+    await runCodeReview(input, () => {}, controller.signal);
+
+    expect(provider.requestOptions).toEqual({ signal: controller.signal });
   });
 });

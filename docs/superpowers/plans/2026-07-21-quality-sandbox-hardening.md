@@ -108,7 +108,29 @@ interface ToolchainSnapshot {
 - [ ] Bound both directory entries scanned and quarantines processed, and report failed, remaining, or truncated startup cleanup before worker creation.
 - [ ] Run all focused tests and the real macOS acceptance suite.
 
-### Task 5: Final Verification And Commit
+### Task 5: Bind Cleanup Ownership And Bound Cancellation
+
+**Files:**
+- Modify: `server/src/verification-cleanup.ts`
+- Modify: `server/src/redaction.ts`
+- Modify: `server/src/automation-worker.ts`
+- Modify: `server/src/delivery-execution-service.ts`
+- Modify: `server/src/ai.ts`
+- Modify: `server/src/automated-testing.ts`
+- Modify: `server/src/verification-fs-helper.ts`
+- Modify: `server/src/verification-toolchain.ts`
+- Modify: `server/src/trusted-subprocess.ts`
+- Modify: `server/src/process-execution.ts`
+- Modify: `server/src/index.ts`
+
+- [x] Create active verification roots as `0700` with a `0600` version/uid/nonce/device/inode marker; accept only exact six-character suffix plus UUID quarantine names.
+- [x] Revalidate marker, uid, modes, device, and inode after scan and before each destructive subprocess. Test unrelated prefixes, forged markers, symlinks, inode replacement, valid stale roots, and concurrent disappearance.
+- [x] Document the residual final-check-to-subprocess TOCTOU window because Node lacks `openat`-style directory-fd operations.
+- [x] Charge serialized UTF-8 JSON bytes incrementally during redaction and prove early termination, multibyte/escaping costs, container overhead, and transaction rollback.
+- [x] Pass per-job cancellation through review providers, materialization, toolchain snapshotting, and managed commands. Kill children/coalitions and finish cleanup before returning `AUTOMATED_TEST_ABORTED`.
+- [x] Bound worker stop with `AUTOMATION_WORKER_STOP_TIMEOUT`; keep SQLite open on timeout and allow a later close to finish after the same in-flight handler settles.
+
+### Task 6: Final Verification And Commit
 
 - [ ] Run `npm test --` with all affected focused files.
 - [ ] Run the real dependency-free npm acceptance and `RUN_MACOS_SANDBOX_ACCEPTANCE=1 npm test`.

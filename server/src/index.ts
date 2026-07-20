@@ -56,7 +56,9 @@ export async function startServer(options: StartupOptions = {}) {
   let worker: AutomationWorker | undefined;
   let app: StartupApp | undefined;
   let resourcesClosed = false;
+  let resourceClosePromise: Promise<void> | undefined;
   let closePromise: Promise<void> | undefined;
+  let appCloseAttempted = false;
   let signalsInstalled = false;
   const removeSignalHandlers = () => {
     if (!signalsInstalled) return;
@@ -64,22 +66,41 @@ export async function startServer(options: StartupOptions = {}) {
     process.off("SIGTERM", onSignal);
     signalsInstalled = false;
   };
-  const closeResources = async () => {
-    if (resourcesClosed) return;
-    resourcesClosed = true;
+  const closeResources = () => {
+    if (resourcesClosed) return Promise.resolve();
+    if (resourceClosePromise) return resourceClosePromise;
     removeSignalHandlers();
-    try {
+    const attempt = Promise.resolve().then(async () => {
       await worker?.stop();
-    } finally {
       store.close();
-    }
+      resourcesClosed = true;
+    });
+    resourceClosePromise = attempt.catch((error) => {
+      resourceClosePromise = undefined;
+      throw error;
+    });
+    return resourceClosePromise;
   };
   const close = () => {
-    if (!closePromise) {
-      closePromise = Promise.resolve()
-        .then(() => app?.close())
-        .finally(closeResources);
-    }
+    if (closePromise) return closePromise;
+    const attempt = Promise.resolve().then(async () => {
+      if (!appCloseAttempted && app) {
+        appCloseAttempted = true;
+        try {
+          await app.close();
+        } catch (error) {
+          if (!(error instanceof Error && error.message === "AUTOMATION_WORKER_STOP_TIMEOUT")) {
+            try { await closeResources(); } catch {}
+          }
+          throw error;
+        }
+      }
+      await closeResources();
+    });
+    closePromise = attempt.catch((error) => {
+      closePromise = undefined;
+      throw error;
+    });
     return closePromise;
   };
   function onSignal() {

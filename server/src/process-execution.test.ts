@@ -228,6 +228,20 @@ describe("runManagedProcess", () => {
     expect(launchctl).not.toHaveBeenCalled();
   });
 
+  it("normalizes cancellation during baseline enumeration", async () => {
+    const controller = new AbortController();
+    const listProcesses = vi.fn(async (_timeoutMs: number, signal?: AbortSignal) => {
+      expect(signal).toBe(controller.signal);
+      controller.abort();
+      throw new Error("enumeration aborted");
+    });
+
+    await expect(runManagedProcess("/bin/echo", [], {
+      cwd: "/tmp", env: {}, timeoutMs: 300_000, maxOutputBytes: 64, signal: controller.signal
+    }, { platform: "darwin", uid: 501, listProcesses, launchctl: vi.fn() } as any))
+      .rejects.toThrow("MANAGED_PROCESS_ABORTED");
+  });
+
   it("uses the independent cleanup budget when bootstrap returns after the deadline", async () => {
     let now = 0;
     let bootedOut = false;
@@ -339,6 +353,89 @@ describe("runManagedProcess", () => {
     expect(servicePrints).toBe(2);
     expect(cleanupList).toHaveBeenCalled();
     expect(launchctl.mock.calls.some(([args]) => args[0] === "bootout")).toBe(true);
+  });
+
+  it("enters independent coalition cleanup immediately when externally aborted", async () => {
+    const controller = new AbortController();
+    let bootedOut = false;
+    let executionPrints = 0;
+    const service = "state = not running\nlast exit code = 0\nresource coalition = {\n ID = 77\n }\n";
+    const launchctl = vi.fn(async (args: string[], _timeoutMs: number, signal?: AbortSignal) => {
+      if (args[0] === "bootstrap") {
+        expect(signal).toBe(controller.signal);
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "bootout") {
+        expect(signal).toBeUndefined();
+        bootedOut = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "print" && bootedOut) {
+        expect(signal).toBeUndefined();
+        throw Object.assign(new Error("absent"), { stderr: "Could not find service" });
+      }
+      executionPrints += 1;
+      if (executionPrints === 1) {
+        expect(signal).toBe(controller.signal);
+        controller.abort();
+      } else {
+        expect(signal).toBeUndefined();
+      }
+      return { stdout: service, stderr: "" };
+    });
+    const listProcesses = vi.fn(async () => []);
+
+    await expect(runManagedProcess("/bin/echo", [], {
+      cwd: "/tmp", env: {}, timeoutMs: 300_000, maxOutputBytes: 64,
+      termGraceMs: 0, signal: controller.signal
+    }, {
+      platform: "darwin", uid: 501, now: () => 0, sleep: async () => {},
+      listProcesses, launchctl,
+      coalitionDependencies: {
+        listProcesses, coalitionForPid: vi.fn(), processExists: vi.fn(), signal: vi.fn(),
+        sleep: async () => {}, now: () => 0
+      }
+    } as any)).rejects.toThrow("MANAGED_PROCESS_ABORTED");
+
+    expect(bootedOut).toBe(true);
+    expect(executionPrints).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does not return success when cancellation arrives during coalition cleanup", async () => {
+    const controller = new AbortController();
+    let bootedOut = false;
+    const service = "state = running\npid = 123\nresource coalition = {\n ID = 77\n }\n";
+    const launchctl = vi.fn(async (args: string[]) => {
+      if (args[0] === "bootstrap") {
+        const controlRoot = dirname(args[2]!);
+        writeFileSync(join(controlRoot, "result.json"), JSON.stringify({
+          version: 1, exitCode: 0, signal: null
+        }), { mode: 0o600 });
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "bootout") {
+        controller.abort();
+        bootedOut = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (args[0] === "print" && bootedOut) {
+        throw Object.assign(new Error("absent"), { stderr: "Could not find service" });
+      }
+      return { stdout: service, stderr: "" };
+    });
+    const listProcesses = vi.fn(async () => []);
+
+    await expect(runManagedProcess("/bin/echo", [], {
+      cwd: "/tmp", env: {}, timeoutMs: 300_000, maxOutputBytes: 64,
+      termGraceMs: 0, signal: controller.signal
+    }, {
+      platform: "darwin", uid: 501, now: () => 0, sleep: async () => {},
+      listProcesses, launchctl,
+      coalitionDependencies: {
+        listProcesses, coalitionForPid: vi.fn(), processExists: vi.fn(), signal: vi.fn(),
+        sleep: async () => {}, now: () => 0
+      }
+    } as any)).rejects.toThrow("MANAGED_PROCESS_ABORTED");
   });
 
   it("fails closed on a status signal before the deadline while still cleaning the job", async () => {

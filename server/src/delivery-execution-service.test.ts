@@ -20,6 +20,7 @@ const directories: string[] = [];
 afterEach(() => {
   stores.splice(0).forEach((store) => store.close());
   directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true }));
+  vi.useRealTimers();
 });
 
 function createFixture(databasePath = ":memory:") {
@@ -257,7 +258,7 @@ describe("DeliveryExecutionService", () => {
       implementation: expect.objectContaining({
         changedFiles: [expect.objectContaining({ content: "export const ready = true;\n" })]
       })
-    }));
+    }), expect.any(AbortSignal));
   });
 
   it("rejects implementation evidence when worktree HEAD differs from its base commit", async () => {
@@ -610,7 +611,7 @@ describe("DeliveryExecutionService", () => {
     expect(reviewEvidence.inputDiffHash).toBe(testingEvidence.inputDiffHash);
     expect(review).toHaveBeenCalledWith(expect.objectContaining({
       implementation: { diff: implementation.diff, changedFiles: snapshot.changedFiles }
-    }));
+    }), expect.any(AbortSignal));
     expect(testing).toHaveBeenCalledWith(expect.objectContaining({
       sourceManifest: snapshot.manifest,
       sensitivePatterns: [".env*"],
@@ -639,7 +640,7 @@ describe("DeliveryExecutionService", () => {
           allowedCommands: [{ command: "npm", argsPrefix: ["test"] }]
         })
       }
-    }));
+    }), undefined);
   });
 
   it("fails closed before review when the full implementation diff is stale", async () => {
@@ -689,6 +690,119 @@ describe("DeliveryExecutionService", () => {
     await expect(service.review(fixture.unit.id, 1, "review-job-retry"))
       .resolves.toMatchObject({ result: "passed" });
     expect(review).toHaveBeenCalledTimes(2);
+  });
+
+  it("propagates worker cancellation to the review provider without writing evidence", async () => {
+    const fixture = createFixture();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult()))
+      .implement(fixture.unit.id);
+    let providerSignal: AbortSignal | undefined;
+    const review = vi.fn(async (_input: unknown, signal: AbortSignal) => {
+      providerSignal = signal;
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("provider aborted")), { once: true });
+      });
+      throw new Error("unreachable");
+    });
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality, { review }
+    );
+    const worker = createAutomationWorker({
+      jobs: fixture.store.automationJobs,
+      handlers: { ...createDeliveryQualityAutomationHandlers(service), test: async () => {} },
+      workerId: "worker-provider-abort"
+    });
+
+    let drain = worker.drainOnce();
+    await Promise.resolve();
+    if (!providerSignal) {
+      await drain;
+      drain = worker.drainOnce();
+      await Promise.resolve();
+    }
+    expect(providerSignal).toBeDefined();
+    await expect(worker.stop()).resolves.toBeUndefined();
+    await expect(drain).resolves.toBe(true);
+
+    expect(providerSignal?.aborted).toBe(true);
+    expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")).toBeNull();
+    expect(fixture.store.automationJobs.byDedupe(`review:${fixture.unit.id}:v1`)).toMatchObject({
+      status: "pending", lastError: "DELIVERY_QUALITY_PROVIDER_UNAVAILABLE"
+    });
+  });
+
+  it("aborts a review provider at the configured deadline without writing evidence", async () => {
+    vi.useFakeTimers();
+    const fixture = createFixture();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult()))
+      .implement(fixture.unit.id);
+    let providerSignal: AbortSignal | undefined;
+    const review = vi.fn(async (_input: unknown, signal: AbortSignal) => {
+      providerSignal = signal;
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      throw new Error("unreachable");
+    });
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality,
+      { review, reviewTimeoutMs: 100 }
+    );
+
+    const pending = service.review(fixture.unit.id, 1, "review-deadline");
+    const rejection = expect(pending).rejects.toThrow("DELIVERY_QUALITY_PROVIDER_UNAVAILABLE");
+    await vi.advanceTimersByTimeAsync(100);
+
+    await rejection;
+    expect(providerSignal?.aborted).toBe(true);
+    expect((providerSignal?.reason as Error).message).toBe("DELIVERY_QUALITY_REVIEW_TIMEOUT");
+    expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not complete review evidence when cancellation arrives with the provider result", async () => {
+    const fixture = createFixture();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult()))
+      .implement(fixture.unit.id);
+    const controller = new AbortController();
+    const review = vi.fn(async () => {
+      controller.abort();
+      return {
+        conclusion: "pass" as const, confidence: 0.9, summary: "must not persist",
+        facts: [], assumptions: [], openQuestions: [], risks: [], findings: []
+      };
+    });
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality, { review }
+    );
+
+    await expect(service.review(fixture.unit.id, 1, "review-late-abort", controller.signal))
+      .rejects.toThrow("DELIVERY_QUALITY_PROVIDER_UNAVAILABLE");
+    expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")).toBeNull();
+  });
+
+  it("does not complete testing evidence when cancellation arrives with the command result", async () => {
+    const fixture = createFixture();
+    await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult()))
+      .implement(fixture.unit.id);
+    const controller = new AbortController();
+    const testing = vi.fn(async () => {
+      controller.abort();
+      return { result: "passed" as const, commandResults: [], acceptanceTrace: [] };
+    });
+    const targetState = {
+      head: fixture.version.headCommit, refsHash: "refs", diffHash: "target-diff", gitCommonDir: "/repo/.git"
+    };
+    const inspectTarget = vi.fn().mockResolvedValue(targetState);
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality,
+      { testing, inspectTarget }
+    );
+
+    await expect(service.test(fixture.unit.id, 1, "test-late-abort", controller.signal))
+      .rejects.toThrow("AUTOMATED_TEST_INFRASTRUCTURE_UNAVAILABLE");
+    expect(inspectTarget).toHaveBeenCalledOnce();
+    expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "automated_testing")).toBeNull();
   });
 
   it("atomically aborts a quality claim when its automation job exhausts three attempts", async () => {
@@ -1001,9 +1115,12 @@ describe("DeliveryExecutionService", () => {
     const service = { review: vi.fn(), test: vi.fn() } as any;
     const handlers = createDeliveryQualityAutomationHandlers(service);
     const baseJob = { ownerType: "delivery_unit", ownerId: fixture.unit.id, evidenceVersion: 1 } as any;
-    await expect(handlers.review!({ ...baseJob, action: "test" })).rejects.toThrow("AUTOMATION_INPUT_INVALID");
-    await expect(handlers.test!({ ...baseJob, action: "test", evidenceVersion: 0 })).rejects.toThrow("AUTOMATION_INPUT_INVALID");
-    await handlers.review!({ ...baseJob, action: "review" });
-    expect(service.review).toHaveBeenCalledWith(fixture.unit.id, 1, undefined);
+    const context = { signal: new AbortController().signal };
+    await expect(handlers.review!({ ...baseJob, action: "test" }, context)).rejects
+      .toThrow("AUTOMATION_INPUT_INVALID");
+    await expect(handlers.test!({ ...baseJob, action: "test", evidenceVersion: 0 }, context)).rejects
+      .toThrow("AUTOMATION_INPUT_INVALID");
+    await handlers.review!({ ...baseJob, action: "review" }, context);
+    expect(service.review).toHaveBeenCalledWith(fixture.unit.id, 1, undefined, context.signal);
   });
 });

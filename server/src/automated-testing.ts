@@ -1,6 +1,5 @@
 import { constants } from "node:fs";
-import { access, mkdir, mkdtemp, realpath } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, mkdir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { MAX_AUTOMATED_TEST_COMMANDS } from "@ai-workflow/shared";
 import { type EvidenceManifest } from "./evidence-tree.js";
@@ -11,7 +10,7 @@ import {
   type VerificationToolchainSnapshot
 } from "./verification-toolchain.js";
 import { materializeVerificationManifest } from "./verification-fs-helper.js";
-import { cleanupVerificationDirectory } from "./verification-cleanup.js";
+import { cleanupVerificationDirectory, createVerificationDirectory } from "./verification-cleanup.js";
 
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 const COMMAND_TIMEOUT_MS = 300_000;
@@ -163,7 +162,8 @@ export interface AutomatedTestingDependencies {
 
 export async function runAutomatedTesting(
   input: AutomatedTestingInput,
-  dependencies: AutomatedTestingDependencies = {}
+  dependencies: AutomatedTestingDependencies = {},
+  signal?: AbortSignal
 ): Promise<AutomatedTestingResult> {
   const now = dependencies.now ?? Date.now;
   const deadline = now() + COMMAND_TIMEOUT_MS;
@@ -178,8 +178,13 @@ export async function runAutomatedTesting(
     }
     throw error;
   }
-  if ((dependencies.platform ?? process.platform) !== "darwin"
-    || !(await (dependencies.sandboxExecutableAvailable ?? defaultSandboxAvailable)())) {
+  throwIfAutomatedTestAborted(signal);
+  if ((dependencies.platform ?? process.platform) !== "darwin") {
+    return { result: "failed", error: "AUTOMATED_TEST_SANDBOX_UNAVAILABLE", commandResults: [], acceptanceTrace: [] };
+  }
+  const sandboxAvailable = await (dependencies.sandboxExecutableAvailable ?? defaultSandboxAvailable)();
+  throwIfAutomatedTestAborted(signal);
+  if (!sandboxAvailable) {
     return { result: "failed", error: "AUTOMATED_TEST_SANDBOX_UNAVAILABLE", commandResults: [], acceptanceTrace: [] };
   }
   if (plan.commands.length === 0) {
@@ -189,17 +194,19 @@ export async function runAutomatedTesting(
     };
   }
   if (now() >= deadline) return automatedDeadlineResult(plan);
-  const parent = await mkdtemp(join(tmpdir(), "ai-workflow-verification-"));
+  const parent = await createVerificationDirectory();
   const verificationRoot = join(parent, "worktree");
   try {
+    throwIfAutomatedTestAborted(signal);
     try {
       const remaining = Math.ceil(deadline - now());
       if (remaining <= 0) return automatedDeadlineResult(plan);
       await (dependencies.materializeManifest ?? materializeVerificationManifest)(
         verificationRoot, input.sourceManifest,
-        { sensitivePatterns: input.sensitivePatterns, timeoutMs: remaining }
+        { sensitivePatterns: input.sensitivePatterns, timeoutMs: remaining, signal }
       );
     } catch (error) {
+      if (automatedTestAborted(signal, error)) throw automatedTestAbort(error);
       if (error instanceof Error && error.message === "AUTOMATED_TEST_DEADLINE_EXCEEDED") {
         return automatedDeadlineResult(plan);
       }
@@ -216,17 +223,20 @@ export async function runAutomatedTesting(
       }
       throw error;
     }
+    throwIfAutomatedTestAborted(signal);
     if (now() >= deadline) return automatedDeadlineResult(plan);
     const home = join(parent, "home");
     const temporaryDirectory = join(parent, "tmp");
     await mkdir(home, { recursive: true });
     await mkdir(temporaryDirectory, { recursive: true });
+    throwIfAutomatedTestAborted(signal);
     if (now() >= deadline) return automatedDeadlineResult(plan);
     const [canonicalParent, canonicalTargetWorktree, canonicalGitCommonDir, canonicalHome, canonicalTemporaryDirectory]
       = await Promise.all([
         realpath(parent), realpath(input.targetWorktree), realpath(input.gitCommonDir),
         realpath(home), realpath(temporaryDirectory)
     ]);
+    throwIfAutomatedTestAborted(signal);
     if (now() >= deadline) return automatedDeadlineResult(plan);
     let toolchain: VerificationToolchainSnapshot | undefined;
     if (!dependencies.execFile) {
@@ -234,9 +244,10 @@ export async function runAutomatedTesting(
         const toolchainRemaining = Math.ceil(deadline - now());
         if (toolchainRemaining <= 0) return automatedDeadlineResult(plan);
         toolchain = await (dependencies.snapshotToolchain ?? snapshotVerificationToolchainBounded)(
-          plan.commands, canonicalParent, { env: process.env, timeoutMs: toolchainRemaining }
+          plan.commands, canonicalParent, { env: process.env, timeoutMs: toolchainRemaining, signal }
         );
       } catch (error) {
+        if (automatedTestAborted(signal, error)) throw automatedTestAbort(error);
         if (error instanceof Error && error.message === "AUTOMATED_TEST_DEADLINE_EXCEEDED") {
           return automatedDeadlineResult(plan);
         }
@@ -258,6 +269,7 @@ export async function runAutomatedTesting(
     const commandResults: CommandResult[] = [];
     let deadlineExceeded = false;
     for (let index = 0; index < plan.commands.length; index += 1) {
+      throwIfAutomatedTestAborted(signal);
       const command = plan.commands[index]!;
       const remaining = deadline - now();
       if (remaining <= 0) {
@@ -273,10 +285,12 @@ export async function runAutomatedTesting(
           output = await (dependencies.runManagedProcess ?? runManagedProcess)(
             SANDBOX_EXEC, ["-p", profile, frozenCommand.file, ...frozenCommand.args], {
               cwd: join(canonicalParent, "worktree"), env,
-              timeoutMs: remaining, maxOutputBytes: COMMAND_OUTPUT_BYTES
+              timeoutMs: remaining, maxOutputBytes: COMMAND_OUTPUT_BYTES, signal
             }
           );
+          throwIfAutomatedTestAborted(signal);
         } catch (error) {
+          if (automatedTestAborted(signal, error)) throw automatedTestAbort(error);
           if (error instanceof Error && error.message === "MANAGED_PROCESS_DEADLINE_EXCEEDED") {
             deadlineExceeded = true;
             commandResults.push(...plan.commands.slice(index).map(deadlineCommandResult));
@@ -308,8 +322,10 @@ export async function runAutomatedTesting(
           shell: false,
           timeout: remaining,
           maxBuffer: COMMAND_OUTPUT_BYTES,
-          windowsHide: true
+          windowsHide: true,
+          signal
         });
+        throwIfAutomatedTestAborted(signal);
         const result: CommandResult = {
           ...command, exitCode: 0,
           stdout: redactSensitive(String(output.stdout ?? ""), input.sensitivePatterns),
@@ -326,6 +342,7 @@ export async function runAutomatedTesting(
         }
         commandResults.push(result);
       } catch (error) {
+        if (automatedTestAborted(signal, error)) throw automatedTestAbort(error);
         const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown; killed?: unknown; signal?: unknown };
         const timedOut = failure.killed === true || failure.signal === "SIGTERM";
         commandResults.push({
@@ -343,6 +360,7 @@ export async function runAutomatedTesting(
         }
       }
     }
+    throwIfAutomatedTestAborted(signal);
     const passed = !deadlineExceeded
       && commandResults.every((result) => result.exitCode === 0 && !result.timedOut && !result.outputOverflow);
     return {
@@ -355,6 +373,22 @@ export async function runAutomatedTesting(
   } finally {
     await (dependencies.cleanupDirectory ?? cleanupVerificationDirectory)(parent);
   }
+}
+
+function automatedTestAborted(signal: AbortSignal | undefined, error: unknown) {
+  return signal?.aborted === true || (error instanceof Error && [
+    "AUTOMATED_TEST_ABORTED", "MANAGED_PROCESS_ABORTED", "TRUSTED_SUBPROCESS_ABORTED"
+  ].includes(error.message));
+}
+
+function automatedTestAbort(cause?: unknown) {
+  return cause instanceof Error && cause.message === "AUTOMATED_TEST_ABORTED"
+    ? cause
+    : new Error("AUTOMATED_TEST_ABORTED", cause === undefined ? undefined : { cause });
+}
+
+function throwIfAutomatedTestAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw automatedTestAbort(signal.reason);
 }
 
 function deadlineCommandResult(command: VerificationCommand): CommandResult {

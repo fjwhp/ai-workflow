@@ -19,6 +19,7 @@ export interface ManagedProcessOptions {
   timeoutMs: number;
   maxOutputBytes: number;
   termGraceMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface ManagedProcessResult {
@@ -34,12 +35,14 @@ interface ManagedProcessDependencies {
   uid?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
-  listProcesses?: (timeoutMs: number) => Promise<DarwinProcessRow[]>;
+  listProcesses?: (timeoutMs: number, signal?: AbortSignal) => Promise<DarwinProcessRow[]>;
   launchctl?: Launchctl;
   coalitionDependencies?: DarwinCoalitionDependencies;
 }
 
-type Launchctl = (args: string[], timeoutMs: number) => Promise<{ stdout: string; stderr: string }>;
+type Launchctl = (
+  args: string[], timeoutMs: number, signal?: AbortSignal
+) => Promise<{ stdout: string; stderr: string }>;
 
 export interface DarwinProcessRow {
   pid: number;
@@ -86,6 +89,7 @@ export async function runManagedProcess(
     throw new Error("MANAGED_PROCESS_CONTAINMENT_UNAVAILABLE");
   }
   validateManagedProcessInput(file, args, options);
+  throwIfManagedProcessAborted(options.signal);
   const uid = dependencies.uid ?? process.getuid?.();
   if (uid === undefined || !Number.isSafeInteger(uid) || uid < 0) {
     throw new Error("MANAGED_PROCESS_CONTAINMENT_UNAVAILABLE");
@@ -96,9 +100,17 @@ export async function runManagedProcess(
   const executionRemaining = () => deadlineRemaining(
     executionDeadline, now, "MANAGED_PROCESS_DEADLINE_EXCEEDED"
   );
-  const listProcesses = dependencies.listProcesses ?? ((timeoutMs) => listDarwinProcesses(uid, timeoutMs));
+  const listProcesses = dependencies.listProcesses
+    ?? ((timeoutMs, signal) => listDarwinProcesses(uid, timeoutMs, signal));
   const launchctlCommand = dependencies.launchctl ?? defaultLaunchctl;
-  const baselineRows = await listProcesses(executionRemaining());
+  let baselineRows: DarwinProcessRow[];
+  try {
+    baselineRows = await listProcesses(executionRemaining(), options.signal);
+  } catch (error) {
+    throwIfManagedProcessAborted(options.signal, error);
+    throw error;
+  }
+  throwIfManagedProcessAborted(options.signal);
   executionRemaining();
   const baseline = new Map(baselineRows.map((row) => [row.pid, row.startedAt]));
   const controlRoot = await mkdtemp(join(tmpdir(), "ai-workflow-process-"));
@@ -175,6 +187,7 @@ export async function runManagedProcess(
   };
 
   try {
+    throwIfManagedProcessAborted(options.signal);
     await Promise.all([
       writeFile(stdoutPath, "", { mode: 0o600 }),
       writeFile(stderrPath, "", { mode: 0o600 }),
@@ -187,14 +200,17 @@ export async function runManagedProcess(
         cwd: controlRoot, env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" }, stdoutPath, stderrPath
       }), { mode: 0o600 })
     ]);
+    throwIfManagedProcessAborted(options.signal);
     const bootstrapTimeoutMs = executionRemaining();
     jobMayExist = true;
-    await launchctlCommand(["bootstrap", `gui/${uid}`, plistPath], bootstrapTimeoutMs);
+    await launchctlCommand(["bootstrap", `gui/${uid}`, plistPath], bootstrapTimeoutMs, options.signal);
+    throwIfManagedProcessAborted(options.signal);
 
     let exitCode = -1;
     let timedOut = false;
     let outputOverflow = false;
     while (true) {
+      throwIfManagedProcessAborted(options.signal);
       if (now() >= executionDeadline) {
         timedOut = true;
         break;
@@ -202,15 +218,17 @@ export async function runManagedProcess(
       let serviceOutput: string;
       try {
         serviceOutput = (await launchctlCommand(
-          ["print", serviceTarget], executionRemaining()
+          ["print", serviceTarget], executionRemaining(), options.signal
         )).stdout;
       } catch (error) {
+        throwIfManagedProcessAborted(options.signal, error);
         if (now() >= executionDeadline || processCallTimedOut(error)) {
           timedOut = true;
           break;
         }
         throw error;
       }
+      throwIfManagedProcessAborted(options.signal);
       const coalition = parseLaunchctlPidCoalition(serviceOutput);
       if (coalition.status !== "member") throw new Error("MANAGED_PROCESS_SERVICE_INVALID");
       coalitionId = coalition.coalitionId;
@@ -235,16 +253,24 @@ export async function runManagedProcess(
       }
       const service = parseLaunchctlService(serviceOutput);
       if (service.state === "exited") throw new Error("MANAGED_PROCESS_WRAPPER_FAILED");
-      await sleep(Math.min(POLL_MS, Math.max(0, executionDeadline - now())));
+      await abortableSleep(
+        sleep,
+        Math.min(POLL_MS, Math.max(0, executionDeadline - now())),
+        options.signal
+      );
     }
 
     await cleanupManagedJob();
+    throwIfManagedProcessAborted(options.signal);
     const finalSizes = await outputSizes(stdoutPath, stderrPath);
     outputOverflow ||= finalSizes.stdout + finalSizes.stderr > options.maxOutputBytes;
     const output = await readCappedOutput(stdoutPath, stderrPath, options.maxOutputBytes);
+    throwIfManagedProcessAborted(options.signal);
     result = { exitCode, ...output, timedOut, outputOverflow };
   } catch (error) {
-    primaryError = error;
+    primaryError = options.signal?.aborted
+      ? new Error("MANAGED_PROCESS_ABORTED", { cause: error })
+      : error;
   } finally {
     if (jobMayExist && !cleanupAttempted) {
       try {
@@ -452,11 +478,11 @@ export async function terminateDarwinCoalition(
   }
 }
 
-async function listDarwinProcesses(uid: number, timeoutMs: number) {
+async function listDarwinProcesses(uid: number, timeoutMs: number, signal?: AbortSignal) {
   try {
     const output = await execFileAsync("/bin/ps", ["-axo", "uid=,pid=,stat=,lstart="], {
       encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, maxBuffer: PROCESS_LIST_BYTES,
-      timeout: Math.min(PROCESS_QUERY_TIMEOUT_MS, timeoutMs)
+      timeout: Math.min(PROCESS_QUERY_TIMEOUT_MS, timeoutMs), signal
     });
     return parseDarwinProcessRows(output.stdout, uid);
   } catch (error) {
@@ -484,10 +510,10 @@ function defaultCoalitionDependencies(
   };
 }
 
-async function defaultLaunchctl(args: string[], timeoutMs: number) {
+async function defaultLaunchctl(args: string[], timeoutMs: number, signal?: AbortSignal) {
   return execFileAsync("/bin/launchctl", args, {
     encoding: "utf8", env: { ...process.env, LC_ALL: "C" }, maxBuffer: LAUNCHCTL_OUTPUT_BYTES,
-    timeout: Math.min(LAUNCHCTL_TIMEOUT_MS, timeoutMs)
+    timeout: Math.min(LAUNCHCTL_TIMEOUT_MS, timeoutMs), signal
   });
 }
 
@@ -634,4 +660,22 @@ export const managedProcessWrapperSource = `(${managedProcessWrapperMain.toStrin
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function throwIfManagedProcessAborted(signal: AbortSignal | undefined, cause?: unknown): void {
+  if (signal?.aborted) throw new Error("MANAGED_PROCESS_ABORTED", cause === undefined ? undefined : { cause });
+}
+
+function abortableSleep(
+  sleep: (ms: number) => Promise<void>,
+  delayMs: number,
+  signal: AbortSignal | undefined
+) {
+  if (!signal) return sleep(delayMs);
+  throwIfManagedProcessAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    const abort = () => reject(new Error("MANAGED_PROCESS_ABORTED"));
+    signal.addEventListener("abort", abort, { once: true });
+    sleep(delayMs).then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
 }

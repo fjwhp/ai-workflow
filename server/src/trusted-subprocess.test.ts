@@ -28,4 +28,17 @@ describe("runTrustedSubprocess", () => {
     expect(result).toMatchObject({ exitCode: -1, timedOut: false, outputOverflow: true });
     expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(64);
   });
+
+  it("terminates an active child when its external signal is aborted", async () => {
+    const controller = new AbortController();
+    const pending = runTrustedSubprocess(process.execPath, [
+      "-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"
+    ], {
+      timeoutMs: 5_000, termGraceMs: 30, maxOutputBytes: 1024, signal: controller.signal
+    });
+
+    controller.abort();
+
+    await expect(pending).rejects.toThrow("TRUSTED_SUBPROCESS_ABORTED");
+  });
 });

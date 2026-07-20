@@ -92,6 +92,38 @@ describe("server entry point", () => {
     expect(worker.stop).toHaveBeenCalledOnce();
   });
 
+  it("keeps SQLite open after stop timeout and lets a later close retry the same worker", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "automation-startup-stop-timeout-"));
+    directories.push(directory);
+    const events: string[] = [];
+    let finishStop!: () => void;
+    const stopped = new Promise<void>((resolve) => { finishStop = resolve; });
+    const worker = {
+      drainOnce: vi.fn(async () => false), start: vi.fn(),
+      stop: vi.fn()
+        .mockRejectedValueOnce(new Error("AUTOMATION_WORKER_STOP_TIMEOUT"))
+        .mockImplementationOnce(() => stopped)
+    };
+
+    const runtime = await startServer({
+      env: { DATA_DIR: directory, PORT: "0" },
+      createStore: (databasePath) => observedStore(databasePath, events),
+      createWorker: () => worker,
+      buildApplication: async () => fakeApp(events),
+      writeListening: () => {}
+    });
+
+    await expect(runtime.close()).rejects.toThrow("AUTOMATION_WORKER_STOP_TIMEOUT");
+    expect(events).not.toContain("store:close");
+    expect(() => runtime.store.listProjects()).not.toThrow();
+
+    const retry = runtime.close();
+    finishStop();
+    await expect(retry).resolves.toBeUndefined();
+    expect(worker.stop).toHaveBeenCalledTimes(2);
+    expect(events.filter((event) => event === "store:close")).toHaveLength(1);
+  });
+
   it("registers Store-backed quality handlers and preserves explicit handler overrides", async () => {
     const directory = mkdtempSync(join(tmpdir(), "automation-startup-handlers-"));
     directories.push(directory);
@@ -120,7 +152,7 @@ describe("server entry point", () => {
     expect(serviceStore).toBe(runtime.store);
     await workerOptions.handlers.review(reviewJob);
     await workerOptions.handlers.test({ ...reviewJob, id: "test-job", action: "test" });
-    expect(review).toHaveBeenCalledWith("unit-1", 3, "review-job");
+    expect(review).toHaveBeenCalledWith("unit-1", 3, "review-job", undefined);
     expect(test).not.toHaveBeenCalled();
     expect(overrideTest).toHaveBeenCalledOnce();
     await runtime.close();

@@ -49,4 +49,34 @@ describe("redactSensitive", () => {
   ])("fails closed when the %s redaction budget is exceeded", (_name, value, limits) => {
     expect(() => redactSensitive(value, [], limits)).toThrow("REDACTION_LIMIT_EXCEEDED");
   });
+
+  it("stops traversing an array as soon as its serialized byte budget is exceeded", () => {
+    const reads: number[] = [];
+    const input = new Array(100);
+    for (let index = 0; index < input.length; index += 1) {
+      Object.defineProperty(input, index, {
+        enumerable: true,
+        get() { reads.push(index); return "abcdefghij"; }
+      });
+    }
+
+    expect(() => redactSensitive(input, [], { maxBytes: 12 })).toThrow("REDACTION_LIMIT_EXCEEDED");
+    expect(reads).toEqual([0]);
+  });
+
+  it("accounts for multibyte UTF-8 and escaped string bytes", () => {
+    expect(redactSensitive("界", [], { maxBytes: 5 })).toBe("界");
+    expect(() => redactSensitive("界", [], { maxBytes: 4 })).toThrow("REDACTION_LIMIT_EXCEEDED");
+    expect(redactSensitive('"', [], { maxBytes: 4 })).toBe('"');
+    expect(() => redactSensitive('"', [], { maxBytes: 3 })).toThrow("REDACTION_LIMIT_EXCEEDED");
+  });
+
+  it("accounts for object keys and container punctuation", () => {
+    expect(redactSensitive({ 界: true }, [], { maxBytes: 12 })).toEqual({ 界: true });
+    expect(() => redactSensitive({ 界: true }, [], { maxBytes: 11 }))
+      .toThrow("REDACTION_LIMIT_EXCEEDED");
+    expect(redactSensitive([null, 12, false], [], { maxBytes: 15 })).toEqual([null, 12, false]);
+    expect(() => redactSensitive([null, 12, false], [], { maxBytes: 14 }))
+      .toThrow("REDACTION_LIMIT_EXCEEDED");
+  });
 });

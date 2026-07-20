@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { MAX_AUTOMATED_TEST_COMMANDS } from "@ai-workflow/shared";
@@ -13,6 +13,7 @@ import {
   type AutomatedTestingInput
 } from "./automated-testing.js";
 import { getWorktreeSnapshot } from "./repository.js";
+import { cleanupVerificationDirectory, VERIFICATION_OWNERSHIP_MARKER } from "./verification-cleanup.js";
 
 const directories: string[] = [];
 const untrustedEvidence: AutomatedTestingInput["untrustedEvidence"] = {
@@ -81,6 +82,126 @@ function processIsRunning(pid: number) {
 }
 
 describe("automated testing safety", () => {
+  it("establishes verification-root ownership before materializing evidence", async () => {
+    const target = initializeTarget();
+    const materializeManifest = vi.fn(async (verificationRoot: string) => {
+      const parent = dirname(verificationRoot);
+      const status = lstatSync(parent);
+      const markerStatus = lstatSync(join(parent, VERIFICATION_OWNERSHIP_MARKER));
+      const marker = JSON.parse(readFileSync(join(parent, VERIFICATION_OWNERSHIP_MARKER), "utf8"));
+      expect(status.mode & 0o777).toBe(0o700);
+      expect(markerStatus.mode & 0o777).toBe(0o600);
+      expect(marker).toMatchObject({ version: 1, uid: status.uid, dev: status.dev, ino: status.ino });
+      mkdirSync(verificationRoot);
+    });
+
+    await expect(runAutomatedTesting(automatedInput(target, [{ command: "npm", argsPrefix: ["test"] }]), {
+      platform: "darwin", sandboxExecutableAvailable: async () => true,
+      materializeManifest: materializeManifest as any,
+      execFile: async () => ({ stdout: "ok", stderr: "" })
+    })).resolves.toMatchObject({ result: "passed" });
+    expect(materializeManifest).toHaveBeenCalledOnce();
+  });
+
+  it("waits for helper termination and root cleanup when materialization is canceled", async () => {
+    const target = initializeTarget();
+    const controller = new AbortController();
+    let startMaterialization!: () => void;
+    const materializationStarted = new Promise<void>((resolve) => { startMaterialization = resolve; });
+    let helperStopped = false;
+    let cleanupFinished = false;
+    const materializeManifest = vi.fn(async (_root, _manifest, options) => {
+      startMaterialization();
+      await new Promise<void>((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          helperStopped = true;
+          reject(new Error("AUTOMATED_TEST_ABORTED"));
+        }, { once: true });
+      });
+    });
+    const cleanupDirectory = vi.fn(async (path: string) => {
+      expect(helperStopped).toBe(true);
+      await cleanupVerificationDirectory(path);
+      cleanupFinished = true;
+    });
+
+    const pending = runAutomatedTesting(
+      automatedInput(target, [{ command: "npm", argsPrefix: ["test"] }]),
+      {
+        platform: "darwin", sandboxExecutableAvailable: async () => true,
+        materializeManifest: materializeManifest as any, cleanupDirectory
+      },
+      controller.signal
+    );
+    await materializationStarted;
+    controller.abort();
+
+    await expect(pending).rejects.toThrow("AUTOMATED_TEST_ABORTED");
+    expect(cleanupFinished).toBe(true);
+  });
+
+  it("waits for managed-command containment cleanup before cleaning a canceled root", async () => {
+    const target = initializeTarget();
+    const controller = new AbortController();
+    let startCommand!: () => void;
+    const commandStarted = new Promise<void>((resolve) => { startCommand = resolve; });
+    let commandCleanupFinished = false;
+    let rootCleanupFinished = false;
+    const runManagedProcess = vi.fn(async (_file, _args, options) => {
+      expect(options.signal).toBe(controller.signal);
+      startCommand();
+      await new Promise<void>((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          commandCleanupFinished = true;
+          reject(new Error("MANAGED_PROCESS_ABORTED"));
+        }, { once: true });
+      });
+      throw new Error("unreachable");
+    });
+    const cleanupDirectory = vi.fn(async (path: string) => {
+      expect(commandCleanupFinished).toBe(true);
+      await cleanupVerificationDirectory(path);
+      rootCleanupFinished = true;
+    });
+
+    const pending = runAutomatedTesting(
+      automatedInput(target, [{ command: "npm", argsPrefix: ["test"] }]),
+      {
+        platform: "darwin", sandboxExecutableAvailable: async () => true,
+        materializeManifest: async (root: string) => { mkdirSync(root); },
+        snapshotToolchain: fakeToolchain,
+        runManagedProcess: runManagedProcess as any,
+        cleanupDirectory
+      },
+      controller.signal
+    );
+    await commandStarted;
+    controller.abort();
+
+    await expect(pending).rejects.toThrow("AUTOMATED_TEST_ABORTED");
+    expect(rootCleanupFinished).toBe(true);
+  });
+
+  it("does not return command evidence when cancellation arrives during managed cleanup", async () => {
+    const target = initializeTarget();
+    const controller = new AbortController();
+    const runManagedProcess = vi.fn(async () => {
+      controller.abort();
+      return { exitCode: 0, stdout: "must not persist", stderr: "", timedOut: false, outputOverflow: false };
+    });
+
+    await expect(runAutomatedTesting(
+      automatedInput(target, [{ command: "npm", argsPrefix: ["test"] }]),
+      {
+        platform: "darwin", sandboxExecutableAvailable: async () => true,
+        materializeManifest: async (root: string) => { mkdirSync(root); },
+        snapshotToolchain: fakeToolchain,
+        runManagedProcess: runManagedProcess as any
+      },
+      controller.signal
+    )).rejects.toThrow("AUTOMATED_TEST_ABORTED");
+  });
+
   it("materializes only the frozen manifest after the live source changes", async () => {
     const root = mkdtempSync(join(tmpdir(), "automated-test-frozen-manifest-")); directories.push(root);
     const source = join(root, "source");
@@ -157,6 +278,19 @@ describe("automated testing safety", () => {
       result: "failed", error: "AUTOMATED_TEST_COMMANDS_LIMIT_EXCEEDED", commandResults: [], acceptanceTrace: []
     });
     expect(sandboxExecutableAvailable).not.toHaveBeenCalled();
+  });
+
+  it("reports cancellation that arrives during sandbox capability detection", async () => {
+    const controller = new AbortController();
+    const sandboxExecutableAvailable = vi.fn(async () => {
+      controller.abort();
+      return false;
+    });
+
+    await expect(runAutomatedTesting(
+      automatedInput("/tmp/not-used", [{ command: "npm", argsPrefix: ["test"] }]),
+      { platform: "darwin", sandboxExecutableAvailable }, controller.signal
+    )).rejects.toThrow("AUTOMATED_TEST_ABORTED");
   });
 
   it("does not start a second command after the single plan deadline", async () => {
@@ -588,7 +722,8 @@ describe("automated testing safety", () => {
       const serializedToolchain = JSON.stringify(result.toolchain);
       expect(Buffer.byteLength(serializedToolchain)).toBeLessThan(1_500_000);
       expect(serializedToolchain).not.toContain("ai-workflow-verification-");
-    }
+    },
+    15_000
   );
 
   it.skipIf(process.platform !== "darwin" || process.env.RUN_MACOS_SANDBOX_ACCEPTANCE !== "1")(

@@ -71,6 +71,7 @@ const TOOLCHAIN_HELPER_OUTPUT_BYTES = 2 * 1024 * 1024;
 interface BoundedSnapshotOptions {
   env?: NodeJS.ProcessEnv;
   timeoutMs: number;
+  signal?: AbortSignal;
 }
 
 interface BoundedSnapshotDependencies {
@@ -78,7 +79,7 @@ interface BoundedSnapshotDependencies {
     file: string,
     args: string[],
     options: {
-      timeoutMs: number; termGraceMs: number; maxOutputBytes: number; input: string;
+      timeoutMs: number; termGraceMs: number; maxOutputBytes: number; input: string; signal?: AbortSignal;
     }
   ) => Promise<{
     exitCode: number; stdout: string; stderr: string; timedOut: boolean; outputOverflow: boolean;
@@ -91,6 +92,7 @@ export async function snapshotVerificationToolchainBounded(
   options: BoundedSnapshotOptions,
   dependencies: BoundedSnapshotDependencies = {}
 ): Promise<VerificationToolchainSnapshot> {
+  if (options.signal?.aborted) throw new Error("AUTOMATED_TEST_ABORTED");
   if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1) {
     throw new Error("AUTOMATED_TEST_DEADLINE_EXCEEDED");
   }
@@ -102,15 +104,25 @@ export async function snapshotVerificationToolchainBounded(
   }
   const runSubprocess = dependencies.runSubprocess
     ?? (await import("./trusted-subprocess.js")).runTrustedSubprocess;
-  const result = await runSubprocess(process.execPath, [
-    "--input-type=commonjs", "--eval", verificationToolchainChildSource,
-    await verificationToolchainModuleUrl()
-  ], {
-    timeoutMs: options.timeoutMs,
-    termGraceMs: Math.min(250, Math.max(0, options.timeoutMs - 1)),
-    maxOutputBytes: TOOLCHAIN_HELPER_OUTPUT_BYTES,
-    input
-  });
+  let result: Awaited<ReturnType<NonNullable<BoundedSnapshotDependencies["runSubprocess"]>>>;
+  try {
+    result = await runSubprocess(process.execPath, [
+      "--input-type=commonjs", "--eval", verificationToolchainChildSource,
+      await verificationToolchainModuleUrl()
+    ], {
+      timeoutMs: options.timeoutMs,
+      termGraceMs: Math.min(250, Math.max(0, options.timeoutMs - 1)),
+      maxOutputBytes: TOOLCHAIN_HELPER_OUTPUT_BYTES,
+      input,
+      signal: options.signal
+    });
+  } catch (error) {
+    if (options.signal?.aborted
+      || (error instanceof Error && error.message === "TRUSTED_SUBPROCESS_ABORTED")) {
+      throw new Error("AUTOMATED_TEST_ABORTED", { cause: error });
+    }
+    throw error;
+  }
   if (result.timedOut) throw new Error("AUTOMATED_TEST_DEADLINE_EXCEEDED");
   if (result.outputOverflow) throw new Error("AUTOMATED_TEST_TOOLCHAIN_LIMIT_EXCEEDED");
   if (result.exitCode !== 0) {

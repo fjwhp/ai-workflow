@@ -28,9 +28,10 @@ export type CodingAgent = (input: CodingAgentInput) => Promise<CodingAgentResult
 type WorktreeSnapshot = Awaited<ReturnType<typeof getWorktreeSnapshot>>;
 type TargetState = { head: string; refsHash: string; diffHash: string; gitCommonDir: string };
 export interface DeliveryQualityDependencies {
-  review?: (input: unknown) => Promise<CodeReviewResult>;
-  testing?: (input: AutomatedTestingInput) => Promise<AutomatedTestingResult>;
+  review?: (input: unknown, signal: AbortSignal) => Promise<CodeReviewResult>;
+  testing?: (input: AutomatedTestingInput, signal?: AbortSignal) => Promise<AutomatedTestingResult>;
   inspectTarget?: (worktreePath: string) => Promise<TargetState>;
+  reviewTimeoutMs?: number;
 }
 
 export type QualityStatus = "running" | "passed" | "failed";
@@ -48,7 +49,12 @@ export class DeliveryExecutionService {
     private readonly model = process.env.OPENAI_CODING_MODEL || process.env.OPENAI_MODEL || "gpt-5.5",
     private readonly qualityPersistence?: DeliveryQualityPersistence,
     private readonly qualityDependencies: DeliveryQualityDependencies = {}
-  ) {}
+  ) {
+    const reviewTimeoutMs = qualityDependencies.reviewTimeoutMs ?? 300_000;
+    if (!Number.isSafeInteger(reviewTimeoutMs) || reviewTimeoutMs < 1 || reviewTimeoutMs > 86_400_000) {
+      throw new Error("DELIVERY_QUALITY_REVIEW_TIMEOUT_INVALID");
+    }
+  }
 
   async implement(unitId: string) {
     const claim = this.persistence.claimImplementation(unitId, this.model);
@@ -106,7 +112,7 @@ export class DeliveryExecutionService {
     });
   }
 
-  async review(unitId: string, evidenceVersion?: number, claimToken?: string) {
+  async review(unitId: string, evidenceVersion?: number, claimToken?: string, signal?: AbortSignal) {
     const quality = this.requireQualityPersistence();
     const claim = quality.claim(unitId, evidenceVersion, "code_review", claimToken);
     if (claim.status === "aborted") return { status: "aborted" as const, error: claim.error };
@@ -120,8 +126,11 @@ export class DeliveryExecutionService {
       return { status: "aborted" as const, error: code };
     }
     let result: CodeReviewResult;
+    const deadline = qualityDeadlineSignal(signal, this.qualityDependencies.reviewTimeoutMs ?? 300_000);
     try {
-      result = await (this.qualityDependencies.review ?? runCodeReview)({
+      const review = this.qualityDependencies.review
+        ?? ((input: unknown, providerSignal: AbortSignal) => runCodeReview(input, () => {}, providerSignal));
+      result = await review({
         requirement: claim.input.requirement,
         approvedArtifacts: claim.input.artifacts,
         deliveryContext: {
@@ -129,14 +138,21 @@ export class DeliveryExecutionService {
           acceptanceCriteria: claim.input.snapshot.acceptanceCriteria
         },
         implementation: { diff: snapshot.diff, changedFiles: snapshot.changedFiles }
-      });
+      }, deadline.signal);
+      if (deadline.signal.aborted) {
+        throw deadline.signal.reason instanceof Error
+          ? deadline.signal.reason
+          : new Error("DELIVERY_QUALITY_REVIEW_ABORTED");
+      }
     } catch (error) {
       throw retryable("DELIVERY_QUALITY_PROVIDER_UNAVAILABLE", error);
+    } finally {
+      deadline.dispose();
     }
     return quality.complete(claim, { ...codeReviewDecision(result), content: result });
   }
 
-  async test(unitId: string, evidenceVersion?: number, claimToken?: string) {
+  async test(unitId: string, evidenceVersion?: number, claimToken?: string, signal?: AbortSignal) {
     const quality = this.requireQualityPersistence();
     const claim = quality.claim(unitId, evidenceVersion, "automated_testing", claimToken);
     if (claim.status === "aborted") return { status: "aborted" as const, error: claim.error };
@@ -153,6 +169,7 @@ export class DeliveryExecutionService {
     let before: TargetState;
     try {
       before = await inspectTarget(claim.input.snapshot.worktreePath);
+      throwIfQualitySignalAborted(signal);
     } catch (error) {
       throw retryable("AUTOMATED_TEST_INFRASTRUCTURE_UNAVAILABLE", error);
     }
@@ -162,7 +179,9 @@ export class DeliveryExecutionService {
     }
     let testResult: AutomatedTestingResult;
     try {
-      testResult = await (this.qualityDependencies.testing ?? runAutomatedTesting)({
+      const testing = this.qualityDependencies.testing
+        ?? ((input: AutomatedTestingInput, testSignal?: AbortSignal) => runAutomatedTesting(input, {}, testSignal));
+      testResult = await testing({
         sourceManifest: snapshot.manifest,
         sensitivePatterns: [...claim.input.snapshot.sensitivePatterns],
         targetWorktree: claim.input.snapshot.worktreePath,
@@ -192,7 +211,8 @@ export class DeliveryExecutionService {
             }))
           }
         }
-      });
+      }, signal);
+      throwIfQualitySignalAborted(signal);
     } catch (error) {
       throw retryable("AUTOMATED_TEST_INFRASTRUCTURE_UNAVAILABLE", error);
     }
@@ -206,6 +226,7 @@ export class DeliveryExecutionService {
     let after: TargetState;
     try {
       after = await inspectTarget(claim.input.snapshot.worktreePath);
+      throwIfQualitySignalAborted(signal);
     } catch (error) {
       throw retryable("AUTOMATED_TEST_INFRASTRUCTURE_UNAVAILABLE", error);
     }
@@ -285,15 +306,37 @@ export function createDeliveryQualityAutomationHandlers(
   service: Pick<DeliveryExecutionService, "review" | "test">
 ): Pick<AutomationHandlers, "review" | "test"> {
   return {
-    review: async (job) => {
+    review: async (job, context) => {
       validateQualityJob(job, "review");
-      await service.review(job.ownerId, job.evidenceVersion, job.id);
+      await service.review(job.ownerId, job.evidenceVersion, job.id, context?.signal);
     },
-    test: async (job) => {
+    test: async (job, context) => {
       validateQualityJob(job, "test");
-      await service.test(job.ownerId, job.evidenceVersion, job.id);
+      await service.test(job.ownerId, job.evidenceVersion, job.id, context?.signal);
     }
   };
+}
+
+function qualityDeadlineSignal(parent: AbortSignal | undefined, timeoutMs: number) {
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort(parent?.reason);
+  if (parent?.aborted) abortFromParent();
+  else parent?.addEventListener("abort", abortFromParent, { once: true });
+  const timeout = setTimeout(() => {
+    controller.abort(new Error("DELIVERY_QUALITY_REVIEW_TIMEOUT"));
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    dispose() {
+      clearTimeout(timeout);
+      parent?.removeEventListener("abort", abortFromParent);
+    }
+  };
+}
+
+function throwIfQualitySignalAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("AUTOMATED_TEST_ABORTED");
 }
 
 function validateQualityJob(job: AutomationJob, action: "review" | "test") {

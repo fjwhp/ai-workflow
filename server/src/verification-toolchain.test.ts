@@ -3,7 +3,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { snapshotVerificationToolchain } from "./verification-toolchain.js";
 import * as verificationToolchain from "./verification-toolchain.js";
 
@@ -62,6 +62,22 @@ describe("verification toolchain snapshot", () => {
       { env: { PATH: input.shim }, timeoutMs: 50 },
       { runSubprocess }
     )).rejects.toThrow("AUTOMATED_TEST_DEADLINE_EXCEEDED");
+  });
+
+  it("forwards cancellation to the snapshot child and reports a stable abort", async () => {
+    const boundedSnapshot = (verificationToolchain as any).snapshotVerificationToolchainBounded;
+    const input = fixture();
+    const controller = new AbortController();
+    const runSubprocess = vi.fn(async (_file, _args, options) => {
+      expect(options.signal).toBe(controller.signal);
+      controller.abort();
+      throw new Error("TRUSTED_SUBPROCESS_ABORTED");
+    });
+
+    await expect(boundedSnapshot(
+      [{ id: "verify-1", command: "npm", args: ["test"] }], input.destination,
+      { env: { PATH: input.shim }, timeoutMs: 2_000, signal: controller.signal }, { runSubprocess }
+    )).rejects.toThrow("AUTOMATED_TEST_ABORTED");
   });
 
   it("rejects isolated snapshot output that changes the frozen argv", async () => {

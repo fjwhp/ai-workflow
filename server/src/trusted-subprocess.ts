@@ -8,6 +8,7 @@ export interface TrustedSubprocessOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   input?: string | Buffer;
+  signal?: AbortSignal;
 }
 
 export interface TrustedSubprocessResult {
@@ -24,6 +25,7 @@ export function runTrustedSubprocess(
   options: TrustedSubprocessOptions
 ): Promise<TrustedSubprocessResult> {
   validateInput(file, args, options);
+  if (options.signal?.aborted) return Promise.reject(new Error("TRUSTED_SUBPROCESS_ABORTED"));
   return new Promise((resolvePromise, reject) => {
     const child = spawn(file, args, {
       cwd: options.cwd,
@@ -38,6 +40,7 @@ export function runTrustedSubprocess(
     let capturedBytes = 0;
     let timedOut = false;
     let outputOverflow = false;
+    let aborted = false;
     let terminating = false;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
@@ -64,14 +67,26 @@ export function runTrustedSubprocess(
     };
     child.stdout.on("data", (chunk: Buffer) => capture(stdout, chunk));
     child.stderr.on("data", (chunk: Buffer) => capture(stderr, chunk));
+    const abort = () => {
+      aborted = true;
+      terminate();
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) abort();
     child.once("error", (error) => {
       if (deadlineTimer) clearTimeout(deadlineTimer);
       if (killTimer) clearTimeout(killTimer);
-      reject(error);
+      options.signal?.removeEventListener("abort", abort);
+      reject(aborted ? new Error("TRUSTED_SUBPROCESS_ABORTED", { cause: error }) : error);
     });
     child.once("close", (code) => {
       if (deadlineTimer) clearTimeout(deadlineTimer);
       if (killTimer) clearTimeout(killTimer);
+      options.signal?.removeEventListener("abort", abort);
+      if (aborted) {
+        reject(new Error("TRUSTED_SUBPROCESS_ABORTED"));
+        return;
+      }
       resolvePromise({
         exitCode: timedOut || outputOverflow ? -1 : code ?? -1,
         stdout: Buffer.concat(stdout).toString("utf8"),

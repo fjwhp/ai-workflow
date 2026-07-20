@@ -46,24 +46,48 @@ export function redactSensitive(
     throw new Error("REDACTION_LIMIT_EXCEEDED");
   }
   let nodes = 0;
+  let serializedBytes = 0;
   const ancestors = new Set<object>();
+
+  const charge = (value: string | number) => {
+    serializedBytes += typeof value === "number" ? value : Buffer.byteLength(value, "utf8");
+    if (serializedBytes > limits.maxBytes) throw new Error("REDACTION_LIMIT_EXCEEDED");
+  };
+
+  const serializedPrimitive = (item: string | number | boolean | null) => {
+    const serialized = JSON.stringify(item);
+    if (serialized === undefined) throw new Error("REDACTION_LIMIT_EXCEEDED");
+    charge(serialized);
+    return item;
+  };
 
   const visit = (item: unknown, depth: number): any => {
     nodes += 1;
     if (nodes > limits.maxNodes || depth > limits.maxDepth) throw new Error("REDACTION_LIMIT_EXCEEDED");
     if (typeof item === "string") {
       if (exceedsCodePoints(item, limits.maxStringCodePoints)) throw new Error("REDACTION_LIMIT_EXCEEDED");
-      return redactText(item, patterns);
+      return serializedPrimitive(redactText(item, patterns));
     }
-    if (item === null || typeof item === "boolean") return item;
-    if (typeof item === "number") return Number.isFinite(item) ? item : REDACTED;
+    if (item === null || typeof item === "boolean") return serializedPrimitive(item);
+    if (typeof item === "number") {
+      return serializedPrimitive(Number.isFinite(item) ? item : REDACTED);
+    }
     if (typeof item === "undefined" || typeof item === "bigint"
-      || typeof item === "function" || typeof item === "symbol") return REDACTED;
+      || typeof item === "function" || typeof item === "symbol") return serializedPrimitive(REDACTED);
     if (ancestors.has(item)) throw new Error("REDACTION_VALUE_INVALID");
     if (Array.isArray(item)) {
       if (item.length > limits.maxCollectionItems) throw new Error("REDACTION_LIMIT_EXCEEDED");
       ancestors.add(item);
-      try { return item.map((child) => visit(child, depth + 1)); }
+      try {
+        charge(1);
+        const result = [];
+        for (let index = 0; index < item.length; index += 1) {
+          if (index > 0) charge(1);
+          result.push(visit(item[index], depth + 1));
+        }
+        charge(1);
+        return result;
+      }
       finally { ancestors.delete(item); }
     }
     const descriptors = Object.getOwnPropertyDescriptors(item);
@@ -71,11 +95,23 @@ export function redactSensitive(
     if (keys.length > limits.maxCollectionItems) throw new Error("REDACTION_LIMIT_EXCEEDED");
     ancestors.add(item);
     try {
-      return Object.fromEntries(keys.map((key) => {
+      charge(1);
+      const entries: Array<[string, unknown]> = [];
+      for (let index = 0; index < keys.length; index += 1) {
+        const key = keys[index]!;
+        if (index > 0) charge(1);
+        charge(JSON.stringify(key));
+        charge(1);
         const descriptor = descriptors[key]!;
-        if (isSensitiveKey(key) || !("value" in descriptor)) return [key, REDACTED];
-        return [key, visit(descriptor.value, depth + 1)];
-      }));
+        entries.push([
+          key,
+          isSensitiveKey(key) || !("value" in descriptor)
+            ? serializedPrimitive(REDACTED)
+            : visit(descriptor.value, depth + 1)
+        ]);
+      }
+      charge(1);
+      return Object.fromEntries(entries);
     } finally {
       ancestors.delete(item);
     }
