@@ -80,7 +80,8 @@ export class DeliveryCoordinator {
     claim: DeliveryQualityClaim,
     completion: DeliveryQualityCompletion
   ): DeliveryQualityEvidence {
-    const evidence = this.quality.completeInTransaction(claim, completion);
+    const { evidence, replayed } = this.quality.completeWithReplayStateInTransaction(claim, completion);
+    if (replayed) return evidence;
     this.settleUnitInTransaction(evidence.deliveryUnitId, evidence.evidenceVersion);
     return evidence;
   }

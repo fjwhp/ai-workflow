@@ -1,14 +1,17 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it } from "vitest";
 import { WorkflowStore } from "./store.js";
 import type { DeliveryQualityKind, DeliveryQualityResult } from "./delivery-quality-repository.js";
 
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
+const workers: Worker[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  await Promise.all(workers.splice(0).map((worker) => worker.terminate()));
   stores.splice(0).forEach((store) => store.close());
   directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true }));
 });
@@ -16,7 +19,8 @@ afterEach(() => {
 function createFixture(edges: Array<[number, number]> = [[0, 1]], required: boolean[] = [true, true]) {
   const directory = mkdtempSync(join(tmpdir(), "delivery-coordinator-"));
   directories.push(directory);
-  const store = new WorkflowStore(join(directory, "workflow.db"));
+  const databasePath = join(directory, "workflow.db");
+  const store = new WorkflowStore(databasePath);
   stores.push(store);
   const count = Math.max(required.length, ...edges.flat().map((position) => position + 1));
   const projects = Array.from({ length: count }, (_, position) => store.createProject({
@@ -51,7 +55,7 @@ function createFixture(edges: Array<[number, number]> = [[0, 1]], required: bool
     }
   });
   for (const unit of plan.units.filter((item) => item.status === "ready")) completeImplementation(store, unit.id);
-  return { store, requirement, units: plan.units };
+  return { store, requirement, units: plan.units, databasePath };
 }
 
 function completeImplementation(store: WorkflowStore, unitId: string) {
@@ -82,6 +86,39 @@ function settle(
 
 function units(store: WorkflowStore, requirementId: string) {
   return store.deliveryUnits.listForRequirement(requirementId);
+}
+
+function raceWorker() {
+  const worker = new Worker(new URL("./delivery-coordinator-race-worker.ts", import.meta.url), {
+    execArgv: ["--import", "tsx"]
+  });
+  workers.push(worker);
+  return worker;
+}
+
+function raceRound(worker: Worker, iteration: number, message: Record<string, unknown>) {
+  let readyResolve!: (value: { threadId: number }) => void;
+  let readyReject!: (error: Error) => void;
+  let resultResolve!: (value: { threadId: number; startedAt: string; finishedAt: string; evidenceId: string }) => void;
+  let resultReject!: (error: Error) => void;
+  const ready = new Promise<{ threadId: number }>((resolve, rejectPromise) => {
+    readyResolve = resolve; readyReject = rejectPromise;
+  });
+  const result = new Promise<{ threadId: number; startedAt: string; finishedAt: string; evidenceId: string }>(
+    (resolve, rejectPromise) => { resultResolve = resolve; resultReject = rejectPromise; }
+  );
+  const cleanup = () => { worker.off("message", onMessage); worker.off("error", onError); };
+  const onError = (error: Error) => { cleanup(); readyReject(error); resultReject(error); };
+  const onMessage = (response: any) => {
+    if (response.iteration !== iteration) return;
+    if (response.type === "ready") readyResolve(response);
+    if (response.type === "result") { cleanup(); resultResolve(response); }
+    if (response.type === "error") onError(new Error(response.error));
+  };
+  worker.on("message", onMessage);
+  worker.on("error", onError);
+  worker.postMessage({ type: "prepare", iteration, ...message });
+  return { ready, result };
 }
 
 describe("DeliveryCoordinator", () => {
@@ -168,6 +205,35 @@ describe("DeliveryCoordinator", () => {
     expect(fixture.store.deliveryQuality.latest(backend.id, "code_review")).toMatchObject({
       id: first.id, result: "passed"
     });
+  });
+
+  it("directly replays terminal evidence after release and after override without settling twice", () => {
+    const fixture = createFixture();
+    const [backend, frontend] = fixture.units;
+    const review = fixture.store.deliveryQuality.claim(backend!.id, 1, "code_review", "replay-review");
+    const testing = fixture.store.deliveryQuality.claim(backend!.id, 1, "automated_testing", "replay-test");
+    if (review.status !== "running" || testing.status !== "running") throw new Error("expected running claims");
+    const reviewCompletion = { result: "failed" as const, content: { summary: "known finding" } };
+    const testCompletion = { result: "passed" as const, content: { summary: "passed" } };
+    const failed = fixture.store.deliveryQuality.complete(review, reviewCompletion);
+    const passed = fixture.store.deliveryQuality.complete(testing, testCompletion);
+    const override = fixture.store.deliveryCoordination.overrideQuality({
+      unitId: backend!.id, evidenceVersion: 1, kind: "code_review", actor: "release-manager",
+      reason: "confirmed false positive", acceptedRisk: "bounded review risk"
+    });
+
+    expect(fixture.store.deliveryQuality.complete(review, reviewCompletion)).toEqual(failed);
+    expect(fixture.store.deliveryQuality.complete(testing, testCompletion)).toEqual(passed);
+    expect(fixture.store.deliveryCoordination.listQualityOverrides(backend!.id)).toEqual([override]);
+    expect(units(fixture.store, fixture.requirement.id).map((unit) => unit.status)).toEqual([
+      "ready_for_acceptance", "ready"
+    ]);
+    expect((fixture.store as any).db.prepare(
+      "SELECT COUNT(*) AS count FROM delivery_dependencies WHERE upstream_unit_id = ? AND released_at IS NOT NULL"
+    ).get(backend!.id).count).toBe(1);
+    expect((fixture.store as any).db.prepare(
+      "SELECT COUNT(*) AS count FROM automation_jobs WHERE dedupe_key = ?"
+    ).get(`implement:${frontend!.id}:v1`).count).toBe(1);
   });
 
   it("supports fan-out and fan-in while enqueuing ready units in stable position order", () => {
@@ -308,7 +374,10 @@ describe("DeliveryCoordinator", () => {
     expect(fixture.store.automationJobs.byDedupe(`implement:${frontend!.id}:v1`)).toBeNull();
   });
 
-  it("settles simultaneous final callbacks exactly once across twenty controlled races", async () => {
+  it("settles simultaneous final callbacks on independent SQLite connections across twenty races", { timeout: 30_000 }, async () => {
+    const firstWorker = raceWorker();
+    const secondWorker = raceWorker();
+    const observedThreadIds = new Set<number>();
     for (let iteration = 0; iteration < 20; iteration += 1) {
       const fixture = createFixture();
       const [backend, frontend] = fixture.units;
@@ -316,10 +385,37 @@ describe("DeliveryCoordinator", () => {
       const testing = fixture.store.deliveryQuality.claim(backend!.id, 1, "automated_testing", `test-${iteration}`);
       if (review.status !== "running" || testing.status !== "running") throw new Error("expected running claims");
 
-      await Promise.all([
-        Promise.resolve().then(() => fixture.store.deliveryQuality.complete(review, { result: "passed", content: {} })),
-        Promise.resolve().then(() => fixture.store.deliveryQuality.complete(testing, { result: "passed", content: {} }))
-      ]);
+      const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
+      const reviewRound = raceRound(firstWorker, iteration, {
+        databasePath: fixture.databasePath,
+        claim: review, completion: { result: "passed", content: {} }, barrier
+      });
+      const testingRound = raceRound(secondWorker, iteration, {
+        databasePath: fixture.databasePath,
+        claim: testing, completion: { result: "passed", content: {} }, barrier
+      });
+      const ready = await Promise.all([reviewRound.ready, testingRound.ready]);
+      expect(Atomics.load(new Int32Array(barrier), 0)).toBe(2);
+      ready.forEach(({ threadId }) => observedThreadIds.add(threadId));
+      Atomics.store(new Int32Array(barrier), 1, 1);
+      Atomics.notify(new Int32Array(barrier), 1, 2);
+      const results = await Promise.all([reviewRound.result, testingRound.result]);
+
+      expect(new Set(results.map((result) => result.threadId)).size).toBe(2);
+      expect(Atomics.load(new Int32Array(barrier), 2)).toBe(2);
+      expect(results.reduce((latest, result) => {
+        const started = BigInt(result.startedAt); return started > latest ? started : latest;
+      }, 0n)).toBeLessThan(results.reduce((earliest, result) => {
+        const finished = BigInt(result.finishedAt); return finished < earliest ? finished : earliest;
+      }, BigInt("0xffffffffffffffff")));
+
+      const reviewEvidence = fixture.store.deliveryQuality.latest(backend!.id, "code_review");
+      const testingEvidence = fixture.store.deliveryQuality.latest(backend!.id, "automated_testing");
+      expect(new Set(results.map((result) => result.evidenceId))).toEqual(
+        new Set([reviewEvidence!.id, testingEvidence!.id])
+      );
+      expect([reviewEvidence!.result, testingEvidence!.result]).toEqual(["passed", "passed"]);
+      expect(fixture.store.deliveryUnits.get(backend!.id)).toMatchObject({ status: "ready_for_acceptance" });
 
       expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)).toEqual([
         expect.objectContaining({ releasedByEvidenceVersion: 1 })
@@ -328,5 +424,6 @@ describe("DeliveryCoordinator", () => {
         "SELECT COUNT(*) AS count FROM automation_jobs WHERE dedupe_key = ?"
       ).get(`implement:${frontend!.id}:v1`).count).toBe(1);
     }
+    expect(observedThreadIds.size).toBe(2);
   });
 });

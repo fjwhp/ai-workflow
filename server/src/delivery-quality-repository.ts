@@ -46,6 +46,11 @@ export interface DeliveryQualityEvidence {
   commandResults: unknown[]; acceptanceTrace: unknown[]; createdAt: string; completedAt: string;
 }
 
+export interface DeliveryQualitySettlement {
+  evidence: DeliveryQualityEvidence;
+  replayed: boolean;
+}
+
 export interface DeliveryQualityPersistence {
   claim(unitId: string, evidenceVersion: number | undefined, kind: DeliveryQualityKind, claimToken?: string): DeliveryQualityClaim;
   complete(claim: DeliveryQualityClaim, completion: DeliveryQualityCompletion): DeliveryQualityEvidence;
@@ -112,9 +117,43 @@ export class DeliveryQualityRepository {
   }
 
   completeInTransaction(claim: DeliveryQualityClaim, completion: DeliveryQualityCompletion): DeliveryQualityEvidence {
+    return this.completeWithReplayStateInTransaction(claim, completion).evidence;
+  }
+
+  completeWithReplayStateInTransaction(
+    claim: DeliveryQualityClaim,
+    completion: DeliveryQualityCompletion
+  ): DeliveryQualitySettlement {
     validateKind(claim.kind);
     if (claim.status !== "running") throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
     if (completion.result !== "passed" && completion.result !== "failed") throw new Error("DELIVERY_QUALITY_RESULT_INVALID");
+    const run = this.db.prepare(`SELECT requirement_id, delivery_unit_id, evidence_version, kind, status
+      FROM delivery_quality_runs WHERE id = ?`).get(claim.id) as {
+        requirement_id: string; delivery_unit_id: string; evidence_version: number;
+        kind: DeliveryQualityKind; status: string;
+      } | undefined;
+    if (!run || run.requirement_id !== claim.requirementId || run.delivery_unit_id !== claim.deliveryUnitId
+      || run.evidence_version !== claim.evidenceVersion || run.kind !== claim.kind) {
+      throw new Error("DELIVERY_QUALITY_RUN_STALE");
+    }
+    if (run.status === "aborted") throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
+    if (run.status === "completed" || run.status === "failed") {
+      const evidence = this.getEvidenceByRun(claim.id);
+      if (!evidence) throw new Error("DELIVERY_QUALITY_EVIDENCE_NOT_FOUND");
+      const sanitized = sanitizeQualityCompletion(completion, claim.input.snapshot.sensitivePatterns);
+      const expected = claim.input.codingEvidence;
+      if (evidence.result !== completion.result
+        || evidence.inputCodingEvidenceId !== expected.id
+        || evidence.inputEvidenceVersion !== expected.evidenceVersion
+        || evidence.inputDiffHash !== expected.diffHash
+        || canonicalPersistedJson(evidence.content) !== canonicalPersistedJson(sanitized.content)
+        || canonicalPersistedJson(evidence.commandResults) !== canonicalPersistedJson(sanitized.commandResults)
+        || canonicalPersistedJson(evidence.acceptanceTrace) !== canonicalPersistedJson(sanitized.acceptanceTrace)) {
+        throw new Error("DELIVERY_QUALITY_REPLAY_CONFLICT");
+      }
+      return { evidence, replayed: true };
+    }
+    if (run.status !== "running") throw new Error("DELIVERY_QUALITY_RUN_STATUS_INVALID");
     const current = this.loadInput(claim.deliveryUnitId, claim.evidenceVersion).codingEvidence;
     const expected = claim.input.codingEvidence;
     if (current.id !== expected.id || current.diffHash !== expected.diffHash || current.evidenceVersion !== expected.evidenceVersion) {
@@ -137,7 +176,7 @@ export class DeliveryQualityRepository {
       .run(completion.result === "passed" ? "completed" : "failed", now, claim.id,
         claim.deliveryUnitId, claim.evidenceVersion, claim.kind);
     if (settled.changes !== 1) throw new Error("DELIVERY_QUALITY_RUN_STALE");
-    return this.getEvidence(evidenceId)!;
+    return { evidence: this.getEvidence(evidenceId)!, replayed: false };
   }
 
   abortInTransaction(claim: DeliveryQualityClaim, error: string) {
@@ -286,6 +325,17 @@ function parseManifest(json: string): EvidenceManifest {
 }
 function stringifyJson(value: unknown) {
   const json = JSON.stringify(value); if (json === undefined) throw new Error("DELIVERY_QUALITY_CONTENT_INVALID"); return json;
+}
+function canonicalPersistedJson(value: unknown): string {
+  const parsed = JSON.parse(stringifyJson(value));
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(Object.entries(item as Record<string, unknown>)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, entry]) => [key, normalize(entry)]));
+  };
+  return JSON.stringify(normalize(parsed));
 }
 function mapEvidence(row: any): DeliveryQualityEvidence {
   return {

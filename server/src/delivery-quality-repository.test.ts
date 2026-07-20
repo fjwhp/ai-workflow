@@ -155,6 +155,78 @@ describe("delivery quality evidence schema", () => {
     }
   );
 
+  it.each(["passed", "failed"] as const)(
+    "directly replays the same sanitized %s completion without consulting live unit state",
+    (result) => {
+      const { store, unit } = fixture();
+      try {
+        const claim = store.deliveryQuality.claim(unit.id, 1, "code_review", `direct-${result}`);
+        if (claim.status !== "running") throw new Error("expected running claim");
+        const first = store.deliveryQuality.complete(claim, {
+          result,
+          content: { summary: result, nested: { alpha: 1, beta: 2 }, authorization: "Bearer first-secret" },
+          commandResults: [{ command: "test", exitCode: 0 }],
+          acceptanceTrace: [{ criterion: "works", passed: true }]
+        });
+        (store as any).db.prepare("UPDATE delivery_units SET evidence_version = 2 WHERE id = ?").run(unit.id);
+
+        const replay = store.deliveryQuality.complete(claim, {
+          result,
+          content: { authorization: "Bearer second-secret", nested: { beta: 2, alpha: 1 }, summary: result },
+          commandResults: [{ exitCode: 0, command: "test" }],
+          acceptanceTrace: [{ passed: true, criterion: "works" }]
+        });
+
+        expect(replay).toEqual(first);
+        expect((store as any).db.prepare(
+          "SELECT COUNT(*) AS count FROM delivery_quality_evidence WHERE run_id = ?"
+        ).get(claim.id).count).toBe(1);
+      } finally {
+        store.close();
+      }
+    }
+  );
+
+  it.each([
+    ["result", { result: "failed" as const, content: { summary: "original" }, commandResults: [], acceptanceTrace: [] }],
+    ["content", { result: "passed" as const, content: { summary: "changed" }, commandResults: [], acceptanceTrace: [] }],
+    ["command results", { result: "passed" as const, content: { summary: "original" }, commandResults: [{ exitCode: 1 }], acceptanceTrace: [] }],
+    ["acceptance trace", { result: "passed" as const, content: { summary: "original" }, commandResults: [], acceptanceTrace: [{ passed: false }] }]
+  ])("fails closed when direct terminal replay %s conflicts after sanitization", (_field, conflicting) => {
+    const { store, unit } = fixture();
+    try {
+      const claim = store.deliveryQuality.claim(unit.id, 1, "code_review", "direct-conflict");
+      if (claim.status !== "running") throw new Error("expected running claim");
+      const first = store.deliveryQuality.complete(claim, {
+        result: "passed", content: { summary: "original" }, commandResults: [], acceptanceTrace: []
+      });
+
+      expect(() => store.deliveryQuality.complete(claim, conflicting))
+        .toThrow("DELIVERY_QUALITY_REPLAY_CONFLICT");
+      expect(() => store.deliveryQuality.complete({ ...claim, deliveryUnitId: "different" }, {
+        result: "passed", content: { summary: "original" }, commandResults: [], acceptanceTrace: []
+      })).toThrow("DELIVERY_QUALITY_RUN_STALE");
+      expect(store.deliveryQuality.latest(unit.id, "code_review")).toEqual(first);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("does not turn an aborted run without evidence into a terminal replay", () => {
+    const { store, unit } = fixture();
+    try {
+      const claim = store.deliveryQuality.claim(unit.id, 1, "code_review", "direct-aborted");
+      if (claim.status !== "running") throw new Error("expected running claim");
+      store.deliveryQuality.abort(claim, "IMPLEMENTATION_EVIDENCE_STALE");
+
+      expect(() => store.deliveryQuality.complete(claim, { result: "passed", content: {} }))
+        .toThrow("DELIVERY_QUALITY_RUN_SETTLED");
+      expect(store.deliveryQuality.latest(unit.id, "code_review")).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
   it("reclaims real terminal evidence without consulting the live unit", () => {
     const { store, unit } = fixture();
     try {
