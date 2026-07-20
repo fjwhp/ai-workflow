@@ -211,6 +211,7 @@ export function createPhase2Schema(db: DatabaseSync) {
         lease_owner IS NULL OR (
           instr(lease_owner, char(0)) = 0
           AND length(lease_owner) BETWEEN 1 AND 128
+          AND lease_owner NOT GLOB '*[^A-Za-z0-9_-]*'
           AND lease_owner = trim(lease_owner, char(9) || char(10) || char(11) || char(12) || char(13) || ' ')
         )
       ),

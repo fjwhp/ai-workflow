@@ -4,9 +4,9 @@
 
 Harden the existing SQLite automation queue against corrupt stored rows, failed lease transactions,
 unreachable persisted states, embedded NUL characters, and simultaneous workers. This change does not
-add queue execution behavior or migrate old rows. The schema marker moves from
-`phase-2-automation-v2` to `phase-2-automation-v3`, so an existing v2 live database is backed up and
-replaced with a fresh v3 database.
+add queue execution behavior or migrate old rows. The final worker-ID constraint changes the schema
+marker from `phase-2-automation-v3` to `phase-2-automation-v4`, so an existing v3 live database is
+backed up and replaced with a fresh v4 database.
 
 ## Repository Boundary
 
@@ -39,8 +39,8 @@ Pending jobs require `attempt < max_attempts`. Leased jobs require
 pending index.
 
 Every constrained automation-job text value rejects embedded NUL explicitly before its length or
-format checks. Nullable text applies the check inside its non-null branch. Normal Unicode payload,
-worker, and error strings remain supported.
+format checks. Nullable text applies the check inside its non-null branch. Normal Unicode payload and
+error strings remain supported; worker identifiers use the ASCII-safe identifier policy below.
 
 ## Concurrency And Verification
 
@@ -50,5 +50,18 @@ a finite timeout, close their database connections, and are terminated in `final
 hangs or leaked handles.
 
 Tests first reproduce transaction rollback, corrupt row groups, unreachable DDL states, NUL bypasses,
-v2-to-v3 reset, and real concurrent leasing. Focused tests precede the full suite, typecheck, production
+v3-to-v4 reset, and real concurrent leasing. Focused tests precede the full suite, typecheck, production
 build, documentation scan, and diff check.
+
+## Public Text Follow-Up
+
+Public worker IDs use `[A-Za-z0-9_-]+` and a maximum length of 128. Emoji, whitespace, colon, NUL, and
+other punctuation fail with `AUTOMATION_JOB_WORKER_ID_INVALID` before a lease transaction starts. The
+stored-row decoder and v4 DDL enforce the same policy, so no public input can leak a SQLite CHECK error.
+
+Failure details have a different trust boundary: handlers may receive arbitrary exception text, so
+failure settlement replaces each NUL with the visible two-character sequence `\0` before truncating
+to 4096 Unicode code points. `Error` objects use their message and other non-string thrown values use
+a safe string conversion; an empty string retains the existing input error. Retryable and terminal
+failure updates clear the lease without exposing a SQLite CHECK error, while normal Unicode and emoji
+remain intact.

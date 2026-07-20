@@ -22,7 +22,7 @@ Flowgate 是本地优先的 AI 研发工作台。当前 foundation 使用五个�
 
 ## 数据基线
 
-当前 schema marker 是 `phase-2-automation-v3`。首次用本版本打开 `phase-2-automation-v2` 或其他旧 live 数据库时，服务先完整备份 SQLite 主文件及现存 WAL/SHM，再创建空的 automation-v3 数据库。旧历史只存在于备份中；不做 row migration、dual read/write 或 fallback，也没有旧新数据库并行入口。用户已授权旧数据以新跑为准。
+当前 schema marker 是 `phase-2-automation-v4`。首次用本版本打开 `phase-2-automation-v3` 或其他旧 live 数据库时，服务先完整备份 SQLite 主文件及现存 WAL/SHM，再创建空的 automation-v4 数据库。旧历史只存在于备份中；不做 row migration、dual read/write 或 fallback，也没有旧新数据库并行入口。用户已授权旧数据以新跑为准。
 
 详细操作见：
 

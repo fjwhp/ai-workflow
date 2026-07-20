@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { prepareCleanDatabase, writeDatabaseVersionMarker } from "./database-reset.js";
 
 const directories: string[] = [];
-const currentSchemaVersion = "phase-2-automation-v3";
+const currentSchemaVersion = "phase-2-automation-v4";
 
 afterEach(async () => {
   const { rm } = await import("node:fs/promises");
@@ -20,17 +20,17 @@ async function databasePath() {
 }
 
 describe("prepareCleanDatabase", () => {
-  it("resets a deployed automation v2 database for the v3 marker", async () => {
+  it("resets a deployed automation v3 database for the v4 marker", async () => {
     const path = await databasePath();
-    await writeFile(path, "deployed automation v2 database");
-    await writeFile(`${path}.schema-version`, "phase-2-automation-v2");
+    await writeFile(path, "deployed automation v3 database");
+    await writeFile(`${path}.schema-version`, "phase-2-automation-v3");
 
     const result = await prepareCleanDatabase(path, currentSchemaVersion, {
       now: () => new Date("2026-07-20T00:00:00.000Z")
     });
 
     expect(result).toMatchObject({ reset: true, backupPath: `${path}.backup-2026-07-20T00-00-00-000Z` });
-    await expect(readFile(result.backupPath!, "utf8")).resolves.toBe("deployed automation v2 database");
+    await expect(readFile(result.backupPath!, "utf8")).resolves.toBe("deployed automation v3 database");
   });
 
   it("backs up an incompatible database and removes its sidecars and marker", async () => {

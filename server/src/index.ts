@@ -4,7 +4,7 @@ import { WorkflowStore } from "./store.js";
 import { buildApp } from "./app.js";
 import { prepareCleanDatabase, writeDatabaseVersionMarker } from "./database-reset.js";
 
-const schemaVersion = "phase-2-automation-v3";
+const schemaVersion = "phase-2-automation-v4";
 
 const dataDir = resolve(process.env.DATA_DIR || "data");
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });

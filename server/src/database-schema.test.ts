@@ -185,6 +185,7 @@ describe("Phase 2 database schema", () => {
     }
     expect(tableSql(db, "automation_jobs")).toMatch(/owner_type TEXT NOT NULL CHECK\s*\([\s\S]*owner_type IN \('requirement', 'delivery_unit'\)/i);
     expect(tableSql(db, "automation_jobs")).toContain("owner_id NOT GLOB '*[^A-Za-z0-9_-]*'");
+    expect(tableSql(db, "automation_jobs")).toContain("lease_owner NOT GLOB '*[^A-Za-z0-9_-]*'");
     expect(tableSql(db, "automation_jobs")).toMatch(/action TEXT NOT NULL CHECK\s*\([\s\S]*action IN \('implement', 'review', 'test', 'apply'\)/i);
     expect(tableSql(db, "automation_jobs")).toMatch(/status TEXT NOT NULL CHECK\s*\([\s\S]*status IN \('pending', 'leased', 'completed', 'failed', 'canceled'\)/i);
     for (const column of [
@@ -304,6 +305,18 @@ describe("Phase 2 database schema", () => {
     expect(() => insertAutomationJob(db, { id: "job-leased-empty", status: "leased" })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, {
       id: "job-leased-zero", status: "leased", attempt: 0, leaseOwner: "worker-1",
+      leaseExpiresAt: "2026-07-20T00:05:00.000Z"
+    })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, {
+      id: "job-worker-colon", status: "leased", attempt: 1, leaseOwner: "worker:unsafe",
+      leaseExpiresAt: "2026-07-20T00:05:00.000Z"
+    })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, {
+      id: "job-worker-emoji", status: "leased", attempt: 1, leaseOwner: "worker😀",
+      leaseExpiresAt: "2026-07-20T00:05:00.000Z"
+    })).toThrow(/CHECK constraint failed/);
+    expect(() => insertAutomationJob(db, {
+      id: "job-worker-long", status: "leased", attempt: 1, leaseOwner: "w".repeat(129),
       leaseExpiresAt: "2026-07-20T00:05:00.000Z"
     })).toThrow(/CHECK constraint failed/);
     expect(() => insertAutomationJob(db, { id: "job-half-lease", leaseOwner: "worker-1" })).toThrow(/CHECK constraint failed/);

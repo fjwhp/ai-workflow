@@ -41,7 +41,7 @@ export interface AutomationJobPersistence {
   leaseNext(workerId: string, now: Date, leaseMs: number): AutomationJob | null;
   renew(jobId: string, workerId: string, now: Date, leaseMs: number): boolean;
   complete(jobId: string, workerId: string): boolean;
-  fail(jobId: string, workerId: string, error: string, retryable: boolean): boolean;
+  fail(jobId: string, workerId: string, error: unknown, retryable: boolean): boolean;
   cancelByOwnerVersion(ownerId: string, evidenceVersion: number, ownerType?: AutomationJobOwnerType): number;
   recoverExpired(now: Date): number;
   get(jobId: string): AutomationJob | null;
@@ -56,6 +56,7 @@ const MAX_WORKER_ID_LENGTH = 128;
 const MAX_LEASE_MS = 86_400_000;
 const MAX_ERROR_LENGTH = 4096;
 const OWNER_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+const WORKER_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export class AutomationJobRepository {
   constructor(
@@ -144,14 +145,11 @@ export class AutomationJobRepository {
     return Number(result.changes) === 1;
   }
 
-  fail(jobId: string, workerId: string, error: string, retryable: boolean): boolean {
+  fail(jobId: string, workerId: string, error: unknown, retryable: boolean): boolean {
     validateBoundedId(jobId, "AUTOMATION_JOB_ID_INVALID");
     validateWorkerId(workerId);
-    if (typeof error !== "string" || error.trim().length === 0) {
-      throw new Error("AUTOMATION_JOB_ERROR_INVALID");
-    }
     if (typeof retryable !== "boolean") throw new Error("AUTOMATION_JOB_RETRYABLE_INVALID");
-    const lastError = truncateCodePoints(error, MAX_ERROR_LENGTH);
+    const lastError = sanitizeFailureError(error);
     const settleNow = validateDate(this.clock());
     const result = this.db.prepare(`UPDATE automation_jobs
       SET status = CASE WHEN ? = 1 AND attempt < max_attempts THEN 'pending' ELSE 'failed' END,
@@ -295,10 +293,27 @@ function validateWorkerId(workerId: unknown) {
     typeof workerId !== "string"
     || workerId.length < 1
     || workerId.length > MAX_WORKER_ID_LENGTH
-    || workerId.trim() !== workerId
+    || !WORKER_ID_PATTERN.test(workerId)
   ) {
     throw new Error("AUTOMATION_JOB_WORKER_ID_INVALID");
   }
+}
+
+function sanitizeFailureError(error: unknown): string {
+  let errorText: string;
+  if (typeof error === "string") {
+    errorText = error;
+  } else if (error instanceof Error) {
+    errorText = error.message || error.name;
+  } else {
+    try {
+      errorText = String(error);
+    } catch {
+      errorText = "Unknown error";
+    }
+  }
+  if (errorText.length === 0) throw new Error("AUTOMATION_JOB_ERROR_INVALID");
+  return truncateCodePoints(errorText.replaceAll("\0", "\\0"), MAX_ERROR_LENGTH);
 }
 
 function validateDate(date: unknown): string {
@@ -379,6 +394,7 @@ function decodeAutomationJobRow(row: unknown): AutomationJob {
     let leaseExpiresAt: string | null;
     if (status === "leased") {
       leaseOwner = decodeStoredString(row.lease_owner, MAX_WORKER_ID_LENGTH, true);
+      if (!WORKER_ID_PATTERN.test(leaseOwner)) throw new Error("invalid lease owner");
       leaseExpiresAt = decodeStoredTimestamp(row.lease_expires_at);
     } else {
       if (row.lease_owner !== null || row.lease_expires_at !== null) throw new Error("invalid lease state");

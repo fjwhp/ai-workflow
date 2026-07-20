@@ -202,3 +202,91 @@ git diff --check
 
 Expected: all commands exit zero. Scan current docs for conflicting current-v2 wording and self-review
 the complete diff for Critical and Important issues before creating one independent fix commit.
+
+### Task 6: Public NUL Handling
+
+**Files:**
+- Modify: `server/src/automation-job-repository.test.ts`
+- Modify: `server/src/automation-job-repository.ts`
+
+- [ ] **Step 1: Write failing public API tests**
+
+Add a lease test using `worker\0id` that expects `AUTOMATION_JOB_WORKER_ID_INVALID` and directly verifies
+the job remains pending with attempt zero. Add retryable string and non-retryable `Error` object
+`fail()` tests whose messages contain NUL and assert visible `\\0` text, a cleared lease, and pending or
+failed status.
+
+- [ ] **Step 2: Verify RED**
+
+Run: `npm test -- server/src/automation-job-repository.test.ts`
+
+Expected: worker NUL leaks a SQLite CHECK error, while both failure updates throw a CHECK error and
+leave the job leased.
+
+- [ ] **Step 3: Reject worker NUL and sanitize failure text**
+
+Validate worker NUL before `BEGIN IMMEDIATE`. Build failure text in this order:
+
+```ts
+const errorText = error instanceof Error ? error.message : String(error);
+const safeError = errorText.replaceAll("\0", "\\0");
+const lastError = truncateCodePoints(safeError, MAX_ERROR_LENGTH);
+```
+
+Keep empty-string and retryable-type validation stable.
+
+- [ ] **Step 4: Verify GREEN**
+
+Run: `npm test -- server/src/automation-job-repository.test.ts`
+
+Expected: worker NUL has the stable public error with no partial lease, and both failure modes settle.
+
+### Task 7: ASCII Worker IDs And Schema V4
+
+**Files:**
+- Modify: `server/src/automation-job-repository.test.ts`
+- Modify: `server/src/automation-job-repository.ts`
+- Modify: `server/src/database-schema.test.ts`
+- Modify: `server/src/database-schema.ts`
+- Modify: `server/src/database-reset.test.ts`
+- Modify: `server/src/startup-acceptance.test.ts`
+- Modify: `server/src/foundation-documentation.test.ts`
+- Modify: `server/src/index.ts`
+- Modify: `README.md`
+- Modify: `docs/getting-started.md`
+- Modify: `docs/states-and-gates.md`
+- Modify: `docs/workflow-sop.md`
+
+- [ ] **Step 1: Write failing worker-policy and v4 tests**
+
+Assert a 128-character ASCII worker leases and is returned by `get()`, while 129 characters, emoji,
+whitespace, colon, and NUL return `AUTOMATION_JOB_WORKER_ID_INVALID` without mutation. Direct SQLite
+inserts with unsafe leased worker IDs must fail. Reset and startup tests must treat v3 as old, back it
+up, create the fresh schema, and write `phase-2-automation-v4`; all four current docs name v4 as live.
+
+- [ ] **Step 2: Verify RED**
+
+Run: `npm test -- server/src/automation-job-repository.test.ts`
+
+Expected: emoji and colon worker IDs reach or survive the old DDL, and production/docs still name v3
+as current.
+
+- [ ] **Step 3: Enforce one ASCII worker policy and bump the marker**
+
+Use the same `[A-Za-z0-9_-]+` predicate and 128-character bound in public validation, stored-row
+decoding, and the lease-owner DDL CHECK. Change the current marker and four docs to v4, describing v3
+and older live databases as backup-only fresh-reset inputs.
+
+- [ ] **Step 4: Verify GREEN and complete verification**
+
+Run:
+
+```bash
+npm test -- server/src/automation-job-repository.test.ts
+npm test
+npm run typecheck
+npm run build
+git diff --check
+```
+
+Expected: focused and full tests pass, typecheck and build exit zero, and the diff is clean.

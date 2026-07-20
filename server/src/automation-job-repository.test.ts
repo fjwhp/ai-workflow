@@ -508,6 +508,11 @@ describe("AutomationJobRepository", () => {
       "get"
     ],
     [
+      "lease owner policy",
+      "status = 'leased', attempt = 1, lease_owner = 'worker:unsafe', lease_expires_at = '2026-07-20T00:05:00.000Z'",
+      "get"
+    ],
+    [
       "lease timestamp format",
       "status = 'leased', attempt = 1, lease_owner = 'worker', lease_expires_at = '2026-07-20T00:05:00Z'",
       "get"
@@ -575,17 +580,47 @@ describe("AutomationJobRepository", () => {
     expect(queryPlan.some(({ detail }) => detail.includes("idx_automation_jobs_pending_lease"))).toBe(true);
   });
 
-  it("preserves normal Unicode in repository-owned queue text", () => {
+  it("preserves normal Unicode in queue payload and failure text", () => {
     const fixture = createFixture();
     const queued = fixture.first.enqueue(job(fixture.requirement.id, {
       payload: { message: "构建完成 😀" }
     }));
 
-    expect(fixture.first.leaseNext("工作者-😀", now, 30_000)).toMatchObject({
-      id: queued.id, leaseOwner: "工作者-😀", payload: { message: "构建完成 😀" }
+    expect(fixture.first.leaseNext("worker-unicode-error", now, 30_000)).toMatchObject({
+      id: queued.id, leaseOwner: "worker-unicode-error", payload: { message: "构建完成 😀" }
     });
-    expect(fixture.first.fail(queued.id, "工作者-😀", "临时错误 😀", false)).toBe(true);
+    expect(fixture.first.fail(queued.id, "worker-unicode-error", "临时错误 😀", false)).toBe(true);
     expect(fixture.first.get(queued.id)?.lastError).toBe("临时错误 😀");
+  });
+
+  it("accepts 128 ASCII worker characters and rejects 129 before mutation", () => {
+    const fixture = createFixture();
+    const accepted = fixture.first.enqueue(job(fixture.requirement.id, { action: "implement" }));
+    const pending = fixture.first.enqueue(job(fixture.requirement.id, { action: "review" }));
+    const maximumWorker = "w".repeat(128);
+
+    expect(fixture.first.leaseNext(maximumWorker, now, 30_000)).toMatchObject({
+      id: accepted.id, leaseOwner: maximumWorker
+    });
+    expect(fixture.first.get(accepted.id)?.leaseOwner).toBe(maximumWorker);
+    expect(() => fixture.first.leaseNext("w".repeat(129), now, 30_000))
+      .toThrow("AUTOMATION_JOB_WORKER_ID_INVALID");
+    expect(fixture.first.get(pending.id)).toMatchObject({ status: "pending", attempt: 0 });
+  });
+
+  it.each([
+    ["emoji", "worker😀"],
+    ["colon", "worker:unsafe"],
+    ["leading space", " worker"],
+    ["trailing space", "worker "],
+    ["tab", "worker\tid"]
+  ])("rejects an unsafe %s worker before mutation", (_label, workerId) => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+
+    expect(() => fixture.first.leaseNext(workerId, now, 30_000))
+      .toThrow("AUTOMATION_JOB_WORKER_ID_INVALID");
+    expect(fixture.first.get(queued.id)).toMatchObject({ status: "pending", attempt: 0 });
   });
 
   it("leases pending jobs in stable created-at and id order", () => {
@@ -715,6 +750,48 @@ describe("AutomationJobRepository", () => {
     fixture.first.enqueue(job(fixture.requirement.id));
     expect(() => fixture.first.leaseNext(workerId, leaseNow, leaseMs)).toThrow(/AUTOMATION_JOB_/);
     expect(fixture.first.listPending()).toHaveLength(1);
+  });
+
+  it("rejects a NUL worker before starting a lease transaction", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+
+    expect(() => fixture.first.leaseNext("worker\0id", now, 30_000))
+      .toThrow("AUTOMATION_JOB_WORKER_ID_INVALID");
+
+    expect(fixture.secondDatabase.prepare(
+      "SELECT status, attempt, lease_owner, lease_expires_at FROM automation_jobs WHERE id = ?"
+    ).get(queued.id)).toEqual({
+      status: "pending", attempt: 0, lease_owner: null, lease_expires_at: null
+    });
+  });
+
+  it("sanitizes a NUL failure before returning a retryable lease to pending", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    fixture.first.leaseNext("worker-a", now, 30_000);
+
+    expect(fixture.first.fail(queued.id, "worker-a", "temporary😀\0outage", true)).toBe(true);
+
+    expect(fixture.second.get(queued.id)).toMatchObject({
+      status: "pending", attempt: 1, lastError: "temporary😀\\0outage",
+      leaseOwner: null, leaseExpiresAt: null
+    });
+  });
+
+  it("sanitizes an Error object before making a lease terminal", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    fixture.first.leaseNext("worker-a", now, 30_000);
+
+    expect(fixture.first.fail(
+      queued.id, "worker-a", new Error("fatal\0failure"), false
+    )).toBe(true);
+
+    expect(fixture.second.get(queued.id)).toMatchObject({
+      status: "failed", attempt: 1, lastError: "fatal\\0failure",
+      leaseOwner: null, leaseExpiresAt: null
+    });
   });
 
   it("returns a retryable first failure to pending with attempt one", () => {
