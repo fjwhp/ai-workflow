@@ -196,7 +196,7 @@ export async function runAutomatedTesting(
   if (now() >= deadline) return automatedDeadlineResult(plan);
   const parent = await createVerificationDirectory();
   const verificationRoot = join(parent, "worktree");
-  try {
+  const executeVerification = async (): Promise<AutomatedTestingResult> => {
     throwIfAutomatedTestAborted(signal);
     try {
       const remaining = Math.ceil(deadline - now());
@@ -370,9 +370,20 @@ export async function runAutomatedTesting(
       acceptanceTrace: plan.acceptanceTrace.map((trace) => ({ ...trace, passed })),
       ...(toolchain ? { toolchain: toolchainEvidence(toolchain) } : {})
     };
-  } finally {
-    await (dependencies.cleanupDirectory ?? cleanupVerificationDirectory)(parent);
+  };
+  let pendingResult: AutomatedTestingResult | undefined;
+  let pendingError: unknown;
+  let executionFailed = false;
+  try {
+    pendingResult = await executeVerification();
+  } catch (error) {
+    executionFailed = true;
+    pendingError = error;
   }
+  await (dependencies.cleanupDirectory ?? cleanupVerificationDirectory)(parent);
+  throwIfAutomatedTestAborted(signal);
+  if (executionFailed) throw pendingError;
+  return pendingResult!;
 }
 
 function automatedTestAborted(signal: AbortSignal | undefined, error: unknown) {

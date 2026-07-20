@@ -202,6 +202,31 @@ describe("automated testing safety", () => {
     )).rejects.toThrow("AUTOMATED_TEST_ABORTED");
   });
 
+  it("reports cancellation that arrives during final verification-root cleanup", async () => {
+    const target = initializeTarget();
+    const controller = new AbortController();
+    let cleanedRoot: string | undefined;
+    const cleanupDirectory = vi.fn(async (path: string) => {
+      cleanedRoot = path;
+      await cleanupVerificationDirectory(path);
+      controller.abort();
+    });
+
+    await expect(runAutomatedTesting(
+      automatedInput(target, [{ command: "npm", argsPrefix: ["test"] }]),
+      {
+        platform: "darwin", sandboxExecutableAvailable: async () => true,
+        materializeManifest: async (root: string) => { mkdirSync(root); },
+        execFile: async () => ({ stdout: "ok", stderr: "" }),
+        cleanupDirectory
+      },
+      controller.signal
+    )).rejects.toThrow("AUTOMATED_TEST_ABORTED");
+    expect(cleanupDirectory).toHaveBeenCalledOnce();
+    expect(cleanedRoot).toBeDefined();
+    expect(existsSync(cleanedRoot!)).toBe(false);
+  });
+
   it("materializes only the frozen manifest after the live source changes", async () => {
     const root = mkdtempSync(join(tmpdir(), "automated-test-frozen-manifest-")); directories.push(root);
     const source = join(root, "source");
