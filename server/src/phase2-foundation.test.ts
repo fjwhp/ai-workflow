@@ -1,7 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./ai.js", () => ({ runAgent: vi.fn() }));
@@ -39,8 +41,16 @@ function createRequirement(store: WorkflowStore) {
   const repoPath = join(root, "repo");
   const worktreePath = join(root, "worktree");
   mkdirSync(repoPath);
-  mkdirSync(worktreePath);
-  writeFileSync(join(worktreePath, "marker.txt"), "unchanged\n");
+  git(repoPath, "init", "--initial-branch", "main");
+  git(repoPath, "config", "user.name", "Phase 2 Test");
+  git(repoPath, "config", "user.email", "phase2@example.invalid");
+  mkdirSync(join(repoPath, "fixtures"));
+  writeFileSync(join(repoPath, "fixtures", "marker.txt"), "unchanged\n");
+  git(repoPath, "add", "fixtures/marker.txt");
+  git(repoPath, "commit", "-m", "fixture");
+  git(repoPath, "branch", "feature/v1");
+  git(repoPath, "worktree", "add", worktreePath, "feature/v1");
+  const headCommit = git(repoPath, "rev-parse", "HEAD").trim();
   const project = store.createProject({
     name: "Foundation",
     repoPath,
@@ -54,7 +64,7 @@ function createRequirement(store: WorkflowStore) {
     branch: "feature/v1",
     baseBranch: "main",
     worktreePath,
-    headCommit: "abc123"
+    headCommit
   });
   const requirement = store.createRequirement({
     title: "Keep downstream stages read-only",
@@ -64,26 +74,50 @@ function createRequirement(store: WorkflowStore) {
     primaryProjectId: project.id,
     primaryProjectVersionId: version.id
   });
-  return { requirement, version, worktreePath };
+  return { requirement, version, repoPath, worktreePath };
 }
-
-const mutationTables = [
-  "requirements", "requirement_revisions", "requirement_projects", "requirement_project_snapshots",
-  "project_versions", "stage_runs", "executions", "automation_jobs", "delivery_units",
-  "delivery_unit_snapshots", "delivery_dependencies", "approvals", "artifacts"
-] as const;
 
 function databaseSnapshot(store: WorkflowStore) {
   const database = new DatabaseSync(databasePaths.get(store)!);
   try {
-    return Object.fromEntries(mutationTables.map((table) => [table, database.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]));
+    const tables = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+      .all() as Array<{ name: string }>;
+    return Object.fromEntries(tables.map(({ name }) => {
+      const quotedName = name.replaceAll('"', '""');
+      return [name, database.prepare(`SELECT * FROM "${quotedName}" ORDER BY rowid`).all()];
+    }));
   } finally {
     database.close();
   }
 }
 
-function worktreeSnapshot(path: string) {
-  return { entries: readdirSync(path).sort(), marker: readFileSync(join(path, "marker.txt"), "utf8") };
+function git(path: string, ...args: string[]) {
+  return execFileSync("git", ["-C", path, ...args], { encoding: "utf8" });
+}
+
+function repositorySnapshot(path: string) {
+  return {
+    status: git(path, "status", "--porcelain=v1", "--untracked-files=all"),
+    head: git(path, "rev-parse", "HEAD").trim(),
+    files: recursiveFileHashes(path)
+  };
+}
+
+function recursiveFileHashes(root: string) {
+  const files: Array<{ path: string; sha256: string }> = [];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name === ".git") continue;
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) files.push({
+        path: relative(root, path),
+        sha256: createHash("sha256").update(readFileSync(path)).digest("hex")
+      });
+    }
+  };
+  visit(root);
+  return files.sort((left, right) => left.path.localeCompare(right.path));
 }
 
 describe("Phase 2 foundation live surface", () => {
@@ -115,11 +149,12 @@ describe("Phase 2 foundation live surface", () => {
 
   it.each(["implementation", "quality_verification", "acceptance_delivery"] as const)("keeps %s runs read-only without any mutation", async (stage) => {
     const store = createStore();
-    const { requirement, worktreePath } = createRequirement(store);
+    const { requirement, repoPath, worktreePath } = createRequirement(store);
     store.updateRequirementState(requirement.id, stage, "ai_ready");
     const app = await buildApp(store);
     const beforeDatabase = databaseSnapshot(store);
-    const beforeWorktree = worktreeSnapshot(worktreePath);
+    const beforeRepository = repositorySnapshot(repoPath);
+    const beforeWorktree = repositorySnapshot(worktreePath);
 
     const response = await app.inject({ method: "POST", url: `/api/requirements/${requirement.id}/run`, payload: {} });
     const detail = await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` });
@@ -133,7 +168,8 @@ describe("Phase 2 foundation live surface", () => {
     expect(store.listExecutions(requirement.id)).toEqual([]);
     expect(store.listStageRuns(requirement.id)).toEqual([]);
     expect(databaseSnapshot(store)).toEqual(beforeDatabase);
-    expect(worktreeSnapshot(worktreePath)).toEqual(beforeWorktree);
+    expect(repositorySnapshot(repoPath)).toEqual(beforeRepository);
+    expect(repositorySnapshot(worktreePath)).toEqual(beforeWorktree);
     expect(detail.json()).not.toHaveProperty("integrationRun");
     await app.close();
   });

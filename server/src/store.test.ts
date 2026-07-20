@@ -9,6 +9,7 @@ import {
   type RequirementProjectSnapshot,
   type RequirementProjectWithVersionMetadata
 } from "./store.js";
+import { evaluateGate, failClosedGateConfig } from "@ai-workflow/shared";
 
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
@@ -442,14 +443,35 @@ describe("WorkflowStore", () => {
     expect(store.getRequirement(req.id)?.status).toBe("ai_ready");
   });
 
-  it("persists gate configuration with defaults", () => {
+  it("persists valid gate configuration and fails closed for invalid internal writes", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     expect(store.getGateConfig()).toEqual({ autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: [] });
     store.updateGateConfig({ autoTransitionEnabled: false, confidenceThreshold: 0.9, mandatoryHumanStages: ["definition"] });
     expect(store.getGateConfig().confidenceThreshold).toBe(0.9);
     expect(store.getGateConfig().autoTransitionEnabled).toBe(false);
     store.updateGateConfig({ autoTransitionEnabled: true, confidenceThreshold: 0.8, mandatoryHumanStages: ["implementation", "definition"] } as any);
-    expect(store.getGateConfig()).toEqual({ autoTransitionEnabled: true, confidenceThreshold: 0.8, mandatoryHumanStages: ["definition"] });
+    expect(store.getGateConfig()).toEqual(failClosedGateConfig);
+  });
+
+  it.each([
+    ["invalid JSON", "{"],
+    ["wrong boolean", JSON.stringify({ autoTransitionEnabled: "true", confidenceThreshold: 0.85, mandatoryHumanStages: [] })],
+    ["string threshold", JSON.stringify({ autoTransitionEnabled: true, confidenceThreshold: "0.85", mandatoryHumanStages: [] })],
+    ["out of range threshold", JSON.stringify({ autoTransitionEnabled: true, confidenceThreshold: 2, mandatoryHumanStages: [] })],
+    ["downstream stage", JSON.stringify({ autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: ["implementation"] })]
+  ])("fails closed for persisted %s", (_name, valueJson) => {
+    const directory = mkdtempSync(join(tmpdir(), "gate-config-")); directories.push(directory);
+    const path = join(directory, "workflow.db");
+    const store = new WorkflowStore(path); stores.push(store);
+    const database = new DatabaseSync(path);
+    database.prepare("INSERT INTO settings (key, value_json, updated_at) VALUES ('gate_config', ?, ?)")
+      .run(valueJson, "2026-07-20T00:00:00.000Z");
+    database.close();
+
+    expect(() => store.getGateConfig()).not.toThrow();
+    const config = store.getGateConfig();
+    expect(config).toEqual(failClosedGateConfig);
+    expect(evaluateGate("definition", { conclusion: "pass", confidence: 0.1, findings: [], risks: [] }, config).decision).toBe("human_review");
   });
 
   it("applies one automatic gate decision per artifact", () => {

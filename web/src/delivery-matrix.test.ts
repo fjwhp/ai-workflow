@@ -339,4 +339,16 @@ describe("DeliveryMatrix", () => {
     expect(containerRule![2]).toMatch(/\.delivery-row-stack\{grid-template-columns:1fr/);
     expect(containerRule![2]).toMatch(/\.delivery-field\{display:grid/);
   });
+
+  it("defines one five-column desktop stats grid while retaining narrow layouts", () => {
+    const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+    const desktopDeclarations = css.match(/\.stats\{[^}]*grid-template-columns:repeat\((?:4|5),minmax\(0,1fr\)\)/g) ?? [];
+    const tabletRule = css.split("\n").find((line) => line.startsWith("@media(max-width:900px){") && line.includes(".stats{"));
+    const mobileRule = css.split("\n").find((line) => line.startsWith("@media(max-width:620px){") && line.includes(".stats{"));
+
+    expect(desktopDeclarations).toHaveLength(1);
+    expect(desktopDeclarations[0]).toContain("repeat(5,minmax(0,1fr))");
+    expect(tabletRule).toContain(".stats{grid-template-columns:repeat(2,1fr)}");
+    expect(mobileRule).toContain(".stats{grid-template-columns:1fr 1fr;gap:8px}");
+  });
 });

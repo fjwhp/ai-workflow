@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { isRequirementAiStage, type RequirementAiStage, type WorkflowStage } from "./domain.js";
 
 export type GateDecision = "auto_approve" | "auto_return" | "human_review";
@@ -6,11 +7,29 @@ export type ConfigurableMandatoryHumanStage = typeof configurableMandatoryHumanS
 export type GateConfig = { autoTransitionEnabled: boolean; confidenceThreshold: number; mandatoryHumanStages: ConfigurableMandatoryHumanStage[] };
 export type GateResult = { decision: GateDecision; reasons: string[] };
 
+export const gateConfigSchema = z.object({
+  autoTransitionEnabled: z.boolean(),
+  confidenceThreshold: z.number().finite().min(0).max(1),
+  mandatoryHumanStages: z.array(z.literal("definition")).max(1)
+}).strict();
+
 export const defaultGateConfig: GateConfig = {
   autoTransitionEnabled: true,
   confidenceThreshold: 0.85,
   mandatoryHumanStages: []
 };
+
+export const failClosedGateConfig: GateConfig = {
+  autoTransitionEnabled: false,
+  confidenceThreshold: 0.85,
+  mandatoryHumanStages: []
+};
+
+export function parseGateConfig(input: unknown): GateConfig {
+  const parsed = gateConfigSchema.safeParse(input);
+  const config = parsed.success ? parsed.data : failClosedGateConfig;
+  return { ...config, mandatoryHumanStages: [...config.mandatoryHumanStages] };
+}
 
 export function evaluateGate(stage: RequirementAiStage, artifact: any, config: GateConfig): GateResult {
   if (!isRequirementAiStage(stage)) throw new Error("REQUIREMENT_AI_STAGE_UNSUPPORTED");

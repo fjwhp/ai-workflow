@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
+import { createPhase2Schema } from "./database-schema.js";
 
 const tempDirectories: string[] = [];
 const runningChildren = new Set<ChildProcess>();
@@ -14,19 +15,30 @@ afterEach(async () => {
 });
 
 describe("real server startup acceptance", () => {
-  it("backs up a v1 database and starts with no legacy stages or gate settings", { timeout: 15_000 }, async () => {
+  it("backs up the deployed v2 schema before creating the Phase 2 foundation schema", { timeout: 15_000 }, async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "workflow-startup-acceptance-"));
     tempDirectories.push(dataDir);
     const databasePath = join(dataDir, "workflow.db");
     const oldDatabase = new DatabaseSync(databasePath);
     oldDatabase.exec(`
-      CREATE TABLE requirements (id TEXT PRIMARY KEY, stage TEXT NOT NULL);
-      CREATE TABLE settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL);
-      INSERT INTO requirements VALUES ('legacy-requirement', 'prd');
-      INSERT INTO settings VALUES ('gate_config', '{"mandatoryHumanStages":["coding","acceptance"]}');
+      CREATE TABLE project_versions (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, branch TEXT NOT NULL,
+        base_branch TEXT NOT NULL, worktree_path TEXT NOT NULL, status TEXT NOT NULL, head_commit TEXT NOT NULL,
+        pending_requirement_id TEXT, pending_integration_run_id TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT
+      );
+      CREATE TABLE approvals (id TEXT PRIMARY KEY, override_json TEXT);
+      CREATE TABLE integration_runs (id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, status TEXT NOT NULL);
+      CREATE UNIQUE INDEX idx_integration_runs_active ON integration_runs(requirement_id) WHERE status = 'running';
+      INSERT INTO project_versions VALUES (
+        'version-old', 'project-old', 'v2', 'feature/v2', 'main', '/tmp/old-v2', 'active', 'abc123',
+        'requirement-old', 'run-old', '2026-07-19T00:00:00.000Z', '2026-07-19T00:00:00.000Z', NULL
+      );
+      INSERT INTO approvals VALUES ('approval-old', '{"actor":"legacy"}');
+      INSERT INTO integration_runs VALUES ('run-old', 'requirement-old', 'running');
     `);
     oldDatabase.close();
-    await writeFile(`${databasePath}.schema-version`, "phase-2-delivery-v1");
+    await writeFile(`${databasePath}.schema-version`, "phase-2-five-stage-v2");
     const stdout = boundedLogs();
     const allLogs = boundedLogs();
     const child = spawn(process.execPath, [resolve("node_modules/tsx/dist/cli.mjs"), resolve("server/src/index.ts")], {
@@ -42,23 +54,48 @@ describe("real server startup acceptance", () => {
       const baseUrl = await waitForListeningEvent(child, stdout.read, allLogs.read);
       await waitForHealth(baseUrl, child, allLogs.read);
       await expect(getJson(baseUrl, "/api/projects")).resolves.toEqual([]);
-      await expect(getJson(baseUrl, "/api/requirements")).resolves.toEqual([]);
-      await expect(getJson(baseUrl, "/api/settings/gates")).resolves.toMatchObject({
-        mandatoryHumanStages: []
-      });
+      const live = new DatabaseSync(databasePath);
+      const expectedFresh = new DatabaseSync(":memory:");
+      createPhase2Schema(expectedFresh);
+      expect(schemaObjects(live)).toEqual(schemaObjects(expectedFresh));
+      expectedFresh.close();
+      expect(columns(live, "project_versions")).toEqual([
+        "id", "project_id", "name", "branch", "base_branch", "worktree_path", "status",
+        "head_commit", "created_at", "updated_at", "closed_at"
+      ]);
+      expect(columns(live, "approvals")).not.toContain(["override", "json"].join("_"));
+      expect(object(live, "table", ["integration", "runs"].join("_"))).toBeUndefined();
+      expect(object(live, "index", ["idx", "integration", "runs", "active"].join("_"))).toBeUndefined();
+      live.close();
       const backupNames = (await readdir(dataDir)).filter((name) => /^workflow\.db\.backup-\d{4}-\d{2}-\d{2}T/.test(name) && !name.endsWith("-wal") && !name.endsWith("-shm"));
       expect(backupNames).toHaveLength(1);
       const backup = new DatabaseSync(join(dataDir, backupNames[0]!));
-      expect(backup.prepare("SELECT stage FROM requirements").get()).toEqual({ stage: "prd" });
-      expect(JSON.parse((backup.prepare("SELECT value_json FROM settings WHERE key = 'gate_config'").get() as { value_json: string }).value_json))
-        .toEqual({ mandatoryHumanStages: ["coding", "acceptance"] });
+      expect(columns(backup, "project_versions")).toEqual(expect.arrayContaining([
+        ["pending", "requirement", "id"].join("_"), ["pending", "integration", "run", "id"].join("_")
+      ]));
+      expect(columns(backup, "approvals")).toContain(["override", "json"].join("_"));
+      expect(object(backup, "table", ["integration", "runs"].join("_"))).toBeDefined();
+      expect(object(backup, "index", ["idx", "integration", "runs", "active"].join("_"))).toBeDefined();
       backup.close();
-      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-five-stage-v2");
+      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-foundation-v3");
     } finally {
       await stopChild(child);
     }
   });
 });
+
+function columns(database: DatabaseSync, table: string) {
+  return (database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(({ name }) => name);
+}
+
+function object(database: DatabaseSync, type: "table" | "index", name: string) {
+  return database.prepare("SELECT name FROM sqlite_master WHERE type = ? AND name = ?").get(type, name);
+}
+
+function schemaObjects(database: DatabaseSync) {
+  return database.prepare(`SELECT type, name, sql FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`).all();
+}
 
 async function waitForListeningEvent(child: ChildProcess, stdout: () => string, logs: () => string) {
   const deadline = Date.now() + 10_000;

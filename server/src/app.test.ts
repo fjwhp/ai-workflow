@@ -470,6 +470,22 @@ describe("stage run API", () => {
     await app.close();
   });
 
+  it.each([
+    ["wrong boolean type", { autoTransitionEnabled: "true", confidenceThreshold: 0.85, mandatoryHumanStages: [] }],
+    ["string threshold", { autoTransitionEnabled: true, confidenceThreshold: "0.85", mandatoryHumanStages: [] }],
+    ["non-finite threshold", { autoTransitionEnabled: true, confidenceThreshold: Number.NaN, mandatoryHumanStages: [] }],
+    ["unknown property", { autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: [], unexpected: true }]
+  ])("rejects gate configuration with %s", async (_name, payload) => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "PATCH", url: "/api/settings/gates", payload });
+
+    expect(response.statusCode).toBe(400);
+    expect(store.getGateConfig()).toEqual({ autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: [] });
+    await app.close();
+  });
+
   it.each(["solution_design", "implementation", "quality_verification", "acceptance_delivery"] as const)("rejects %s as a configurable gate stage", async (stage) => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     const app = await buildApp(store);

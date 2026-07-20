@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { defaultGateConfig, returnStage, workflowStages, type GateConfig, type ProjectVersion, type RequirementInput, type RequirementProject, type RequirementProjectInput, type WorkflowStage } from "@ai-workflow/shared";
+import { defaultGateConfig, parseGateConfig, returnStage, workflowStages, type GateConfig, type ProjectVersion, type RequirementInput, type RequirementProject, type RequirementProjectInput, type WorkflowStage } from "@ai-workflow/shared";
 import { hasMaterialAssociationChange, validateRequirementProjects } from "./requirement-projects.js";
 import { buildReworkContext } from "./rework-context.js";
 import { createPhase2Schema } from "./database-schema.js";
@@ -645,11 +645,11 @@ export class WorkflowStore {
   getGateConfig(): GateConfig {
     const row = this.db.prepare("SELECT value_json FROM settings WHERE key = 'gate_config'").get() as { value_json: string } | undefined;
     if (!row) return { ...defaultGateConfig, mandatoryHumanStages: [...defaultGateConfig.mandatoryHumanStages] };
-    const stored = JSON.parse(row.value_json);
-    const mandatoryHumanStages = Array.isArray(stored.mandatoryHumanStages) && stored.mandatoryHumanStages.includes("definition")
-      ? ["definition"] as const
-      : [];
-    return { ...defaultGateConfig, ...stored, mandatoryHumanStages: [...mandatoryHumanStages] };
+    try {
+      return parseGateConfig(JSON.parse(row.value_json));
+    } catch {
+      return parseGateConfig(undefined);
+    }
   }
 
   updateGateConfig(config: GateConfig) {

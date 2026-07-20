@@ -46,7 +46,7 @@
 
 ## 数据重建 SOP
 
-升级到 `phase-2-five-stage-v2` 前停止服务。服务识别 v1 或其他旧 live DB 后，先备份主文件及现有 WAL/SHM，再创建空的新库。旧 Phase 1 history 只保存在 backup；没有 row migration、dual read/write 或 fallback。重新登记项目、版本和需求，以新跑结果作为当前事实；用户已授权旧数据以新跑为准。
+升级到 `phase-2-foundation-v3` 前停止服务。服务识别 v2 或其他旧 live DB 后，先备份主文件及现有 WAL/SHM，再创建空的新库。旧 history 只保存在 backup；没有 row migration、dual read/write 或 fallback。重新登记项目、版本和需求，以新跑结果作为当前事实；用户已授权旧数据以新跑为准。
 
 ## 异常处理
 

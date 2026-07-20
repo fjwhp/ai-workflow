@@ -7,9 +7,9 @@ describe("Phase 2 foundation documentation contract", () => {
   const documentationFiles = ["README.md", "docs/states-and-gates.md", "docs/workflow-sop.md", "docs/getting-started.md"];
   const documentation = documentationFiles.map((file) => readFileSync(join(root, file), "utf8")).join("\n");
 
-  it("documents the v2 fresh reset and the staged delivery roadmap", () => {
+  it("documents the v3 fresh reset and the staged delivery roadmap", () => {
     for (const file of documentationFiles) {
-      expect(readFileSync(join(root, file), "utf8"), file).toContain("phase-2-five-stage-v2");
+      expect(readFileSync(join(root, file), "utf8"), file).toContain("phase-2-foundation-v3");
     }
     expect(documentation).toContain("definition");
     expect(documentation).toContain("solution_design");
@@ -21,6 +21,20 @@ describe("Phase 2 foundation documentation contract", () => {
     expect(documentation).toContain("Phase 3");
     expect(documentation).toContain("dual read/write");
     expect(documentation).toContain("no-commit");
+  });
+
+  it("documents downstream runs as an automatic read-only view", () => {
+    const gettingStarted = readFileSync(join(root, "docs/getting-started.md"), "utf8");
+    expect(gettingStarted).toContain("自动显示只读交付矩阵");
+    expect(gettingStarted).not.toMatch(/点击 `\/run`/);
+  });
+
+  it("assigns Phase 3 application orchestration to delivery units and retained primitives", () => {
+    const plan = readFileSync(join(root, "docs/superpowers/plans/2026-07-19-phase-2-acceptance-application.md"), "utf8");
+    expect(plan).not.toContain("server/src/version-application.ts");
+    expect(plan).not.toContain("server/src/version-application.test.ts");
+    expect(plan).toContain("server/src/integration.ts");
+    expect(plan).toContain("delivery-unit-owned");
   });
 
   it("contains no banned legacy token outside historical superpowers material", () => {

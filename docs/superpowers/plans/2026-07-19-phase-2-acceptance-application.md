@@ -17,7 +17,7 @@
 - Create `server/src/delivery-application-repository.ts`: per-unit application attempts and aggregate settlement.
 - Create `server/src/delivery-application-service.ts`: preflight, safe no-commit apply, verification, and retry.
 - Create `server/src/delivery-acceptance-routes.ts`: overall acceptance and per-unit application recovery endpoints.
-- Modify `server/src/version-application.ts` and `server/src/project-version-routes.ts`: extract reusable Git-safe primitives without requirement-level ownership.
+- Modify `server/src/integration.ts`: retain and reuse its Git-safe `preflightLocalIntegration` and `executeLocalIntegration` primitives without adding orchestration ownership.
 - Modify `server/src/delivery-coordinator.ts` and `server/src/automation-worker.ts`: application job sequencing.
 - Create `web/src/acceptance-delivery-panel.tsx`: aggregate acceptance, ordered plan, partial state, and scoped retry UI.
 - Modify `web/src/delivery-matrix.tsx`, `web/src/main.tsx`, and CSS: application evidence and responsive recovery actions.
@@ -161,13 +161,11 @@ git add server/src/delivery-application-repository.ts server/src/delivery-applic
 git commit -m "feat: persist delivery applications"
 ```
 
-### Task 4: Extract A Reusable Safe No-Commit Apply Primitive
+### Task 4: Build A Delivery-Unit-Owned Safe No-Commit Apply Service
 
 **Files:**
-- Modify: `server/src/version-application.ts`
-- Modify: `server/src/version-application.test.ts`
-- Modify: `server/src/project-version-routes.ts`
-- Modify: `server/src/project-version-routes.test.ts`
+- Modify: `server/src/integration.ts`
+- Modify: `server/src/integration.test.ts`
 - Create: `server/src/delivery-application-service.ts`
 - Create: `server/src/delivery-application-service.test.ts`
 
@@ -187,33 +185,32 @@ Add dirty target, wrong repository identity, wrong branch, stale diff hash, occu
 
 - [ ] **Step 2: Run application service tests**
 
-Run: `npm test -- server/src/delivery-application-service.test.ts server/src/version-application.test.ts`
+Run: `npm test -- server/src/delivery-application-service.test.ts server/src/integration.test.ts`
 
-Expected: FAIL because safe apply is coupled to requirement-level routes/runs.
+Expected: FAIL because Phase 3 delivery-unit-owned orchestration does not exist.
 
 - [ ] **Step 3: Extract and reuse the primitive**
 
-Expose:
+Reuse the retained low-level primitives from `server/src/integration.ts`:
 
 ```ts
-preflightVersionApplication(input: FrozenApplicationInput): Promise<ApplicationPreflight>
-applyVersionWithoutCommit(input: FrozenApplicationInput): Promise<ApplicationResult>
-verifyAppliedVersion(input: FrozenApplicationInput): Promise<CommandResult[]>
+preflightLocalIntegration(input: FrozenApplicationInput): Promise<ApplicationPreflight>
+executeLocalIntegration(input: FrozenApplicationInput): Promise<ApplicationResult>
 ```
 
-The primitive may invoke only local Git and frozen allowed commands. It must never run `git commit`, `git push`, create remote refs, or mutate the source worktree. Keep existing Phase 1 route tests passing until the clean reset removes the old live path.
+The delivery application service owns all Phase 3 sequencing, leases, evidence association, settlement, and retry by `deliveryUnitId`. `integration.ts` remains a low-level no-commit Git boundary: it may invoke only local Git and frozen allowed commands, must never run `git push` or create remote refs, and must not acquire requirement-level ownership. Do not restore a removed route or requirement-owned application coordinator.
 
 - [ ] **Step 4: Run all Git-safety tests**
 
-Run: `npm test -- server/src/delivery-application-service.test.ts server/src/version-application.test.ts server/src/project-version-routes.test.ts`
+Run: `npm test -- server/src/delivery-application-service.test.ts server/src/integration.test.ts`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add server/src/version-application.ts server/src/version-application.test.ts server/src/project-version-routes.ts server/src/project-version-routes.test.ts server/src/delivery-application-service.ts server/src/delivery-application-service.test.ts
-git commit -m "refactor: extract safe version application"
+git add server/src/integration.ts server/src/integration.test.ts server/src/delivery-application-service.ts server/src/delivery-application-service.test.ts
+git commit -m "feat: add delivery unit application service"
 ```
 
 ### Task 5: Sequence Applications Through Persistent Jobs

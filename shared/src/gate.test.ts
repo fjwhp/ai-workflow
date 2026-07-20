@@ -1,9 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { configurableMandatoryHumanStages, evaluateGate, defaultGateConfig } from "./gate.js";
+import { configurableMandatoryHumanStages, evaluateGate, failClosedGateConfig, gateConfigSchema, parseGateConfig, defaultGateConfig } from "./gate.js";
 
 const pass = { conclusion: "pass", confidence: 0.9, openQuestions: [], risks: [], findings: [] };
 
 describe("evaluateGate", () => {
+  it.each([
+    null,
+    {},
+    { autoTransitionEnabled: "true", confidenceThreshold: 0.85, mandatoryHumanStages: [] },
+    { autoTransitionEnabled: true, confidenceThreshold: Number.NaN, mandatoryHumanStages: [] },
+    { autoTransitionEnabled: true, confidenceThreshold: "0.85", mandatoryHumanStages: [] },
+    { autoTransitionEnabled: true, confidenceThreshold: -0.1, mandatoryHumanStages: [] },
+    { autoTransitionEnabled: true, confidenceThreshold: 1.1, mandatoryHumanStages: [] },
+    { autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: ["implementation"] },
+    { autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: ["definition", "implementation"] },
+    { autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: [], unexpected: true }
+  ])("fails closed for invalid persisted gate config %#", (input) => {
+    expect(gateConfigSchema.safeParse(input).success).toBe(false);
+    const config = parseGateConfig(input);
+    expect(config).toEqual(failClosedGateConfig);
+    expect(evaluateGate("definition", { ...pass, confidence: 0.1 }, config).decision).toBe("human_review");
+  });
+
   it("only exposes definition as a configurable mandatory stage", () => {
     expect(configurableMandatoryHumanStages).toEqual(["definition"]);
   });
