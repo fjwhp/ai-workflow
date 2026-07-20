@@ -20,6 +20,13 @@ import {
   AutomationJobRepository,
   type AutomationJobPersistence
 } from "./automation-job-repository.js";
+import {
+  ExecutionRepository,
+  type CodingEvidenceInput,
+  type ExecutionInput
+} from "./execution-repository.js";
+
+export type { ExecutionInput } from "./execution-repository.js";
 
 export type RequirementProjectWithVersionMetadata = RequirementProject & {
   projectVersionWorktreePath?: string;
@@ -46,26 +53,6 @@ export interface RequirementArtifact {
   createdAt: string;
 }
 
-export interface ExecutionInput {
-  requirementId: string;
-  deliveryUnitId: string;
-  evidenceVersion: number;
-  stage: WorkflowStage;
-  projectId: string;
-  projectVersionId?: string;
-  branch: string;
-  worktreePath: string;
-  baseCommit?: string;
-  status: string;
-  commands?: unknown[];
-  diff?: string;
-  error?: string;
-  codexThreadId?: string;
-  events?: unknown[];
-  diagnostics?: string;
-  completedAt?: string;
-}
-
 export interface StageRunInput {
   requirementId: string;
   stage: WorkflowStage;
@@ -83,6 +70,7 @@ export class WorkflowStore {
   private db: DatabaseSync;
   private readonly deliveryUnitRepository: DeliveryUnitRepository;
   private readonly deliveryExecutionRepository: DeliveryExecutionRepository;
+  private readonly executionRepository: ExecutionRepository;
   public readonly deliveryUnits: DeliveryUnitPersistence;
   public readonly deliveryExecutions: DeliveryExecutionPersistence;
   public readonly automationJobs: AutomationJobPersistence;
@@ -93,6 +81,7 @@ export class WorkflowStore {
     createPhase2Schema(this.db);
     this.deliveryUnitRepository = new DeliveryUnitRepository(this.db);
     this.deliveryExecutionRepository = new DeliveryExecutionRepository(this.db);
+    this.executionRepository = new ExecutionRepository(this.db);
     const automationJobRepository = new AutomationJobRepository(this.db);
     this.deliveryUnits = {
       createPlan: (input) => this.withImmediateTransaction(
@@ -1006,61 +995,19 @@ export class WorkflowStore {
   }
 
   addExecution(input: ExecutionInput) {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      if (input.projectVersionId && !input.baseCommit) throw new Error("REQUIREMENT_VERSION_REQUIRED");
-      if (input.projectVersionId) {
-        const version = this.db.prepare("SELECT project_id FROM project_versions WHERE id = ?").get(input.projectVersionId) as { project_id: string } | undefined;
-        if (!version || version.project_id !== input.projectId) throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
-      }
-      const item = { id: randomUUID(), createdAt: new Date().toISOString(), ...input };
-      this.db.prepare(`INSERT INTO executions
-        (id, requirement_id, delivery_unit_id, evidence_version, stage, project_id, project_version_id,
-         branch, worktree_path, base_commit, status, commands_json, diff_text, error, created_at,
-         completed_at, codex_thread_id, events_json, diagnostics_text)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
-        item.id, item.requirementId, item.deliveryUnitId, item.evidenceVersion, item.stage, item.projectId,
-        item.projectVersionId ?? null, item.branch, item.worktreePath, item.baseCommit ?? null,
-        item.status, JSON.stringify(item.commands ?? []), item.diff ?? "", item.error ?? null,
-        item.createdAt, item.completedAt ?? null, item.codexThreadId ?? null,
-        JSON.stringify(item.events ?? []), item.diagnostics ?? ""
-      );
-      this.db.exec("COMMIT");
-      return item;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    return this.executionRepository.add(input);
   }
 
   listExecutions(requirementId: string) {
-    return this.db.prepare("SELECT * FROM executions WHERE requirement_id = ? ORDER BY created_at DESC").all(requirementId).map((row: any) => ({
-      id: row.id, requirementId: row.requirement_id, stage: row.stage, projectId: row.project_id,
-      deliveryUnitId: row.delivery_unit_id, evidenceVersion: row.evidence_version,
-      projectVersionId: row.project_version_id ?? undefined, branch: row.branch, worktreePath: row.worktree_path,
-      baseCommit: row.base_commit ?? undefined, status: row.status,
-      commands: JSON.parse(row.commands_json), diff: row.diff_text, error: row.error,
-      codexThreadId: row.codex_thread_id, events: JSON.parse(row.events_json || "[]"), diagnostics: row.diagnostics_text,
-      createdAt: row.created_at, completedAt: row.completed_at
-    }));
+    return this.executionRepository.listForRequirement(requirementId);
   }
 
-  addCodingEvidence(input: any) {
-    const item = { id: randomUUID(), createdAt: new Date().toISOString(), ...input };
-    this.db.prepare(`INSERT INTO coding_evidence
-      (id, execution_id, requirement_id, delivery_unit_id, evidence_version, project_id, branch,
-       worktree_path, diff_hash, diff_text, original_chars, truncated, files_json, additions, deletions,
-       diagnostics_text, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(item.id, item.executionId, item.requirementId, item.deliveryUnitId, item.evidenceVersion,
-        item.projectId, item.branch, item.worktreePath, item.diffHash, item.diff,
-        item.originalChars, item.truncated ? 1 : 0, JSON.stringify(item.files ?? []), item.additions ?? 0, item.deletions ?? 0, item.diagnostics ?? "", item.createdAt);
-    return item;
+  addCodingEvidence(input: CodingEvidenceInput) {
+    return this.executionRepository.addCodingEvidence(input);
   }
 
   getLatestCodingEvidence(requirementId: string) {
-    const row = this.db.prepare("SELECT * FROM coding_evidence WHERE requirement_id = ? ORDER BY created_at DESC LIMIT 1").get(requirementId);
-    return row ? mapCodingEvidence(row as any) : null;
+    return this.executionRepository.getLatestCodingEvidence(requirementId);
   }
 
   addReworkContext(requirementId: string,input:any){
@@ -1177,15 +1124,6 @@ function mapStageRun(row: any, events: any[]) {
 function mapStageRunEvent(row: any) {
   return { id: row.id, runId: row.run_id, sequence: row.sequence, type: row.type,
     payload: JSON.parse(row.payload_json), createdAt: row.created_at };
-}
-
-function mapCodingEvidence(row: any) {
-  return { id: row.id, executionId: row.execution_id, requirementId: row.requirement_id,
-    deliveryUnitId: row.delivery_unit_id, evidenceVersion: row.evidence_version, projectId: row.project_id,
-    branch: row.branch, worktreePath: row.worktree_path, diffHash: row.diff_hash, diff: row.diff_text,
-    originalChars: row.original_chars, truncated: Boolean(row.truncated), files: JSON.parse(row.files_json || "[]"),
-    fileCount: JSON.parse(row.files_json || "[]").length, additions: row.additions, deletions: row.deletions,
-    diagnostics: row.diagnostics_text, createdAt: row.created_at };
 }
 
 function mapProjectKnowledge(row:any){return {id:row.id,projectId:row.project_id,version:row.version,status:row.status,sourceHead:row.source_head,refreshReason:row.refresh_reason,summary:row.summary??"",entries:JSON.parse(row.entries_json||"[]"),entryCount:row.entry_count,moduleCount:row.module_count,error:row.error,createdAt:row.created_at,completedAt:row.completed_at};}

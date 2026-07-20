@@ -211,4 +211,23 @@ describe("DeliveryExecutionService", () => {
     });
     expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toBeNull();
   });
+
+  it.each([
+    ["Error rejection", new Error("coding failed")],
+    ["primitive rejection", "coding failed as text"]
+  ])("surfaces a stale failure settlement for an %s and preserves the coding failure as cause", async (_name, codingFailure) => {
+    const fixture = createFixture();
+    const settlementFailure = new Error("DELIVERY_UNIT_RUN_STALE");
+    const failImplementation = vi.fn(() => { throw settlementFailure; });
+    const persistence = { ...fixture.store.deliveryExecutions, failImplementation };
+    const service = new DeliveryExecutionService(
+      persistence,
+      vi.fn().mockRejectedValue(codingFailure)
+    );
+
+    await expect(service.implement(fixture.unit.id)).rejects.toBe(settlementFailure);
+
+    expect(settlementFailure.cause).toBe(codingFailure);
+    expect(failImplementation).toHaveBeenCalledOnce();
+  });
 });

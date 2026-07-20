@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
@@ -43,6 +43,17 @@ afterEach(() => {
 });
 
 describe("WorkflowStore", () => {
+  it("keeps generic execution persistence as repository facade methods", () => {
+    const source = readFileSync(new URL("./store.ts", import.meta.url), "utf8");
+    const facade = source.slice(source.indexOf("  addExecution("), source.indexOf("  addReworkContext("));
+
+    expect(facade).not.toContain("this.db");
+    expect(facade).toContain("this.executionRepository.add");
+    expect(facade).toContain("this.executionRepository.listForRequirement");
+    expect(facade).toContain("this.executionRepository.addCodingEvidence");
+    expect(facade).toContain("this.executionRepository.getLatestCodingEvidence");
+  });
+
   it("opens with an empty fresh schema", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     expect(store.listRequirements()).toEqual([]);
@@ -540,7 +551,7 @@ describe("WorkflowStore", () => {
     expect(store.listExecutions(req.id)[0]).toMatchObject({ projectVersionId: version.id, baseCommit: "version-head" });
     const evidence = store.addCodingEvidence({ executionId: execution.id, requirementId: req.id, deliveryUnitId: unit.id, evidenceVersion: 1, projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", diffHash: "abc", diff: "diff", originalChars: 4, truncated: false, files: ["a.ts"], additions: 1, deletions: 0, diagnostics: "" });
     expect(store.getLatestCodingEvidence(req.id)?.id).toBe(evidence.id);
-    expect(() => store.addCodingEvidence({ ...evidence, id: undefined })).toThrow();
+    expect(() => store.addCodingEvidence({ ...evidence, id: undefined } as any)).toThrow();
   });
 
   it("validates execution project version provenance before inserting", () => {

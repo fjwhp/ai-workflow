@@ -26,9 +26,7 @@ export class DeliveryExecutionService {
       try {
         this.persistence.failImplementation(claim, errorText(error));
       } catch (settlementError) {
-        if (error && (typeof error === "object" || typeof error === "function")) {
-          Object.defineProperty(error, "settlementError", { value: settlementError, configurable: true });
-        }
+        throw settlementErrorWithCause(settlementError, error);
       }
       throw error;
     }
@@ -64,4 +62,14 @@ export class DeliveryExecutionService {
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function settlementErrorWithCause(settlementError: unknown, codingError: unknown) {
+  if (!(settlementError instanceof Error)) return new Error(String(settlementError), { cause: codingError });
+  Object.defineProperty(settlementError, "cause", {
+    value: codingError,
+    configurable: true,
+    writable: true
+  });
+  return settlementError;
 }

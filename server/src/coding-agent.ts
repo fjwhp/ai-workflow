@@ -117,6 +117,7 @@ async function executeTool(name: string, args: any, worktree: string, allowed: C
   }
   if (name === "run_command") {
     const command = String(args.command), commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
+    if (isForbiddenCodingExecutable(command)) throw new Error("CODING_COMMAND_FORBIDDEN");
     if (!isAllowedCommand(command, commandArgs, allowed)) throw new Error("命令不在项目白名单中");
     const result = await runCommand(worktree, command, commandArgs);
     commands.push({ command, args: commandArgs, ...result });
@@ -124,4 +125,11 @@ async function executeTool(name: string, args: any, worktree: string, allowed: C
   }
   if (name === "git_diff") return (await getWorktreeDiff(worktree)).slice(0, 80000);
   throw new Error("未知工具");
+}
+
+function isForbiddenCodingExecutable(command: string) {
+  const normalized = command.trim().replaceAll("\\", "/");
+  const basename = normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
+  const executable = basename.endsWith(".exe") ? basename.slice(0, -4) : basename;
+  return executable === "git" || executable === "gh";
 }
