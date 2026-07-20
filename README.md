@@ -18,6 +18,8 @@ Flowgate 是本地优先的 AI 研发工作台。当前 foundation 使用五个�
 - **Phase 2**：激活交付单元队列、worker、独立 Review 和自动化测试。Phase 1 不预实现这些执行器。
 - **Phase 3**：提供总体业务验收，以及按依赖顺序执行的 no-commit 本地应用。应用 owner 是交付单元，不是需求记录。
 
+自动化 worker 生命周期已经接入服务启动，但 `AUTOMATION_WORKER_ENABLED` 当前默认关闭。在 Phase 2 action handlers 完整注册前不要启用；启动仍会恢复过期 lease，但不会消费 pending job。
+
 任何阶段都不得在目标项目自动执行 commit、push、tag 或创建 PR。Phase 3 的本地应用也只允许留下未提交改动，必须由人工检查和决定后续处理。
 
 ## 数据基线

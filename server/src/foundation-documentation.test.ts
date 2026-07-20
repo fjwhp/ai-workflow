@@ -21,6 +21,8 @@ describe("Phase 2 foundation documentation contract", () => {
     expect(documentation).toContain("Phase 3");
     expect(documentation).toContain("dual read/write");
     expect(documentation).toContain("no-commit");
+    expect(documentation).toContain("AUTOMATION_WORKER_ENABLED");
+    expect(documentation).toContain("默认关闭");
   });
 
   it("documents downstream runs as an automatic read-only view", () => {
