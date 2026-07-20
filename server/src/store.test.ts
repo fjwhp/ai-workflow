@@ -445,9 +445,11 @@ describe("WorkflowStore", () => {
   it("persists gate configuration with defaults", () => {
     const store = new WorkflowStore(":memory:"); stores.push(store);
     expect(store.getGateConfig()).toEqual({ autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: [] });
-    store.updateGateConfig({ autoTransitionEnabled: false, confidenceThreshold: 0.9, mandatoryHumanStages: ["implementation"] });
+    store.updateGateConfig({ autoTransitionEnabled: false, confidenceThreshold: 0.9, mandatoryHumanStages: ["definition"] });
     expect(store.getGateConfig().confidenceThreshold).toBe(0.9);
     expect(store.getGateConfig().autoTransitionEnabled).toBe(false);
+    store.updateGateConfig({ autoTransitionEnabled: true, confidenceThreshold: 0.8, mandatoryHumanStages: ["implementation", "definition"] } as any);
+    expect(store.getGateConfig()).toEqual({ autoTransitionEnabled: true, confidenceThreshold: 0.8, mandatoryHumanStages: ["definition"] });
   });
 
   it("applies one automatic gate decision per artifact", () => {

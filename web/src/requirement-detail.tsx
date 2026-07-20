@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, Bot, Check, Code2, FileText, Play, RefreshCw, ShieldCheck } from "lucide-react";
-import { stageLabels, statusLabels, workflowStages, type Requirement, type WorkflowStage, type WorkflowStatus } from "@ai-workflow/shared";
+import { stageLabels, workflowStages, type Requirement, type WorkflowStage, type WorkflowStatus } from "@ai-workflow/shared";
 import { DeliveryMatrix, type DeliveryDependencyView, type DeliveryUnitView } from "./delivery-matrix.js";
 import { gateLabel, gateReasons, latestGateForStage } from "./gate-view.js";
 import { InlineRunStream } from "./inline-run-stream.js";
@@ -9,6 +9,7 @@ import { isRequirementDeliveryPlanFrozen, PlannedDelivery, RequirementProjectSum
 import { groupReworkItems } from "./rework-view.js";
 import { latestRunForStage, type StageRun } from "./run-observability.js";
 import { workflowSteps } from "./workflow-view.js";
+import { requirementStatusLabel } from "./workflow-presentation.js";
 
 export type Detail = Requirement & {
   projectId?: string;
@@ -41,8 +42,8 @@ type RequirementDetailProps = {
   onManageProjects: () => void;
 };
 
-export function Status({ status }: { status: WorkflowStatus }) {
-  return <span className={`status ${status}`}>{statusLabels[status]}</span>;
+export function Status({ stage, status }: { stage: WorkflowStage; status: WorkflowStatus }) {
+  return <span className={`status ${status}`}>{requirementStatusLabel(stage, status)}</span>;
 }
 
 export function priority(value: string) {
@@ -67,12 +68,12 @@ export function RequirementDetail({ item, onRun, onViewRun, onEdit, onApprove, o
 
   return <div className="content detail">
     <div className="timeline">{workflowStages.map((stage, index) => <button type="button" onClick={() => setViewStage(stage)} className={`step ${stage === item.stage ? "current" : workflowStages.indexOf(item.stage) > index ? "done" : ""} ${stage === viewStage ? "selected" : ""}`} key={stage}><span>{workflowStages.indexOf(item.stage) > index ? <Check size={14}/> : index + 1}</span><small>{steps[index]}</small></button>)}</div>
-    <div className="detail-grid"><section className="section"><div className="section-head"><div><h2>{stageLabels[viewStage]}</h2><p>当前需求版本 v{item.version || 1} · {isCurrentView ? "当前阶段成果与人工门禁" : "历史阶段产物"}</p></div>{isCurrentView && item.status === "ai_running" && stageRun ? <button className="run-status-button" onClick={() => onViewRun(stageRun)} title="查看 AI 执行详情"><Status status={item.status}/></button> : isCurrentView ? <Status status={item.status}/> : <span className="status">历史</span>}</div>
+    <div className="detail-grid"><section className="section"><div className="section-head"><div><h2>{stageLabels[viewStage]}</h2><p>当前需求版本 v{item.version || 1} · {isCurrentView ? (aiStage ? "当前阶段成果与人工门禁" : "只读交付矩阵") : "历史阶段产物"}</p></div>{isCurrentView && aiStage && item.status === "ai_running" && stageRun ? <button className="run-status-button" onClick={() => onViewRun(stageRun)} title="查看 AI 执行详情"><Status stage={item.stage} status={item.status}/></button> : isCurrentView ? <Status stage={item.stage} status={item.status}/> : <span className="status">历史</span>}</div>
       <PlannedDelivery items={projects} stage={viewStage}/>
       {showsDeliveryMatrix && <DeliveryMatrix units={item.deliveryUnits || []} dependencies={item.deliveryDependencies || []} projects={projects.map((project) => ({ ...project, projectName: project.projectName || project.projectId }))}/>}
-      {isCurrentView && item.status === "ai_running" && stageRun ? <InlineRunStream initialRun={stageRun} onOpenDetails={() => onViewRun(stageRun)} onTerminal={onRefresh}/> : <>{isCurrentView && item.reworkContext?.targetStage === viewStage && <ReworkPanel context={item.reworkContext}/>} {gate && <GateNotice gate={gate}/>} {item.codingEvidence && ["implementation", "quality_verification", "acceptance_delivery"].includes(viewStage) && <CodingEvidence evidence={item.codingEvidence}/>} {latest ? <Artifact artifact={latest}/> : <div className="empty compact"><Bot size={30}/><b>{isCurrentView ? "等待阶段结果" : "该阶段暂无产物"}</b><span>{isCurrentView ? "当前阶段尚无成果" : "返回当前节点继续处理"}</span></div>}{viewStage === "implementation" && item.executions?.[0] && <ExecutionResult execution={item.executions[0]}/>}</>}
-    </section><aside className="action-panel"><h3>{isCurrentView ? "下一步" : "阶段记录"}</h3><p>{isCurrentView ? (item.status === "awaiting_approval" ? "检查 AI 结论、风险和证据后作出决定。" : "确认上下文后手动启动本阶段 AI。") : `正在查看${stageLabels[viewStage]}的历史产物，不会改变当前流程。`}</p>
-      {stageRun && <button className="secondary wide view-run" onClick={() => onViewRun(stageRun)}><RefreshCw size={16}/>查看{stageRun.status === "running" ? "实时执行" : "执行记录"}</button>}{canApprove ? <button className="primary wide" onClick={onApprove}><ShieldCheck size={17}/>人工审批</button> : isCurrentView && needsRequirementCorrection ? <button className="primary wide" onClick={onEdit}><FileText size={17}/>纠正需求</button> : canRun ? <button className="primary wide" onClick={onRun}><Play size={17}/>启动 AI</button> : null}
+      {isCurrentView && aiStage && item.status === "ai_running" && stageRun ? <InlineRunStream initialRun={stageRun} onOpenDetails={() => onViewRun(stageRun)} onTerminal={onRefresh}/> : <>{isCurrentView && item.reworkContext?.targetStage === viewStage && <ReworkPanel context={item.reworkContext}/>} {gate && <GateNotice gate={gate}/>} {item.codingEvidence && ["implementation", "quality_verification", "acceptance_delivery"].includes(viewStage) && <CodingEvidence evidence={item.codingEvidence}/>} {latest ? <Artifact artifact={latest}/> : <div className="empty compact"><Bot size={30}/><b>{isCurrentView ? "等待阶段结果" : "该阶段暂无产物"}</b><span>{isCurrentView ? "当前阶段尚无成果" : "返回当前节点继续处理"}</span></div>}{viewStage === "implementation" && item.executions?.[0] && <ExecutionResult execution={item.executions[0]}/>}</>}
+    </section><aside className="action-panel"><h3>{isCurrentView ? "下一步" : "阶段记录"}</h3><p>{isCurrentView ? (!aiStage ? "当前交付矩阵为只读，等待 Phase 2 自动化接管。" : item.status === "awaiting_approval" ? "检查 AI 结论、风险和证据后作出决定。" : "确认上下文后手动启动本阶段 AI。") : `正在查看${stageLabels[viewStage]}的历史产物，不会改变当前流程。`}</p>
+      {aiStage && stageRun && <button className="secondary wide view-run" onClick={() => onViewRun(stageRun)}><RefreshCw size={16}/>查看{stageRun.status === "running" ? "实时执行" : "执行记录"}</button>}{canApprove ? <button className="primary wide" onClick={onApprove}><ShieldCheck size={17}/>人工审批</button> : isCurrentView && aiStage && needsRequirementCorrection ? <button className="primary wide" onClick={onEdit}><FileText size={17}/>纠正需求</button> : canRun ? <button className="primary wide" onClick={onRun}><Play size={17}/>启动 AI</button> : null}
       <RequirementProjectSummary items={projects} snapshot={item.projectSnapshot} frozen={deliveryPlanFrozen} onManage={onManageProjects}/><KnowledgeChanges changes={item.knowledgeChanges}/><dl><div><dt>优先级</dt><dd>{priority(item.priority)}</dd></div><div><dt>产物版本</dt><dd>{item.artifacts.length}</dd></div></dl></aside></div>
   </div>;
 }

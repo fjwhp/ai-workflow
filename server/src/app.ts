@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { evaluateGate, projectInputSchema, projectUpdateSchema, requirementInputSchema, requirementProjectsInputSchema, workflowStages } from "@ai-workflow/shared";
+import { configurableMandatoryHumanStages, evaluateGate, projectInputSchema, projectUpdateSchema, requirementInputSchema, requirementProjectsInputSchema } from "@ai-workflow/shared";
 import { WorkflowStore } from "./store.js";
 import { runAgent } from "./ai.js";
 import { createBackup } from "./backup.js";
@@ -206,7 +206,7 @@ export async function buildApp(store: WorkflowStore) {
   app.get("/api/settings/gates", async () => store.getGateConfig());
   app.patch("/api/settings/gates", async (req: any, reply) => {
     const body = req.body;
-    const validStages = Array.isArray(body?.mandatoryHumanStages) && body.mandatoryHumanStages.every((stage: string) => workflowStages.includes(stage as any));
+    const validStages = Array.isArray(body?.mandatoryHumanStages) && body.mandatoryHumanStages.length <= 1 && body.mandatoryHumanStages.every((stage: string) => configurableMandatoryHumanStages.includes(stage as "definition"));
     if (typeof body?.autoTransitionEnabled !== "boolean" || typeof body?.confidenceThreshold !== "number" || body.confidenceThreshold < 0 || body.confidenceThreshold > 1 || !validStages) {
       return reply.code(400).send({ error: "VALIDATION_ERROR", message: "门禁配置无效" });
     }

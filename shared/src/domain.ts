@@ -10,6 +10,11 @@ export const workflowStatuses = [
 
 export type WorkflowStage = typeof workflowStages[number];
 export type WorkflowStatus = typeof workflowStatuses[number];
+export type RequirementAiStage = Extract<WorkflowStage, "definition" | "solution_design">;
+
+export function isRequirementAiStage(stage: WorkflowStage): stage is RequirementAiStage {
+  return stage === "definition" || stage === "solution_design";
+}
 
 const transitions: Record<WorkflowStatus, readonly WorkflowStatus[]> = {
   ai_ready: ["ai_running", "blocked", "cancelled"],

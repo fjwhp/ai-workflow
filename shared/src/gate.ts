@@ -1,7 +1,9 @@
-import type { WorkflowStage } from "./domain.js";
+import { isRequirementAiStage, type RequirementAiStage, type WorkflowStage } from "./domain.js";
 
 export type GateDecision = "auto_approve" | "auto_return" | "human_review";
-export type GateConfig = { autoTransitionEnabled: boolean; confidenceThreshold: number; mandatoryHumanStages: WorkflowStage[] };
+export const configurableMandatoryHumanStages = ["definition"] as const satisfies readonly WorkflowStage[];
+export type ConfigurableMandatoryHumanStage = typeof configurableMandatoryHumanStages[number];
+export type GateConfig = { autoTransitionEnabled: boolean; confidenceThreshold: number; mandatoryHumanStages: ConfigurableMandatoryHumanStage[] };
 export type GateResult = { decision: GateDecision; reasons: string[] };
 
 export const defaultGateConfig: GateConfig = {
@@ -10,11 +12,12 @@ export const defaultGateConfig: GateConfig = {
   mandatoryHumanStages: []
 };
 
-export function evaluateGate(stage: WorkflowStage, artifact: any, config: GateConfig): GateResult {
+export function evaluateGate(stage: RequirementAiStage, artifact: any, config: GateConfig): GateResult {
+  if (!isRequirementAiStage(stage)) throw new Error("REQUIREMENT_AI_STAGE_UNSUPPORTED");
   // Overall acceptance is a separate server workflow; acceptance_delivery is only a delivery-unit phase.
   if (stage === "solution_design") return { decision: "human_review", reasons: ["solution_design 是不可配置的人工阶段"] };
   if (!config.autoTransitionEnabled) return { decision: "human_review", reasons: ["自动流转已关闭"] };
-  if (config.mandatoryHumanStages.includes(stage)) return { decision: "human_review", reasons: [`${stage} 是强制人工阶段`] };
+  if (stage === "definition" && config.mandatoryHumanStages.includes(stage)) return { decision: "human_review", reasons: [`${stage} 是强制人工阶段`] };
   const findings = Array.isArray(artifact?.findings) ? artifact.findings : [];
   const s0 = findings.filter((finding: any) => finding?.severity === "S0").length;
   if (artifact?.conclusion === "return") return { decision: "auto_return", reasons: ["AI 结论要求退回"] };

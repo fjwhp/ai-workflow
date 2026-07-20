@@ -462,11 +462,22 @@ describe("stage run API", () => {
     const app = await buildApp(store);
     const defaults = await app.inject({ method: "GET", url: "/api/settings/gates" });
     expect(defaults.json().confidenceThreshold).toBe(0.85);
-    const updated = await app.inject({ method: "PATCH", url: "/api/settings/gates", payload: { autoTransitionEnabled: false, confidenceThreshold: 0.9, mandatoryHumanStages: ["implementation", "acceptance_delivery"] } });
+    const updated = await app.inject({ method: "PATCH", url: "/api/settings/gates", payload: { autoTransitionEnabled: false, confidenceThreshold: 0.9, mandatoryHumanStages: ["definition"] } });
     expect(updated.statusCode).toBe(200);
-    expect(updated.json().autoTransitionEnabled).toBe(false);
+    expect(updated.json()).toMatchObject({ autoTransitionEnabled: false, mandatoryHumanStages: ["definition"] });
     const invalid = await app.inject({ method: "PATCH", url: "/api/settings/gates", payload: { autoTransitionEnabled: true, confidenceThreshold: 2, mandatoryHumanStages: [] } });
     expect(invalid.statusCode).toBe(400);
+    await app.close();
+  });
+
+  it.each(["solution_design", "implementation", "quality_verification", "acceptance_delivery"] as const)("rejects %s as a configurable gate stage", async (stage) => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "PATCH", url: "/api/settings/gates", payload: { autoTransitionEnabled: true, confidenceThreshold: 0.85, mandatoryHumanStages: [stage] } });
+
+    expect(response.statusCode).toBe(400);
+    expect(store.getGateConfig().mandatoryHumanStages).toEqual([]);
     await app.close();
   });
 

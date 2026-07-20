@@ -644,7 +644,12 @@ export class WorkflowStore {
 
   getGateConfig(): GateConfig {
     const row = this.db.prepare("SELECT value_json FROM settings WHERE key = 'gate_config'").get() as { value_json: string } | undefined;
-    return row ? { ...defaultGateConfig, ...JSON.parse(row.value_json) } : { ...defaultGateConfig, mandatoryHumanStages: [...defaultGateConfig.mandatoryHumanStages] };
+    if (!row) return { ...defaultGateConfig, mandatoryHumanStages: [...defaultGateConfig.mandatoryHumanStages] };
+    const stored = JSON.parse(row.value_json);
+    const mandatoryHumanStages = Array.isArray(stored.mandatoryHumanStages) && stored.mandatoryHumanStages.includes("definition")
+      ? ["definition"] as const
+      : [];
+    return { ...defaultGateConfig, ...stored, mandatoryHumanStages: [...mandatoryHumanStages] };
   }
 
   updateGateConfig(config: GateConfig) {

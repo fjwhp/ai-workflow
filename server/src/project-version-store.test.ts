@@ -25,6 +25,11 @@ function columns(database: DatabaseSync, table: string) {
   return (database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(({ name }) => name);
 }
 
+function schemaObjectNames(database: DatabaseSync, type: "index" | "trigger") {
+  return (database.prepare("SELECT name FROM sqlite_master WHERE type = ? AND sql IS NOT NULL ORDER BY name").all(type) as { name: string }[])
+    .map(({ name }) => name);
+}
+
 function requirementInput(projectId: string, projectVersionId: string, title: string) {
   return {
     title,
@@ -56,14 +61,41 @@ describe("project versions fresh schema", () => {
     const database = new DatabaseSync(path);
     databases.push(database);
 
-    expect(columns(database, "project_versions")).toEqual(expect.arrayContaining([
+    const projectVersionColumns = columns(database, "project_versions");
+    expect(projectVersionColumns).toEqual([
       "id", "project_id", "name", "branch", "base_branch", "worktree_path", "status",
       "head_commit", "created_at", "updated_at", "closed_at"
+    ]);
+    expect(projectVersionColumns).not.toEqual(expect.arrayContaining([
+      ["pending", "requirement", "id"].join("_"),
+      ["pending", "integration", "run", "id"].join("_")
     ]));
     expect(columns(database, "requirement_projects")).toContain("project_version_id");
     expect(columns(database, "executions")).toEqual(expect.arrayContaining(["project_version_id", "base_commit"]));
-    expect(columns(database, "integration_runs")).toEqual([]);
-    expect(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'requirement_integration_targets'").get()).toBeUndefined();
+    expect(columns(database, ["integration", "runs"].join("_"))).toEqual([]);
+    expect(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(["requirement", "integration", "targets"].join("_"))).toBeUndefined();
+    expect(columns(database, "approvals")).not.toContain(["override", "json"].join("_"));
+    expect(schemaObjectNames(database, "index")).toEqual([
+      "idx_approvals_ai_gate_artifact",
+      "idx_artifacts_owner_version",
+      "idx_artifacts_requirement_version",
+      "idx_automation_job_dedupe",
+      "idx_delivery_dependency_edge",
+      "idx_delivery_unit_active_run",
+      "idx_delivery_unit_project",
+      "idx_project_knowledge_active",
+      "idx_requirement_project_snapshots_active",
+      "idx_requirement_projects_active_primary",
+      "idx_requirement_projects_active_project"
+    ]);
+    expect(schemaObjectNames(database, "trigger")).toEqual([
+      "validate_artifact_owner_insert",
+      "validate_artifact_owner_update",
+      "validate_automation_job_owner_insert",
+      "validate_automation_job_owner_update",
+      "validate_stage_run_owner_insert",
+      "validate_stage_run_owner_update"
+    ]);
   });
 
   it("initializes the global requirement counter at zero", () => {
