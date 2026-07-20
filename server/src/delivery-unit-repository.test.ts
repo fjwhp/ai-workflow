@@ -129,6 +129,8 @@ describe("DeliveryUnitRepository", () => {
       fixture.backendVersion.id, fixture.frontendVersion.id
     ]);
     expect(result.units.every((item) => item.associationSnapshotId === fixture.snapshot.id)).toBe(true);
+    expect(fixture.store.deliveryUnits.get(result.units[0]!.id)).toEqual(result.units[0]);
+    expect(fixture.store.deliveryUnits.get("missing-unit")).toBeNull();
     expect(new Set(result.units.map((item) => item.createdAt))).toHaveLength(1);
     expect(result.dependencies).toHaveLength(1);
     expect(result.dependencies[0]).toMatchObject({

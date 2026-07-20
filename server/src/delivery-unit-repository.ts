@@ -82,6 +82,7 @@ export interface DeliveryPlanResult {
 
 export interface DeliveryUnitPersistence {
   createPlan(input: CreateDeliveryPlanInput): DeliveryPlanResult;
+  get(unitId: string): DeliveryUnit | null;
   listForRequirement(requirementId: string): DeliveryUnit[];
   listDependencies(requirementId: string): DeliveryDependency[];
 }
@@ -258,6 +259,11 @@ export class DeliveryUnitRepository {
   listForRequirement(requirementId: string): DeliveryUnit[] {
     return (this.db.prepare("SELECT * FROM delivery_units WHERE requirement_id = ? ORDER BY position, created_at, rowid")
       .all(requirementId) as any[]).map(mapDeliveryUnit);
+  }
+
+  get(unitId: string): DeliveryUnit | null {
+    const row = this.db.prepare("SELECT * FROM delivery_units WHERE id = ?").get(unitId);
+    return row ? mapDeliveryUnit(row as any) : null;
   }
 
   listDependencies(requirementId: string): DeliveryDependency[] {

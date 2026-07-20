@@ -203,7 +203,9 @@ export class DeliveryQualityRepository {
         AND sr.evidence_version = ce.evidence_version AND sr.stage = 'implementation' AND sr.status = 'completed'
       WHERE du.id = ? AND du.evidence_version = ?`).get(evidenceVersion, unitId, evidenceVersion) as any;
     if (!row) throw new Error("IMPLEMENTATION_EVIDENCE_NOT_FOUND");
-    if (row.unit_status !== "awaiting_gate") throw new Error("DELIVERY_UNIT_NOT_AWAITING_QUALITY");
+    if (!["awaiting_gate", "returned", "failed"].includes(row.unit_status)) {
+      throw new Error("DELIVERY_UNIT_NOT_AWAITING_QUALITY");
+    }
     const implementationInput = parseObject(row.input_json);
     return {
       requirement: implementationInput.requirement,

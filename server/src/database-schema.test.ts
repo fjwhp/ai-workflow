@@ -167,7 +167,7 @@ describe("Phase 2 database schema", () => {
     const db = openFreshStoreDatabase();
     expect(tableNames(db)).toEqual(expect.arrayContaining([
       "delivery_units", "delivery_dependencies", "delivery_unit_snapshots",
-      "automation_jobs"
+      "automation_jobs", "delivery_quality_overrides"
     ]));
     expect(columns(db, "stage_runs")).toEqual(expect.arrayContaining(["owner_type", "owner_id", "evidence_version"]));
     expect(columns(db, "artifacts")).toEqual(expect.arrayContaining(["owner_type", "owner_id"]));
@@ -179,6 +179,13 @@ describe("Phase 2 database schema", () => {
     );
     expect(tableSql(db, "delivery_quality_runs")).toMatch(
       /status = 'aborted' AND error IS NOT NULL AND completed_at IS NOT NULL/i
+    );
+    expect(columns(db, "delivery_quality_overrides")).toEqual(expect.arrayContaining([
+      "actor", "reason", "accepted_risk", "coding_evidence_id", "input_diff_hash",
+      "quality_evidence_id", "evidence_ids_json", "evidence_version"
+    ]));
+    expect(indexSql(db, "idx_delivery_quality_override_unit_version")).toMatch(
+      /delivery_quality_overrides\s*\(delivery_unit_id,\s*evidence_version,\s*kind\)/i
     );
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_stage_runs_running'").get()).toBeUndefined();
     db.close();
@@ -266,6 +273,9 @@ describe("Phase 2 database schema", () => {
     );
     expect(triggerNames(db)).toEqual(expect.arrayContaining([
       "validate_delivery_dependency_owner_insert",
+      "validate_delivery_quality_override_insert",
+      "delivery_quality_override_immutable_update",
+      "delivery_quality_override_immutable_delete",
       "validate_delivery_dependency_owner_update",
       "validate_delivery_unit_snapshot_owner_insert",
       "validate_delivery_unit_snapshot_owner_update"

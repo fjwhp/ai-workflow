@@ -342,6 +342,33 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(input_coding_evidence_id) REFERENCES coding_evidence(id),
       UNIQUE(delivery_unit_id, evidence_version, kind)
     );
+    CREATE TABLE IF NOT EXISTS delivery_quality_overrides (
+      id TEXT PRIMARY KEY,
+      requirement_id TEXT NOT NULL,
+      delivery_unit_id TEXT NOT NULL,
+      evidence_version INTEGER NOT NULL CHECK(
+        typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND ${MAX_AUTOMATION_EVIDENCE_VERSION}
+      ),
+      kind TEXT NOT NULL CHECK(kind IN ('code_review', 'automated_testing')),
+      actor TEXT NOT NULL CHECK(instr(actor, char(0)) = 0 AND length(trim(actor)) BETWEEN 1 AND 256),
+      reason TEXT NOT NULL CHECK(instr(reason, char(0)) = 0 AND length(trim(reason)) BETWEEN 1 AND 4096),
+      accepted_risk TEXT NOT NULL CHECK(
+        instr(accepted_risk, char(0)) = 0 AND length(trim(accepted_risk)) BETWEEN 1 AND 4096
+      ),
+      coding_evidence_id TEXT NOT NULL,
+      input_diff_hash TEXT NOT NULL,
+      quality_evidence_id TEXT NOT NULL,
+      evidence_ids_json TEXT NOT NULL CHECK(
+        instr(evidence_ids_json, char(0)) = 0 AND json_valid(evidence_ids_json)
+          AND json_type(evidence_ids_json) = 'array' AND json_array_length(evidence_ids_json) > 0
+      ),
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
+      FOREIGN KEY(coding_evidence_id) REFERENCES coding_evidence(id),
+      FOREIGN KEY(quality_evidence_id) REFERENCES delivery_quality_evidence(id),
+      UNIQUE(delivery_unit_id, evidence_version, kind)
+    );
     CREATE TABLE IF NOT EXISTS rework_contexts (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, approval_id TEXT NOT NULL UNIQUE, artifact_id TEXT,
       source_stage TEXT NOT NULL, target_stage TEXT NOT NULL, actor_type TEXT NOT NULL, decision_at TEXT NOT NULL,
@@ -413,6 +440,8 @@ export function createPhase2Schema(db: DatabaseSync) {
       ON coding_evidence(delivery_unit_id, evidence_version);
     CREATE INDEX IF NOT EXISTS idx_delivery_quality_evidence_unit_version
       ON delivery_quality_evidence(delivery_unit_id, evidence_version, kind);
+    CREATE INDEX IF NOT EXISTS idx_delivery_quality_override_unit_version
+      ON delivery_quality_overrides(delivery_unit_id, evidence_version, kind);
     DROP TRIGGER IF EXISTS validate_stage_run_owner_insert;
     DROP TRIGGER IF EXISTS validate_stage_run_owner_update;
     CREATE TRIGGER validate_stage_run_owner_insert
@@ -646,5 +675,52 @@ export function createPhase2Schema(db: DatabaseSync) {
     CREATE TRIGGER IF NOT EXISTS delivery_quality_evidence_immutable_delete
     BEFORE DELETE ON delivery_quality_evidence
     BEGIN SELECT RAISE(ABORT, 'DELIVERY_QUALITY_EVIDENCE_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_quality_override_insert
+    BEFORE INSERT ON delivery_quality_overrides
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_QUALITY_OVERRIDE_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units du
+        JOIN coding_evidence ce
+          ON ce.id = NEW.coding_evidence_id
+         AND ce.delivery_unit_id = du.id
+         AND ce.requirement_id = du.requirement_id
+         AND ce.evidence_version = NEW.evidence_version
+         AND ce.diff_hash = NEW.input_diff_hash
+        JOIN delivery_quality_evidence quality
+          ON quality.id = NEW.quality_evidence_id
+         AND quality.delivery_unit_id = du.id
+         AND quality.requirement_id = du.requirement_id
+         AND quality.evidence_version = NEW.evidence_version
+         AND quality.kind = NEW.kind
+         AND quality.input_coding_evidence_id = ce.id
+         AND quality.input_evidence_version = NEW.evidence_version
+         AND quality.input_diff_hash = ce.diff_hash
+        WHERE du.id = NEW.delivery_unit_id
+          AND du.requirement_id = NEW.requirement_id
+          AND du.evidence_version = NEW.evidence_version
+      ) OR NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.evidence_ids_json) ids
+        WHERE ids.value = NEW.quality_evidence_id
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(NEW.evidence_ids_json) ids
+        WHERE typeof(ids.value) <> 'text' OR NOT EXISTS (
+          SELECT 1 FROM delivery_quality_evidence quality
+          WHERE quality.id = ids.value
+            AND quality.delivery_unit_id = NEW.delivery_unit_id
+            AND quality.requirement_id = NEW.requirement_id
+            AND quality.evidence_version = NEW.evidence_version
+            AND quality.input_coding_evidence_id = NEW.coding_evidence_id
+            AND quality.input_evidence_version = NEW.evidence_version
+            AND quality.input_diff_hash = NEW.input_diff_hash
+        )
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS delivery_quality_override_immutable_update
+    BEFORE UPDATE ON delivery_quality_overrides
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_QUALITY_OVERRIDE_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_quality_override_immutable_delete
+    BEFORE DELETE ON delivery_quality_overrides
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_QUALITY_OVERRIDE_IMMUTABLE'); END;
   `);
 }

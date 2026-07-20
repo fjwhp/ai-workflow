@@ -21,6 +21,10 @@ import {
   type DeliveryQualityPersistence
 } from "./delivery-quality-repository.js";
 import {
+  DeliveryCoordinator,
+  type DeliveryCoordinationPersistence
+} from "./delivery-coordinator.js";
+import {
   AutomationJobRepository,
   type AutomationJobPersistence
 } from "./automation-job-repository.js";
@@ -79,6 +83,7 @@ export class WorkflowStore {
   public readonly deliveryUnits: DeliveryUnitPersistence;
   public readonly deliveryExecutions: DeliveryExecutionPersistence;
   public readonly deliveryQuality: DeliveryQualityPersistence;
+  public readonly deliveryCoordination: DeliveryCoordinationPersistence;
   public readonly automationJobs: AutomationJobPersistence;
 
   constructor(path: string) {
@@ -88,12 +93,14 @@ export class WorkflowStore {
     this.deliveryUnitRepository = new DeliveryUnitRepository(this.db);
     this.deliveryExecutionRepository = new DeliveryExecutionRepository(this.db);
     this.deliveryQualityRepository = new DeliveryQualityRepository(this.db);
+    const deliveryCoordinator = new DeliveryCoordinator(this.db, this.deliveryQualityRepository);
     this.executionRepository = new ExecutionRepository(this.db);
     const automationJobRepository = new AutomationJobRepository(this.db);
     this.deliveryUnits = {
       createPlan: (input) => this.withImmediateTransaction(
         () => this.deliveryUnitRepository.createPlanInTransaction(input)
       ),
+      get: (unitId) => this.deliveryUnitRepository.get(unitId),
       listForRequirement: (requirementId) => this.deliveryUnitRepository.listForRequirement(requirementId),
       listDependencies: (requirementId) => this.deliveryUnitRepository.listDependencies(requirementId)
     };
@@ -151,12 +158,19 @@ export class WorkflowStore {
         () => this.deliveryQualityRepository.claimInTransaction(unitId, evidenceVersion, kind, claimToken)
       ),
       complete: (claim, completion) => this.withImmediateTransaction(
-        () => this.deliveryQualityRepository.completeInTransaction(claim, completion)
+        () => deliveryCoordinator.recordQualityInTransaction(claim, completion)
       ),
       abort: (claim, error) => this.withImmediateTransaction(
         () => this.deliveryQualityRepository.abortInTransaction(claim, error)
       ),
       latest: (unitId, kind) => this.deliveryQualityRepository.latest(unitId, kind)
+    };
+    this.deliveryCoordination = {
+      overrideQuality: (input) => this.withImmediateTransaction(
+        () => deliveryCoordinator.overrideQualityInTransaction(input)
+      ),
+      listQualityOverrides: (unitId, evidenceVersion) =>
+        deliveryCoordinator.listQualityOverrides(unitId, evidenceVersion)
     };
   }
 
