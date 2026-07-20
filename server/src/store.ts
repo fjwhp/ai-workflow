@@ -13,6 +13,10 @@ import {
   type DeliveryUnitPersistence
 } from "./delivery-unit-repository.js";
 import {
+  DeliveryExecutionRepository,
+  type DeliveryExecutionPersistence
+} from "./delivery-execution-repository.js";
+import {
   AutomationJobRepository,
   type AutomationJobPersistence
 } from "./automation-job-repository.js";
@@ -44,6 +48,8 @@ export interface RequirementArtifact {
 
 export interface ExecutionInput {
   requirementId: string;
+  deliveryUnitId: string;
+  evidenceVersion: number;
   stage: WorkflowStage;
   projectId: string;
   projectVersionId?: string;
@@ -76,7 +82,9 @@ export interface StageRunInput {
 export class WorkflowStore {
   private db: DatabaseSync;
   private readonly deliveryUnitRepository: DeliveryUnitRepository;
+  private readonly deliveryExecutionRepository: DeliveryExecutionRepository;
   public readonly deliveryUnits: DeliveryUnitPersistence;
+  public readonly deliveryExecutions: DeliveryExecutionPersistence;
   public readonly automationJobs: AutomationJobPersistence;
 
   constructor(path: string) {
@@ -84,6 +92,7 @@ export class WorkflowStore {
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     createPhase2Schema(this.db);
     this.deliveryUnitRepository = new DeliveryUnitRepository(this.db);
+    this.deliveryExecutionRepository = new DeliveryExecutionRepository(this.db);
     const automationJobRepository = new AutomationJobRepository(this.db);
     this.deliveryUnits = {
       createPlan: (input) => this.withImmediateTransaction(
@@ -91,6 +100,21 @@ export class WorkflowStore {
       ),
       listForRequirement: (requirementId) => this.deliveryUnitRepository.listForRequirement(requirementId),
       listDependencies: (requirementId) => this.deliveryUnitRepository.listDependencies(requirementId)
+    };
+    this.deliveryExecutions = {
+      claimImplementation: (unitId, model) => this.withImmediateTransaction(
+        () => this.deliveryExecutionRepository.claimImplementationInTransaction(unitId, model)
+      ),
+      completeImplementation: (claim, result) => this.withImmediateTransaction(
+        () => this.deliveryExecutionRepository.completeImplementationInTransaction(claim, result)
+      ),
+      failImplementation: (claim, error) => this.withImmediateTransaction(
+        () => this.deliveryExecutionRepository.failImplementationInTransaction(claim, error)
+      ),
+      listExecutions: (deliveryUnitId, evidenceVersion) =>
+        this.deliveryExecutionRepository.listExecutions(deliveryUnitId, evidenceVersion),
+      getCodingEvidence: (deliveryUnitId, evidenceVersion) =>
+        this.deliveryExecutionRepository.getCodingEvidence(deliveryUnitId, evidenceVersion)
     };
     this.automationJobs = {
       enqueue: (input) => automationJobRepository.enqueue(input),
@@ -507,7 +531,7 @@ export class WorkflowStore {
   createStageRun(input: StageRunInput) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const requirement = this.db.prepare("SELECT stage, status, updated_at FROM requirements WHERE id = ?").get(input.requirementId) as { stage: string; status: string; updated_at: string } | undefined;
+      const requirement = this.db.prepare("SELECT stage, status, version, updated_at FROM requirements WHERE id = ?").get(input.requirementId) as { stage: string; status: string; version: number; updated_at: string } | undefined;
       if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
       if (this.db.prepare("SELECT id FROM stage_runs WHERE requirement_id = ? AND stage = ? AND status = 'running'").get(input.requirementId, input.stage)) {
         throw new Error("RUN_ALREADY_ACTIVE");
@@ -531,9 +555,9 @@ export class WorkflowStore {
       const now = new Date().toISOString();
       const item = { id: randomUUID(), ...input, status: "running", createdAt: now, completedAt: null };
       this.db.prepare(`INSERT INTO stage_runs
-        (id, requirement_id, owner_type, owner_id, stage, status, model, input_json, created_at)
-        VALUES (?, ?, 'requirement', ?, ?, ?, ?, ?, ?)`)
-        .run(item.id, item.requirementId, item.requirementId, item.stage, item.status, item.model, JSON.stringify(item.input), item.createdAt);
+        (id, requirement_id, owner_type, owner_id, evidence_version, stage, status, model, input_json, created_at)
+        VALUES (?, ?, 'requirement', ?, ?, ?, ?, ?, ?, ?)`)
+        .run(item.id, item.requirementId, item.requirementId, requirement.version, item.stage, item.status, item.model, JSON.stringify(item.input), item.createdAt);
       const claimed = this.db.prepare(`UPDATE requirements SET status = 'ai_running', updated_at = ?
         WHERE id = ? AND stage = ? AND status = 'ai_ready' AND updated_at = ?`)
         .run(now, input.requirementId, input.stage, requirement.updated_at);
@@ -991,9 +1015,12 @@ export class WorkflowStore {
       }
       const item = { id: randomUUID(), createdAt: new Date().toISOString(), ...input };
       this.db.prepare(`INSERT INTO executions
-        (id, requirement_id, stage, project_id, project_version_id, branch, worktree_path, base_commit, status, commands_json, diff_text, error, created_at, completed_at, codex_thread_id, events_json, diagnostics_text)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
-        item.id, item.requirementId, item.stage, item.projectId, item.projectVersionId ?? null, item.branch, item.worktreePath, item.baseCommit ?? null,
+        (id, requirement_id, delivery_unit_id, evidence_version, stage, project_id, project_version_id,
+         branch, worktree_path, base_commit, status, commands_json, diff_text, error, created_at,
+         completed_at, codex_thread_id, events_json, diagnostics_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
+        item.id, item.requirementId, item.deliveryUnitId, item.evidenceVersion, item.stage, item.projectId,
+        item.projectVersionId ?? null, item.branch, item.worktreePath, item.baseCommit ?? null,
         item.status, JSON.stringify(item.commands ?? []), item.diff ?? "", item.error ?? null,
         item.createdAt, item.completedAt ?? null, item.codexThreadId ?? null,
         JSON.stringify(item.events ?? []), item.diagnostics ?? ""
@@ -1009,6 +1036,7 @@ export class WorkflowStore {
   listExecutions(requirementId: string) {
     return this.db.prepare("SELECT * FROM executions WHERE requirement_id = ? ORDER BY created_at DESC").all(requirementId).map((row: any) => ({
       id: row.id, requirementId: row.requirement_id, stage: row.stage, projectId: row.project_id,
+      deliveryUnitId: row.delivery_unit_id, evidenceVersion: row.evidence_version,
       projectVersionId: row.project_version_id ?? undefined, branch: row.branch, worktreePath: row.worktree_path,
       baseCommit: row.base_commit ?? undefined, status: row.status,
       commands: JSON.parse(row.commands_json), diff: row.diff_text, error: row.error,
@@ -1020,9 +1048,12 @@ export class WorkflowStore {
   addCodingEvidence(input: any) {
     const item = { id: randomUUID(), createdAt: new Date().toISOString(), ...input };
     this.db.prepare(`INSERT INTO coding_evidence
-      (id, execution_id, requirement_id, project_id, branch, worktree_path, diff_hash, diff_text, original_chars, truncated, files_json, additions, deletions, diagnostics_text, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(item.id, item.executionId, item.requirementId, item.projectId, item.branch, item.worktreePath, item.diffHash, item.diff,
+      (id, execution_id, requirement_id, delivery_unit_id, evidence_version, project_id, branch,
+       worktree_path, diff_hash, diff_text, original_chars, truncated, files_json, additions, deletions,
+       diagnostics_text, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(item.id, item.executionId, item.requirementId, item.deliveryUnitId, item.evidenceVersion,
+        item.projectId, item.branch, item.worktreePath, item.diffHash, item.diff,
         item.originalChars, item.truncated ? 1 : 0, JSON.stringify(item.files ?? []), item.additions ?? 0, item.deletions ?? 0, item.diagnostics ?? "", item.createdAt);
     return item;
   }
@@ -1137,7 +1168,8 @@ function canonicalRepoPath(repoPath: string) {
 }
 
 function mapStageRun(row: any, events: any[]) {
-  return { id: row.id, requirementId: row.requirement_id, stage: row.stage, status: row.status, model: row.model,
+  return { id: row.id, requirementId: row.requirement_id, ownerType: row.owner_type, ownerId: row.owner_id,
+    evidenceVersion: row.evidence_version, stage: row.stage, status: row.status, model: row.model,
     input: JSON.parse(row.input_json || "null"), output: row.output_json ? JSON.parse(row.output_json) : null,
     error: row.error, createdAt: row.created_at, completedAt: row.completed_at, events };
 }
@@ -1148,7 +1180,8 @@ function mapStageRunEvent(row: any) {
 }
 
 function mapCodingEvidence(row: any) {
-  return { id: row.id, executionId: row.execution_id, requirementId: row.requirement_id, projectId: row.project_id,
+  return { id: row.id, executionId: row.execution_id, requirementId: row.requirement_id,
+    deliveryUnitId: row.delivery_unit_id, evidenceVersion: row.evidence_version, projectId: row.project_id,
     branch: row.branch, worktreePath: row.worktree_path, diffHash: row.diff_hash, diff: row.diff_text,
     originalChars: row.original_chars, truncated: Boolean(row.truncated), files: JSON.parse(row.files_json || "[]"),
     fileCount: JSON.parse(row.files_json || "[]").length, additions: row.additions, deletions: row.deletions,

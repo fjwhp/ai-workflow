@@ -47,4 +47,4 @@ Phase 2 才能推进实现、独立 Review 和自动化测试相关状态。Phas
 
 ## 数据状态边界
 
-`phase-2-automation-v4` 是唯一 live schema marker。`phase-2-automation-v3` 或其他旧数据库先备份后 fresh reset；旧历史只在 backup。系统不做 row migration、dual read/write、fallback 或跨 schema 状态兼容。用户已授权旧数据以新跑为准。
+`phase-2-delivery-execution-v5` 是唯一 live schema marker。`phase-2-automation-v4` 或其他旧数据库先备份后 fresh reset；旧历史只在 backup。系统不做 row migration、dual read/write、fallback 或跨 schema 状态兼容。用户已授权旧数据以新跑为准。

@@ -29,10 +29,10 @@ describe("prepareCodingWorktree", () => {
 
     await expect(prepareCodingWorktree(
       { id: "project-1", repoPath: "/tmp/project", defaultBranch: "main", allowedCommands: [] },
-      { id: "version-1", projectId: "project-1", branch: "release/2.2.1", worktreePath: "/tmp/version", status: "active" },
+      { id: "version-1", projectId: "project-1", branch: "release/2.2.1", worktreePath: "/tmp/version", status: "active", headCommit: "version-head" },
       "REQ-0001"
     )).resolves.toEqual({ branch: "ai/REQ-0001", worktreePath: "/tmp/requirements/REQ-0001", baseCommit: "version-head", reused: false });
-    expect(createWorktree).toHaveBeenCalledWith("/tmp/project", "release/2.2.1", "REQ-0001");
+    expect(createWorktree).toHaveBeenCalledWith("/tmp/project", "release/2.2.1", "REQ-0001", "version-head");
   });
 
   it("rejects a closed version before touching Git", async () => {

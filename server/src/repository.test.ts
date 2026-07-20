@@ -100,6 +100,25 @@ async function mainState(repoPath: string) {
 }
 
 describe("requirement worktree lifecycle", () => {
+  it("creates a delivery worktree from the frozen head after its source branch advances", async () => {
+    const { repoPath } = await setupVersionRepository();
+    const frozenHead = await git(repoPath, "rev-parse", "feature/2.2.1");
+    const tree = await git(repoPath, "rev-parse", "feature/2.2.1^{tree}");
+    const advancedHead = await git(repoPath, "commit-tree", tree, "-p", frozenHead, "-m", "advance version");
+    await git(repoPath, "update-ref", "refs/heads/feature/2.2.1", advancedHead, frozenHead);
+
+    const created = await createOrReuseRequirementWorktree(
+      repoPath,
+      "feature/2.2.1",
+      "REQ-0099",
+      frozenHead
+    );
+
+    expect(created.baseCommit).toBe(frozenHead);
+    expect(await git(created.worktreePath, "rev-parse", "HEAD")).toBe(frozenHead);
+    expect(await git(repoPath, "rev-parse", "feature/2.2.1")).toBe(advancedHead);
+  });
+
   it("creates independent deterministic worktrees from a version branch current HEAD", async () => {
     const { repoPath } = await setupVersionRepository();
     const before = await mainState(repoPath);

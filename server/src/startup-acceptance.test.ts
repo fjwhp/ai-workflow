@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 describe("real server startup acceptance", () => {
-  it("backs up deployed automation v3 before creating the v4 schema", { timeout: 15_000 }, async () => {
+  it("backs up deployed automation v4 before creating the delivery execution v5 schema", { timeout: 15_000 }, async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "workflow-startup-acceptance-"));
     tempDirectories.push(dataDir);
     const databasePath = join(dataDir, "workflow.db");
@@ -45,7 +45,7 @@ describe("real server startup acceptance", () => {
       INSERT INTO integration_runs VALUES ('run-old', 'requirement-old', 'running');
     `);
     oldDatabase.close();
-    await writeFile(`${databasePath}.schema-version`, "phase-2-automation-v3");
+    await writeFile(`${databasePath}.schema-version`, "phase-2-automation-v4");
     const stdout = boundedLogs();
     const allLogs = boundedLogs();
     const child = spawn(process.execPath, [resolve("node_modules/tsx/dist/cli.mjs"), resolve("server/src/index.ts")], {
@@ -87,7 +87,7 @@ describe("real server startup acceptance", () => {
       expect(columns(backup, "automation_jobs")).toEqual(expect.arrayContaining(["evidence_version", "max_attempts"]));
       expect(object(backup, "index", "idx_automation_jobs_pending_lease")).toBeUndefined();
       backup.close();
-      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-automation-v4");
+      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-delivery-execution-v5");
     } finally {
       await stopChild(child);
     }

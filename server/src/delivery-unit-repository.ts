@@ -218,9 +218,9 @@ export class DeliveryUnitRepository {
       VALUES (?, ?, ?, ?, ?, ?, ?, 'implementation', ?, 1, ?, ?, NULL)`);
     const insertSnapshot = this.db.prepare(`INSERT INTO delivery_unit_snapshots
       (id, delivery_unit_id, requirement_id, project_id, project_version_id, repo_path, branch,
-       base_branch, worktree_path, head_commit, module_ids_json, sensitive_patterns_json,
+       base_branch, worktree_path, head_commit, module_ids_json, acceptance_criteria_json, sensitive_patterns_json,
        allowed_commands_json, project_knowledge_version_id, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const insertDependency = this.db.prepare(`INSERT INTO delivery_dependencies
       (id, requirement_id, upstream_unit_id, downstream_unit_id, release_condition,
        released_by_evidence_version, released_at, created_at)
@@ -238,7 +238,7 @@ export class DeliveryUnitRepository {
         unit.version.base_branch,
         unit.association.projectVersionWorktreePath ?? unit.version.worktree_path,
         unit.association.projectVersionHead ?? unit.version.head_commit,
-        JSON.stringify(unit.input.moduleIds), unit.project.sensitive_patterns,
+        JSON.stringify(unit.input.moduleIds), JSON.stringify(unit.input.acceptanceCriteria), unit.project.sensitive_patterns,
         unit.project.allowed_commands, unit.knowledgeVersionId, now
       );
     }

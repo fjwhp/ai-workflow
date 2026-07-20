@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { isAllowedCommand, runCommand } from "./command-policy.js";
-import { createOrReuseRequirementWorktree, getWorktreeDiff } from "./repository.js";
+import { createOrReuseRequirementWorktree, getWorktreeDiff, getWorktreeSnapshot } from "./repository.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -16,16 +16,49 @@ export function resolveWorktreePath(worktree: string, requested: string) {
   return target;
 }
 
-type CodingProject = { id: string; repoPath: string; defaultBranch: string; allowedCommands: { command: string; argsPrefix?: string[] }[] };
-export type CodingVersion = { id: string; projectId: string; branch: string; worktreePath: string; status: "active" | "closed" };
+export type CodingProject = { id: string; repoPath: string; defaultBranch: string; allowedCommands: { command: string; argsPrefix?: string[] }[] };
+export type CodingVersion = { id: string; projectId: string; branch: string; worktreePath: string; status: "active" | "closed"; headCommit?: string };
+export interface CodingDeliveryContext {
+  deliveryUnitId: string;
+  requirementId: string;
+  evidenceVersion: number;
+  moduleIds: string[];
+  acceptanceCriteria: string[];
+  sensitivePatterns: string[];
+  allowedCommands: { command: string; argsPrefix?: string[] }[];
+  projectKnowledgeVersionId: string | null;
+}
+export interface CodingAgentInput {
+  requirement: any;
+  artifacts: any[];
+  project: CodingProject;
+  version: CodingVersion;
+  deliveryContext: CodingDeliveryContext;
+}
+export interface CodingAgentResult {
+  runId: string;
+  branch: string;
+  worktreePath: string;
+  baseCommit: string;
+  reused: boolean;
+  summary: string;
+  diff: string;
+  commands: unknown[];
+  files: string[];
+  additions: number;
+  deletions: number;
+  diagnostics?: string[] | string;
+  codexThreadId?: string;
+  events?: unknown[];
+}
 
 export async function prepareCodingWorktree(project: CodingProject, version: CodingVersion, requirementCode: string) {
   if (version.projectId !== project.id) throw new Error("REQUIREMENT_VERSION_PROJECT_MISMATCH");
   if (version.status !== "active") throw new Error("PROJECT_VERSION_NOT_ACTIVE");
-  return createOrReuseRequirementWorktree(project.repoPath, version.branch, requirementCode);
+  return createOrReuseRequirementWorktree(project.repoPath, version.branch, requirementCode, version.headCommit);
 }
 
-export async function runCodingAgent(input: { requirement: any; artifacts: any[]; project: CodingProject; version: CodingVersion }) {
+export async function runCodingAgent(input: CodingAgentInput): Promise<CodingAgentResult> {
   if (!process.env.OPENAI_API_KEY) throw new Error("未配置 OPENAI_API_KEY");
   if (process.env.OPENAI_API_MODE !== "chat") throw new Error("编码代理当前要求 OPENAI_API_MODE=chat");
   const runId = crypto.randomUUID();
@@ -40,7 +73,11 @@ export async function runCodingAgent(input: { requirement: any; artifacts: any[]
     tool("git_diff", "读取当前未提交差异", {}, [])
   ];
   const messages: any[] = [{ role: "system", content: "你是谨慎的 Java 编码代理。先搜索和读取相关代码，再做最小修改并运行允许的测试。不得修改需求范围，不得提交、合并或推送。完成后总结变更、测试和残余风险。" }, {
-    role: "user", content: JSON.stringify({ requirement: input.requirement, approvedArtifacts: input.artifacts })
+    role: "user", content: JSON.stringify({
+      requirement: input.requirement,
+      approvedArtifacts: input.artifacts,
+      deliveryContext: input.deliveryContext
+    })
   }];
 
   for (let round = 0; round < 16; round++) {
@@ -49,8 +86,8 @@ export async function runCodingAgent(input: { requirement: any; artifacts: any[]
     if (!message) throw new Error("编码模型未返回消息");
     messages.push(message);
     if (!message.tool_calls?.length) {
-      const diff = await getWorktreeDiff(worktree.worktreePath);
-      return { ...worktree, runId, summary: message.content || "编码代理已完成", diff, commands };
+      const snapshot = await getWorktreeSnapshot(worktree.worktreePath);
+      return { ...worktree, ...snapshot, runId, summary: message.content || "编码代理已完成", commands };
     }
     for (const call of message.tool_calls) {
       let result: unknown;

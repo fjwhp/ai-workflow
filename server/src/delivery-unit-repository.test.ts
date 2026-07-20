@@ -157,13 +157,15 @@ describe("DeliveryUnitRepository", () => {
       head_commit: fixture.backendVersion.headCommit,
       project_knowledge_version_id: fixture.backendKnowledge.id,
       module_ids_json: JSON.stringify([`src/${fixture.backend.id}`]),
+      acceptance_criteria_json: JSON.stringify([`${fixture.backend.id} acceptance passes`]),
       sensitive_patterns_json: JSON.stringify(fixture.backend.sensitivePatterns),
       allowed_commands_json: JSON.stringify(fixture.backend.allowedCommands)
     });
     expect(snapshots[1]).toMatchObject({
       delivery_unit_id: result.units[1]!.id,
       project_knowledge_version_id: fixture.frontendKnowledge.id,
-      module_ids_json: JSON.stringify([`src/${fixture.frontend.id}`])
+      module_ids_json: JSON.stringify([`src/${fixture.frontend.id}`]),
+      acceptance_criteria_json: JSON.stringify([`${fixture.frontend.id} acceptance passes`])
     });
 
     expect(() => fixture.store.deliveryUnits.createPlan(fixture.input)).toThrow("DELIVERY_PLAN_EXISTS");

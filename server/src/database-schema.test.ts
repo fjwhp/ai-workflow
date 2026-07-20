@@ -99,8 +99,9 @@ function insertDeliveryDependency(db: DatabaseSync, id: string, requirementId: s
 function insertDeliveryUnitSnapshot(db: DatabaseSync, input: { id: string; unitId: string; requirementId: string; projectId: string; versionId: string }) {
   db.prepare(`INSERT INTO delivery_unit_snapshots
     (id, delivery_unit_id, requirement_id, project_id, project_version_id, repo_path, branch, base_branch,
-      worktree_path, head_commit, module_ids_json, sensitive_patterns_json, allowed_commands_json, created_at)
-    VALUES (?, ?, ?, ?, ?, '/tmp/repo', 'main', 'main', '/tmp/worktree', 'head', '[]', '[]', '[]',
+      worktree_path, head_commit, module_ids_json, acceptance_criteria_json, sensitive_patterns_json,
+      allowed_commands_json, created_at)
+    VALUES (?, ?, ?, ?, ?, '/tmp/repo', 'main', 'main', '/tmp/worktree', 'head', '[]', '[]', '[]', '[]',
       '2026-07-20T00:00:00.000Z')`)
     .run(input.id, input.unitId, input.requirementId, input.projectId, input.versionId);
 }
@@ -159,8 +160,11 @@ describe("Phase 2 database schema", () => {
       "delivery_units", "delivery_dependencies", "delivery_unit_snapshots",
       "automation_jobs"
     ]));
-    expect(columns(db, "stage_runs")).toEqual(expect.arrayContaining(["owner_type", "owner_id"]));
+    expect(columns(db, "stage_runs")).toEqual(expect.arrayContaining(["owner_type", "owner_id", "evidence_version"]));
     expect(columns(db, "artifacts")).toEqual(expect.arrayContaining(["owner_type", "owner_id"]));
+    expect(columns(db, "delivery_unit_snapshots")).toContain("acceptance_criteria_json");
+    expect(columns(db, "executions")).toEqual(expect.arrayContaining(["delivery_unit_id", "evidence_version"]));
+    expect(columns(db, "coding_evidence")).toEqual(expect.arrayContaining(["delivery_unit_id", "evidence_version"]));
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_stage_runs_running'").get()).toBeUndefined();
     db.close();
   });

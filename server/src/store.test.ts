@@ -531,9 +531,14 @@ describe("WorkflowStore", () => {
     const project = store.createProject({ name: "Repo", repoPath: "/tmp/repo", defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
     const version = ensureProjectVersion(store, project.id)!;
     const req = createRequirement(store, { title: "接口", businessProblem: "缺少", expectedOutcome: "新增", priority: "medium", primaryProjectId: project.id });
-    const execution = store.addExecution({ requirementId: req.id, stage: "implementation", projectId: project.id, projectVersionId: version.id, branch: "ai/one", worktreePath: "/tmp/wt", baseCommit: "version-head", status: "completed", diff: "diff", events: [] });
+    const unit = store.deliveryUnits.createPlan({
+      requirementId: req.id,
+      snapshot: store.createRequirementProjectSnapshot(req.id),
+      plan: { units: [{ projectId: project.id, moduleIds: [], acceptanceCriteria: ["passes"] }], dependencies: [] }
+    }).units[0]!;
+    const execution = store.addExecution({ requirementId: req.id, deliveryUnitId: unit.id, evidenceVersion: 1, stage: "implementation", projectId: project.id, projectVersionId: version.id, branch: "ai/one", worktreePath: "/tmp/wt", baseCommit: "version-head", status: "completed", diff: "diff", events: [] });
     expect(store.listExecutions(req.id)[0]).toMatchObject({ projectVersionId: version.id, baseCommit: "version-head" });
-    const evidence = store.addCodingEvidence({ executionId: execution.id, requirementId: req.id, projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", diffHash: "abc", diff: "diff", originalChars: 4, truncated: false, files: ["a.ts"], additions: 1, deletions: 0, diagnostics: "" });
+    const evidence = store.addCodingEvidence({ executionId: execution.id, requirementId: req.id, deliveryUnitId: unit.id, evidenceVersion: 1, projectId: project.id, branch: "ai/one", worktreePath: "/tmp/wt", diffHash: "abc", diff: "diff", originalChars: 4, truncated: false, files: ["a.ts"], additions: 1, deletions: 0, diagnostics: "" });
     expect(store.getLatestCodingEvidence(req.id)?.id).toBe(evidence.id);
     expect(() => store.addCodingEvidence({ ...evidence, id: undefined })).toThrow();
   });
@@ -545,7 +550,12 @@ describe("WorkflowStore", () => {
     const version = ensureProjectVersion(store, project.id)!;
     const otherVersion = ensureProjectVersion(store, other.id)!;
     const req = createRequirement(store, { title: "执行来源", businessProblem: "执行来源必须与项目匹配", expectedOutcome: "拒绝无效来源", priority: "medium", primaryProjectId: project.id });
-    const base: ExecutionInput = { requirementId: req.id, stage: "implementation", projectId: project.id, projectVersionId: version.id, branch: "ai/REQ-0001", worktreePath: "/tmp/execution-wt", baseCommit: "base", status: "completed", commands: [], diff: "", events: [] };
+    const unit = store.deliveryUnits.createPlan({
+      requirementId: req.id,
+      snapshot: store.createRequirementProjectSnapshot(req.id),
+      plan: { units: [{ projectId: project.id, moduleIds: [], acceptanceCriteria: ["passes"] }], dependencies: [] }
+    }).units[0]!;
+    const base: ExecutionInput = { requirementId: req.id, deliveryUnitId: unit.id, evidenceVersion: 1, stage: "implementation", projectId: project.id, projectVersionId: version.id, branch: "ai/REQ-0001", worktreePath: "/tmp/execution-wt", baseCommit: "base", status: "completed", commands: [], diff: "", events: [] };
 
     expect(() => store.addExecution({ ...base, baseCommit: undefined })).toThrow("REQUIREMENT_VERSION_REQUIRED");
     expect(() => store.addExecution({ ...base, projectVersionId: otherVersion.id })).toThrow("REQUIREMENT_VERSION_PROJECT_MISMATCH");

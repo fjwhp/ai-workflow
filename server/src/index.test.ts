@@ -122,7 +122,7 @@ async function seedExpiredJob(directory: string) {
   });
   store.automationJobs.leaseNext("old-worker", new Date(), 1);
   store.close();
-  writeFileSync(`${databasePath}.schema-version`, "phase-2-automation-v4");
+  writeFileSync(`${databasePath}.schema-version`, "phase-2-delivery-execution-v5");
   await new Promise((resolve) => setTimeout(resolve, 5));
   return { jobId: queued.id };
 }

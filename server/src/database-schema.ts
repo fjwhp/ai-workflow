@@ -115,6 +115,7 @@ export function createPhase2Schema(db: DatabaseSync) {
       worktree_path TEXT NOT NULL,
       head_commit TEXT NOT NULL,
       module_ids_json TEXT NOT NULL,
+      acceptance_criteria_json TEXT NOT NULL,
       sensitive_patterns_json TEXT NOT NULL,
       allowed_commands_json TEXT NOT NULL,
       project_knowledge_version_id TEXT,
@@ -128,7 +129,11 @@ export function createPhase2Schema(db: DatabaseSync) {
     CREATE TABLE IF NOT EXISTS stage_runs (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL,
       owner_type TEXT NOT NULL CHECK(owner_type IN ('requirement', 'delivery_unit')),
-      owner_id TEXT NOT NULL, stage TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      evidence_version INTEGER NOT NULL DEFAULT 1 CHECK(
+        typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND ${MAX_AUTOMATION_EVIDENCE_VERSION}
+      ),
+      stage TEXT NOT NULL,
       status TEXT NOT NULL, model TEXT, input_json TEXT NOT NULL, output_json TEXT,
       error TEXT, created_at TEXT NOT NULL, completed_at TEXT,
       FOREIGN KEY(requirement_id) REFERENCES requirements(id)
@@ -157,15 +162,22 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(requirement_id) REFERENCES requirements(id)
     );
     CREATE TABLE IF NOT EXISTS executions (
-      id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL,
+      id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL,
+      delivery_unit_id TEXT NOT NULL,
+      evidence_version INTEGER NOT NULL CHECK(
+        typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND ${MAX_AUTOMATION_EVIDENCE_VERSION}
+      ),
+      stage TEXT NOT NULL,
       project_id TEXT NOT NULL, project_version_id TEXT, branch TEXT NOT NULL, worktree_path TEXT NOT NULL,
       base_commit TEXT,
       status TEXT NOT NULL, commands_json TEXT NOT NULL, diff_text TEXT NOT NULL,
       error TEXT, codex_thread_id TEXT, events_json TEXT NOT NULL DEFAULT '[]',
       diagnostics_text TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, completed_at TEXT,
       FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
       FOREIGN KEY(project_id) REFERENCES projects(id),
-      FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
+      FOREIGN KEY(project_version_id) REFERENCES project_versions(id),
+      UNIQUE(delivery_unit_id, evidence_version)
     );
     CREATE TABLE IF NOT EXISTS requirement_revisions (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, version INTEGER NOT NULL,
@@ -263,11 +275,19 @@ export function createPhase2Schema(db: DatabaseSync) {
       )
     );
     CREATE TABLE IF NOT EXISTS coding_evidence (
-      id TEXT PRIMARY KEY, execution_id TEXT NOT NULL UNIQUE, requirement_id TEXT NOT NULL, project_id TEXT NOT NULL,
+      id TEXT PRIMARY KEY, execution_id TEXT NOT NULL UNIQUE, requirement_id TEXT NOT NULL,
+      delivery_unit_id TEXT NOT NULL,
+      evidence_version INTEGER NOT NULL CHECK(
+        typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND ${MAX_AUTOMATION_EVIDENCE_VERSION}
+      ),
+      project_id TEXT NOT NULL,
       branch TEXT NOT NULL, worktree_path TEXT NOT NULL, diff_hash TEXT NOT NULL, diff_text TEXT NOT NULL,
       original_chars INTEGER NOT NULL, truncated INTEGER NOT NULL, files_json TEXT NOT NULL,
       additions INTEGER NOT NULL, deletions INTEGER NOT NULL, diagnostics_text TEXT NOT NULL, created_at TEXT NOT NULL,
-      FOREIGN KEY(execution_id) REFERENCES executions(id), FOREIGN KEY(requirement_id) REFERENCES requirements(id)
+      FOREIGN KEY(execution_id) REFERENCES executions(id),
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
+      UNIQUE(delivery_unit_id, evidence_version)
     );
     CREATE TABLE IF NOT EXISTS rework_contexts (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, approval_id TEXT NOT NULL UNIQUE, artifact_id TEXT,
@@ -334,6 +354,10 @@ export function createPhase2Schema(db: DatabaseSync) {
       WHERE status = 'leased';
     CREATE INDEX IF NOT EXISTS idx_automation_jobs_owner_version_status
       ON automation_jobs(owner_type, owner_id, evidence_version, status);
+    CREATE INDEX IF NOT EXISTS idx_executions_delivery_unit_version
+      ON executions(delivery_unit_id, evidence_version);
+    CREATE INDEX IF NOT EXISTS idx_coding_evidence_delivery_unit_version
+      ON coding_evidence(delivery_unit_id, evidence_version);
     CREATE TRIGGER IF NOT EXISTS validate_stage_run_owner_insert
     BEFORE INSERT ON stage_runs
     BEGIN
@@ -464,6 +488,58 @@ export function createPhase2Schema(db: DatabaseSync) {
           AND requirement_id = NEW.requirement_id
           AND project_id = NEW.project_id
           AND project_version_id = NEW.project_version_id
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_execution_owner_insert
+    BEFORE INSERT ON executions
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_UNIT_EXECUTION_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units
+        WHERE id = NEW.delivery_unit_id
+          AND requirement_id = NEW.requirement_id
+          AND project_id = NEW.project_id
+          AND project_version_id = NEW.project_version_id
+          AND evidence_version = NEW.evidence_version
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_execution_owner_update
+    BEFORE UPDATE OF delivery_unit_id, evidence_version, requirement_id, project_id, project_version_id ON executions
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_UNIT_EXECUTION_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units
+        WHERE id = NEW.delivery_unit_id
+          AND requirement_id = NEW.requirement_id
+          AND project_id = NEW.project_id
+          AND project_version_id = NEW.project_version_id
+          AND evidence_version = NEW.evidence_version
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_coding_evidence_owner_insert
+    BEFORE INSERT ON coding_evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'CODING_EVIDENCE_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM executions
+        WHERE id = NEW.execution_id
+          AND delivery_unit_id = NEW.delivery_unit_id
+          AND evidence_version = NEW.evidence_version
+          AND requirement_id = NEW.requirement_id
+          AND project_id = NEW.project_id
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_coding_evidence_owner_update
+    BEFORE UPDATE OF execution_id, delivery_unit_id, evidence_version, requirement_id, project_id ON coding_evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'CODING_EVIDENCE_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM executions
+        WHERE id = NEW.execution_id
+          AND delivery_unit_id = NEW.delivery_unit_id
+          AND evidence_version = NEW.evidence_version
+          AND requirement_id = NEW.requirement_id
+          AND project_id = NEW.project_id
       );
     END;
   `);

@@ -305,16 +305,26 @@ export async function cleanupFailedManagedWorktreeCreation(input: {
   return removed;
 }
 
-export async function createOrReuseRequirementWorktree(repoPath: string, baseBranch: string, requirementCode: string) {
+export async function createOrReuseRequirementWorktree(
+  repoPath: string,
+  baseBranch: string,
+  requirementCode: string,
+  expectedBaseCommit?: string
+) {
   if (!/^REQ-[0-9]{4,}$/.test(requirementCode)) throw new Error("REQUIREMENT_CODE_INVALID");
   repoPath = await requirementRepoPath(repoPath);
   const branch = `ai/${requirementCode}`;
   return withRepoWorktreeMutationLock(repoPath, async () => {
     await validateLocalBranch(repoPath, baseBranch, "REQUIREMENT_BASE_BRANCH_INVALID", "REQUIREMENT_BASE_BRANCH_NOT_FOUND");
+    if (expectedBaseCommit) await validateRequirementBaseCommit(repoPath, baseBranch, expectedBaseCommit);
     const root = resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "requirements");
     const worktreePath = resolve(root, requirementCode);
     const existing = await findRegisteredWorktree(repoPath, branch, root);
-    if (existing) return { branch, worktreePath: existing.path, baseCommit: await readOrRecoverRequirementBaseCommit(repoPath,existing.path,branch), reused: true };
+    if (existing) {
+      const baseCommit = await readOrRecoverRequirementBaseCommit(repoPath, existing.path, branch);
+      if (expectedBaseCommit && baseCommit !== expectedBaseCommit) throw new Error("DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH");
+      return { branch, worktreePath: existing.path, baseCommit, reused: true };
+    }
 
     await ensureRequirementDirectory(resolve(repoPath, ".."), [
       ".ai-workflow-worktrees", basename(repoPath), "requirements"
@@ -335,8 +345,7 @@ export async function createOrReuseRequirementWorktree(repoPath: string, baseBra
     let worktreeAdded = false;
     try {
       if (!branchExists) {
-        const { stdout } = await execFileAsync("git", ["-C", repoPath, "rev-parse", baseBranch]);
-        const baseHead = stdout.trim();
+        const baseHead = expectedBaseCommit ?? (await execFileAsync("git", ["-C", repoPath, "rev-parse", baseBranch])).stdout.trim();
         await execFileAsync("git", ["-C", repoPath, "update-ref", `refs/heads/${branch}`, baseHead, ""]);
         ownedHead = baseHead;
       }
@@ -348,6 +357,7 @@ export async function createOrReuseRequirementWorktree(repoPath: string, baseBra
       const created = await findRegisteredWorktree(repoPath, branch, root);
       if (!created || created.path !== worktreePath) throw new Error("REQUIREMENT_WORKTREE_POSTCONDITION_FAILED");
       const baseCommit=ownedHead??await recoverRequirementBaseCommit(repoPath,branch);
+      if (expectedBaseCommit && baseCommit !== expectedBaseCommit) throw new Error("DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH");
       await writeRequirementBaseCommit(worktreePath,baseCommit);
       return { branch, worktreePath, baseCommit, reused: false };
     } catch (cause) {
