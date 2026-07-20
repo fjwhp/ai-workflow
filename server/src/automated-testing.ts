@@ -31,6 +31,7 @@ export function buildSandboxProfile(input: {
   gitCommonDir: string;
 }) {
   return `(version 1)
+(import "dyld-support.sb")
 (deny default)
 (allow process*)
 (allow file-read*
@@ -129,10 +130,13 @@ export async function runAutomatedTesting(
     const temporaryDirectory = join(parent, "tmp");
     await mkdir(home, { recursive: true });
     await mkdir(temporaryDirectory, { recursive: true });
+    const [canonicalParent, canonicalTargetWorktree, canonicalGitCommonDir] = await Promise.all([
+      realpath(parent), realpath(input.targetWorktree), realpath(input.gitCommonDir)
+    ]);
     const profile = buildSandboxProfile({
-      verificationRoot: parent,
-      targetWorktree: input.targetWorktree,
-      gitCommonDir: input.gitCommonDir
+      verificationRoot: canonicalParent,
+      targetWorktree: canonicalTargetWorktree,
+      gitCommonDir: canonicalGitCommonDir
     });
     const env = sanitizedVerificationEnvironment(home, temporaryDirectory);
     const run = dependencies.execFile ?? (async (file, args, options) => execFileAsync(file, args, options as any));
@@ -140,7 +144,7 @@ export async function runAutomatedTesting(
     for (const command of plan.commands) {
       try {
         const output = await run(SANDBOX_EXEC, ["-p", profile, command.command, ...command.args], {
-          cwd: verificationRoot,
+          cwd: join(canonicalParent, "worktree"),
           env,
           shell: false,
           timeout: COMMAND_TIMEOUT_MS,
