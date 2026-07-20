@@ -251,6 +251,16 @@ describe("runCodingAgent tool boundary", () => {
     expect(toolResult()).toEqual({ error: "CODING_FILE_PATH_UNSAFE" });
   });
 
+  it("rejects invalid UTF-8 content through read_file instead of returning replacement characters", async () => {
+    const worktree = await temporaryWorktree();
+    await writeFile(join(worktree, "binary.dat"), Buffer.from([0x80]));
+    respondWithToolCalls([{ name: "read_file", arguments: { path: "binary.dat" } }]);
+
+    await runCodingAgent(codingInput([]));
+
+    expect(toolResult()).toEqual({ error: "CODING_FILE_NOT_TEXT" });
+  });
+
   it("rejects write_file when the final file is a symlink outside the worktree", async () => {
     const { worktree, outside } = await temporaryWorktreeWithOutside();
     const externalFile = join(outside, "target.txt");

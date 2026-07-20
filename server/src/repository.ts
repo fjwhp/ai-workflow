@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
-import { safeReadWorktreeFile } from "./worktree-file-safety.js";
+import { promisify, TextDecoder } from "node:util";
+import { safeReadWorktreeFileBuffer } from "./worktree-file-safety.js";
 
 const execFileAsync = promisify(execFile);
 const protectedBranches=new Set(["prod","production","main","master"]);
@@ -472,9 +473,19 @@ export async function getWorktreeSnapshot(worktreePath: string) {
   const files = [...new Set([...trackedFiles, ...untracked])];
   const patches: string[] = [tracked];
   for (const file of untracked) {
-    const content = await safeReadWorktreeFile(worktreePath, file);
-    const lines = content.split("\n");
-    patches.push(`diff --git a/${file} b/${file}\nnew file mode 100644\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((line) => `+${line}`).join("\n")}\n`);
+    const content = await safeReadWorktreeFileBuffer(worktreePath, file);
+    let text: string | undefined;
+    if (!content.includes(0)) {
+      try { text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(content); }
+      catch { /* binary content */ }
+    }
+    if (text === undefined) {
+      const digest = createHash("sha256").update(content).digest("hex");
+      patches.push(`diff --git a/${file} b/${file}\nnew file mode 100644\nBinary files /dev/null and b/${file} differ\nbinary-size: ${content.length}\nbinary-sha256: ${digest}\n`);
+    } else {
+      const lines = text.split("\n");
+      patches.push(`diff --git a/${file} b/${file}\nnew file mode 100644\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((line) => `+${line}`).join("\n")}\n`);
+    }
   }
   const diff = patches.filter(Boolean).join("\n");
   const additions = diff.split("\n").filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;

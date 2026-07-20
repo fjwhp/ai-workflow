@@ -1,9 +1,11 @@
 import { constants } from "node:fs";
 import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { TextDecoder } from "node:util";
 
 const MAX_SAFE_FILE_BYTES = 10 * 1024 * 1024;
 const UNSAFE_PATH = "CODING_FILE_PATH_UNSAFE";
+const NOT_TEXT = "CODING_FILE_NOT_TEXT";
 
 export function resolveWorktreePath(worktree: string, requested: string) {
   if (isAbsolute(requested)) throw new Error("文件路径必须位于工作区内");
@@ -85,7 +87,7 @@ async function verifyOpenRegularFile(
   }
 }
 
-export async function safeReadWorktreeFile(worktree: string, requested: string) {
+export async function safeReadWorktreeFileBuffer(worktree: string, requested: string) {
   const root = await canonicalRoot(worktree);
   const target = resolveWorktreePath(root, requested);
   await safeParentPath(root, target, false);
@@ -94,10 +96,17 @@ export async function safeReadWorktreeFile(worktree: string, requested: string) 
   const handle = await open(target, flags).catch(unsafePath);
   try {
     await verifyOpenRegularFile(root, target, handle, true);
-    return await handle.readFile("utf8").catch(unsafePath);
+    return await handle.readFile().catch(unsafePath);
   } finally {
     await handle.close();
   }
+}
+
+export async function safeReadWorktreeFile(worktree: string, requested: string) {
+  const content = await safeReadWorktreeFileBuffer(worktree, requested);
+  if (content.includes(0)) throw new Error(NOT_TEXT);
+  try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(content); }
+  catch { throw new Error(NOT_TEXT); }
 }
 
 export async function safeWriteWorktreeFile(worktree: string, requested: string, content: string) {

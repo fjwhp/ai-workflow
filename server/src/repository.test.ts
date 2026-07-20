@@ -1,9 +1,11 @@
 import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, delimiter, isAbsolute, join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { buildCodingEvidence } from "./coding-evidence.js";
 import {
   classifyGitFailure,
   cleanupFailedManagedWorktreeCreation,
@@ -28,15 +30,52 @@ describe("getWorktreeSnapshot",()=>{
     expect(snapshot.diff).toContain("+hello");
   });
 
-  it("includes an untracked regular binary file without following another path", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "workflow-git-")); dirs.push(dir);
+  it("keeps invalid UTF-8 binary bytes distinct in snapshot and evidence hashes", async () => {
+    const snapshotFor = async (byte: number) => {
+      const dir = await mkdtemp(join(tmpdir(), "workflow-binary-snapshot-")); dirs.push(dir);
+      await exec("git", ["init", dir]);
+      await writeFile(join(dir, "payload.bin"), Buffer.from([byte]));
+      return getWorktreeSnapshot(dir);
+    };
+    const firstBytes = Buffer.from([0x80]);
+    const secondBytes = Buffer.from([0x81]);
+
+    const [first, second] = await Promise.all([snapshotFor(firstBytes[0]!), snapshotFor(secondBytes[0]!)]);
+
+    expect(first.diff).not.toBe(second.diff);
+    expect(buildCodingEvidence({ diff: first.diff }).diffHash)
+      .not.toBe(buildCodingEvidence({ diff: second.diff }).diffHash);
+    for (const [snapshot, bytes] of [[first, firstBytes], [second, secondBytes]] as const) {
+      expect(snapshot.files).toContain("payload.bin");
+      expect(snapshot.diff).toContain("Binary files /dev/null and b/payload.bin differ");
+      expect(snapshot.diff).toContain(`binary-size: ${bytes.length}`);
+      expect(snapshot.diff).toContain(`binary-sha256: ${createHash("sha256").update(bytes).digest("hex")}`);
+      expect(snapshot.diff).not.toContain("\uFFFD");
+    }
+  });
+
+  it("treats NUL-containing untracked content as binary", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "workflow-nul-snapshot-")); dirs.push(dir);
     await exec("git", ["init", dir]);
-    await writeFile(join(dir, "payload.bin"), Buffer.from([0, 1, 2, 255]));
+    const bytes = Buffer.from("prefix\0suffix", "utf8");
+    await writeFile(join(dir, "nul.dat"), bytes);
 
     const snapshot = await getWorktreeSnapshot(dir);
 
-    expect(snapshot.files).toContain("payload.bin");
-    expect(snapshot.diff).toContain("diff --git a/payload.bin b/payload.bin");
+    expect(snapshot.diff).toContain("Binary files /dev/null and b/nul.dat differ");
+    expect(snapshot.diff).toContain(`binary-size: ${bytes.length}`);
+    expect(snapshot.diff).toContain(`binary-sha256: ${createHash("sha256").update(bytes).digest("hex")}`);
+  });
+
+  it("keeps valid Unicode untracked content as a text patch", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "workflow-unicode-snapshot-")); dirs.push(dir);
+    await exec("git", ["init", dir]);
+    await writeFile(join(dir, "unicode.txt"), "你好，世界 😀\n", "utf8");
+
+    const snapshot = await getWorktreeSnapshot(dir);
+
+    expect(snapshot.diff).toContain("+你好，世界 😀");
+    expect(snapshot.diff).not.toContain("binary-sha256:");
   });
 
   it("rejects an untracked final symlink instead of reading its outside target", async () => {
