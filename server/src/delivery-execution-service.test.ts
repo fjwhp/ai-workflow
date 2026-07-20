@@ -625,6 +625,8 @@ describe("DeliveryExecutionService", () => {
       .implement(fixture.unit.id);
     const review = vi.fn();
     const claim = fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", "corrupt-review");
+    expect(claim.status).toBe("running");
+    if (claim.status !== "running") throw new Error("expected running claim");
     const quality = {
       ...fixture.store.deliveryQuality,
       claim: vi.fn(() => ({ ...claim, input: {
@@ -721,6 +723,8 @@ describe("DeliveryExecutionService", () => {
       .implement(fixture.unit.id);
     const review = vi.fn();
     const claim = fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", "corrupt-sensitive-review");
+    expect(claim.status).toBe("running");
+    if (claim.status !== "running") throw new Error("expected running claim");
     const quality = {
       ...fixture.store.deliveryQuality,
       claim: vi.fn(() => ({ ...claim, input: {
@@ -819,6 +823,9 @@ describe("DeliveryExecutionService", () => {
       fixture.unit.id, 1, "code_review", reviewJob.id
     );
     fixture.store.deliveryQuality.abort(aborted, "IMPLEMENTATION_EVIDENCE_STALE");
+    (fixture.store as any).db.prepare(
+      "UPDATE delivery_units SET status = 'returned', evidence_version = 2 WHERE id = ?"
+    ).run(fixture.unit.id);
     const review = vi.fn();
     const service = new DeliveryExecutionService(
       fixture.store.deliveryExecutions, vi.fn(), "test-model", fixture.store.deliveryQuality, { review }

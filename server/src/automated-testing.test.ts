@@ -44,6 +44,16 @@ function initializeTarget() {
   return target;
 }
 
+function processIsRunning(pid: number) {
+  try {
+    const state = execFileSync("/bin/ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    return Boolean(state) && !state.startsWith("Z");
+  } catch (error) {
+    if ((error as { status?: number }).status === 1) return false;
+    throw error;
+  }
+}
+
 describe("automated testing safety", () => {
   it("materializes only the frozen manifest after the live source changes", async () => {
     const root = mkdtempSync(join(tmpdir(), "automated-test-frozen-manifest-")); directories.push(root);
@@ -340,6 +350,8 @@ curl --max-time 2 https://example.com >/dev/null 2>&1; echo network:$?
 PATH="$PWD/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 echo gh_path:$(command -v gh)
 gh api user; echo gh:$?
+env -i PATH=/usr/bin:/bin /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec "/bin/sleep", "1000"' </dev/null >/dev/null 2>&1 &
+echo daemon:$!
 exit 0
 `);
       initializeSource(source);
@@ -356,6 +368,13 @@ exit 0
       expect(output).toMatch(/gh_path:.*\/bin\/gh/);
       expect(output).toContain("fake-gh-invoked");
       expect(output).toMatch(/gh:[1-9]/);
+      const daemonPid = Number(/daemon:(\d+)/.exec(output)?.[1]);
+      expect(Number.isSafeInteger(daemonPid)).toBe(true);
+      try {
+        expect(processIsRunning(daemonPid)).toBe(false);
+      } finally {
+        if (processIsRunning(daemonPid)) process.kill(daemonPid, "SIGKILL");
+      }
       expect(existsSync(marker)).toBe(false);
       expect(execFileSync("git", ["-C", target, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()).toBe(headBefore);
       expect(execFileSync("git", ["-C", target, "show-ref"], { encoding: "utf8" })).toBe(refsBefore);

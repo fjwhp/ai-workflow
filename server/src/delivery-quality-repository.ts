@@ -23,11 +23,11 @@ export interface DeliveryQualityInput {
 
 interface DeliveryQualityClaimBase {
   id: string; requirementId: string; deliveryUnitId: string; evidenceVersion: number;
-  kind: DeliveryQualityKind; input: DeliveryQualityInput;
+  kind: DeliveryQualityKind;
 }
 
 export type DeliveryQualityClaim =
-  | (DeliveryQualityClaimBase & { status: "running" })
+  | (DeliveryQualityClaimBase & { status: "running"; input: DeliveryQualityInput })
   | (DeliveryQualityClaimBase & { status: "completed" | "failed"; evidence: DeliveryQualityEvidence })
   | (DeliveryQualityClaimBase & { status: "aborted"; error: string });
 
@@ -71,17 +71,18 @@ export class DeliveryQualityRepository {
       if (!row) throw new Error("DELIVERY_UNIT_NOT_FOUND");
       evidenceVersion = row.evidence_version;
     }
-    const input = this.loadInput(unitId, evidenceVersion);
-    const existing = this.db.prepare(`SELECT id, status, claim_token, error FROM delivery_quality_runs
+    const existing = this.db.prepare(`SELECT id, requirement_id, status, claim_token, error FROM delivery_quality_runs
       WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ?`).get(unitId, evidenceVersion, kind) as
-      { id: string; status: string; claim_token: string; error: string | null } | undefined;
+      { id: string; requirement_id: string; status: string; claim_token: string; error: string | null } | undefined;
     if (existing) {
       if (claimToken !== undefined && existing.claim_token === claimToken) {
         const resumed = {
-          id: existing.id, requirementId: input.codingEvidence.requirementId,
-          deliveryUnitId: unitId, evidenceVersion, kind, input
+          id: existing.id, requirementId: existing.requirement_id,
+          deliveryUnitId: unitId, evidenceVersion, kind
         };
-        if (existing.status === "running") return { ...resumed, status: "running" };
+        if (existing.status === "running") {
+          return { ...resumed, status: "running", input: this.loadInput(unitId, evidenceVersion) };
+        }
         if (existing.status === "aborted") {
           if (!existing.error) throw new Error("DELIVERY_QUALITY_ABORT_NOT_FOUND");
           return { ...resumed, status: "aborted", error: existing.error };
@@ -95,6 +96,7 @@ export class DeliveryQualityRepository {
       }
       throw new Error(existing.status === "running" ? "DELIVERY_QUALITY_RUN_ACTIVE" : "DELIVERY_QUALITY_RUN_SETTLED");
     }
+    const input = this.loadInput(unitId, evidenceVersion);
     const id = randomUUID();
     const persistedClaimToken = claimToken ?? randomUUID();
     this.db.prepare(`INSERT INTO delivery_quality_runs

@@ -114,6 +114,27 @@ describe("delivery quality evidence schema", () => {
     }
   });
 
+  it.each([
+    ["unit status", "UPDATE delivery_units SET status = 'returned' WHERE id = ?"],
+    ["evidence version", "UPDATE delivery_units SET evidence_version = 2 WHERE id = ?"]
+  ])("reclaims an aborted run after the live %s changes", (_label, mutation) => {
+    const { store, unit } = fixture();
+    try {
+      const first = store.deliveryQuality.claim(unit.id, 1, "code_review", "job-review-terminal");
+      store.deliveryQuality.abort(first, "IMPLEMENTATION_EVIDENCE_STALE");
+      (store as any).db.prepare(mutation).run(unit.id);
+
+      expect(store.deliveryQuality.claim(unit.id, 1, "code_review", "job-review-terminal"))
+        .toMatchObject({
+          id: first.id, status: "aborted", error: "IMPLEMENTATION_EVIDENCE_STALE"
+        });
+      expect(() => store.deliveryQuality.claim(unit.id, 1, "code_review", "other-job"))
+        .toThrow("DELIVERY_QUALITY_RUN_SETTLED");
+    } finally {
+      store.close();
+    }
+  });
+
   it.each(["passed", "failed"] as const)(
     "idempotently reclaims a %s run with its real quality evidence",
     (result) => {
@@ -134,11 +155,36 @@ describe("delivery quality evidence schema", () => {
     }
   );
 
+  it("reclaims real terminal evidence without consulting the live unit", () => {
+    const { store, unit } = fixture();
+    try {
+      const first = store.deliveryQuality.claim(unit.id, 1, "code_review", "job-review-evidence");
+      const evidence = store.deliveryQuality.complete(first, {
+        result: "failed", content: { summary: "business failure" }
+      });
+      (store as any).db.prepare(
+        "UPDATE delivery_units SET status = 'returned', evidence_version = 2 WHERE id = ?"
+      ).run(unit.id);
+
+      expect(store.deliveryQuality.claim(unit.id, 1, "code_review", "job-review-evidence"))
+        .toMatchObject({ id: first.id, status: "failed", evidence: { id: evidence.id } });
+      expect(() => store.deliveryQuality.claim(unit.id, 1, "code_review", "other-job"))
+        .toThrow("DELIVERY_QUALITY_RUN_SETTLED");
+    } finally {
+      store.close();
+    }
+  });
+
   it("persists separate terminal evidence and makes it immutable", () => {
     const { store, unit } = fixture();
     try {
       const review = store.deliveryQuality.claim(unit.id, 1, "code_review");
       const testing = store.deliveryQuality.claim(unit.id, 1, "automated_testing");
+      expect(review.status).toBe("running");
+      expect(testing.status).toBe("running");
+      if (review.status !== "running" || testing.status !== "running") {
+        throw new Error("expected running claims");
+      }
       store.deliveryQuality.complete(review, { result: "passed", content: { summary: "ok" } });
       store.deliveryQuality.complete(testing, {
         result: "failed", content: { summary: "failed" },
@@ -202,6 +248,8 @@ describe("delivery quality evidence schema", () => {
     const { store, requirement, unit } = fixture();
     try {
       const claim = store.deliveryQuality.claim(unit.id, 1, "code_review");
+      expect(claim.status).toBe("running");
+      if (claim.status !== "running") throw new Error("expected running claim");
       const db = (store as any).db;
       expect(() => db.prepare(`INSERT INTO delivery_quality_evidence
         (id, run_id, requirement_id, delivery_unit_id, evidence_version, kind, result,

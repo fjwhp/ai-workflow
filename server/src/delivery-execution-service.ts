@@ -247,7 +247,11 @@ export class DeliveryExecutionService {
   }
 }
 
-type DeliveryQualityClaimInput = ReturnType<DeliveryQualityPersistence["claim"]>["input"]["codingEvidence"];
+type DeliveryQualityRunningClaim = Extract<
+  ReturnType<DeliveryQualityPersistence["claim"]>,
+  { status: "running" }
+>;
+type DeliveryQualityClaimInput = DeliveryQualityRunningClaim["input"]["codingEvidence"];
 
 function validateImplementationIdentity(
   claim: Parameters<DeliveryExecutionPersistence["completeImplementation"]>[0],
