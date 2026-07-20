@@ -62,6 +62,19 @@ class RunPreparationRacingStore extends WorkflowStore {
   }
 }
 
+class FailingKnowledgeRefreshStore extends WorkflowStore {
+  override replaceKnowledgeCandidates(): any[] {
+    throw new Error("knowledge refresh failed");
+  }
+}
+
+async function waitForRun(store: WorkflowStore, runId: string) {
+  for (let attempt = 0; attempt < 50 && store.getStageRun(runId)?.status === "running"; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return store.getStageRun(runId);
+}
+
 
 const projectPayload=(repoPath:string,extra:any={})=>({name:"API project",repoPath,defaultBranch:"main",allowedCommands:[],sensitivePatterns:[],...extra});
 
@@ -88,6 +101,100 @@ describe("project and requirement association APIs",()=>{
     expect(response.statusCode).toBe(202);for(let attempt=0;attempt<50&&store.getStageRun(response.json().id)?.status==="running";attempt++)await new Promise(resolve=>setTimeout(resolve,10));
     expect(runAgent).toHaveBeenCalledWith("definition",expect.objectContaining({projectContext:expect.objectContaining({projects:[expect.objectContaining({projectId:project.id})]})}),expect.any(Function));
     expect(store.getRequirement(req.id)).toMatchObject({stage:"solution_design",status:"ai_ready"});await app.close();
+  });
+
+  it("keeps an atomically completed auto-approved run successful when knowledge refresh fails", async () => {
+    const store = new FailingKnowledgeRefreshStore(":memory:"); stores.push(store);
+    const project = store.createProject(projectPayload(await projectRepo(), { name: "Refresh failure" }));
+    const req = createRequirement(store, { title: "知识刷新故障", businessProblem: "提交后刷新可能失败", expectedOutcome: "运行结果保持成功", priority: "high", primaryProjectId: project.id });
+    const knowledge = store.beginProjectKnowledge(project.id, "fixture-head", "test");
+    store.completeProjectKnowledge(knowledge.id, { summary: "ready", entries: [] });
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "POST", url: `/api/requirements/${req.id}/run`, payload: {} });
+    const run = await waitForRun(store, response.json().id);
+
+    expect(run).toMatchObject({ status: "completed", output: expect.objectContaining({ summary: "ready" }) });
+    expect(store.getRequirement(req.id)).toMatchObject({ stage: "solution_design", status: "ai_ready" });
+    expect(store.listArtifacts(req.id)).toHaveLength(1);
+    expect(store.listApprovals(req.id)).toHaveLength(1);
+    await app.close();
+  });
+
+  it.each([
+    ["automatic approval", definitionResult],
+    ["human review", { ...definitionResult, blockingQuestions: [{ question: "谁批准？", impact: "权限边界", options: ["负责人"] }] }],
+    ["automatic return", { ...definitionResult, conclusion: "return" }]
+  ])("rolls back the entire %s success commit when run completion fails", async (_case, result) => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject(projectPayload(await projectRepo(), { name: `Atomic ${_case}` }));
+    const req = createRequirement(store, { title: `原子提交 ${_case}`, businessProblem: "后段写入可能失败", expectedOutcome: "不留下部分状态", priority: "high", primaryProjectId: project.id });
+    const knowledge = store.beginProjectKnowledge(project.id, "fixture-head", "test");
+    store.completeProjectKnowledge(knowledge.id, { summary: "ready", entries: [] });
+    agent.run.mockResolvedValue(result);
+    (store as any).db.exec(`CREATE TRIGGER fail_run_completion
+      BEFORE UPDATE OF status ON stage_runs
+      WHEN NEW.status = 'completed'
+      BEGIN SELECT RAISE(ABORT, 'RUN_COMPLETION_FAILED'); END;`);
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "POST", url: `/api/requirements/${req.id}/run`, payload: {} });
+    const run = await waitForRun(store, response.json().id);
+
+    expect(run).toMatchObject({ status: "failed", error: "RUN_COMPLETION_FAILED" });
+    expect(run?.events.some((event: any) => event.type === "gate.decided")).toBe(false);
+    expect(store.getRequirement(req.id)).toMatchObject({ stage: "definition", status: "ai_ready" });
+    expect(store.listArtifacts(req.id)).toEqual([]);
+    expect(store.listApprovals(req.id)).toEqual([]);
+    expect(store.getLatestReworkContext(req.id)).toBeNull();
+    await app.close();
+  });
+
+  it("does not commit generated output after the claimed requirement becomes stale", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject(projectPayload(await projectRepo(), { name: "Stale success" }));
+    const req = createRequirement(store, { title: "过期成功", businessProblem: "运行期间状态会变化", expectedOutcome: "拒绝过期输出", priority: "high", primaryProjectId: project.id });
+    const knowledge = store.beginProjectKnowledge(project.id, "fixture-head", "test");
+    store.completeProjectKnowledge(knowledge.id, { summary: "ready", entries: [] });
+    let resolveAgent!: (value: any) => void;
+    agent.run.mockImplementation(() => new Promise((resolve) => { resolveAgent = resolve; }));
+    const app = await buildApp(store);
+    const response = await app.inject({ method: "POST", url: `/api/requirements/${req.id}/run`, payload: {} });
+
+    store.updateRequirementState(req.id, "definition", "awaiting_approval");
+    resolveAgent(definitionResult);
+    const run = await waitForRun(store, response.json().id);
+
+    expect(run?.status).toBe("failed");
+    expect(store.getRequirement(req.id)).toMatchObject({ stage: "definition", status: "awaiting_approval" });
+    expect(store.listArtifacts(req.id)).toEqual([]);
+    expect(store.listApprovals(req.id)).toEqual([]);
+    await app.close();
+  });
+
+  it("keeps solution design on human review and creates its delivery plan only after approval", async () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const project = store.createProject(projectPayload(await projectRepo(), { name: "Integrated plan" }));
+    const req = createRequirement(store, { title: "集成交付计划", businessProblem: "方案需先审批再冻结", expectedOutcome: "审批后创建交付单元", priority: "high", primaryProjectId: project.id });
+    const knowledge = store.beginProjectKnowledge(project.id, "fixture-head", "test");
+    store.completeProjectKnowledge(knowledge.id, { summary: "ready", entries: [] });
+    const definition = store.addArtifact(req.id, "definition", "Approved definition", definitionResult);
+    store.addApproval(req.id, "definition", { decision: "approve", comment: "approved", artifactId: definition.id });
+    store.updateRequirementState(req.id, "solution_design", "ai_ready");
+    agent.run.mockResolvedValue(solutionResult([project.id]));
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "POST", url: `/api/requirements/${req.id}/run`, payload: {} });
+    const run = await waitForRun(store, response.json().id);
+
+    expect(run?.status).toBe("completed");
+    expect(store.getRequirement(req.id)).toMatchObject({ stage: "solution_design", status: "awaiting_approval" });
+    expect(store.deliveryUnits.listForRequirement(req.id)).toEqual([]);
+    const approval = await app.inject({ method: "POST", url: `/api/requirements/${req.id}/approve`, payload: { decision: "approve", comment: "freeze plan" } });
+    expect(approval.statusCode).toBe(200);
+    expect(store.getRequirement(req.id)).toMatchObject({ stage: "implementation", status: "ai_ready" });
+    expect(store.deliveryUnits.listForRequirement(req.id)).toHaveLength(1);
+    await app.close();
   });
 
   it("keeps definition awaiting approval when product blockers remain",async()=>{

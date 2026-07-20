@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   WorkflowStore,
   type ExecutionInput,
@@ -202,6 +202,26 @@ describe("WorkflowStore", () => {
     expect(a.version).toBe(1);
     expect(b.version).toBe(2);
     expect(store.listArtifacts(req.id)).toHaveLength(2);
+  });
+
+  it("orders same-clock artifacts and stage runs by stable insertion recency", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-20T00:00:00.000Z"));
+    try {
+      const store = new WorkflowStore(":memory:"); stores.push(store);
+      const req = createRequirement(store, { title: "稳定排序", businessProblem: "同毫秒写入需要确定顺序", expectedOutcome: "最新记录稳定可见", priority: "medium" });
+      const firstArtifact = store.addArtifact(req.id, "definition", "第一版", { version: 1 });
+      const secondArtifact = store.addArtifact(req.id, "definition", "第二版", { version: 2 });
+      const firstRun = store.createStageRun({ requirementId: req.id, stage: "definition", model: "test", input: {} });
+      store.failStageRun(firstRun.id, "retry");
+      const secondRun = store.createStageRun({ requirementId: req.id, stage: "definition", model: "test", input: {} });
+
+      expect(store.listArtifacts(req.id).map((artifact) => artifact.id)).toEqual([secondArtifact.id, firstArtifact.id]);
+      expect(store.listArtifacts(req.id)[0]).toMatchObject({ version: 2, title: "第二版" });
+      expect(store.listStageRuns(req.id).map((run: any) => run.id)).toEqual([secondRun.id, firstRun.id]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("creates and replaces the interim primary project association", () => {
@@ -414,6 +434,26 @@ describe("WorkflowStore", () => {
     expect(store.getStageRun(run.id)?.events.map((event: any) => event.sequence)).toEqual([1, 2, 3]);
     store.completeStageRun(run.id, { conclusion: "pass" });
     expect(store.getStageRun(run.id)?.status).toBe("completed");
+  });
+
+  it("rejects a stale run at the atomic success boundary without writing business output", () => {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const req = createRequirement(store, { title: "过期运行", businessProblem: "旧运行不能提交", expectedOutcome: "无部分成功数据", priority: "high" });
+    const run = store.createStageRun({ requirementId: req.id, stage: "definition", model: "test", input: {} });
+    store.failStageRun(run.id, "interrupted");
+
+    expect(() => store.commitStageRunSuccess({
+      runId: run.id,
+      requirementId: req.id,
+      stage: "definition",
+      title: "Stale output",
+      content: { conclusion: "pass" },
+      output: { conclusion: "pass" },
+      gate: { decision: "auto_approve", reasons: ["pass"] }
+    })).toThrow("STAGE_RUN_COMMIT_STALE");
+    expect(store.listArtifacts(req.id)).toEqual([]);
+    expect(store.listApprovals(req.id)).toEqual([]);
+    expect(store.getRequirement(req.id)).toMatchObject({ stage: "definition", status: "ai_ready" });
   });
 
   it("prevents association replacement while any stage run is active", () => {

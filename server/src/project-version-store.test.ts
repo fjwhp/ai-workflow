@@ -93,6 +93,10 @@ describe("project versions fresh schema", () => {
       "validate_artifact_owner_update",
       "validate_automation_job_owner_insert",
       "validate_automation_job_owner_update",
+      "validate_delivery_dependency_owner_insert",
+      "validate_delivery_dependency_owner_update",
+      "validate_delivery_unit_snapshot_owner_insert",
+      "validate_delivery_unit_snapshot_owner_update",
       "validate_stage_run_owner_insert",
       "validate_stage_run_owner_update"
     ]);

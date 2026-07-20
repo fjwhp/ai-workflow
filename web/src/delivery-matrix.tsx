@@ -106,11 +106,13 @@ export function deliveryMatrixRowViews(
   const unitIds = new Set(units.map((unit) => unit.id));
   const invalidUnitIds = new Set<string>();
   const validDependencies: DeliveryDependencyView[] = [];
+  let invalidGraph = false;
 
   for (const dependency of dependencies) {
     const hasUpstream = unitIds.has(dependency.upstreamUnitId);
     const hasDownstream = unitIds.has(dependency.downstreamUnitId);
     if (!hasUpstream || !hasDownstream) {
+      if (!hasUpstream && !hasDownstream) invalidGraph = true;
       if (hasUpstream) invalidUnitIds.add(dependency.upstreamUnitId);
       if (hasDownstream) invalidUnitIds.add(dependency.downstreamUnitId);
       continue;
@@ -122,7 +124,7 @@ export function deliveryMatrixRowViews(
 
   return new Map(units.map((unit) => {
     const view = deliveryRowView(unit, dependencies);
-    return [unit.id, invalidUnitIds.has(unit.id) ? {
+    return [unit.id, invalidGraph || invalidUnitIds.has(unit.id) ? {
       ...view,
       dependencyLabel: "交付依赖数据异常",
       blocker: "交付依赖数据异常",

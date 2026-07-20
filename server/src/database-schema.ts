@@ -340,5 +340,57 @@ export function createPhase2Schema(db: DatabaseSync) {
         SELECT 1 FROM delivery_units WHERE id = NEW.owner_id
       ));
     END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_dependency_owner_insert
+    BEFORE INSERT ON delivery_dependencies
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_DEPENDENCY_SELF_EDGE')
+      WHERE NEW.upstream_unit_id = NEW.downstream_unit_id;
+      SELECT RAISE(ABORT, 'DELIVERY_DEPENDENCY_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units
+        WHERE id = NEW.upstream_unit_id AND requirement_id = NEW.requirement_id
+      ) OR NOT EXISTS (
+        SELECT 1 FROM delivery_units
+        WHERE id = NEW.downstream_unit_id AND requirement_id = NEW.requirement_id
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_dependency_owner_update
+    BEFORE UPDATE OF requirement_id, upstream_unit_id, downstream_unit_id ON delivery_dependencies
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_DEPENDENCY_SELF_EDGE')
+      WHERE NEW.upstream_unit_id = NEW.downstream_unit_id;
+      SELECT RAISE(ABORT, 'DELIVERY_DEPENDENCY_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units
+        WHERE id = NEW.upstream_unit_id AND requirement_id = NEW.requirement_id
+      ) OR NOT EXISTS (
+        SELECT 1 FROM delivery_units
+        WHERE id = NEW.downstream_unit_id AND requirement_id = NEW.requirement_id
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_unit_snapshot_owner_insert
+    BEFORE INSERT ON delivery_unit_snapshots
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_UNIT_SNAPSHOT_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units
+        WHERE id = NEW.delivery_unit_id
+          AND requirement_id = NEW.requirement_id
+          AND project_id = NEW.project_id
+          AND project_version_id = NEW.project_version_id
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_unit_snapshot_owner_update
+    BEFORE UPDATE OF delivery_unit_id, requirement_id, project_id, project_version_id ON delivery_unit_snapshots
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_UNIT_SNAPSHOT_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units
+        WHERE id = NEW.delivery_unit_id
+          AND requirement_id = NEW.requirement_id
+          AND project_id = NEW.project_id
+          AND project_version_id = NEW.project_version_id
+      );
+    END;
   `);
 }

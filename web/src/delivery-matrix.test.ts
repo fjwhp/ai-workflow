@@ -230,6 +230,24 @@ describe("deliveryMatrixRowViews", () => {
       .filter((cell) => cell.name === "交付依赖数据异常")).toHaveLength(4);
   });
 
+  it("marks every visible row invalid when a dependency has no known endpoint", () => {
+    const peer = { ...unit, id: "unit-web", projectId: "web", projectVersionId: "web-v1" };
+    const dependencies = [{
+      upstreamUnitId: "unit-missing-upstream",
+      downstreamUnitId: "unit-missing-downstream",
+      releaseCondition: "automated_testing_passed" as const,
+      releasedAt: null
+    }];
+
+    const views = deliveryMatrixRowViews([unit, peer], dependencies);
+
+    for (const view of views.values()) expect(view).toMatchObject({
+      dependencyLabel: "交付依赖数据异常",
+      blocker: "交付依赖数据异常",
+      nextAction: null
+    });
+  });
+
   it("keeps every row in a valid diamond dependency graph free of data errors", () => {
     const units = ["api", "web", "worker", "release"].map((projectId) => ({
       ...unit,

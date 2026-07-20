@@ -447,10 +447,14 @@ export class WorkflowStore {
   }
 
   addArtifact(requirementId: string, stage: WorkflowStage, title: string, content: unknown) {
+    return this.insertRequirementArtifactInTransaction(requirementId, stage, title, content, new Date().toISOString());
+  }
+
+  private insertRequirementArtifactInTransaction(requirementId: string, stage: WorkflowStage, title: string, content: unknown, now: string) {
     const versionRow = this.db.prepare(`SELECT COALESCE(MAX(version), 0) + 1 AS version FROM artifacts
       WHERE owner_type = 'requirement' AND owner_id = ? AND stage = ?`)
       .get(requirementId, stage) as { version: number };
-    const artifact = { id: randomUUID(), requirementId, stage, version: versionRow.version, title, content, createdAt: new Date().toISOString() };
+    const artifact = { id: randomUUID(), requirementId, stage, version: versionRow.version, title, content, createdAt: now };
     this.db.prepare(`INSERT INTO artifacts
       (id, requirement_id, owner_type, owner_id, stage, version, title, content_json, created_at)
       VALUES (?, ?, 'requirement', ?, ?, ?, ?, ?, ?)`)
@@ -459,7 +463,7 @@ export class WorkflowStore {
   }
 
   listArtifacts(requirementId: string) {
-    return this.db.prepare("SELECT * FROM artifacts WHERE requirement_id = ? ORDER BY created_at DESC").all(requirementId).map((row: any) => ({
+    return this.db.prepare("SELECT * FROM artifacts WHERE requirement_id = ? ORDER BY created_at DESC, version DESC, rowid DESC").all(requirementId).map((row: any) => ({
       id: row.id, requirementId: row.requirement_id, stage: row.stage, version: row.version,
       title: row.title, content: JSON.parse(row.content_json), createdAt: row.created_at
     }));
@@ -542,9 +546,77 @@ export class WorkflowStore {
 
   listStageRuns(requirementId: string, stage?: WorkflowStage) {
     const rows = stage
-      ? this.db.prepare("SELECT * FROM stage_runs WHERE requirement_id = ? AND stage = ? ORDER BY created_at DESC").all(requirementId, stage)
-      : this.db.prepare("SELECT * FROM stage_runs WHERE requirement_id = ? ORDER BY created_at DESC").all(requirementId);
+      ? this.db.prepare("SELECT * FROM stage_runs WHERE requirement_id = ? AND stage = ? ORDER BY created_at DESC, rowid DESC").all(requirementId, stage)
+      : this.db.prepare("SELECT * FROM stage_runs WHERE requirement_id = ? ORDER BY created_at DESC, rowid DESC").all(requirementId);
     return rows.map((row: any) => mapStageRun(row, []));
+  }
+
+  commitStageRunSuccess(input: {
+    runId: string;
+    requirementId: string;
+    stage: WorkflowStage;
+    title: string;
+    content: unknown;
+    output: unknown;
+    gate: { decision: "auto_approve" | "auto_return" | "human_review"; reasons: string[] };
+  }) {
+    const now = new Date().toISOString();
+    return this.withImmediateTransaction(() => {
+      const run = this.db.prepare(`SELECT requirement_id, owner_type, owner_id, stage, status, created_at
+        FROM stage_runs WHERE id = ?`).get(input.runId) as {
+          requirement_id: string; owner_type: string; owner_id: string; stage: WorkflowStage; status: string; created_at: string;
+        } | undefined;
+      if (!run || run.status !== "running" || run.owner_type !== "requirement"
+        || run.owner_id !== input.requirementId || run.requirement_id !== input.requirementId || run.stage !== input.stage) {
+        throw new Error("STAGE_RUN_COMMIT_STALE");
+      }
+      const requirement = this.db.prepare("SELECT stage, status, updated_at FROM requirements WHERE id = ?")
+        .get(input.requirementId) as { stage: WorkflowStage; status: string; updated_at: string } | undefined;
+      if (!requirement || requirement.stage !== input.stage || requirement.status !== "ai_running"
+        || requirement.updated_at !== run.created_at) {
+        throw new Error("STAGE_RUN_COMMIT_STALE");
+      }
+
+      const artifact = this.insertRequirementArtifactInTransaction(input.requirementId, input.stage, input.title, input.content, now);
+      this.appendStageRunEvent(input.runId, "gate.decided", input.gate);
+      const approvalDecision = input.gate.decision === "auto_approve" ? "approve"
+        : input.gate.decision === "auto_return" ? "return" : "review";
+      const targetStage = input.gate.decision === "auto_return" ? returnStage(input.stage) : null;
+      const approval = this.insertApprovalInTransaction(input.requirementId, input.stage, {
+        decision: approvalDecision,
+        comment: input.gate.reasons.join("；"),
+        targetStage,
+        actorType: "ai_gate",
+        artifactId: artifact.id,
+        reasons: input.gate.reasons
+      }, now);
+
+      let nextStage: WorkflowStage = input.stage;
+      let nextStatus: string;
+      if (input.gate.decision === "auto_approve") {
+        const stageIndex = workflowStages.indexOf(input.stage);
+        nextStage = workflowStages[stageIndex + 1] ?? input.stage;
+        nextStatus = nextStage === input.stage ? "completed" : "ai_ready";
+      } else if (input.gate.decision === "auto_return") {
+        nextStage = targetStage!;
+        nextStatus = "returned";
+        this.insertReworkContext(input.requirementId, buildReworkContext({ approval, artifact }), now);
+      } else {
+        nextStatus = "awaiting_approval";
+      }
+      const transitioned = this.db.prepare(`UPDATE requirements SET stage = ?, status = ?, updated_at = ?
+        WHERE id = ? AND stage = ? AND status = 'ai_running' AND updated_at = ?`)
+        .run(nextStage, nextStatus, now, input.requirementId, input.stage, run.created_at);
+      if (transitioned.changes !== 1) throw new Error("STAGE_RUN_COMMIT_STALE");
+
+      const completed = this.db.prepare(`UPDATE stage_runs SET status = 'completed', output_json = ?, completed_at = ?
+        WHERE id = ? AND status = 'running' AND owner_type = 'requirement' AND owner_id = ?
+          AND requirement_id = ? AND stage = ?`)
+        .run(JSON.stringify(input.output), now, input.runId, input.requirementId, input.requirementId, input.stage);
+      if (completed.changes !== 1) throw new Error("STAGE_RUN_COMMIT_STALE");
+      this.appendStageRunEvent(input.runId, "run.completed", { completedAt: now });
+      return { artifact, approval, requirement: this.getRequirement(input.requirementId), run: this.getStageRun(input.runId) };
+    });
   }
 
   completeStageRun(id: string, output: unknown) {

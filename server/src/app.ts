@@ -7,7 +7,6 @@ import { createBackup } from "./backup.js";
 import { redactSensitive } from "./redaction.js";
 import { hashDiff } from "./coding-evidence.js";
 import { getWorktreeSnapshot } from "./repository.js";
-import { buildReworkContext } from "./rework-context.js";
 import { ensureProjectKnowledge } from "./knowledge-service.js";
 import { getRepositoryHead } from "./project-knowledge.js";
 import { publishRequirementKnowledge, refreshRequirementKnowledge } from "./project-memory-service.js";
@@ -130,7 +129,6 @@ export async function buildApp(store: WorkflowStore) {
       const emit = (type: string, payload: unknown) => store.appendStageRunEvent(runId, type, redactSensitive(payload, patterns));
     try {
       const content = await runAgent(runItem.stage, runContext, emit);
-      const artifact = store.addArtifact(runItem.id, runItem.stage, `${stageLabel(runItem.stage)} AI 成果`, content);
       let gate = evaluateGate(runItem.stage, content, store.getGateConfig());
       const blockingQuestions=runItem.stage==="definition"&&"blockingQuestions" in content&&Array.isArray(content.blockingQuestions)?content.blockingQuestions:[];
       if (blockingQuestions.length) {
@@ -144,11 +142,17 @@ export async function buildApp(store: WorkflowStore) {
           reasons: ["方案设计必须经人工审批，审批将冻结项目关联并创建交付计划"]
         };
       }
-      emit("gate.decided", gate);
-      const applied=store.applyGateDecision({ requirementId: runItem.id, stage: runItem.stage, artifactId: artifact.id, ...gate });
-      refreshRequirementKnowledge(store,runItem.id);
-      if(gate.decision==="auto_return"&&applied.approval){store.addReworkContext(runItem.id,buildReworkContext({approval:applied.approval,artifact}));}
-      store.completeStageRun(runId, redactSensitive(content,patterns));
+      store.commitStageRunSuccess({
+        runId,
+        requirementId: runItem.id,
+        stage: runItem.stage,
+        title: `${stageLabel(runItem.stage)} AI 成果`,
+        content,
+        output: redactSensitive(content, patterns),
+        gate
+      });
+      try { refreshRequirementKnowledge(store, runItem.id); }
+      catch { /* The run is committed; knowledge extraction remains best effort. */ }
     } catch (error) {
       const message = error instanceof Error ? error.message : "AI 执行失败";
       store.failStageRun(runId, redactSensitive(message,patterns));

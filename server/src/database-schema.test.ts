@@ -48,6 +48,11 @@ function foreignKeys(db: DatabaseSync, table: string) {
   }));
 }
 
+function triggerNames(db: DatabaseSync) {
+  return (db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name").all() as Array<{ name: string }>)
+    .map(({ name }) => name);
+}
+
 function insertRequirement(db: DatabaseSync, id = "r1") {
   db.prepare(`INSERT INTO requirements
     (id, code, title, business_problem, expected_outcome, priority, stage, status, created_at, updated_at)
@@ -82,6 +87,22 @@ function insertDeliveryFixture(db: DatabaseSync) {
   insertUnit.run("u1", "r1", "s1", "p1", "v1", 0, now, now);
   insertUnit.run("u2", "r1", "s1", "p2", "v2", 1, now, now);
   insertUnit.run("u3", "r2", "s2", "p3", "v3", 0, now, now);
+}
+
+function insertDeliveryDependency(db: DatabaseSync, id: string, requirementId: string, upstreamUnitId: string, downstreamUnitId: string) {
+  db.prepare(`INSERT INTO delivery_dependencies
+    (id, requirement_id, upstream_unit_id, downstream_unit_id, release_condition, created_at)
+    VALUES (?, ?, ?, ?, 'automated_testing_passed', '2026-07-20T00:00:00.000Z')`)
+    .run(id, requirementId, upstreamUnitId, downstreamUnitId);
+}
+
+function insertDeliveryUnitSnapshot(db: DatabaseSync, input: { id: string; unitId: string; requirementId: string; projectId: string; versionId: string }) {
+  db.prepare(`INSERT INTO delivery_unit_snapshots
+    (id, delivery_unit_id, requirement_id, project_id, project_version_id, repo_path, branch, base_branch,
+      worktree_path, head_commit, module_ids_json, sensitive_patterns_json, allowed_commands_json, created_at)
+    VALUES (?, ?, ?, ?, ?, '/tmp/repo', 'main', 'main', '/tmp/worktree', 'head', '[]', '[]', '[]',
+      '2026-07-20T00:00:00.000Z')`)
+    .run(input.id, input.unitId, input.requirementId, input.projectId, input.versionId);
 }
 
 function insertArtifact(db: DatabaseSync, input: { id: string; ownerType: string | null; ownerId: string | null; stage?: string }) {
@@ -173,6 +194,12 @@ describe("Phase 2 database schema", () => {
     expect(indexSql(db, "idx_delivery_dependency_edge")).toMatch(/UNIQUE[\s\S]*delivery_dependencies\s*\(requirement_id,\s*upstream_unit_id,\s*downstream_unit_id\)/i);
     expect(indexSql(db, "idx_delivery_unit_active_run")).toMatch(/UNIQUE[\s\S]*stage_runs\s*\(owner_type,\s*owner_id,\s*stage\)[\s\S]*WHERE status = 'running'/i);
     expect(indexSql(db, "idx_automation_job_dedupe")).toMatch(/UNIQUE[\s\S]*automation_jobs\s*\(dedupe_key\)/i);
+    expect(triggerNames(db)).toEqual(expect.arrayContaining([
+      "validate_delivery_dependency_owner_insert",
+      "validate_delivery_dependency_owner_update",
+      "validate_delivery_unit_snapshot_owner_insert",
+      "validate_delivery_unit_snapshot_owner_update"
+    ]));
     db.close();
   });
 
@@ -265,6 +292,38 @@ describe("Phase 2 database schema", () => {
     expect(() => db.prepare("UPDATE artifacts SET requirement_id = 'r2' WHERE id = 'artifact-1'").run()).toThrow("OWNER_REQUIREMENT_MISMATCH");
     expect(() => db.prepare("UPDATE stage_runs SET requirement_id = 'r2' WHERE id = 'run-1'").run()).toThrow("OWNER_REQUIREMENT_MISMATCH");
     expect(() => db.prepare("UPDATE automation_jobs SET owner_id = 'missing' WHERE id = 'job-1'").run()).toThrow("OWNER_NOT_FOUND");
+    db.close();
+  });
+
+  it("rejects cross-requirement and self delivery dependencies on insert and update", () => {
+    const db = openFreshStoreDatabase();
+    insertDeliveryFixture(db);
+
+    expect(() => insertDeliveryDependency(db, "d-cross", "r1", "u1", "u3"))
+      .toThrow("DELIVERY_DEPENDENCY_OWNER_MISMATCH");
+    expect(() => insertDeliveryDependency(db, "d-self", "r1", "u1", "u1"))
+      .toThrow("DELIVERY_DEPENDENCY_SELF_EDGE");
+    insertDeliveryDependency(db, "d-valid", "r1", "u1", "u2");
+    expect(() => db.prepare("UPDATE delivery_dependencies SET downstream_unit_id = 'u3' WHERE id = 'd-valid'").run())
+      .toThrow("DELIVERY_DEPENDENCY_OWNER_MISMATCH");
+    expect(() => db.prepare("UPDATE delivery_dependencies SET downstream_unit_id = 'u1' WHERE id = 'd-valid'").run())
+      .toThrow("DELIVERY_DEPENDENCY_SELF_EDGE");
+    db.close();
+  });
+
+  it("rejects delivery unit snapshots whose owner fields do not match the unit", () => {
+    const db = openFreshStoreDatabase();
+    insertDeliveryFixture(db);
+
+    expect(() => insertDeliveryUnitSnapshot(db, { id: "us-cross-requirement", unitId: "u1", requirementId: "r2", projectId: "p1", versionId: "v1" }))
+      .toThrow("DELIVERY_UNIT_SNAPSHOT_OWNER_MISMATCH");
+    expect(() => insertDeliveryUnitSnapshot(db, { id: "us-cross-project", unitId: "u1", requirementId: "r1", projectId: "p2", versionId: "v1" }))
+      .toThrow("DELIVERY_UNIT_SNAPSHOT_OWNER_MISMATCH");
+    expect(() => insertDeliveryUnitSnapshot(db, { id: "us-cross-version", unitId: "u1", requirementId: "r1", projectId: "p1", versionId: "v2" }))
+      .toThrow("DELIVERY_UNIT_SNAPSHOT_OWNER_MISMATCH");
+    insertDeliveryUnitSnapshot(db, { id: "us-valid", unitId: "u1", requirementId: "r1", projectId: "p1", versionId: "v1" });
+    expect(() => db.prepare("UPDATE delivery_unit_snapshots SET project_id = 'p2' WHERE id = 'us-valid'").run())
+      .toThrow("DELIVERY_UNIT_SNAPSHOT_OWNER_MISMATCH");
     db.close();
   });
 
