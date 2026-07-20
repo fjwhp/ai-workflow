@@ -796,6 +796,16 @@ describe("AutomationJobRepository", () => {
     });
   });
 
+  it("rejects a whitespace-only Error message before settling a lease", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    fixture.first.leaseNext("worker-a", now, 30_000);
+
+    expect(() => fixture.first.fail(queued.id, "worker-a", new Error("   "), true))
+      .toThrow("AUTOMATION_JOB_ERROR_INVALID");
+    expect(fixture.first.get(queued.id)?.status).toBe("leased");
+  });
+
   it("returns a retryable first failure to pending with attempt one", () => {
     const fixture = createFixture();
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
@@ -907,6 +917,8 @@ describe("AutomationJobRepository", () => {
 
     expect(fixture.first.fail(queued.id, "worker-b", "late", true)).toBe(false);
     expect(() => fixture.first.fail(queued.id, "worker-a", "", true)).toThrow("AUTOMATION_JOB_ERROR_INVALID");
+    expect(() => fixture.first.fail(queued.id, "worker-a", "   ", true))
+      .toThrow("AUTOMATION_JOB_ERROR_INVALID");
     expect(() => fixture.first.fail(queued.id, "worker-a", "error", "yes" as unknown as boolean))
       .toThrow("AUTOMATION_JOB_RETRYABLE_INVALID");
     expect(() => fixture.first.cancelByOwnerVersion("", 1)).toThrow("AUTOMATION_JOB_OWNER_INVALID");

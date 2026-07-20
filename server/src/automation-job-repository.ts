@@ -312,7 +312,7 @@ function sanitizeFailureError(error: unknown): string {
       errorText = "Unknown error";
     }
   }
-  if (errorText.length === 0) throw new Error("AUTOMATION_JOB_ERROR_INVALID");
+  if (errorText.trim().length === 0) throw new Error("AUTOMATION_JOB_ERROR_INVALID");
   return truncateCodePoints(errorText.replaceAll("\0", "\\0"), MAX_ERROR_LENGTH);
 }
 
