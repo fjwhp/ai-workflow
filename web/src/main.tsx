@@ -18,6 +18,7 @@ import { NewRequirement } from "./new-requirement.js";
 import { RequirementDetail, type Detail } from "./requirement-detail.js";
 import { MandatoryHumanStageSettings } from "./gate-settings.js";
 import { requirementStatusLabel } from "./workflow-presentation.js";
+import { deliveryActionRequest } from "./delivery-unit-view.js";
 
 type Page = "dashboard" | "requirements" | "projects" | "settings";
 
@@ -59,7 +60,11 @@ function App() {
       <header><div><h1>{selected ? selected.title : pageTitle(page)}</h1><p>{selected ? `${selected.code} · ${stageLabels[selected.stage]}` : pageSubtitle(page)}</p></div>
         <button className="primary" onClick={() => setModal("new")}><Plus size={17}/>新建需求</button></header>
       {error && <div className="alert"><AlertTriangle size={18}/>{error}<button onClick={() => setError("")}><X size={16}/></button></div>}
-      {selected ? <RequirementDetail item={selected} onRun={() => setModal("run")} onViewRun={setRunView} onEdit={() => setModal("edit")} onApprove={() => setModal("approve")} onRefresh={refresh} onManageProjects={() => setModal("associations")}/> :
+      {selected ? <RequirementDetail item={selected} onRun={() => setModal("run")} onViewRun={setRunView} onEdit={() => setModal("edit")} onApprove={() => setModal("approve")} onRefresh={refresh} onManageProjects={() => setModal("associations")} onDeliveryAction={async (request) => {
+        const action = deliveryActionRequest(selected.id, request);
+        await post(action.path, action.body);
+        await refresh();
+      }}/> :
        page === "projects" ? <ProjectManagement/> : page === "settings" ? <SettingsPage/> : <Dashboard items={visibleItems} queues={queues} queueFilter={queueFilter} onQueue={selectQueue} onClearFilter={()=>setQueueFilter(null)} onOpen={open}/>}
     </main>
     {modal === "new" && <NewRequirement

@@ -475,6 +475,20 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(skip_id) REFERENCES delivery_unit_skips(id),
       FOREIGN KEY(invalidation_id) REFERENCES delivery_evidence_invalidations(id)
     );
+    CREATE TABLE IF NOT EXISTS delivery_unit_retry_audit (
+      id TEXT PRIMARY KEY,
+      requirement_id TEXT NOT NULL,
+      delivery_unit_id TEXT NOT NULL,
+      evidence_version INTEGER NOT NULL,
+      job_id TEXT NOT NULL,
+      target TEXT NOT NULL CHECK(target IN ('implementation', 'code_review', 'automated_testing')),
+      actor TEXT NOT NULL CHECK(instr(actor, char(0)) = 0 AND length(trim(actor)) BETWEEN 1 AND 256),
+      reason TEXT NOT NULL CHECK(instr(reason, char(0)) = 0 AND length(trim(reason)) BETWEEN 1 AND 4096),
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
+      FOREIGN KEY(job_id) REFERENCES automation_jobs(id)
+    );
     CREATE TABLE IF NOT EXISTS rework_contexts (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, approval_id TEXT NOT NULL UNIQUE, artifact_id TEXT,
       source_stage TEXT NOT NULL, target_stage TEXT NOT NULL, actor_type TEXT NOT NULL, decision_at TEXT NOT NULL,
@@ -1063,5 +1077,32 @@ export function createPhase2Schema(db: DatabaseSync) {
               AND run.evidence_version = unit.evidence_version AND run.status = 'running')
       );
     END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_unit_retry_audit_insert
+    BEFORE INSERT ON delivery_unit_retry_audit
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_UNIT_RETRY_AUDIT_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units unit
+        JOIN automation_jobs job ON job.id = NEW.job_id
+          AND job.owner_type = 'delivery_unit'
+          AND job.owner_id = unit.id
+          AND job.evidence_version = unit.evidence_version
+          AND job.status = 'failed'
+          AND job.action = CASE NEW.target
+            WHEN 'implementation' THEN 'implement'
+            WHEN 'code_review' THEN 'review'
+            WHEN 'automated_testing' THEN 'test'
+          END
+        WHERE unit.id = NEW.delivery_unit_id
+          AND unit.requirement_id = NEW.requirement_id
+          AND unit.evidence_version = NEW.evidence_version
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS delivery_unit_retry_audit_immutable_update
+    BEFORE UPDATE ON delivery_unit_retry_audit
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_UNIT_RETRY_AUDIT_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_unit_retry_audit_immutable_delete
+    BEFORE DELETE ON delivery_unit_retry_audit
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_UNIT_RETRY_AUDIT_IMMUTABLE'); END;
   `);
 }

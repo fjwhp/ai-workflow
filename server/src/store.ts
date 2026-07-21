@@ -17,6 +17,10 @@ import {
   type DeliveryExecutionPersistence
 } from "./delivery-execution-repository.js";
 import {
+  DeliveryUnitDetailRepository,
+  type DeliveryUnitDetailPersistence
+} from "./delivery-unit-detail.js";
+import {
   DeliveryQualityRepository,
   type DeliveryQualityPersistence
 } from "./delivery-quality-repository.js";
@@ -84,6 +88,7 @@ export class WorkflowStore {
   public readonly deliveryExecutions: DeliveryExecutionPersistence;
   public readonly deliveryQuality: DeliveryQualityPersistence;
   public readonly deliveryCoordination: DeliveryCoordinationPersistence;
+  public readonly deliveryUnitDetails: DeliveryUnitDetailPersistence;
   public readonly automationJobs: AutomationJobPersistence;
 
   constructor(path: string, clock: () => Date = () => new Date()) {
@@ -94,6 +99,8 @@ export class WorkflowStore {
     this.deliveryExecutionRepository = new DeliveryExecutionRepository(this.db);
     this.deliveryQualityRepository = new DeliveryQualityRepository(this.db, clock);
     const deliveryCoordinator = new DeliveryCoordinator(this.db, this.deliveryQualityRepository);
+    const deliveryUnitDetails = new DeliveryUnitDetailRepository(this.db, this.deliveryUnitRepository,
+      this.deliveryExecutionRepository, this.deliveryQualityRepository);
     this.executionRepository = new ExecutionRepository(this.db);
     const automationJobRepository = new AutomationJobRepository(this.db, clock);
     this.deliveryUnits = {
@@ -207,13 +214,33 @@ export class WorkflowStore {
       skipOptional: (input) => this.withImmediateTransaction(
         () => deliveryCoordinator.skipOptionalInTransaction(input)
       ),
+      retryUnit: (input) => this.withImmediateTransaction(
+        () => deliveryCoordinator.retryUnitInTransaction(input)
+      ),
       listQualityOverrides: (unitId, evidenceVersion) =>
         deliveryCoordinator.listQualityOverrides(unitId, evidenceVersion)
+    };
+    this.deliveryUnitDetails = {
+      getForRequirement: (requirementId) => this.withReadTransaction(
+        () => deliveryUnitDetails.getForRequirement(requirementId)
+      )
     };
   }
 
   withImmediateTransaction<T>(operation: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private withReadTransaction<T>(operation: () => T): T {
+    this.db.exec("BEGIN");
     try {
       const result = operation();
       this.db.exec("COMMIT");

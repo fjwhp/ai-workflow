@@ -56,7 +56,8 @@ export async function buildApp(store: WorkflowStore) {
     }
     const artifacts=store.listArtifacts(item.id),approvals=store.listApprovals(item.id);
     const reworkContext=store.getLatestReworkContext(item.id);
-    return { ...item, artifacts, approvals, executions: store.listExecutions(item.id), revisions: store.listRequirementRevisions(item.id), runs: store.listStageRuns(item.id), codingEvidence, reworkContext, knowledgeChanges:store.getKnowledgeChangeSet(item.id),deliveryUnits:store.deliveryUnits.listForRequirement(item.id),deliveryDependencies:store.deliveryUnits.listDependencies(item.id) };
+    const delivery = store.deliveryUnitDetails.getForRequirement(item.id);
+    return { ...item, artifacts, approvals, executions: store.listExecutions(item.id), revisions: store.listRequirementRevisions(item.id), runs: store.listStageRuns(item.id), codingEvidence, reworkContext, knowledgeChanges:store.getKnowledgeChangeSet(item.id),deliveryUnits:delivery.units,deliveryDependencies:delivery.dependencies,automation:delivery.automation };
   });
   app.patch("/api/requirements/:id", async (req: any, reply) => {
     const input = requirementRevisionSchema.safeParse(req.body);

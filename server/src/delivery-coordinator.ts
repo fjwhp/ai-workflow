@@ -75,6 +75,7 @@ export interface DeliveryCoordinationPersistence {
   pauseAutomation(input: RequirementAutomationInput): RequirementAutomationState;
   resumeAutomation(input: RequirementAutomationInput): RequirementAutomationState;
   skipOptional(input: DeliverySkipInput): DeliveryUnitSkip;
+  retryUnit(input: DeliveryUnitRetryInput): DeliveryUnitRetryAudit;
 }
 
 export interface DeliveryContractEvidenceInput {
@@ -114,6 +115,25 @@ export interface DeliverySkipInput { unitId: string; actor: string; reason: stri
 export interface DeliveryUnitSkip {
   id: string; requirementId: string; deliveryUnitId: string; evidenceVersion: number;
   actor: string; reason: string; createdAt: string;
+}
+
+export type DeliveryUnitRetryTarget = "implementation" | "code_review" | "automated_testing";
+export interface DeliveryUnitRetryInput {
+  unitId: string;
+  target: DeliveryUnitRetryTarget;
+  actor: string;
+  reason: string;
+}
+export interface DeliveryUnitRetryAudit {
+  id: string;
+  requirementId: string;
+  deliveryUnitId: string;
+  evidenceVersion: number;
+  jobId: string;
+  target: DeliveryUnitRetryTarget;
+  actor: string;
+  reason: string;
+  createdAt: string;
 }
 
 export interface DeliveryStaleResolutionInput {
@@ -547,6 +567,62 @@ export class DeliveryCoordinator {
     return this.completeSkipInTransaction(this.getSkip(input.unitId)!, now);
   }
 
+  retryUnitInTransaction(input: DeliveryUnitRetryInput): DeliveryUnitRetryAudit {
+    validateRetryInput(input);
+    const actor = input.actor.trim();
+    const reason = input.reason.trim();
+    const unit = this.db.prepare(`SELECT id, requirement_id, evidence_version, phase, status
+      FROM delivery_units WHERE id = ?`).get(input.unitId) as {
+        id: string; requirement_id: string; evidence_version: number; phase: string; status: string;
+      } | undefined;
+    if (!unit) throw new Error("DELIVERY_UNIT_NOT_FOUND");
+    if (this.requirementPaused(unit.requirement_id)) throw new Error("DELIVERY_UNIT_RETRY_NOT_ELIGIBLE");
+    const action = retryAction(input.target);
+    const job = this.db.prepare(`SELECT id FROM automation_jobs WHERE owner_type = 'delivery_unit'
+      AND owner_id = ? AND evidence_version = ? AND action = ? AND status = 'failed'`)
+      .get(unit.id, unit.evidence_version, action) as { id: string } | undefined;
+    if (!job || this.hasActiveUnitWork(unit.id, unit.evidence_version)) {
+      throw new Error("DELIVERY_UNIT_RETRY_NOT_ELIGIBLE");
+    }
+    if (input.target === "implementation") {
+      const hasEvidence = this.db.prepare(`SELECT 1 FROM coding_evidence
+        WHERE delivery_unit_id = ? AND evidence_version = ?`).get(unit.id, unit.evidence_version);
+      if (unit.phase !== "implementation" || unit.status !== "failed" || hasEvidence
+        || !this.dependenciesSatisfied(unit.id)) throw new Error("DELIVERY_UNIT_RETRY_NOT_ELIGIBLE");
+    } else {
+      const kind = input.target;
+      const hasCoding = this.db.prepare(`SELECT 1 FROM coding_evidence
+        WHERE delivery_unit_id = ? AND evidence_version = ?`).get(unit.id, unit.evidence_version);
+      const hasEvidence = this.db.prepare(`SELECT 1 FROM delivery_quality_evidence
+        WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ?`)
+        .get(unit.id, unit.evidence_version, kind);
+      if (!hasCoding || hasEvidence || !["awaiting_gate", "returned", "failed"].includes(unit.status)) {
+        throw new Error("DELIVERY_UNIT_RETRY_NOT_ELIGIBLE");
+      }
+    }
+    const now = new Date().toISOString();
+    const audit: DeliveryUnitRetryAudit = {
+      id: randomUUID(), requirementId: unit.requirement_id, deliveryUnitId: unit.id,
+      evidenceVersion: unit.evidence_version, jobId: job.id, target: input.target, actor, reason, createdAt: now
+    };
+    this.db.prepare(`INSERT INTO delivery_unit_retry_audit
+      (id, requirement_id, delivery_unit_id, evidence_version, job_id, target, actor, reason, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(audit.id, audit.requirementId, audit.deliveryUnitId,
+      audit.evidenceVersion, audit.jobId, audit.target, audit.actor, audit.reason, audit.createdAt);
+    if (input.target === "implementation") {
+      const updated = this.db.prepare(`UPDATE delivery_units SET status = 'ready', updated_at = ?
+        WHERE id = ? AND evidence_version = ? AND phase = 'implementation' AND status = 'failed'`)
+        .run(now, unit.id, unit.evidence_version);
+      if (updated.changes !== 1) throw new Error("DELIVERY_UNIT_RETRY_NOT_ELIGIBLE");
+    }
+    const revived = new AutomationJobRepository(this.db, () => new Date(now)).enqueue({
+      ownerType: "delivery_unit", ownerId: unit.id, evidenceVersion: unit.evidence_version,
+      action, payload: {}, maxAttempts: 3
+    }, { reviveTerminal: true });
+    if (revived.id !== job.id || revived.status !== "pending") throw new Error("DELIVERY_UNIT_RETRY_CONFLICT");
+    return audit;
+  }
+
   private completeSkipInTransaction(skip: DeliveryUnitSkip, now: string) {
     const unit = this.db.prepare(`SELECT required, status, evidence_version FROM delivery_units WHERE id = ?`)
       .get(skip.deliveryUnitId) as { required: number; status: string; evidence_version: number } | undefined;
@@ -581,6 +657,18 @@ export class DeliveryCoordinator {
       WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ? AND status = 'pending'`)
       .run(now, skip.deliveryUnitId, skip.evidenceVersion);
     return this.getSkip(skip.deliveryUnitId)!;
+  }
+
+  private hasActiveUnitWork(unitId: string, evidenceVersion: number) {
+    return Boolean(this.db.prepare(`SELECT 1 WHERE EXISTS (
+        SELECT 1 FROM automation_jobs WHERE owner_type = 'delivery_unit' AND owner_id = ?
+          AND evidence_version = ? AND status = 'leased'
+      ) OR EXISTS (
+        SELECT 1 FROM delivery_quality_runs WHERE delivery_unit_id = ? AND evidence_version = ? AND status = 'running'
+      ) OR EXISTS (
+        SELECT 1 FROM stage_runs WHERE owner_type = 'delivery_unit' AND owner_id = ?
+          AND evidence_version = ? AND status = 'running'
+      )`).get(unitId, evidenceVersion, unitId, evidenceVersion, unitId, evidenceVersion));
   }
 
   overrideQualityInTransaction(input: DeliveryQualityOverrideInput): DeliveryQualityOverride {
@@ -1028,6 +1116,21 @@ function validateSkipInput(input: DeliverySkipInput) {
     || !validText(input.actor, 256) || !validText(input.reason, 4096)) {
     throw new Error("DELIVERY_UNIT_SKIP_INVALID");
   }
+}
+
+function validateRetryInput(input: DeliveryUnitRetryInput) {
+  const validText = (value: unknown, max: number) => typeof value === "string"
+    && value.trim().length > 0 && value.length <= max && !value.includes("\0");
+  if (!input || typeof input !== "object" || !validText(input.unitId, 256)
+    || !["implementation", "code_review", "automated_testing"].includes(input.target)
+    || !validText(input.actor, 256) || !validText(input.reason, 4096)) {
+    throw new Error("DELIVERY_UNIT_RETRY_INVALID");
+  }
+}
+
+function retryAction(target: DeliveryUnitRetryTarget): "implement" | "review" | "test" {
+  if (target === "implementation") return "implement";
+  return target === "code_review" ? "review" : "test";
 }
 
 function mapStaleDecision(row: StaleDecisionRow, sourceRows: StaleDecisionSourceRow[]): DeliveryStaleDecision {

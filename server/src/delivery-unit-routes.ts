@@ -47,6 +47,19 @@ export async function registerDeliveryUnitRoutes(app: FastifyInstance, { store }
     } catch (error) { return coordinationError(reply, error); }
   });
 
+  app.post("/api/delivery-units/:id/retry", async (request, reply) => {
+    const unitId = routeId((request.params as { id?: unknown }).id);
+    const body = objectBody(request.body);
+    const target = body.target;
+    const reason = boundedReason(body.reason);
+    if (!unitId || !reason || (target !== "implementation" && target !== "code_review"
+      && target !== "automated_testing")) return badRequest(reply, "DELIVERY_UNIT_RETRY_INVALID");
+    if (!store.deliveryUnits.get(unitId)) return notFound(reply, "DELIVERY_UNIT_NOT_FOUND");
+    try {
+      return store.deliveryCoordination.retryUnit({ unitId, target, actor: LOCAL_HUMAN_ACTOR, reason });
+    } catch (error) { return coordinationError(reply, error); }
+  });
+
   app.post("/api/requirements/:id/automation/pause", async (request, reply) => {
     return automationRoute(store, request.params, request.body, reply, "pause");
   });

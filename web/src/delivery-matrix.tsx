@@ -1,9 +1,18 @@
-import { AlertTriangle, Rows3 } from "lucide-react";
+import { useState, type FormEvent, type ReactNode } from "react";
+import { AlertTriangle, Pause, Play, RefreshCw, Repeat2, RotateCcw, Rows3, SkipForward } from "lucide-react";
 import {
   deliveryReleaseConditions,
   deliveryUnitPhases,
   deliveryUnitStatuses
 } from "@ai-workflow/shared";
+import { AccessibleDialog } from "./accessible-dialog.js";
+import {
+  deliveryUnitView,
+  type DeliveryEvidenceSummary,
+  type DeliveryUnitActionType,
+  type DeliveryUnitAllowedAction,
+  type RequirementAutomationView
+} from "./delivery-unit-view.js";
 
 type DeliveryUnitPhase = typeof deliveryUnitPhases[number];
 type DeliveryUnitStatus = typeof deliveryUnitStatuses[number];
@@ -17,6 +26,13 @@ export type DeliveryUnitView = {
   phase: DeliveryUnitPhase;
   status: DeliveryUnitStatus;
   evidenceVersion: number;
+  implementationEvidence?: DeliveryEvidenceSummary | null;
+  codeReviewEvidence?: DeliveryEvidenceSummary | null;
+  automatedTestingEvidence?: DeliveryEvidenceSummary | null;
+  blocker?: { code: string; message: string } | null;
+  dependencyReleases?: unknown[];
+  automation?: RequirementAutomationView;
+  allowedActions?: readonly DeliveryUnitAllowedAction[];
 };
 
 export type DeliveryDependencyView = {
@@ -40,6 +56,19 @@ export type DeliveryMatrixProps = {
   units: readonly DeliveryUnitView[];
   dependencies: readonly DeliveryDependencyView[];
   projects: readonly DeliveryProjectView[];
+  automation?: RequirementAutomationView & {
+    allowedActions: ReadonlyArray<{ type: "pause_automation" | "resume_automation"; reasonRequired: true }>;
+  };
+  onAction?: (request: DeliveryMatrixActionRequest) => Promise<void>;
+};
+
+export type DeliveryMatrixActionType = DeliveryUnitActionType | "pause_automation" | "resume_automation";
+export type DeliveryMatrixActionRequest = { type: DeliveryMatrixActionType; reason: string; unitId?: string };
+export type DeliveryMatrixAction = {
+  type: DeliveryMatrixActionType;
+  label: string;
+  reasonRequired: true;
+  unitId?: string;
 };
 
 type DeliveryStatusView = {
@@ -160,7 +189,10 @@ function cyclicUnitIds(
   return cyclic;
 }
 
-export function DeliveryMatrix({ units, dependencies, projects }: DeliveryMatrixProps) {
+export function DeliveryMatrix({ units, dependencies, projects, automation, onAction }: DeliveryMatrixProps) {
+  const [pendingAction, setPendingAction] = useState<DeliveryMatrixAction | null>(null);
+  const [actionBusy, setActionBusy] = useState(false);
+  const [actionError, setActionError] = useState("");
   const unitById = new Map(units.map((unit) => [unit.id, unit]));
   const projectById = new Map(projects.map((project) => [project.projectId, project]));
   const namedDependencies = dependencies.map((dependency) => {
@@ -173,11 +205,36 @@ export function DeliveryMatrix({ units, dependencies, projects }: DeliveryMatrix
     };
   });
   const rowViews = deliveryMatrixRowViews(units, namedDependencies);
+  const openAction = (action: DeliveryMatrixAction) => {
+    setActionError("");
+    setPendingAction(action);
+  };
+  const submitAction = async (reason: string) => {
+    if (!pendingAction || !onAction) return;
+    setActionBusy(true);
+    setActionError("");
+    try {
+      await onAction({ type: pendingAction.type, reason, ...(pendingAction.unitId
+        ? { unitId: pendingAction.unitId } : {}) });
+      setPendingAction(null);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "操作失败，请重试");
+    } finally {
+      setActionBusy(false);
+    }
+  };
 
   return <section className="delivery-matrix" aria-labelledby="delivery-matrix-title">
     <div className="delivery-matrix-title">
       <div><Rows3 size={17}/><h3 id="delivery-matrix-title">项目交付矩阵</h3></div>
-      <span>只读</span>
+      {automation && <div className={`delivery-automation-state ${automation.status}`}>
+        <span>{automation.status === "paused" ? `自动化已暂停${automation.reason ? ` · ${automation.reason}` : ""}` : "自动化运行中"}</span>
+        {onAction && automation.allowedActions.map((allowed) => <button type="button" className="secondary compact-action"
+          key={allowed.type} onClick={() => openAction({ ...allowed,
+            label: allowed.type === "pause_automation" ? "暂停自动化" : "恢复自动化" })}>
+          {allowed.type === "pause_automation" ? <Pause size={14}/> : <Play size={14}/>}<span>{allowed.type === "pause_automation" ? "暂停" : "恢复"}</span>
+        </button>)}
+      </div>}
     </div>
     <table className="delivery-matrix-table" aria-labelledby="delivery-matrix-title">
       <thead>
@@ -189,27 +246,47 @@ export function DeliveryMatrix({ units, dependencies, projects }: DeliveryMatrix
       {units.map((unit) => {
         const project = projectById.get(unit.projectId);
         const view = rowViews.get(unit.id)!;
+        const hasLiveDetail = unit.implementationEvidence !== undefined;
+        const live = deliveryUnitView({
+          ...unit,
+          implementationEvidence: unit.implementationEvidence ?? null,
+          codeReviewEvidence: unit.codeReviewEvidence ?? null,
+          automatedTestingEvidence: unit.automatedTestingEvidence ?? null,
+          blocker: unit.blocker ?? null,
+          dependencyReleases: [],
+          automation: unit.automation ?? { status: "active" },
+          allowedActions: unit.allowedActions ?? []
+        });
+        const graphInvalid = view.blocker === "交付依赖数据异常";
+        const blocker = graphInvalid ? view.blocker : unit.blocker === undefined ? view.blocker : live.blocker;
         const version = project?.projectVersionName ?? unit.projectVersionId;
         const branch = project?.projectVersionBranch;
         return <tr className="delivery-row-grid delivery-row-stack" data-delivery-row={unit.id} key={unit.id}>
           <td className="delivery-project"><span className="delivery-field-label" aria-hidden="true">项目 / 版本</span><b>{project?.projectName ?? unit.projectId}<span className="delivery-requirement">{unit.required ? "必需" : "可选"}</span></b><small>{version}{branch ? ` · ${branch}` : ""}</small></td>
           <DeliveryField label="依赖" value={view.dependencyLabel}/>
-          <DeliveryField label="实现" value={view.implementationLabel}/>
-          <DeliveryField label="Code Review" field="code-review" value={view.reviewLabel}/>
-          <DeliveryField label="自动化测试" field="automated-testing" value={view.automatedTestingLabel}/>
+          <DeliveryField label="实现" value={hasLiveDetail ? <EvidenceValue view={live.implementation}/> : view.implementationLabel}/>
+          <DeliveryField label="Code Review" field="code-review" value={hasLiveDetail ? <EvidenceValue view={live.review}/> : view.reviewLabel}/>
+          <DeliveryField label="自动化测试" field="automated-testing" value={hasLiveDetail ? <EvidenceValue view={live.testing}/> : view.automatedTestingLabel}/>
           <DeliveryField label="应用" value={view.applicationLabel}/>
-          <DeliveryField label="Blocker" value={view.blocker ?? "无"} blocker={Boolean(view.blocker) && (unit.status !== "skipped" || unit.required)}/>
-          <DeliveryField label="下一步" field="next-action" value={view.nextAction ?? "—"}/>
+          <DeliveryField label="Blocker" value={blocker ?? "无"} blocker={Boolean(blocker) && (unit.status !== "skipped" || unit.required)}/>
+          <DeliveryField label="下一步" field="next-action" value={onAction && live.actions.length > 0
+            ? <div className="delivery-actions">{live.actions.map((action) => <button type="button" className="secondary compact-action"
+              key={action.type} onClick={() => openAction({ ...action, unitId: unit.id })}>
+              <ActionIcon type={action.type}/><span>{action.label}</span>
+            </button>)}</div>
+            : "—"}/>
         </tr>;
       })}
       </tbody>
     </table>
+    {pendingAction && <DeliveryActionDialog action={pendingAction} busy={actionBusy} error={actionError}
+      onClose={() => { if (!actionBusy) setPendingAction(null); }} onSubmit={submitAction}/>}
   </section>;
 }
 
 function DeliveryField({ label, value, field, blocker = false }: {
   label: string;
-  value: string;
+  value: ReactNode;
   field?: string;
   blocker?: boolean;
 }) {
@@ -217,6 +294,57 @@ function DeliveryField({ label, value, field, blocker = false }: {
     <span className="delivery-field-label" aria-hidden="true">{label}</span>
     {blocker && <AlertTriangle size={14}/>}<span>{value}</span>
   </td>;
+}
+
+function EvidenceValue({ view }: { view: { label: string; tone: string } }) {
+  return <span className={`delivery-evidence ${view.tone}`}>{view.label}</span>;
+}
+
+function ActionIcon({ type }: { type: DeliveryUnitActionType }) {
+  if (type === "reuse_evidence") return <RotateCcw size={14}/>;
+  if (type === "rerun") return <Repeat2 size={14}/>;
+  if (type === "skip_optional") return <SkipForward size={14}/>;
+  return <RefreshCw size={14}/>;
+}
+
+export function DeliveryActionDialog({ action, busy, error, onClose, onSubmit }: {
+  action: DeliveryMatrixAction;
+  busy: boolean;
+  error: string;
+  onClose: () => void;
+  onSubmit: (reason: string) => Promise<void>;
+}) {
+  const [reason, setReason] = useState("");
+  const [validationError, setValidationError] = useState("");
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const normalized = reason.trim();
+    if (action.reasonRequired && !normalized) {
+      setValidationError("请填写操作原因");
+      return;
+    }
+    setValidationError("");
+    await onSubmit(normalized);
+  };
+  const title = action.type === "skip_optional" ? "跳过可选交付"
+    : action.type === "pause_automation" ? "暂停需求自动化"
+      : action.type === "resume_automation" ? "恢复需求自动化" : action.label;
+  const confirm = action.type === "skip_optional" ? "确认跳过"
+    : action.type === "pause_automation" ? "确认暂停"
+      : action.type === "resume_automation" ? "确认恢复" : "确认执行";
+  return <AccessibleDialog role="alertdialog" className="delivery-action-dialog" title={title}
+    subtitle="请记录本次操作依据" titleId="delivery-action-title"
+    descriptionId="delivery-action-description" busy={busy} onClose={onClose}>
+    <form onSubmit={submit}>
+      <label><span>操作原因</span><textarea aria-label="操作原因" value={reason} disabled={busy}
+        onChange={(event) => setReason(event.target.value)} data-autofocus/></label>
+      {(validationError || error) && <p className="form-error" role="alert">{validationError || error}</p>}
+      <div className="modal-actions"><button type="button" className="secondary" disabled={busy}
+        onClick={onClose}>取消</button><button type="submit" className="primary" disabled={busy}>
+        {busy && <RefreshCw className="spin" size={15}/>}<span>{confirm}</span>
+      </button></div>
+    </form>
+  </AccessibleDialog>;
 }
 
 function applicationLabel(unit: DeliveryUnitView): string {

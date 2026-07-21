@@ -572,6 +572,191 @@ describe("project and requirement association APIs",()=>{
   });
 });
 
+describe("live delivery unit detail", () => {
+  function createDeliveryFixture(options: { optional?: boolean } = {}) {
+    const store = new WorkflowStore(":memory:"); stores.push(store);
+    const primary = store.createProject(projectPayload(`/tmp/live-unit-primary-${crypto.randomUUID()}`));
+    const secondary = store.createProject(projectPayload(`/tmp/live-unit-secondary-${crypto.randomUUID()}`));
+    const requirement = createRequirement(store, {
+      title: "实时交付状态", businessProblem: "查看服务端权威动作", expectedOutcome: "只执行安全动作",
+      priority: "medium", primaryProjectId: primary.id
+    });
+    store.replaceRequirementProjects(requirement.id, [{
+      projectId: primary.id, projectVersionId: ensureProjectVersion(store, primary.id).id,
+      role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0
+    }, {
+      projectId: secondary.id, projectVersionId: ensureProjectVersion(store, secondary.id).id,
+      role: "collaborator", usage: "delivery", deliveryRequired: !options.optional,
+      moduleMode: "all", moduleIds: [], position: 1
+    }]);
+    const snapshot = store.createRequirementProjectSnapshot(requirement.id);
+    const plan = store.deliveryUnits.createPlan({ requirementId: requirement.id, snapshot, plan: {
+      units: [
+        { projectId: primary.id, moduleIds: [], acceptanceCriteria: ["primary passes"] },
+        { projectId: secondary.id, moduleIds: [], acceptanceCriteria: ["secondary passes"] }
+      ],
+      dependencies: [{ upstreamProjectId: primary.id, downstreamProjectId: secondary.id,
+        releaseCondition: "automated_testing_passed" }]
+    } });
+    return { store, requirement, plan, primary: plan.units[0]!, secondary: plan.units[1]! };
+  }
+
+  function completeImplementation(store: WorkflowStore, unitId: string) {
+    const claim = store.deliveryExecutions.claimImplementation(unitId, "test-model");
+    const evidenceVersion = claim.deliveryUnit.evidenceVersion;
+    return store.deliveryExecutions.completeImplementation(claim, {
+      branch: claim.version.branch, worktreePath: claim.version.worktreePath, baseCommit: claim.version.headCommit,
+      commands: [], diff: `diff --git a/a.ts b/a.ts\n+change-v${evidenceVersion}`,
+      diffHash: `hash-${unitId}-v${evidenceVersion}`,
+      changedFiles: [{ path: "a.ts", status: "modified", kind: "text", content: "change" }],
+      identity: { repositoryPath: claim.project.repoPath, gitCommonDir: `${claim.project.repoPath}/.git`,
+        worktreePath: claim.version.worktreePath, branch: claim.version.branch, headCommit: claim.version.headCommit },
+      manifest: { version: 1, entries: [] }, manifestHash: `manifest-${unitId}-v${evidenceVersion}`,
+      originalChars: 42, truncated: false, files: ["a.ts"], additions: 1, deletions: 0,
+      diagnostics: "", output: { summary: "implemented" }
+    });
+  }
+
+  function passQuality(store: WorkflowStore, unitId: string, evidenceVersion: number) {
+    for (const kind of ["code_review", "automated_testing"] as const) {
+      const claim = store.deliveryQuality.claim(unitId, evidenceVersion, kind);
+      expect(claim.status).toBe("running");
+      if (claim.status === "running") store.deliveryQuality.complete(claim, {
+        result: "passed", content: { summary: `${kind} passed` },
+        commandResults: kind === "automated_testing" ? [{ command: "npm test", code: 0 }] : [],
+        acceptanceTrace: kind === "automated_testing" ? [{ criterion: "primary passes", status: "passed" }] : []
+      });
+    }
+  }
+
+  it("returns current evidence, releases, pause state, blockers, and server-owned stale actions", async () => {
+    const { store, requirement, primary, secondary } = createDeliveryFixture();
+    completeImplementation(store, primary.id);
+    passQuality(store, primary.id, 1);
+    completeImplementation(store, secondary.id);
+    const db = (store as any).db;
+    db.prepare(`UPDATE delivery_units SET evidence_version = 2, phase = 'implementation', status = 'ready'
+      WHERE id = ?`).run(primary.id);
+    completeImplementation(store, primary.id);
+    passQuality(store, primary.id, 2);
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.automation).toEqual({ status: "active", allowedActions: [{ type: "pause_automation", reasonRequired: true }] });
+    expect(body.deliveryUnits.find((unit: any) => unit.id === primary.id)).toMatchObject({
+      implementationEvidence: { deliveryUnitId: primary.id, evidenceVersion: 2, diffHash: `hash-${primary.id}-v2` },
+      codeReviewEvidence: { kind: "code_review", result: "passed", inputEvidenceVersion: 2 },
+      automatedTestingEvidence: { kind: "automated_testing", result: "passed", inputEvidenceVersion: 2 },
+      blocker: null,
+      dependencyReleases: [expect.objectContaining({ direction: "outgoing", downstreamUnitId: secondary.id,
+        releasedByEvidenceVersion: 2, releasedAt: expect.any(String) })],
+      automation: { status: "active" }, allowedActions: []
+    });
+    expect(body.deliveryUnits.find((unit: any) => unit.id === secondary.id)).toMatchObject({
+      blocker: { code: "DELIVERY_EVIDENCE_POTENTIALLY_STALE", message: "上游证据已变化，需要确认复用或重新执行" },
+      dependencyReleases: [expect.objectContaining({ direction: "incoming", upstreamUnitId: primary.id })],
+      allowedActions: [
+        { type: "reuse_evidence", reasonRequired: true },
+        { type: "rerun", reasonRequired: true }
+      ]
+    });
+
+    const paused = await app.inject({ method: "POST", url: `/api/requirements/${requirement.id}/automation/pause`,
+      payload: { reason: "人工检查依赖变化", actor: "spoofed-client" } });
+    expect(paused.statusCode).toBe(200);
+    const pausedDetail = (await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` })).json();
+    expect(pausedDetail.automation).toMatchObject({ status: "paused", actor: "local-human",
+      reason: "人工检查依赖变化", allowedActions: [{ type: "resume_automation", reasonRequired: true }] });
+    expect(pausedDetail.deliveryUnits.every((unit: any) => unit.allowedActions.length === 0)).toBe(true);
+    expect(pausedDetail.deliveryUnits[0].automation).toMatchObject({ status: "paused", actor: "local-human" });
+    await app.close();
+  });
+
+  it("exposes only the failed job retry and optional skip, then enforces reason and fixed actor", async () => {
+    const { store, requirement, primary, secondary } = createDeliveryFixture({ optional: true });
+    const db = (store as any).db;
+    db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id IN (?, ?)").run(primary.id, secondary.id);
+    for (const unit of [primary, secondary]) {
+      store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id, evidenceVersion: 1,
+        action: "implement", payload: {}, maxAttempts: 1 });
+      const job = store.automationJobs.leaseNext(`worker-${unit.id.slice(0, 8)}`, new Date(), 30_000)!;
+      expect(store.automationJobs.fail(job.id, job.leaseOwner!, "terminal implementation failure", false)).toBe(true);
+    }
+    const app = await buildApp(store);
+
+    const detail = (await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` })).json();
+    expect(detail.deliveryUnits.find((unit: any) => unit.id === primary.id).allowedActions).toEqual([
+      { type: "retry_implementation", reasonRequired: true }
+    ]);
+    expect(detail.deliveryUnits.find((unit: any) => unit.id === secondary.id).allowedActions).toEqual([
+      { type: "skip_optional", reasonRequired: true }
+    ]);
+    expect((await app.inject({ method: "POST", url: `/api/delivery-units/${primary.id}/retry`,
+      payload: { target: "implementation", reason: " " } })).statusCode).toBe(400);
+    const retried = await app.inject({ method: "POST", url: `/api/delivery-units/${primary.id}/retry`,
+      payload: { target: "implementation", reason: "服务恢复后重试", actor: "spoofed-client" } });
+    expect(retried.statusCode).toBe(200);
+    expect(retried.json()).toMatchObject({ deliveryUnitId: primary.id, target: "implementation",
+      actor: "local-human", reason: "服务恢复后重试" });
+    expect(store.automationJobs.byDedupe(`implement:${primary.id}:v1`)).toMatchObject({ status: "pending", attempt: 0 });
+    expect(db.prepare(`SELECT actor, reason, target FROM delivery_unit_retry_audit
+      WHERE delivery_unit_id = ?`).get(primary.id)).toEqual({
+      actor: "local-human", reason: "服务恢复后重试", target: "implementation"
+    });
+    expect(() => db.prepare("UPDATE delivery_unit_retry_audit SET reason = 'rewritten' WHERE delivery_unit_id = ?")
+      .run(primary.id)).toThrow("DELIVERY_UNIT_RETRY_AUDIT_IMMUTABLE");
+    expect((await app.inject({ method: "POST", url: `/api/delivery-units/${secondary.id}/skip`,
+      payload: { reason: "" } })).statusCode).toBe(400);
+    const skipped = await app.inject({ method: "POST", url: `/api/delivery-units/${secondary.id}/skip`,
+      payload: { reason: "本版本不交付可选项目", actor: "spoofed-client" } });
+    expect(skipped.statusCode).toBe(200);
+    expect(skipped.json()).toMatchObject({ deliveryUnitId: secondary.id, actor: "local-human",
+      reason: "本版本不交付可选项目" });
+    const afterSkip = (await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` })).json();
+    expect(afterSkip.deliveryUnits.find((unit: any) => unit.id === secondary.id).allowedActions).toEqual([]);
+    await app.close();
+  });
+
+  it("keeps waiting and terminal units actionless and retries only the failed quality job", async () => {
+    const { store, requirement, primary, secondary } = createDeliveryFixture();
+    const app = await buildApp(store);
+    const initial = (await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` })).json();
+    expect(initial.deliveryUnits.find((unit: any) => unit.id === primary.id).allowedActions).toEqual([]);
+    expect(initial.deliveryUnits.find((unit: any) => unit.id === secondary.id)).toMatchObject({
+      status: "waiting_dependency", allowedActions: []
+    });
+
+    completeImplementation(store, primary.id);
+    store.automationJobs.cancelByOwnerVersion(primary.id, 1);
+    store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: primary.id, evidenceVersion: 1,
+      action: "review", payload: {}, maxAttempts: 1 });
+    const reviewJob = store.automationJobs.leaseNext("quality-worker", new Date(), 30_000)!;
+    expect(reviewJob.action).toBe("review");
+    expect(store.automationJobs.fail(reviewJob.id, "quality-worker", "review provider unavailable", false)).toBe(true);
+    const failedReview = (await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` })).json();
+    expect(failedReview.deliveryUnits.find((unit: any) => unit.id === primary.id).allowedActions).toEqual([
+      { type: "retry_code_review", reasonRequired: true }
+    ]);
+    expect((await app.inject({ method: "POST", url: `/api/delivery-units/${primary.id}/retry`,
+      payload: { target: "automated_testing", reason: "wrong target" } })).statusCode).toBe(409);
+    expect((await app.inject({ method: "POST", url: `/api/delivery-units/${primary.id}/retry`,
+      payload: { target: "code_review", reason: "review service recovered" } })).statusCode).toBe(200);
+
+    const db = (store as any).db;
+    store.automationJobs.cancelByOwnerVersion(primary.id, 1);
+    db.prepare("UPDATE delivery_units SET phase = 'acceptance_delivery', status = 'applied' WHERE id = ?")
+      .run(primary.id);
+    db.prepare("UPDATE delivery_units SET phase = 'acceptance_delivery', status = 'skipped' WHERE id = ?")
+      .run(secondary.id);
+    const terminal = (await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` })).json();
+    expect(terminal.deliveryUnits.map((unit: any) => unit.allowedActions)).toEqual([[], []]);
+    await app.close();
+  });
+});
+
 describe("stage run API", () => {
   it("exposes project memory and requirement knowledge changes",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);

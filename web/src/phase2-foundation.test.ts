@@ -11,7 +11,7 @@ describe("Phase 2 foundation UI", () => {
     ["quality_verification", "awaiting_approval", "质量验证"],
     ["acceptance_delivery", "ai_ready", "验收交付"],
     ["acceptance_delivery", "awaiting_approval", "验收交付"]
-  ] as const)("renders %s/%s as read-only evidence without requirement actions", (stage, status, stageLabel) => {
+  ] as const)("renders %s/%s as live delivery evidence without requirement-level actions", (stage, status, stageLabel) => {
     const markup = renderToStaticMarkup(React.createElement(RequirementDetail, {
       item: {
         id: "REQ-1", code: "REQ-0001", title: "Foundation",
@@ -32,7 +32,8 @@ describe("Phase 2 foundation UI", () => {
 
     expect(markup).toContain(stageLabel);
     expect(markup).toContain("自动化待接管");
-    expect(markup).toContain("只读");
+    expect(markup).toContain("项目交付进度");
+    expect(markup).not.toContain("只读");
     expect(markup).not.toContain("启动 AI");
     expect(markup).not.toContain("人工审批");
     expect(markup).not.toContain("手动启动本阶段 AI");

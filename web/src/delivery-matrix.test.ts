@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
+  DeliveryActionDialog,
   DeliveryMatrix,
   deliveryMatrixRowViews,
   deliveryRowView,
@@ -324,6 +325,50 @@ describe("DeliveryMatrix", () => {
     ]);
     expect(screen.getAllByRole("row")).toHaveLength(3);
     expect(screen.getByRole("cell", { name: /^Backend必需2\.4\.0/ })).toBeDefined();
+  });
+
+  it("renders only server-authorized unit actions and live evidence conclusions", () => {
+    const markup = renderToStaticMarkup(React.createElement(DeliveryMatrix, {
+      units: [{
+        id: "unit-stale", projectId: "web", projectVersionId: "web-v1", required: true,
+        phase: "quality_verification" as const, status: "potentially_stale" as const, evidenceVersion: 2,
+        implementationEvidence: { id: "implementation-2", evidenceVersion: 2, diffHash: "abcdef",
+          fileCount: 2, additions: 8, deletions: 1 },
+        codeReviewEvidence: { id: "review-2", kind: "code_review" as const, result: "passed" as const,
+          inputEvidenceVersion: 2 },
+        automatedTestingEvidence: null,
+        blocker: { code: "DELIVERY_EVIDENCE_POTENTIALLY_STALE", message: "上游证据已变化" },
+        dependencyReleases: [], automation: { status: "active" as const },
+        allowedActions: [{ type: "reuse_evidence" as const, reasonRequired: true },
+          { type: "rerun" as const, reasonRequired: true }]
+      }],
+      dependencies: [], projects: [{ projectId: "web", projectName: "Web" }],
+      onAction: async () => undefined
+    }));
+
+    expect(markup).toContain("2 个文件 · +8 / -1");
+    expect(markup).toContain("已通过");
+    expect(markup).toContain("等待证据");
+    expect(markup).toContain("复用证据");
+    expect(markup).toContain("重新执行");
+    expect(markup).not.toContain("重试实现");
+    expect(markup).not.toContain("跳过可选交付");
+    expect(markup).not.toContain("只读");
+  });
+
+  it("renders an accessible reason dialog without dropping an action error", () => {
+    const markup = renderToStaticMarkup(React.createElement(DeliveryActionDialog, {
+      action: { type: "skip_optional" as const, label: "跳过可选交付", reasonRequired: true,
+        unitId: "unit-docs" },
+      busy: false, error: "DELIVERY_UNIT_SKIP_NOT_ELIGIBLE",
+      onClose: () => undefined, onSubmit: async () => undefined
+    }));
+
+    expect(markup).toContain('role="alertdialog"');
+    expect(markup).toContain('aria-label="操作原因"');
+    expect(markup).toContain('role="alert"');
+    expect(markup).toContain("DELIVERY_UNIT_SKIP_NOT_ELIGIBLE");
+    expect(markup).toContain("确认跳过");
   });
 
   it("stacks the actual delivery row classes across the 901-937px gap and at 390px", () => {
