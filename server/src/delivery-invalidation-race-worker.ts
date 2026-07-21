@@ -17,6 +17,7 @@ type RaceMessage = {
     | { kind: "stale_resolution"; input: {
         unitId: string; decision: "reuse" | "rerun"; actor: string; reason: string;
       } }
+    | { kind: "skip"; input: { unitId: string; actor: string; reason: string } }
     | { kind: "lease"; workerId: string; now: string; leaseMs: number };
 };
 
@@ -41,6 +42,8 @@ parentPort.on("message", (message: RaceMessage) => {
       value = store.deliveryCoordination.pauseAutomation(message.operation.input);
     } else if (message.operation.kind === "stale_resolution") {
       value = store.deliveryCoordination.resolveStale(message.operation.input);
+    } else if (message.operation.kind === "skip") {
+      value = store.deliveryCoordination.skipOptional(message.operation.input);
     } else {
       value = store.automationJobs.leaseNext(message.operation.workerId, new Date(message.operation.now),
         message.operation.leaseMs);

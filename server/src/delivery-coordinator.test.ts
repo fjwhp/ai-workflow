@@ -157,8 +157,8 @@ function raceRound(worker: Worker, iteration: number, message: Record<string, un
   return { ready, result };
 }
 
-function staleFixture() {
-  const fixture = createFixture([[0, 1]], [true, true]);
+function staleFixture(required: boolean[] = [true, true]) {
+  const fixture = createFixture([[0, 1]], required);
   const [source, downstream] = fixture.units;
   settle(fixture.store, source!.id, "code_review", "passed");
   settle(fixture.store, source!.id, "automated_testing", "passed");
@@ -407,6 +407,88 @@ describe("DeliveryCoordinator", () => {
       WHERE owner_id = ? AND status = 'pending'`).get(applied!.id)).toEqual({ count: 0 });
   });
 
+  it("treats applied as a propagation barrier without clearing its released graph effect", () => {
+    const fixture = createFixture([[0, 1], [1, 2]], [true, true, true]);
+    const [source, applied, downstream] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, applied!.id);
+    settle(fixture.store, applied!.id, "code_review", "passed");
+    settle(fixture.store, applied!.id, "automated_testing", "passed");
+    fixture.database.prepare(`UPDATE delivery_units SET status = 'applied', completed_at = ? WHERE id = ?`)
+      .run(new Date().toISOString(), applied!.id);
+    fixture.database.prepare(`UPDATE automation_jobs SET status = 'canceled', updated_at = ?
+      WHERE owner_id = ? AND status = 'pending'`).run(new Date().toISOString(), applied!.id);
+
+    advanceImplementation(fixture.store, source!.id, 2);
+    settle(fixture.store, source!.id, "code_review", "passed", "applied-barrier-review");
+    settle(fixture.store, source!.id, "automated_testing", "passed", "applied-barrier-test");
+
+    expect(fixture.store.deliveryUnits.get(applied!.id)).toMatchObject({ status: "applied" });
+    expect(fixture.store.deliveryUnits.get(downstream!.id)).toMatchObject({ status: "ready" });
+    expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)
+      .find((edge) => edge.upstreamUnitId === applied!.id)).toMatchObject({ releasedByEvidenceVersion: 1 });
+    expect(fixture.store.automationJobs.byDedupe(`implement:${downstream!.id}:v1`)).toMatchObject({ status: "pending" });
+  });
+
+  it("treats skipped as a propagation barrier while preserving its previously released graph effect", () => {
+    const fixture = createFixture([[0, 1], [1, 2]], [true, false, true]);
+    const [source, skipped, downstream] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, skipped!.id);
+    settle(fixture.store, skipped!.id, "code_review", "passed");
+    settle(fixture.store, skipped!.id, "automated_testing", "passed");
+    fixture.store.deliveryCoordination.skipOptional({ unitId: skipped!.id,
+      actor: "local-human", reason: "terminal optional delivery" });
+
+    advanceImplementation(fixture.store, source!.id, 2);
+    settle(fixture.store, source!.id, "code_review", "passed", "skipped-barrier-review");
+    settle(fixture.store, source!.id, "automated_testing", "passed", "skipped-barrier-test");
+
+    expect(fixture.store.deliveryUnits.get(skipped!.id)).toMatchObject({ status: "skipped" });
+    expect(fixture.store.deliveryUnits.get(downstream!.id)).toMatchObject({ status: "ready" });
+    expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)
+      .find((edge) => edge.upstreamUnitId === skipped!.id)).toMatchObject({ releasedByEvidenceVersion: 1 });
+    expect(fixture.store.automationJobs.byDedupe(`implement:${downstream!.id}:v1`)).toMatchObject({ status: "pending" });
+  });
+
+  it("still revokes outgoing releases for a nonterminal invalidated descendant", () => {
+    const fixture = createFixture([[0, 1], [1, 2]], [true, true, true]);
+    const [source, middle] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, middle!.id);
+    settle(fixture.store, middle!.id, "code_review", "passed");
+    settle(fixture.store, middle!.id, "automated_testing", "passed");
+
+    advanceImplementation(fixture.store, source!.id, 2);
+
+    expect(fixture.store.deliveryUnits.get(middle!.id)).toMatchObject({ status: "potentially_stale" });
+    expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)
+      .find((edge) => edge.upstreamUnitId === middle!.id)).toMatchObject({ releasedByEvidenceVersion: null });
+  });
+
+  it("rolls skip audit, source coverage, and unit state back when source-link persistence fails", () => {
+    const fixture = staleFixture([true, false]);
+    fixture.database.exec(`CREATE TRIGGER fail_skip_source_insert BEFORE INSERT ON delivery_unit_skip_sources
+      BEGIN SELECT RAISE(ABORT, 'INJECTED_SKIP_SOURCE_FAILURE'); END;`);
+
+    expect(() => fixture.store.deliveryCoordination.skipOptional({ unitId: fixture.downstream.id,
+      actor: "local-human", reason: "rollback skip" })).toThrow("INJECTED_SKIP_SOURCE_FAILURE");
+
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_unit_skips
+      WHERE delivery_unit_id = ?`).get(fixture.downstream.id)).toEqual({ count: 0 });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_unit_skip_sources`).get()).toEqual({ count: 0 });
+    expect(fixture.store.deliveryUnits.get(fixture.downstream.id)).toMatchObject({ status: "potentially_stale" });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_evidence_invalidations invalidation
+      WHERE target_unit_id = ?
+        AND NOT EXISTS (SELECT 1 FROM delivery_stale_decision_sources source
+          WHERE source.invalidation_id = invalidation.id)
+        AND NOT EXISTS (SELECT 1 FROM delivery_unit_skip_sources source
+          WHERE source.invalidation_id = invalidation.id)`).get(fixture.downstream.id)).toEqual({ count: 1 });
+  });
+
   it("reruns once while resolving every active source fact", () => {
     const fixture = createFixture([[0, 1]], [true, true]);
     const [source, target] = fixture.units;
@@ -454,6 +536,45 @@ describe("DeliveryCoordinator", () => {
       expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
         WHERE owner_id = ? AND evidence_version = 2 AND action = 'implement'`)
         .get(fixture.downstream.id)).toEqual({ count: 1 });
+    }
+  });
+
+  it("serializes optional skip against stale resolution with one fact owner", { timeout: 30_000 }, async () => {
+    const skipWorker = invalidationRaceWorker();
+    const resolutionWorker = invalidationRaceWorker();
+    for (let iteration = 0; iteration < 20; iteration += 1) {
+      const fixture = staleFixture([true, false]);
+      const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
+      const skip = invalidationRaceRound(skipWorker, iteration, { databasePath: fixture.databasePath, barrier,
+        operation: { kind: "skip", input: { unitId: fixture.downstream.id,
+          actor: "local-human", reason: `skip race ${iteration}` } } });
+      await skip.ready;
+      const resolution = invalidationRaceRound(resolutionWorker, iteration, {
+        databasePath: fixture.databasePath, barrier, operation: { kind: "stale_resolution", input: {
+          unitId: fixture.downstream.id, decision: "reuse",
+          actor: "local-human", reason: `resolution race ${iteration}`
+        } }
+      });
+      await resolution.ready;
+      Atomics.store(new Int32Array(barrier), 1, 1);
+      Atomics.notify(new Int32Array(barrier), 1, 2);
+      const [skipResult, resolutionResult] = await Promise.all([skip.result, resolution.result]);
+
+      expect(skipResult.ok).toBe(true);
+      expect([true, false]).toContain(resolutionResult.ok);
+      expect(fixture.store.deliveryUnits.get(fixture.downstream.id)).toMatchObject({ status: "skipped" });
+      const ownership = fixture.database.prepare(`SELECT
+          (SELECT COUNT(*) FROM delivery_stale_decision_sources source
+            WHERE source.invalidation_id = invalidation.id) AS decision_count,
+          (SELECT COUNT(*) FROM delivery_unit_skip_sources source
+            WHERE source.invalidation_id = invalidation.id) AS skip_count
+        FROM delivery_evidence_invalidations invalidation WHERE target_unit_id = ?`)
+        .get(fixture.downstream.id) as { decision_count: number; skip_count: number };
+      expect(ownership.decision_count + ownership.skip_count).toBe(1);
+      expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_unit_skips
+        WHERE delivery_unit_id = ?`).get(fixture.downstream.id)).toEqual({ count: 1 });
+      expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+        WHERE owner_id = ? AND status = 'pending'`).get(fixture.downstream.id)).toEqual({ count: 0 });
     }
   });
 

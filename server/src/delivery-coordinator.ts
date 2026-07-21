@@ -308,7 +308,9 @@ export class DeliveryCoordinator {
     const descendants = this.descendantsFailClosed(change.sourceUnitId, change.requirementId);
     if (descendants.length === 0) return;
     const now = new Date().toISOString();
-    const affectedIds = [change.sourceUnitId, ...descendants.map((row) => row.id)];
+    const affectedIds = [change.sourceUnitId, ...descendants
+      .filter((row) => row.status !== "skipped" && row.status !== "applied")
+      .map((row) => row.id)];
     const placeholders = affectedIds.map(() => "?").join(", ");
     this.db.prepare(`UPDATE delivery_dependencies SET released_by_evidence_version = NULL, released_at = NULL
       WHERE upstream_unit_id IN (${placeholders})`).run(...affectedIds);
@@ -634,26 +636,31 @@ export class DeliveryCoordinator {
   }
 
   private descendantsFailClosed(sourceUnitId: string, requirementId: string) {
-    const rows = this.db.prepare(`WITH RECURSIVE walk(id, path, cycle) AS (
+    const rows = this.db.prepare(`WITH RECURSIVE walk(id, path, cycle, blocked) AS (
         SELECT dependency.downstream_unit_id,
-          '|' || dependency.upstream_unit_id || '|' || dependency.downstream_unit_id || '|', 0
+          '|' || dependency.upstream_unit_id || '|' || dependency.downstream_unit_id || '|', 0, 0
         FROM delivery_dependencies dependency
         WHERE dependency.requirement_id = ? AND dependency.upstream_unit_id = ?
         UNION ALL
         SELECT dependency.downstream_unit_id,
           walk.path || dependency.downstream_unit_id || '|',
-          CASE WHEN instr(walk.path, '|' || dependency.downstream_unit_id || '|') > 0 THEN 1 ELSE 0 END
-        FROM walk JOIN delivery_dependencies dependency ON dependency.upstream_unit_id = walk.id
+          CASE WHEN instr(walk.path, '|' || dependency.downstream_unit_id || '|') > 0 THEN 1 ELSE 0 END,
+          CASE WHEN walk.blocked = 1 OR parent.status IN ('skipped', 'applied') THEN 1 ELSE 0 END
+        FROM walk
+        JOIN delivery_units parent ON parent.id = walk.id
+        JOIN delivery_dependencies dependency ON dependency.upstream_unit_id = walk.id
         WHERE dependency.requirement_id = ? AND walk.cycle = 0
       )
-      SELECT walk.id, walk.cycle, unit.phase, unit.status, unit.evidence_version
+      SELECT walk.id, walk.cycle, walk.blocked, unit.phase, unit.status, unit.evidence_version
       FROM walk JOIN delivery_units unit ON unit.id = walk.id
       ORDER BY unit.position, unit.created_at, unit.rowid`).all(
       requirementId, sourceUnitId, requirementId
-    ) as Array<{ id: string; cycle: number; phase: string; status: string; evidence_version: number }>;
+    ) as Array<{
+      id: string; cycle: number; blocked: number; phase: string; status: string; evidence_version: number;
+    }>;
     if (rows.some((row) => row.cycle === 1)) throw new Error("DELIVERY_DEPENDENCY_CYCLE_RUNTIME");
     const unique = new Map<string, typeof rows[number]>();
-    for (const row of rows) if (!unique.has(row.id)) unique.set(row.id, row);
+    for (const row of rows) if (row.blocked === 0 && !unique.has(row.id)) unique.set(row.id, row);
     return [...unique.values()];
   }
 
