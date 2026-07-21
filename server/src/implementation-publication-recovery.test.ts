@@ -303,6 +303,34 @@ describe("implementation publication startup recovery", () => {
     });
   });
 
+  it("rolls back every runtime settlement write when bound run settlement fails", async () => {
+    let inject = true;
+    const fixture = await preparedFixture({
+      beforeRecoverySettlement: () => {
+        if (inject) throw new Error("INJECTED_RECOVERY_SETTLEMENT_FAILURE");
+      }
+    });
+    applyImplementationPatchSync(fixture.repo, fixture.patch);
+
+    await expect(fixture.store.deliveryExecutions.reconcilePreparedImplementation(fixture.claim))
+      .rejects.toThrow("INJECTED_RECOVERY_SETTLEMENT_FAILURE");
+
+    expect(fixture.db.prepare(`SELECT status, cleanup_status FROM implementation_publication_journals
+      WHERE delivery_unit_id = ?`).get(fixture.unit.id)).toEqual({
+      status: "prepared", cleanup_status: "pending"
+    });
+    expect(fixture.store.automationJobs.get(fixture.job.id)).toMatchObject({ status: "leased" });
+    expect(fixture.store.deliveryUnits.get(fixture.unit.id)).toMatchObject({ status: "running" });
+    expect(fixture.store.deliveryExecutions.listExecutions(fixture.unit.id, 1)[0])
+      .toMatchObject({ status: "running" });
+    expect(fixture.store.getStageRun(fixture.claim.runId)).toMatchObject({ status: "running" });
+
+    inject = false;
+    await fixture.store.deliveryExecutions.reconcilePreparedImplementation(fixture.claim);
+    expect(fixture.store.deliveryUnits.get(fixture.unit.id)).toMatchObject({ status: "ready" });
+    expect(fixture.store.getStageRun(fixture.claim.runId)).toMatchObject({ status: "interrupted" });
+  });
+
   it("fences a stale child so the replacement child is the only publisher", async () => {
     const fixture = await preparedFixture();
     await fixture.store.reconcileImplementationPublications();
@@ -429,7 +457,11 @@ async function killChildAtBarrier(child: ReturnType<typeof spawn>, barrier: stri
   expect({ code, signal }).toEqual({ code: null, signal: "SIGKILL" });
 }
 
-async function preparedFixture(options: { clock?: () => Date; afterApply?: () => void } = {}) {
+async function preparedFixture(options: {
+  clock?: () => Date;
+  afterApply?: () => void;
+  beforeRecoverySettlement?: () => void;
+} = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "implementation-publication-recovery-")));
   directories.push(root);
   const repo = join(root, "repo");
@@ -441,7 +473,10 @@ async function preparedFixture(options: { clock?: () => Date; afterApply?: () =>
   execFileSync("git", ["-C", repo, "add", "--all"]);
   execFileSync("git", ["-C", repo, "commit", "--quiet", "-m", "base"]);
   const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const store = new WorkflowStore(databasePath, options.clock, { afterApply: options.afterApply });
+  const store = new WorkflowStore(databasePath, options.clock, {
+    afterApply: options.afterApply,
+    beforeRecoverySettlement: options.beforeRecoverySettlement
+  });
   stores.push(store);
   const project = store.createProject({
     name: "Recovery", repoPath: repo, defaultBranch: "main", allowedCommands: [], sensitivePatterns: []

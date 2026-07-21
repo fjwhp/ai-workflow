@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,7 @@ import { evidenceFingerprint, evidenceManifestHash } from "./evidence-tree.js";
 import { createAutomationWorker } from "./automation-worker.js";
 import { captureImplementationPatchSync } from "./implementation-publication.js";
 import { getWorktreeSnapshot } from "./repository.js";
+import { prepareDeliveryImplementationAttempt } from "./coding-agent.js";
 
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
@@ -49,8 +50,12 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function createFixture(databasePath = ":memory:", clock: () => Date = () => new Date()) {
-  const store = new WorkflowStore(databasePath, clock);
+function createFixture(
+  databasePath = ":memory:",
+  clock: () => Date = () => new Date(),
+  publicationHooks: { afterApply?: () => void; beforeRecoverySettlement?: () => void } = {}
+) {
+  const store = new WorkflowStore(databasePath, clock, publicationHooks);
   stores.push(store);
   const project = store.createProject({
     name: "Frozen project",
@@ -176,6 +181,80 @@ function claimOnNextTurn(store: WorkflowStore, unitId: string) {
 }
 
 describe("DeliveryExecutionService", () => {
+  it("retries in the same worker after runtime publication recovery settles the old run", async () => {
+    let now = new Date("2026-07-22T09:00:00.000Z");
+    let codingCalls = 0;
+    const fixture = createFixture(fileBackedDatabase(), () => now, {
+      afterApply: () => {
+        if (codingCalls === 1) now = new Date(now.getTime() + 61_000);
+      }
+    });
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "runtime-publication-worker-")));
+    directories.push(root);
+    const repo = join(root, "repo");
+    execFileSync("git", ["init", "--quiet", "--initial-branch=main", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "Test"]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+    writeFileSync(join(repo, "base.txt"), "base\n");
+    execFileSync("git", ["-C", repo, "add", "--all"]);
+    execFileSync("git", ["-C", repo, "commit", "--quiet", "-m", "base"]);
+    const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const db = (fixture.store as any).db;
+    db.prepare("UPDATE projects SET repo_path = ? WHERE id = ?").run(repo, fixture.project.id);
+    db.prepare("UPDATE project_versions SET branch = 'main', worktree_path = ?, head_commit = ? WHERE id = ?")
+      .run(repo, head, fixture.version.id);
+    db.prepare(`UPDATE delivery_unit_snapshots SET repo_path = ?, branch = 'main',
+      worktree_path = ?, head_commit = ? WHERE delivery_unit_id = ?`)
+      .run(repo, repo, head, fixture.unit.id);
+    fixture.store.automationJobs.enqueue({
+      ownerType: "delivery_unit", ownerId: fixture.unit.id, evidenceVersion: 1,
+      action: "implement", payload: {}, maxAttempts: 3
+    });
+    const coding = vi.fn(async (input: any) => {
+      codingCalls += 1;
+      const path = join(input.attemptWorkspace.worktreePath, `attempt-${codingCalls}.txt`);
+      writeFileSync(path, `attempt ${codingCalls}\n`);
+      const snapshot = await getWorktreeSnapshot(input.attemptWorkspace.worktreePath);
+      return {
+        runId: `runtime-${codingCalls}`, ...input.attemptWorkspace,
+        summary: `attempt ${codingCalls}`, commands: [] as const,
+        diff: snapshot.diff, files: snapshot.files, additions: snapshot.additions,
+        deletions: snapshot.deletions, evidenceSnapshot: snapshot
+      };
+    });
+    const service = new RealDeliveryExecutionService(
+      fixture.store.deliveryExecutions, coding, "test-model", fixture.store.deliveryQuality, {},
+      { prepare: prepareDeliveryImplementationAttempt }
+    );
+    const worker = createAutomationWorker({
+      jobs: fixture.store.automationJobs,
+      handlers: createDeliveryAutomationHandlers(service),
+      workerId: "runtime-publication-worker", leaseMs: 30_000, clock: () => now
+    });
+
+    await expect(worker.drainOnce()).resolves.toBe(true);
+
+    expect(captureImplementationPatchSync(repo)).toHaveLength(0);
+    expect(fixture.store.automationJobs.byDedupe(`implement:${fixture.unit.id}:v1`))
+      .toMatchObject({ status: "pending", attempt: 1 });
+    expect(fixture.store.deliveryUnits.get(fixture.unit.id)).toMatchObject({ status: "ready" });
+    expect(fixture.store.deliveryExecutions.listExecutions(fixture.unit.id, 1)[0])
+      .toMatchObject({ status: "failed" });
+    expect(db.prepare(`SELECT status FROM stage_runs WHERE owner_type = 'delivery_unit'
+      AND owner_id = ? AND evidence_version = 1`).get(fixture.unit.id)).toEqual({ status: "interrupted" });
+
+    await expect(worker.drainOnce()).resolves.toBe(true);
+
+    expect(coding).toHaveBeenCalledTimes(2);
+    expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toEqual(expect.any(Object));
+    expect(db.prepare(`SELECT count(*) AS count FROM coding_evidence
+      WHERE delivery_unit_id = ? AND evidence_version = 1`).get(fixture.unit.id)).toEqual({ count: 1 });
+    expect(db.prepare(`SELECT action, count(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND evidence_version = 1 GROUP BY action ORDER BY action`).all(fixture.unit.id)).toEqual([
+      { action: "implement", count: 1 }, { action: "review", count: 1 }, { action: "test", count: 1 }
+    ]);
+  }, 20_000);
+
   it("runs immediate publication reconciliation when final publication fails", async () => {
     const fixture = createFixture();
     const claimed = fixture.store.deliveryExecutions.claimImplementation(fixture.unit.id, "test-model");

@@ -36,6 +36,8 @@ Before preparation, the service ignores custom-agent evidence as an authority an
 
 Preparation reserves the exact token/worker lease through a bounded publication deadline. Final settlement fences expiry again after synchronous apply. If that fence or later settlement fails after apply, the service immediately runs the same prepared/exact-patch reconciliation path, reverses the patch, and makes the job retryable without waiting for restart.
 
+Canceling a prepared journal settles its journal-bound stage run, execution, delivery unit, evidence version, and exact automation job in the same `BEGIN IMMEDIATE` transaction. The old run becomes interrupted, its execution becomes failed, and the unit becomes ready only when the exact job remains retryable; terminal jobs leave the unit failed. Startup abandoned/expired recovery uses the same compare-and-set settlement helper, so it cannot mutate a newer attempt or evidence version.
+
 No asynchronous Git process is awaited while the SQLite transaction is open. SQLite rollback cannot undo the filesystem, so a row remains `prepared` when the process dies after apply and before commit. Startup reconciliation consumes that durable intent.
 
 Calling settlement again with the same job and claim token returns the already completed evidence without rerunning the coding agent or duplicating evidence/jobs. A different or stale token fails closed.
