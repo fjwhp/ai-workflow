@@ -67,8 +67,8 @@ export function subscribeDeliveryLiveRefresh(input: {
       if (fallbackTimer !== null) return;
       fallbackTimer = schedule(() => {
         if (!active) return;
-        void refresh();
-        connect();
+        if (source) void refresh();
+        else connect();
       }, input.fallbackMs ?? 2_000);
     };
   };

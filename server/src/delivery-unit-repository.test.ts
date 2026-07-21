@@ -114,6 +114,22 @@ function expectNoWrites(fixture: ReturnType<typeof createFixture>) {
 }
 
 describe("DeliveryUnitRepository", () => {
+  it("rejects delivery plans beyond the bounded detail response limits before graph processing", () => {
+    const fixture = createFixture();
+    const tooManyUnits = Array.from({ length: 65 }, (_, index) => unit(`project-${index}`));
+    expect(() => fixture.store.deliveryUnits.createPlan({
+      ...fixture.input, plan: { units: tooManyUnits, dependencies: [] }
+    })).toThrow("DELIVERY_PLAN_UNIT_LIMIT");
+    expectNoWrites(fixture);
+
+    const tooManyDependencies = Array.from({ length: 2_049 }, () =>
+      dependency(fixture.backend.id, fixture.frontend.id));
+    expect(() => fixture.store.deliveryUnits.createPlan({
+      ...fixture.input, plan: { ...fixture.input.plan, dependencies: tooManyDependencies }
+    })).toThrow("DELIVERY_PLAN_DEPENDENCY_LIMIT");
+    expectNoWrites(fixture);
+  });
+
   it("persists a frozen delivery plan with stable positions and dependency-derived statuses", () => {
     const fixture = createFixture();
 

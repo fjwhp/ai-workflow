@@ -1,29 +1,49 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import type { DeliveryQualityKind } from "./delivery-quality-repository.js";
 import type { WorkflowStore } from "./store.js";
-import { watchDeliveryEvents } from "./delivery-live-events.js";
+import { createDeliveryEventWriter, DeliveryEventHub } from "./delivery-live-events.js";
 
 const LOCAL_HUMAN_ACTOR = "local-human";
 
 interface RouteOptions { store: WorkflowStore }
 
 export async function registerDeliveryUnitRoutes(app: FastifyInstance, { store }: RouteOptions) {
+  const deliveryEvents = new DeliveryEventHub({
+    generation: (requirementId) => store.getDeliveryEventGeneration(requirementId)
+  });
+  app.addHook("onClose", () => deliveryEvents.close());
   app.get("/api/requirements/:id/delivery-events", async (request, reply) => {
     const requirementId = routeId((request.params as { id?: unknown }).id);
     if (!requirementId || !store.getRequirement(requirementId)) {
       return notFound(reply, "REQUIREMENT_NOT_FOUND");
     }
+    let writer: ReturnType<typeof createDeliveryEventWriter> | undefined;
+    let subscription: ReturnType<DeliveryEventHub["subscribe"]>;
+    try {
+      subscription = deliveryEvents.subscribe(requirementId, (generation) => writer?.emit(generation));
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "DELIVERY_EVENT_LIMIT";
+      if (code === "DELIVERY_EVENT_GLOBAL_LIMIT" || code === "DELIVERY_EVENT_REQUIREMENT_LIMIT") {
+        return reply.code(429).send({ error: code });
+      }
+      throw error;
+    }
     reply.hijack();
     reply.raw.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-      "Access-Control-Allow-Origin": request.headers.origin || "*"
+      Connection: "keep-alive"
     });
-    const stop = watchDeliveryEvents({
-      generation: () => store.getDeliveryEventGeneration(requirementId),
-      emit: (generation) => reply.raw.write(`event: delivery-change\ndata: ${JSON.stringify({ generation })}\n\n`)
-    });
+    writer = createDeliveryEventWriter(reply.raw);
+    writer.emit(subscription.initialGeneration);
+    let stopped = false;
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      request.raw.off("close", stop);
+      writer?.close();
+      subscription.close();
+    };
     request.raw.once("close", stop);
   });
 

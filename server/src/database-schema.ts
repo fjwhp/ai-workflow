@@ -489,6 +489,11 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
       FOREIGN KEY(job_id) REFERENCES automation_jobs(id)
     );
+    CREATE TABLE IF NOT EXISTS delivery_event_generations (
+      requirement_id TEXT PRIMARY KEY,
+      generation INTEGER NOT NULL CHECK(typeof(generation) = 'integer' AND generation >= 0),
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id) ON DELETE CASCADE
+    );
     CREATE TABLE IF NOT EXISTS rework_contexts (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, approval_id TEXT NOT NULL UNIQUE, artifact_id TEXT,
       source_stage TEXT NOT NULL, target_stage TEXT NOT NULL, actor_type TEXT NOT NULL, decision_at TEXT NOT NULL,
@@ -1104,5 +1109,92 @@ export function createPhase2Schema(db: DatabaseSync) {
     CREATE TRIGGER IF NOT EXISTS delivery_unit_retry_audit_immutable_delete
     BEFORE DELETE ON delivery_unit_retry_audit
     BEGIN SELECT RAISE(ABORT, 'DELIVERY_UNIT_RETRY_AUDIT_IMMUTABLE'); END;
+  `);
+  createDeliveryEventGenerationTriggers(db);
+}
+
+function createDeliveryEventGenerationTriggers(db: DatabaseSync) {
+  const requirementTables = [
+    "delivery_units", "delivery_dependencies", "executions", "coding_evidence",
+    "delivery_quality_runs", "delivery_quality_evidence", "delivery_quality_overrides",
+    "delivery_contract_evidence", "delivery_evidence_invalidations", "delivery_stale_decisions",
+    "requirement_automation_state", "requirement_automation_audit", "delivery_unit_skips",
+    "delivery_unit_retry_audit"
+  ];
+  for (const table of requirementTables) createRequirementGenerationTriggers(db, table);
+  createRequirementGenerationTriggers(db, "stage_runs", "NEW.owner_type = 'delivery_unit'", "OLD.owner_type = 'delivery_unit'");
+  createOwnerGenerationTriggers(db, "automation_jobs");
+}
+
+function createRequirementGenerationTriggers(
+  db: DatabaseSync,
+  table: string,
+  newCondition = "1",
+  oldCondition = "1"
+) {
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS notify_delivery_event_${table}_insert
+    AFTER INSERT ON ${table} WHEN ${newCondition}
+    BEGIN
+      INSERT INTO delivery_event_generations(requirement_id, generation)
+        VALUES (NEW.requirement_id, 1)
+        ON CONFLICT(requirement_id) DO UPDATE SET generation = generation + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS notify_delivery_event_${table}_update
+    AFTER UPDATE ON ${table} WHEN (${oldCondition}) OR (${newCondition})
+    BEGIN
+      INSERT INTO delivery_event_generations(requirement_id, generation)
+        SELECT OLD.requirement_id, 1 WHERE ${oldCondition}
+        ON CONFLICT(requirement_id) DO UPDATE SET generation = generation + 1;
+      INSERT INTO delivery_event_generations(requirement_id, generation)
+        SELECT NEW.requirement_id, 1
+        WHERE (${newCondition}) AND NEW.requirement_id IS NOT OLD.requirement_id
+        ON CONFLICT(requirement_id) DO UPDATE SET generation = generation + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS notify_delivery_event_${table}_delete
+    AFTER DELETE ON ${table} WHEN ${oldCondition}
+    BEGIN
+      INSERT INTO delivery_event_generations(requirement_id, generation)
+        VALUES (OLD.requirement_id, 1)
+        ON CONFLICT(requirement_id) DO UPDATE SET generation = generation + 1;
+    END;
+  `);
+}
+
+function createOwnerGenerationTriggers(db: DatabaseSync, table: string) {
+  const newRequirement = `SELECT requirement_id FROM delivery_units
+    WHERE NEW.owner_type = 'delivery_unit' AND id = NEW.owner_id`;
+  const oldRequirement = `SELECT requirement_id FROM delivery_units
+    WHERE OLD.owner_type = 'delivery_unit' AND id = OLD.owner_id`;
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS notify_delivery_event_${table}_insert
+    AFTER INSERT ON ${table} WHEN NEW.owner_type = 'delivery_unit'
+    BEGIN
+      INSERT INTO delivery_event_generations(requirement_id, generation)
+        SELECT requirement_id, 1 FROM delivery_units
+          WHERE NEW.owner_type = 'delivery_unit' AND id = NEW.owner_id
+        ON CONFLICT(requirement_id) DO UPDATE SET generation = generation + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS notify_delivery_event_${table}_update
+    AFTER UPDATE ON ${table} WHEN OLD.owner_type = 'delivery_unit' OR NEW.owner_type = 'delivery_unit'
+    BEGIN
+      INSERT INTO delivery_event_generations(requirement_id, generation)
+        SELECT requirement_id, 1 FROM delivery_units
+          WHERE OLD.owner_type = 'delivery_unit' AND id = OLD.owner_id
+        ON CONFLICT(requirement_id) DO UPDATE SET generation = generation + 1;
+      INSERT INTO delivery_event_generations(requirement_id, generation)
+        SELECT requirement_id, 1 FROM delivery_units
+          WHERE NEW.owner_type = 'delivery_unit' AND id = NEW.owner_id
+            AND NOT EXISTS (${oldRequirement} INTERSECT ${newRequirement})
+        ON CONFLICT(requirement_id) DO UPDATE SET generation = generation + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS notify_delivery_event_${table}_delete
+    AFTER DELETE ON ${table} WHEN OLD.owner_type = 'delivery_unit'
+    BEGIN
+      INSERT INTO delivery_event_generations(requirement_id, generation)
+        SELECT requirement_id, 1 FROM delivery_units
+          WHERE OLD.owner_type = 'delivery_unit' AND id = OLD.owner_id
+        ON CONFLICT(requirement_id) DO UPDATE SET generation = generation + 1;
+    END;
   `);
 }

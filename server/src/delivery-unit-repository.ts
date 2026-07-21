@@ -4,6 +4,8 @@ import {
   deliveryReleaseConditions,
   deliveryUnitPhases,
   deliveryUnitStatuses,
+  MAX_DELIVERY_PLAN_DEPENDENCIES,
+  MAX_DELIVERY_PLAN_UNITS,
   requirementProjectsInputSchema,
   validateDeliveryGraph,
   type DeliveryDependencyInput
@@ -278,6 +280,10 @@ export class DeliveryUnitRepository {
     }
     if (!input.plan || !Array.isArray(input.plan.units) || input.plan.units.length === 0 || !Array.isArray(input.plan.dependencies)) {
       throw new Error("DELIVERY_PLAN_INVALID");
+    }
+    if (input.plan.units.length > MAX_DELIVERY_PLAN_UNITS) throw new Error("DELIVERY_PLAN_UNIT_LIMIT");
+    if (input.plan.dependencies.length > MAX_DELIVERY_PLAN_DEPENDENCIES) {
+      throw new Error("DELIVERY_PLAN_DEPENDENCY_LIMIT");
     }
     for (const unit of input.plan.units) {
       if (

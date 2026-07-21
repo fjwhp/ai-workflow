@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { MAX_AUTOMATION_EVIDENCE_VERSION } from "@ai-workflow/shared";
+import { deliveryUnitHasActiveWork } from "./delivery-unit-eligibility.js";
 import { AutomationJobRepository } from "./automation-job-repository.js";
 import { deliveryUnitDependenciesSatisfied } from "./delivery-unit-eligibility.js";
 import {
@@ -413,12 +414,10 @@ export class DeliveryCoordinator {
       throw new Error("DELIVERY_STALE_RESOLUTION_STALE");
     }
     const sourceSnapshots = active.map((fact) => ({ fact, current: this.currentSourceEvidence(fact) }));
-    const liveJob = this.db.prepare(`SELECT 1 FROM automation_jobs WHERE owner_type = 'delivery_unit'
-      AND owner_id = ? AND evidence_version = ? AND status IN ('pending', 'leased') LIMIT 1`)
-      .get(unit.id, unit.evidence_version);
     const newerEvidence = this.db.prepare(`SELECT 1 FROM coding_evidence
       WHERE delivery_unit_id = ? AND evidence_version > ? LIMIT 1`).get(unit.id, unit.evidence_version);
-    if (liveJob || newerEvidence) throw new Error("DELIVERY_STALE_RESOLUTION_CONFLICT");
+    if (deliveryUnitHasActiveWork(this.db, unit.id, unit.evidence_version, { includePendingJobs: true })
+      || newerEvidence) throw new Error("DELIVERY_STALE_RESOLUTION_CONFLICT");
     const dependenciesSatisfied = this.dependenciesSatisfied(unit.id);
     if (input.decision === "reuse" && !dependenciesSatisfied) {
       throw new Error("DELIVERY_STALE_DEPENDENCIES_UNSATISFIED");

@@ -9,6 +9,8 @@ export const deliveryUnitStatuses = [
 export const deliveryReleaseConditions = ["automated_testing_passed"] as const;
 export const automationActions = ["implement", "review", "test", "apply"] as const;
 export const MAX_AUTOMATION_EVIDENCE_VERSION = 2_147_483_647;
+export const MAX_DELIVERY_PLAN_UNITS = 64;
+export const MAX_DELIVERY_PLAN_DEPENDENCIES = 2_048;
 
 export type AutomationAction = typeof automationActions[number];
 
@@ -22,6 +24,8 @@ export function validateDeliveryGraph(
   projectIds: string[],
   dependencies: DeliveryDependencyInput[]
 ): { order: string[] } {
+  if (projectIds.length > MAX_DELIVERY_PLAN_UNITS) throw new Error("DELIVERY_PLAN_UNIT_LIMIT");
+  if (dependencies.length > MAX_DELIVERY_PLAN_DEPENDENCIES) throw new Error("DELIVERY_PLAN_DEPENDENCY_LIMIT");
   const projectIdSet = new Set(projectIds);
   const adjacency = new Map(projectIds.map((projectId) => [projectId, [] as string[]]));
   const inDegrees = new Map(projectIds.map((projectId) => [projectId, 0]));

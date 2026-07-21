@@ -97,7 +97,7 @@ describe("project versions fresh schema", () => {
       "idx_requirement_projects_active_primary",
       "idx_requirement_projects_active_project"
     ]);
-    expect(schemaObjectNames(database, "trigger")).toEqual([
+    expect(schemaObjectNames(database, "trigger").filter((name) => !name.startsWith("notify_delivery_event_"))).toEqual([
       "coding_evidence_immutable_delete",
       "coding_evidence_immutable_update",
       "delivery_contract_evidence_immutable_delete",

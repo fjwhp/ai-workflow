@@ -785,6 +785,105 @@ describe("live delivery unit detail", () => {
     }
   });
 
+  it.each(["leased_job", "running_quality", "running_stage"] as const)(
+    "keeps stale resolution unauthorized while %s remains active",
+    async (activeKind) => {
+      const fixture = createDeliveryFixture();
+      completeImplementation(fixture.store, fixture.primary.id);
+      passQuality(fixture.store, fixture.primary.id, 1);
+      completeImplementation(fixture.store, fixture.secondary.id);
+      const db = (fixture.store as any).db;
+
+      if (activeKind === "running_quality") {
+        const claim = fixture.store.deliveryQuality.claim(
+          fixture.secondary.id, 1, "code_review", "stale-quality-active"
+        );
+        expect(claim.status).toBe("running");
+      }
+      if (activeKind === "running_stage") {
+        db.prepare(`UPDATE stage_runs SET status = 'running', completed_at = NULL
+          WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = 1
+            AND stage = 'implementation'`).run(fixture.secondary.id);
+        db.prepare(`UPDATE executions SET status = 'running', completed_at = NULL
+          WHERE delivery_unit_id = ? AND evidence_version = 1`).run(fixture.secondary.id);
+      }
+
+      db.prepare(`UPDATE delivery_units SET evidence_version = 2, phase = 'implementation', status = 'ready'
+        WHERE id = ?`).run(fixture.primary.id);
+      completeImplementation(fixture.store, fixture.primary.id);
+      passQuality(fixture.store, fixture.primary.id, 2);
+      expect(fixture.store.deliveryUnits.get(fixture.secondary.id)).toMatchObject({
+        status: "potentially_stale", evidenceVersion: 1
+      });
+
+      if (activeKind === "leased_job") {
+        const job = db.prepare(`SELECT id FROM automation_jobs WHERE owner_type = 'delivery_unit'
+          AND owner_id = ? AND evidence_version = 1 ORDER BY rowid LIMIT 1`).get(fixture.secondary.id) as { id: string };
+        db.prepare(`UPDATE automation_jobs SET status = 'leased', attempt = 1,
+          lease_owner = 'stale-active-worker', lease_expires_at = '2099-01-01T00:00:00.000Z',
+          updated_at = ? WHERE id = ?`).run(new Date().toISOString(), job.id);
+      }
+
+      const app = await buildApp(fixture.store);
+      const detail = (await app.inject({ method: "GET",
+        url: `/api/requirements/${fixture.requirement.id}` })).json();
+      expect(detail.deliveryUnits.find((unit: any) => unit.id === fixture.secondary.id).allowedActions).toEqual([]);
+      expect((await app.inject({ method: "POST",
+        url: `/api/delivery-units/${fixture.secondary.id}/stale-resolution`,
+        payload: { decision: "rerun", reason: "active work must settle first" } })).statusCode).toBe(409);
+      await app.close();
+    }
+  );
+
+  it("keeps delivery detail query count constant as the unit count grows", () => {
+    const queryCount = (unitCount: number) => {
+      const store = new WorkflowStore(":memory:");
+      stores.push(store);
+      const projects = Array.from({ length: unitCount }, (_, index) => {
+        const project = store.createProject({ name: `Batch ${unitCount}-${index}`,
+          repoPath: `/tmp/batch-detail-${unitCount}-${index}`, defaultBranch: "main",
+          allowedCommands: [], sensitivePatterns: [] });
+        const version = store.createProjectVersion({ projectId: project.id, name: "v1",
+          branch: `feature/batch-${index}`, baseBranch: "main",
+          worktreePath: `/tmp/batch-detail-${unitCount}-${index}-worktree`, headCommit: "head" });
+        return { project, version };
+      });
+      const requirement = store.createRequirement({ title: `Batch detail ${unitCount}`,
+        businessProblem: "Detail query count must remain bounded as delivery units grow",
+        expectedOutcome: "One fixed batch of detail queries", priority: "medium",
+        primaryProjectId: projects[0]!.project.id, primaryProjectVersionId: projects[0]!.version.id });
+      store.replaceRequirementProjects(requirement.id, projects.map(({ project, version }, index) => ({
+        projectId: project.id, projectVersionId: version.id,
+        role: index === 0 ? "primary" as const : "collaborator" as const,
+        usage: "delivery" as const, deliveryRequired: true, moduleMode: "all" as const,
+        moduleIds: [], position: index
+      })));
+      store.deliveryUnits.createPlan({ requirementId: requirement.id,
+        snapshot: store.createRequirementProjectSnapshot(requirement.id), plan: {
+          units: projects.map(({ project }) => ({ projectId: project.id, moduleIds: [], acceptanceCriteria: ["done"] })),
+          dependencies: []
+        } });
+      const db = (store as any).db;
+      const originalPrepare = db.prepare;
+      let prepares = 0;
+      db.prepare = function(this: any, ...args: any[]) {
+        prepares += 1;
+        return originalPrepare.apply(this, args);
+      };
+      try {
+        expect(store.deliveryUnitDetails.getForRequirement(requirement.id).units).toHaveLength(unitCount);
+      } finally {
+        db.prepare = originalPrepare;
+      }
+      return prepares;
+    };
+
+    const small = queryCount(2);
+    const large = queryCount(16);
+    expect(large).toBe(small);
+    expect(large).toBeLessThanOrEqual(10);
+  });
+
   it("exposes only the failed job retry and optional skip, then enforces reason and fixed actor", async () => {
     const { store, requirement, primary, secondary } = createDeliveryFixture({ optional: true });
     const db = (store as any).db;

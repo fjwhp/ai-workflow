@@ -1,73 +1,148 @@
-import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 type TimerHandle = any;
 
+export const MAX_DELIVERY_EVENT_SUBSCRIBERS = 64;
+export const MAX_DELIVERY_EVENT_SUBSCRIBERS_PER_REQUIREMENT = 8;
+
 export function deliveryEventGeneration(db: DatabaseSync, requirementId: string): string {
-  const snapshot = [
-    rows(db, `SELECT id, phase, status, evidence_version, updated_at, completed_at
-      FROM delivery_units WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, upstream_unit_id, downstream_unit_id, released_by_evidence_version, released_at
-      FROM delivery_dependencies WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT job.id, job.action, job.status, job.attempt, job.evidence_version, job.updated_at
-      FROM automation_jobs job JOIN delivery_units unit ON unit.id = job.owner_id
-      WHERE job.owner_type = 'delivery_unit' AND unit.requirement_id = ? ORDER BY job.id`, requirementId),
-    rows(db, `SELECT id, delivery_unit_id, evidence_version, status, completed_at
-      FROM executions WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, delivery_unit_id, evidence_version, diff_hash, created_at
-      FROM coding_evidence WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, delivery_unit_id, evidence_version, kind, status, completed_at
-      FROM delivery_quality_runs WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, delivery_unit_id, evidence_version, kind, result, completed_at
-      FROM delivery_quality_evidence WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, delivery_unit_id, evidence_version, kind, created_at
-      FROM delivery_quality_overrides WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, delivery_unit_id, evidence_version, contract_hash, created_at
-      FROM delivery_contract_evidence WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, source_unit_id, target_unit_id, target_evidence_version, created_at
-      FROM delivery_evidence_invalidations WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, delivery_unit_id, target_evidence_version, decision, resulting_evidence_version, created_at
-      FROM delivery_stale_decisions WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT requirement_id, status, actor, reason, updated_at
-      FROM requirement_automation_state WHERE requirement_id = ?`, requirementId),
-    rows(db, `SELECT id, action, actor, reason, created_at
-      FROM requirement_automation_audit WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, delivery_unit_id, evidence_version, created_at
-      FROM delivery_unit_skips WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, delivery_unit_id, evidence_version, target, job_id, created_at
-      FROM delivery_unit_retry_audit WHERE requirement_id = ? ORDER BY id`, requirementId),
-    rows(db, `SELECT id, owner_id, evidence_version, stage, status, completed_at
-      FROM stage_runs WHERE requirement_id = ? AND owner_type = 'delivery_unit' ORDER BY id`, requirementId)
-  ];
-  return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+  const row = db.prepare(`SELECT generation FROM delivery_event_generations
+    WHERE requirement_id = ?`).get(requirementId) as { generation: number } | undefined;
+  return String(row?.generation ?? 0);
 }
 
-export function watchDeliveryEvents(input: {
-  generation: () => string;
-  emit: (generation: string) => void;
+interface DeliveryEventHubOptions {
+  generation: (requirementId: string) => string;
   setInterval?: (callback: () => void, delay: number) => TimerHandle;
   clearInterval?: (handle: TimerHandle) => void;
   intervalMs?: number;
-}) {
-  const schedule = input.setInterval ?? globalThis.setInterval;
-  const cancel = input.clearInterval ?? globalThis.clearInterval;
-  let stopped = false;
-  let current = input.generation();
-  input.emit(current);
-  const timer = schedule(() => {
-    if (stopped) return;
-    const next = input.generation();
-    if (next === current) return;
-    current = next;
-    input.emit(next);
-  }, input.intervalMs ?? 500);
-  return () => {
-    if (stopped) return;
-    stopped = true;
-    cancel(timer);
+  maxSubscribers?: number;
+  maxSubscribersPerRequirement?: number;
+}
+
+interface DeliveryEventWatcher {
+  current: string;
+  listeners: Set<(generation: string) => void>;
+  timer: TimerHandle;
+}
+
+export class DeliveryEventHub {
+  private readonly watchers = new Map<string, DeliveryEventWatcher>();
+  private readonly schedule: (callback: () => void, delay: number) => TimerHandle;
+  private readonly cancel: (handle: TimerHandle) => void;
+  private readonly intervalMs: number;
+  private readonly maxSubscribers: number;
+  private readonly maxSubscribersPerRequirement: number;
+  private subscriberCount = 0;
+  private closed = false;
+
+  constructor(private readonly options: DeliveryEventHubOptions) {
+    this.schedule = options.setInterval ?? globalThis.setInterval;
+    this.cancel = options.clearInterval ?? globalThis.clearInterval;
+    this.intervalMs = options.intervalMs ?? 500;
+    this.maxSubscribers = options.maxSubscribers ?? MAX_DELIVERY_EVENT_SUBSCRIBERS;
+    this.maxSubscribersPerRequirement = options.maxSubscribersPerRequirement
+      ?? MAX_DELIVERY_EVENT_SUBSCRIBERS_PER_REQUIREMENT;
+  }
+
+  subscribe(requirementId: string, listener: (generation: string) => void) {
+    if (this.closed) throw new Error("DELIVERY_EVENT_HUB_CLOSED");
+    if (this.subscriberCount >= this.maxSubscribers) throw new Error("DELIVERY_EVENT_GLOBAL_LIMIT");
+    let watcher = this.watchers.get(requirementId);
+    if (watcher && watcher.listeners.size >= this.maxSubscribersPerRequirement) {
+      throw new Error("DELIVERY_EVENT_REQUIREMENT_LIMIT");
+    }
+    if (!watcher) {
+      if (this.maxSubscribersPerRequirement < 1) throw new Error("DELIVERY_EVENT_REQUIREMENT_LIMIT");
+      const created: DeliveryEventWatcher = {
+        current: this.options.generation(requirementId),
+        listeners: new Set(),
+        timer: undefined
+      };
+      created.timer = this.schedule(() => this.poll(requirementId, created), this.intervalMs);
+      watcher = created;
+      this.watchers.set(requirementId, watcher);
+    }
+    watcher.listeners.add(listener);
+    this.subscriberCount += 1;
+    let active = true;
+    return {
+      initialGeneration: watcher.current,
+      close: () => {
+        if (!active) return;
+        active = false;
+        const current = this.watchers.get(requirementId);
+        if (!current || !current.listeners.delete(listener)) return;
+        this.subscriberCount -= 1;
+        if (current.listeners.size > 0) return;
+        this.cancel(current.timer);
+        this.watchers.delete(requirementId);
+      }
+    };
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const watcher of this.watchers.values()) this.cancel(watcher.timer);
+    this.watchers.clear();
+    this.subscriberCount = 0;
+  }
+
+  private poll(requirementId: string, watcher: DeliveryEventWatcher) {
+    if (this.closed || this.watchers.get(requirementId) !== watcher) return;
+    const next = this.options.generation(requirementId);
+    if (next === watcher.current) return;
+    watcher.current = next;
+    for (const listener of [...watcher.listeners]) listener(next);
+  }
+}
+
+interface DeliveryEventWritable {
+  write(chunk: string): boolean;
+  once(event: "drain", listener: () => void): unknown;
+  off(event: "drain", listener: () => void): unknown;
+}
+
+export function createDeliveryEventWriter(response: DeliveryEventWritable) {
+  let closed = false;
+  let blocked = false;
+  let drainAttached = false;
+  let pending: string | null = null;
+
+  const onDrain = () => {
+    drainAttached = false;
+    if (closed) return;
+    blocked = false;
+    const latest = pending;
+    pending = null;
+    if (latest !== null) write(latest);
+  };
+  const write = (generation: string) => {
+    if (closed) return;
+    if (blocked) {
+      pending = generation;
+      return;
+    }
+    if (response.write(formatDeliveryEvent(generation))) return;
+    blocked = true;
+    if (!drainAttached) {
+      drainAttached = true;
+      response.once("drain", onDrain);
+    }
+  };
+  return {
+    emit: write,
+    close: () => {
+      if (closed) return;
+      closed = true;
+      pending = null;
+      if (drainAttached) response.off("drain", onDrain);
+      drainAttached = false;
+    }
   };
 }
 
-function rows(db: DatabaseSync, query: string, requirementId: string) {
-  return db.prepare(query).all(requirementId);
+function formatDeliveryEvent(generation: string) {
+  return `event: delivery-change\ndata: ${JSON.stringify({ generation })}\n\n`;
 }

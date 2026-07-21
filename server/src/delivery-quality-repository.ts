@@ -271,7 +271,7 @@ export class DeliveryQualityRepository {
     validateKind(kind);
     const row = this.db.prepare(`SELECT * FROM delivery_quality_evidence
       WHERE delivery_unit_id = ? AND kind = ? ORDER BY evidence_version DESC LIMIT 1`).get(unitId, kind);
-    return row ? mapEvidence(row as any) : null;
+    return row ? mapDeliveryQualityEvidence(row as any) : null;
   }
 
   private assertLiveAutomationLease(
@@ -303,12 +303,12 @@ export class DeliveryQualityRepository {
 
   private getEvidence(id: string): DeliveryQualityEvidence | null {
     const row = this.db.prepare("SELECT * FROM delivery_quality_evidence WHERE id = ?").get(id);
-    return row ? mapEvidence(row as any) : null;
+    return row ? mapDeliveryQualityEvidence(row as any) : null;
   }
 
   private getEvidenceByRun(runId: string): DeliveryQualityEvidence | null {
     const row = this.db.prepare("SELECT * FROM delivery_quality_evidence WHERE run_id = ?").get(runId);
-    return row ? mapEvidence(row as any) : null;
+    return row ? mapDeliveryQualityEvidence(row as any) : null;
   }
 
   private loadFrozenSensitivePatterns(unitId: string): string[] {
@@ -451,7 +451,7 @@ function canonicalPersistedJson(value: unknown): string {
   };
   return JSON.stringify(normalize(parsed));
 }
-function mapEvidence(row: any): DeliveryQualityEvidence {
+export function mapDeliveryQualityEvidence(row: any): DeliveryQualityEvidence {
   return {
     id: row.id, runId: row.run_id, requirementId: row.requirement_id, deliveryUnitId: row.delivery_unit_id,
     evidenceVersion: row.evidence_version, kind: row.kind, result: row.result,

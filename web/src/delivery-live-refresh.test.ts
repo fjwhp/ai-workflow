@@ -53,8 +53,11 @@ describe("delivery live refresh", () => {
     expect(intervals.size).toBe(1);
     intervals.values().next().value?.();
     await Promise.resolve();
-    expect(refreshes).toBe(2);
+    expect(refreshes).toBe(1);
     expect(sources).toHaveLength(2);
+    sources[1]!.source.emit("delivery-change");
+    await Promise.resolve();
+    expect(refreshes).toBe(2);
     sources[1]!.source.onopen?.();
     expect(intervals.size).toBe(0);
 

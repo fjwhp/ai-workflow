@@ -178,6 +178,37 @@ describe("Phase 2 database schema", () => {
     expect(indexes).toContain("idx_delivery_evidence_invalidation_active");
     db.close();
   });
+
+  it("installs transactional delivery generation triggers for every live-detail source", () => {
+    const path = databasePath();
+    const first = new WorkflowStore(path);
+    first.close();
+    const legacy = new DatabaseSync(path);
+    const generationTriggers = (legacy.prepare(`SELECT name FROM sqlite_master
+      WHERE type = 'trigger' AND name LIKE 'notify_delivery_event_%'`).all() as Array<{ name: string }>);
+    for (const trigger of generationTriggers) legacy.exec(`DROP TRIGGER ${trigger.name}`);
+    legacy.exec("DROP TABLE IF EXISTS delivery_event_generations");
+    legacy.close();
+
+    const upgraded = new WorkflowStore(path);
+    upgraded.close();
+    const db = new DatabaseSync(path);
+    expect(tableNames(db)).toContain("delivery_event_generations");
+    const watchedTables = [
+      "delivery_units", "delivery_dependencies", "automation_jobs", "executions", "coding_evidence",
+      "delivery_quality_runs", "delivery_quality_evidence", "delivery_quality_overrides",
+      "delivery_contract_evidence", "delivery_evidence_invalidations", "delivery_stale_decisions",
+      "requirement_automation_state", "requirement_automation_audit", "delivery_unit_skips",
+      "delivery_unit_retry_audit", "stage_runs"
+    ];
+    const triggerTables = (db.prepare(`SELECT tbl_name, COUNT(*) AS count FROM sqlite_master
+      WHERE type = 'trigger' AND name LIKE 'notify_delivery_event_%' GROUP BY tbl_name`).all() as Array<{
+        tbl_name: string; count: number;
+      }>);
+    const counts = new Map(triggerTables.map((row) => [row.tbl_name, row.count]));
+    for (const table of watchedTables) expect(counts.get(table), table).toBe(3);
+    db.close();
+  });
   it("creates only the Phase 2 delivery schema on a fresh database", () => {
     const db = openFreshStoreDatabase();
     expect(tableNames(db)).toEqual(expect.arrayContaining([

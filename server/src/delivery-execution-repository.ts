@@ -332,7 +332,7 @@ function mapDeliveryExecution(row: any) {
   };
 }
 
-function mapDeliveryCodingEvidence(row: any) {
+export function mapDeliveryCodingEvidence(row: any) {
   const files = JSON.parse(row.files_json || "[]");
   return {
     id: row.id,

@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -45,48 +46,117 @@ function completeImplementation(store: WorkflowStore, unitId: string) {
 }
 
 describe("delivery unit control routes", () => {
-  it("tracks delivery generation changes and stops its watcher cleanly", async () => {
+  it("reads a transactional monotonic delivery generation with one bounded query", async () => {
     const liveModule = await import("./delivery-live-events.js").catch(() => ({}));
     const deliveryEventGeneration = (liveModule as any).deliveryEventGeneration;
-    const watchDeliveryEvents = (liveModule as any).watchDeliveryEvents;
     expect(deliveryEventGeneration).toBeTypeOf("function");
-    expect(watchDeliveryEvents).toBeTypeOf("function");
-    if (!deliveryEventGeneration || !watchDeliveryEvents) return;
+    if (!deliveryEventGeneration) return;
+    let queryCount = 0;
+    const fakeDb = {
+      prepare: () => {
+        queryCount += 1;
+        return { get: () => ({ generation: 41 }), all: () => [] };
+      }
+    };
+    expect(deliveryEventGeneration(fakeDb as any, "bounded-requirement")).toBe("41");
+    expect(queryCount).toBe(1);
+
     const { store, requirement, unit } = fixture();
     const db = (store as any).db;
     const initial = deliveryEventGeneration(db, requirement.id);
+    db.exec("BEGIN IMMEDIATE");
+    db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id = ?").run(unit.id);
+    const uncommitted = deliveryEventGeneration(db, requirement.id);
+    expect(Number(uncommitted)).toBeGreaterThan(Number(initial));
+    db.exec("ROLLBACK");
+    expect(deliveryEventGeneration(db, requirement.id)).toBe(initial);
+
     db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id = ?").run(unit.id);
     const unitChanged = deliveryEventGeneration(db, requirement.id);
-    expect(unitChanged).not.toBe(initial);
+    expect(Number(unitChanged)).toBeGreaterThan(Number(initial));
     store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id, evidenceVersion: 1,
       action: "implement", payload: {}, maxAttempts: 3 });
     const jobChanged = deliveryEventGeneration(db, requirement.id);
-    expect(jobChanged).not.toBe(unitChanged);
+    expect(Number(jobChanged)).toBeGreaterThan(Number(unitChanged));
     store.deliveryCoordination.pauseAutomation({ requirementId: requirement.id, actor: "local-human",
       reason: "watch pause" });
     const pauseChanged = deliveryEventGeneration(db, requirement.id);
-    expect(pauseChanged).not.toBe(jobChanged);
+    expect(Number(pauseChanged)).toBeGreaterThan(Number(jobChanged));
+  });
 
-    let tick: (() => void) | undefined;
-    let cleared = false;
-    const events: string[] = [];
-    const stop = watchDeliveryEvents({
-      generation: () => deliveryEventGeneration(db, requirement.id),
-      emit: (generation: string) => events.push(generation),
-      setInterval: (callback: () => void) => { tick = callback; return 7; },
-      clearInterval: (id: number) => { expect(id).toBe(7); cleared = true; }
+  it("shares one watcher per requirement and enforces subscriber quotas", async () => {
+    const liveModule = await import("./delivery-live-events.js").catch(() => ({}));
+    const DeliveryEventHub = (liveModule as any).DeliveryEventHub;
+    expect(DeliveryEventHub).toBeTypeOf("function");
+    if (!DeliveryEventHub) return;
+    const timers = new Map<number, () => void>();
+    const cleared: number[] = [];
+    let nextTimer = 1;
+    let generation = 1;
+    const hub = new DeliveryEventHub({
+      generation: () => String(generation),
+      setInterval: (callback: () => void) => {
+        const id = nextTimer++;
+        timers.set(id, callback);
+        return id;
+      },
+      clearInterval: (id: number) => { cleared.push(id); timers.delete(id); },
+      maxSubscribers: 3,
+      maxSubscribersPerRequirement: 2
     });
-    expect(events).toEqual([pauseChanged]);
-    db.prepare("UPDATE delivery_units SET status = 'ready' WHERE id = ?").run(unit.id);
-    tick?.();
-    expect(events).toHaveLength(2);
-    tick?.();
-    expect(events).toHaveLength(2);
-    stop();
-    expect(cleared).toBe(true);
-    db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id = ?").run(unit.id);
-    tick?.();
-    expect(events).toHaveLength(2);
+    const firstEvents: string[] = [];
+    const secondEvents: string[] = [];
+    const first = hub.subscribe("r1", (value: string) => firstEvents.push(value));
+    const second = hub.subscribe("r1", (value: string) => secondEvents.push(value));
+    expect(first.initialGeneration).toBe("1");
+    expect(second.initialGeneration).toBe("1");
+    expect(timers.size).toBe(1);
+    expect(() => hub.subscribe("r1", () => undefined)).toThrow("DELIVERY_EVENT_REQUIREMENT_LIMIT");
+    const third = hub.subscribe("r2", () => undefined);
+    expect(() => hub.subscribe("r3", () => undefined)).toThrow("DELIVERY_EVENT_GLOBAL_LIMIT");
+
+    generation = 2;
+    timers.values().next().value?.();
+    expect(firstEvents).toEqual(["2"]);
+    expect(secondEvents).toEqual(["2"]);
+    first.close();
+    expect(timers.size).toBe(2);
+    second.close();
+    expect(timers.size).toBe(1);
+    third.close();
+    expect(timers.size).toBe(0);
+    expect(cleared).toHaveLength(2);
+    hub.close();
+  });
+
+  it("coalesces delivery events while the response is backpressured and cleans up drain listeners", async () => {
+    const liveModule = await import("./delivery-live-events.js").catch(() => ({}));
+    const createDeliveryEventWriter = (liveModule as any).createDeliveryEventWriter;
+    expect(createDeliveryEventWriter).toBeTypeOf("function");
+    if (!createDeliveryEventWriter) return;
+    class SlowResponse extends EventEmitter {
+      writes: string[] = [];
+      blocked = true;
+      write(chunk: string) {
+        this.writes.push(chunk);
+        return !this.blocked;
+      }
+    }
+    const response = new SlowResponse();
+    const writer = createDeliveryEventWriter(response);
+    writer.emit("1");
+    writer.emit("2");
+    writer.emit("3");
+    expect(response.writes).toHaveLength(1);
+    expect(response.listenerCount("drain")).toBe(1);
+    response.blocked = false;
+    response.emit("drain");
+    expect(response.writes).toHaveLength(2);
+    expect(response.writes[1]).toContain('"generation":"3"');
+    expect(response.listenerCount("drain")).toBe(0);
+    writer.close();
+    writer.emit("4");
+    expect(response.writes).toHaveLength(2);
   });
 
   it("returns a stable not-found response for a missing delivery event stream", async () => {
@@ -124,6 +194,49 @@ describe("delivery unit control routes", () => {
     } finally {
       controller.abort();
       await reader?.cancel().catch(() => undefined);
+      await app.close();
+    }
+  });
+
+  it("does not reflect an untrusted Origin on the delivery event stream", async () => {
+    const { store, requirement } = fixture();
+    const app = await buildApp(store);
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const controller = new AbortController();
+    try {
+      const response = await fetch(`${address}/api/requirements/${requirement.id}/delivery-events`, {
+        headers: { Origin: "https://evil.example" }, signal: controller.signal
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("access-control-allow-origin")).toBeNull();
+    } finally {
+      controller.abort();
+      await app.close();
+    }
+  });
+
+  it("rejects a delivery event connection beyond the per-requirement quota", async () => {
+    const { store, requirement } = fixture();
+    const app = await buildApp(store);
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const controllers: AbortController[] = [];
+    const responses: Response[] = [];
+    try {
+      for (let connection = 0; connection < 8; connection += 1) {
+        const controller = new AbortController();
+        controllers.push(controller);
+        const response = await fetch(`${address}/api/requirements/${requirement.id}/delivery-events`, {
+          signal: controller.signal
+        });
+        expect(response.status).toBe(200);
+        responses.push(response);
+      }
+      const rejected = await fetch(`${address}/api/requirements/${requirement.id}/delivery-events`);
+      expect(rejected.status).toBe(429);
+      expect(await rejected.json()).toEqual({ error: "DELIVERY_EVENT_REQUIREMENT_LIMIT" });
+    } finally {
+      for (const controller of controllers) controller.abort();
+      await Promise.all(responses.map((response) => response.body?.cancel().catch(() => undefined)));
       await app.close();
     }
   });

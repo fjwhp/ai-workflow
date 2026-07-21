@@ -100,8 +100,7 @@ export class WorkflowStore {
     this.deliveryExecutionRepository = new DeliveryExecutionRepository(this.db);
     this.deliveryQualityRepository = new DeliveryQualityRepository(this.db, clock);
     const deliveryCoordinator = new DeliveryCoordinator(this.db, this.deliveryQualityRepository);
-    const deliveryUnitDetails = new DeliveryUnitDetailRepository(this.db, this.deliveryUnitRepository,
-      this.deliveryExecutionRepository, this.deliveryQualityRepository);
+    const deliveryUnitDetails = new DeliveryUnitDetailRepository(this.db, this.deliveryUnitRepository);
     this.executionRepository = new ExecutionRepository(this.db);
     const automationJobRepository = new AutomationJobRepository(this.db, clock);
     this.deliveryUnits = {

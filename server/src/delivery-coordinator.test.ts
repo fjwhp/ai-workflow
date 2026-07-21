@@ -780,7 +780,7 @@ describe("DeliveryCoordinator", () => {
       .toEqual({ count: 2 });
   });
 
-  it("replaces an orphan running quality attempt when stale evidence is reused", () => {
+  it("waits for an orphan running quality attempt to settle before stale evidence is reused", () => {
     const fixture = staleFixture();
     const job = fixture.store.automationJobs.byDedupe(`review:${fixture.downstream.id}:v1`)!;
     const now = new Date().toISOString();
@@ -789,8 +789,15 @@ describe("DeliveryCoordinator", () => {
       VALUES ('orphan-review', ?, ?, 1, 'code_review', ?, 'running', NULL, ?, NULL)`)
       .run(fixture.requirement.id, fixture.downstream.id, job.claimToken, now);
 
-    fixture.store.deliveryCoordination.resolveStale({ unitId: fixture.downstream.id,
-      decision: "reuse", reason: "quality work remains valid", actor: "local-human" });
+    const input = { unitId: fixture.downstream.id,
+      decision: "reuse" as const, reason: "quality work remains valid", actor: "local-human" };
+    expect(() => fixture.store.deliveryCoordination.resolveStale(input))
+      .toThrow("DELIVERY_STALE_RESOLUTION_CONFLICT");
+    fixture.database.prepare(`UPDATE delivery_quality_runs
+      SET status = 'aborted', error = 'DELIVERY_QUALITY_AUTOMATION_ORPHANED', completed_at = ?
+      WHERE id = 'orphan-review'`).run(new Date().toISOString());
+
+    fixture.store.deliveryCoordination.resolveStale(input);
 
     expect(fixture.database.prepare("SELECT status, error FROM delivery_quality_runs WHERE id = 'orphan-review'").get())
       .toEqual({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_ORPHANED" });

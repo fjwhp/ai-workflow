@@ -1,8 +1,12 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { DeliveryExecutionRepository } from "./delivery-execution-repository.js";
-import type { DeliveryQualityRepository } from "./delivery-quality-repository.js";
+import { mapDeliveryCodingEvidence } from "./delivery-execution-repository.js";
+import {
+  mapDeliveryQualityEvidence,
+  type DeliveryQualityEvidence,
+  type DeliveryQualityKind
+} from "./delivery-quality-repository.js";
 import type { DeliveryDependency, DeliveryUnit, DeliveryUnitRepository } from "./delivery-unit-repository.js";
-import { deliveryUnitDependenciesSatisfied } from "./delivery-unit-eligibility.js";
+import { isDeliveryUnitActiveWork } from "./delivery-unit-eligibility.js";
 
 export type DeliveryUnitActionType =
   | "retry_implementation"
@@ -44,18 +48,34 @@ export interface DeliveryUnitDetailPersistence {
   getForRequirement(requirementId: string): DeliveryRequirementDetail;
 }
 
+interface CurrentJobState {
+  pending: boolean;
+  leased: boolean;
+  failedActions: Set<string>;
+  latestFailure?: string | null;
+}
+
+interface DeliveryDetailSnapshot {
+  implementationEvidence: Map<string, unknown>;
+  qualityEvidence: Map<string, DeliveryQualityEvidence>;
+  jobs: Map<string, CurrentJobState>;
+  activeRuns: Set<string>;
+  activeInvalidations: Set<string>;
+  dependenciesSatisfied: Map<string, boolean>;
+  dependencyReleases: Map<string, Array<DeliveryDependency & { direction: "incoming" | "outgoing" }>>;
+}
+
 export class DeliveryUnitDetailRepository {
   constructor(
     private readonly db: DatabaseSync,
-    private readonly units: DeliveryUnitRepository,
-    private readonly executions: DeliveryExecutionRepository,
-    private readonly quality: DeliveryQualityRepository
+    private readonly units: DeliveryUnitRepository
   ) {}
 
   getForRequirement(requirementId: string): DeliveryRequirementDetail {
     const units = this.units.listForRequirement(requirementId);
     const dependencies = this.units.listDependencies(requirementId);
     const automation = this.automationState(requirementId);
+    const snapshot = this.loadSnapshot(requirementId, units, dependencies);
     return {
       automation: {
         ...automation,
@@ -65,28 +85,20 @@ export class DeliveryUnitDetailRepository {
         }]
       },
       units: units.map((unit) => {
-        const implementationEvidence = this.executions.getCodingEvidence(unit.id, unit.evidenceVersion);
-        const codeReviewEvidence = currentEvidence(this.quality.latest(unit.id, "code_review"), unit.evidenceVersion);
-        const automatedTestingEvidence = currentEvidence(
-          this.quality.latest(unit.id, "automated_testing"), unit.evidenceVersion
-        );
-        const dependencyReleases: Array<DeliveryDependency & { direction: "incoming" | "outgoing" }> = [];
-        for (const dependency of dependencies) {
-          if (dependency.upstreamUnitId === unit.id) {
-            dependencyReleases.push({ ...dependency, direction: "outgoing" });
-          } else if (dependency.downstreamUnitId === unit.id) {
-            dependencyReleases.push({ ...dependency, direction: "incoming" });
-          }
-        }
+        const implementationEvidence = snapshot.implementationEvidence.get(unit.id) ?? null;
+        const codeReviewEvidence = snapshot.qualityEvidence.get(qualityKey(unit.id, "code_review")) ?? null;
+        const automatedTestingEvidence = snapshot.qualityEvidence.get(
+          qualityKey(unit.id, "automated_testing")
+        ) ?? null;
         return {
           ...unit,
           implementationEvidence,
           codeReviewEvidence,
           automatedTestingEvidence,
-          blocker: this.blocker(unit, automation, dependencyReleases),
-          dependencyReleases,
+          blocker: this.blocker(unit, automation, snapshot),
+          dependencyReleases: snapshot.dependencyReleases.get(unit.id) ?? [],
           automation,
-          allowedActions: this.allowedActions(unit, automation, {
+          allowedActions: this.allowedActions(unit, automation, snapshot, {
             implementation: implementationEvidence,
             codeReview: codeReviewEvidence,
             automatedTesting: automatedTestingEvidence
@@ -106,32 +118,137 @@ export class DeliveryUnitDetailRepository {
       : { status: "active" };
   }
 
+  private loadSnapshot(
+    requirementId: string,
+    units: DeliveryUnit[],
+    dependencies: DeliveryDependency[]
+  ): DeliveryDetailSnapshot {
+    const implementationEvidence = new Map<string, unknown>();
+    for (const row of this.db.prepare(`SELECT evidence.* FROM coding_evidence evidence
+      JOIN delivery_units unit ON unit.id = evidence.delivery_unit_id
+        AND unit.evidence_version = evidence.evidence_version
+      WHERE unit.requirement_id = ?`).all(requirementId) as any[]) {
+      implementationEvidence.set(row.delivery_unit_id, mapDeliveryCodingEvidence(row));
+    }
+
+    const qualityEvidence = new Map<string, DeliveryQualityEvidence>();
+    for (const row of this.db.prepare(`SELECT evidence.* FROM delivery_quality_evidence evidence
+      JOIN delivery_units unit ON unit.id = evidence.delivery_unit_id
+        AND unit.evidence_version = evidence.evidence_version
+      WHERE unit.requirement_id = ?
+      ORDER BY evidence.completed_at DESC, evidence.rowid DESC`).all(requirementId) as any[]) {
+      const key = qualityKey(row.delivery_unit_id, row.kind);
+      if (!qualityEvidence.has(key)) qualityEvidence.set(key, mapDeliveryQualityEvidence(row));
+    }
+
+    const jobs = new Map<string, CurrentJobState>();
+    const jobRows = this.db.prepare(`SELECT job.owner_id AS delivery_unit_id, job.action, job.status,
+        job.last_error, job.updated_at, job.rowid
+      FROM automation_jobs job
+      JOIN delivery_units unit ON job.owner_type = 'delivery_unit' AND unit.id = job.owner_id
+        AND unit.evidence_version = job.evidence_version
+      WHERE unit.requirement_id = ?
+      ORDER BY job.updated_at DESC, job.rowid DESC`).all(requirementId) as Array<{
+        delivery_unit_id: string; action: string; status: string; last_error: string | null;
+      }>;
+    for (const row of jobRows) {
+      const state = jobs.get(row.delivery_unit_id) ?? {
+        pending: false, leased: false, failedActions: new Set<string>()
+      };
+      if (row.status === "pending") state.pending = true;
+      if (row.status === "leased") state.leased = true;
+      if (row.status === "failed") {
+        state.failedActions.add(row.action);
+        if (state.latestFailure === undefined) state.latestFailure = row.last_error;
+      }
+      jobs.set(row.delivery_unit_id, state);
+    }
+
+    const activeRuns = new Set<string>();
+    const activeRows = this.db.prepare(`SELECT quality.delivery_unit_id
+      FROM delivery_quality_runs quality
+      JOIN delivery_units unit ON unit.id = quality.delivery_unit_id
+        AND unit.evidence_version = quality.evidence_version
+      WHERE unit.requirement_id = ? AND quality.status = 'running'
+      UNION SELECT run.owner_id
+      FROM stage_runs run
+      JOIN delivery_units unit ON run.owner_type = 'delivery_unit' AND unit.id = run.owner_id
+        AND unit.evidence_version = run.evidence_version
+      WHERE unit.requirement_id = ? AND run.status = 'running'
+      UNION SELECT execution.delivery_unit_id
+      FROM executions execution
+      JOIN delivery_units unit ON unit.id = execution.delivery_unit_id
+        AND unit.evidence_version = execution.evidence_version
+      WHERE unit.requirement_id = ? AND execution.status = 'running'`)
+      .all(requirementId, requirementId, requirementId) as Array<{ delivery_unit_id: string }>;
+    for (const row of activeRows) activeRuns.add(row.delivery_unit_id);
+
+    const activeInvalidations = new Set<string>();
+    const invalidationRows = this.db.prepare(`SELECT invalidation.target_unit_id
+      FROM delivery_evidence_invalidations invalidation
+      JOIN delivery_units unit ON unit.id = invalidation.target_unit_id
+        AND unit.evidence_version = invalidation.target_evidence_version
+      WHERE unit.requirement_id = ?
+        AND NOT EXISTS (SELECT 1 FROM delivery_stale_decision_sources source
+          WHERE source.invalidation_id = invalidation.id)
+        AND NOT EXISTS (SELECT 1 FROM delivery_unit_skip_sources source
+          WHERE source.invalidation_id = invalidation.id)
+      GROUP BY invalidation.target_unit_id`).all(requirementId) as Array<{ target_unit_id: string }>;
+    for (const row of invalidationRows) activeInvalidations.add(row.target_unit_id);
+
+    const dependencyReleases = new Map<
+      string,
+      Array<DeliveryDependency & { direction: "incoming" | "outgoing" }>
+    >();
+    const dependenciesSatisfied = new Map(units.map((unit) => [unit.id, true]));
+    const unitById = new Map(units.map((unit) => [unit.id, unit]));
+    for (const dependency of dependencies) {
+      appendDependency(dependencyReleases, dependency.upstreamUnitId, { ...dependency, direction: "outgoing" });
+      appendDependency(dependencyReleases, dependency.downstreamUnitId, { ...dependency, direction: "incoming" });
+      if (dependency.releasedByEvidenceVersion !== unitById.get(dependency.upstreamUnitId)?.evidenceVersion) {
+        dependenciesSatisfied.set(dependency.downstreamUnitId, false);
+      }
+    }
+    return {
+      implementationEvidence, qualityEvidence, jobs, activeRuns, activeInvalidations,
+      dependenciesSatisfied, dependencyReleases
+    };
+  }
+
   private allowedActions(
     unit: DeliveryUnit,
     automation: RequirementAutomationDetail,
+    snapshot: DeliveryDetailSnapshot,
     evidence: { implementation: unknown | null; codeReview: unknown | null; automatedTesting: unknown | null }
   ): AllowedDeliveryUnitAction[] {
     if (automation.status === "paused" || ["waiting_dependency", "running", "applying", "applied", "skipped"]
       .includes(unit.status)) return [];
+    const jobs = snapshot.jobs.get(unit.id);
+    const active = isDeliveryUnitActiveWork({
+      pendingJob: Boolean(jobs?.pending),
+      leasedJob: Boolean(jobs?.leased),
+      runningExecution: snapshot.activeRuns.has(unit.id)
+    }, { includePendingJobs: unit.status === "potentially_stale" });
+    if (active) return [];
+    const dependenciesSatisfied = snapshot.dependenciesSatisfied.get(unit.id) ?? true;
     if (unit.status === "potentially_stale") {
-      return this.hasActiveInvalidation(unit)
-        ? [...(this.dependenciesSatisfied(unit.id) ? [action("reuse_evidence")] : []), action("rerun")]
+      return snapshot.activeInvalidations.has(unit.id)
+        ? [...(dependenciesSatisfied ? [action("reuse_evidence")] : []), action("rerun")]
         : [];
     }
-    const active = this.hasActiveWork(unit);
     const actions: AllowedDeliveryUnitAction[] = [];
-    if (!active && unit.phase === "implementation" && unit.status === "failed" && !evidence.implementation
-      && this.dependenciesSatisfied(unit.id) && this.failedJob(unit, "implement")) {
+    if (unit.phase === "implementation" && unit.status === "failed" && !evidence.implementation
+      && dependenciesSatisfied && jobs?.failedActions.has("implement")) {
       actions.push(action("retry_implementation"));
     }
-    if (!active && evidence.implementation && this.dependenciesSatisfied(unit.id)
+    if (evidence.implementation && dependenciesSatisfied
       && ["awaiting_gate", "returned", "failed"].includes(unit.status)) {
-      if (!evidence.codeReview && this.failedJob(unit, "review")) actions.push(action("retry_code_review"));
-      if (!evidence.automatedTesting && this.failedJob(unit, "test")) {
+      if (!evidence.codeReview && jobs?.failedActions.has("review")) actions.push(action("retry_code_review"));
+      if (!evidence.automatedTesting && jobs?.failedActions.has("test")) {
         actions.push(action("retry_automated_testing"));
       }
     }
-    if (!active && !unit.required && !["running", "applying", "applied", "skipped"].includes(unit.status)) {
+    if (!unit.required && !["running", "applying", "applied", "skipped"].includes(unit.status)) {
       actions.push(action("skip_optional"));
     }
     return actions;
@@ -140,7 +257,7 @@ export class DeliveryUnitDetailRepository {
   private blocker(
     unit: DeliveryUnit,
     automation: RequirementAutomationDetail,
-    dependencies: Array<DeliveryDependency & { direction: "incoming" | "outgoing" }>
+    snapshot: DeliveryDetailSnapshot
   ) {
     if (automation.status === "paused") return {
       code: "REQUIREMENT_AUTOMATION_PAUSED",
@@ -150,7 +267,7 @@ export class DeliveryUnitDetailRepository {
       code: "DELIVERY_EVIDENCE_POTENTIALLY_STALE",
       message: "上游证据已变化，需要确认复用或重新执行"
     };
-    if (unit.status === "waiting_dependency" || !this.dependenciesSatisfied(unit.id)) return {
+    if (unit.status === "waiting_dependency" || !(snapshot.dependenciesSatisfied.get(unit.id) ?? true)) return {
       code: "DELIVERY_DEPENDENCY_PENDING", message: "等待上游依赖释放"
     };
     if (unit.status === "returned") return {
@@ -159,48 +276,11 @@ export class DeliveryUnitDetailRepository {
     if (unit.status === "conflicted") return {
       code: "DELIVERY_APPLICATION_CONFLICT", message: "本地应用存在冲突"
     };
-    if (unit.status === "failed") {
-      const failure = this.latestFailedJob(unit);
-      return { code: "DELIVERY_UNIT_FAILED", message: failure?.last_error || "交付处理失败" };
-    }
+    if (unit.status === "failed") return {
+      code: "DELIVERY_UNIT_FAILED",
+      message: snapshot.jobs.get(unit.id)?.latestFailure || "交付处理失败"
+    };
     return null;
-  }
-
-  private failedJob(unit: DeliveryUnit, action: "implement" | "review" | "test") {
-    return Boolean(this.db.prepare(`SELECT 1 FROM automation_jobs WHERE owner_type = 'delivery_unit'
-      AND owner_id = ? AND evidence_version = ? AND action = ? AND status = 'failed'`)
-      .get(unit.id, unit.evidenceVersion, action));
-  }
-
-  private latestFailedJob(unit: DeliveryUnit) {
-    return this.db.prepare(`SELECT last_error FROM automation_jobs WHERE owner_type = 'delivery_unit'
-      AND owner_id = ? AND evidence_version = ? AND status = 'failed' ORDER BY updated_at DESC, rowid DESC LIMIT 1`)
-      .get(unit.id, unit.evidenceVersion) as { last_error: string | null } | undefined;
-  }
-
-  private hasActiveWork(unit: DeliveryUnit) {
-    return Boolean(this.db.prepare(`SELECT 1 WHERE EXISTS (
-        SELECT 1 FROM automation_jobs WHERE owner_type = 'delivery_unit' AND owner_id = ?
-          AND evidence_version = ? AND status = 'leased'
-      ) OR EXISTS (
-        SELECT 1 FROM delivery_quality_runs WHERE delivery_unit_id = ? AND evidence_version = ? AND status = 'running'
-      ) OR EXISTS (
-        SELECT 1 FROM stage_runs WHERE owner_type = 'delivery_unit' AND owner_id = ?
-          AND evidence_version = ? AND status = 'running'
-      )`).get(unit.id, unit.evidenceVersion, unit.id, unit.evidenceVersion, unit.id, unit.evidenceVersion));
-  }
-
-  private hasActiveInvalidation(unit: DeliveryUnit) {
-    return Boolean(this.db.prepare(`SELECT 1 FROM delivery_evidence_invalidations invalidation
-      WHERE invalidation.target_unit_id = ? AND invalidation.target_evidence_version = ?
-        AND NOT EXISTS (SELECT 1 FROM delivery_stale_decision_sources source
-          WHERE source.invalidation_id = invalidation.id)
-        AND NOT EXISTS (SELECT 1 FROM delivery_unit_skip_sources source
-          WHERE source.invalidation_id = invalidation.id) LIMIT 1`).get(unit.id, unit.evidenceVersion));
-  }
-
-  private dependenciesSatisfied(unitId: string) {
-    return deliveryUnitDependenciesSatisfied(this.db, unitId);
   }
 }
 
@@ -208,6 +288,16 @@ function action(type: DeliveryUnitActionType): AllowedDeliveryUnitAction {
   return { type, reasonRequired: true };
 }
 
-function currentEvidence<T extends { evidenceVersion: number }>(evidence: T | null, version: number): T | null {
-  return evidence?.evidenceVersion === version ? evidence : null;
+function qualityKey(unitId: string, kind: DeliveryQualityKind) {
+  return `${unitId}:${kind}`;
+}
+
+function appendDependency(
+  map: Map<string, Array<DeliveryDependency & { direction: "incoming" | "outgoing" }>>,
+  unitId: string,
+  dependency: DeliveryDependency & { direction: "incoming" | "outgoing" }
+) {
+  const current = map.get(unitId) ?? [];
+  current.push(dependency);
+  map.set(unitId, current);
 }
