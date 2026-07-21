@@ -23,8 +23,8 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function createFixture(databasePath = ":memory:") {
-  const store = new WorkflowStore(databasePath);
+function createFixture(databasePath = ":memory:", clock: () => Date = () => new Date()) {
+  const store = new WorkflowStore(databasePath, clock);
   stores.push(store);
   const project = store.createProject({
     name: "Frozen project",
@@ -827,12 +827,17 @@ describe("DeliveryExecutionService", () => {
     }
 
     expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "failed", attempt: 3 });
-    expect((fixture.store as any).db.prepare(
-      "SELECT status, error FROM delivery_quality_runs WHERE claim_token = ?"
-    ).get(reviewJob.id)).toEqual({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" });
+    const attempts = (fixture.store as any).db.prepare(`SELECT claim_token, status, error
+      FROM delivery_quality_runs WHERE delivery_unit_id = ? AND kind = 'code_review' ORDER BY rowid`)
+      .all(fixture.unit.id);
+    expect(attempts).toHaveLength(3);
+    expect(new Set(attempts.map((attempt: any) => attempt.claim_token)).size).toBe(3);
+    expect(attempts.map(({ status, error }: any) => ({ status, error }))).toEqual([
+      { status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_LEASE_STALE" },
+      { status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_LEASE_STALE" },
+      { status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" }
+    ]);
     expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")).toBeNull();
-    expect(fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", reviewJob.id))
-      .toMatchObject({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" });
     expect(() => fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", "different-job"))
       .toThrow("DELIVERY_QUALITY_RUN_SETTLED");
     expect(fixture.store.automationJobs.enqueue({
@@ -861,12 +866,12 @@ describe("DeliveryExecutionService", () => {
     (fixture.store as any).db.prepare(
       "UPDATE automation_jobs SET status = 'canceled' WHERE dedupe_key = ?"
     ).run(`test:${fixture.unit.id}:v1`);
-    fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", reviewJob.id);
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       fixture.store.automationJobs.leaseNext(`worker-${attempt}`, new Date(), 30_000);
       expect(fixture.store.automationJobs.fail(reviewJob.id, `worker-${attempt}`, "provider unavailable", true)).toBe(true);
     }
-    fixture.store.automationJobs.leaseNext("worker-3", new Date(), 30_000);
+    const finalLease = fixture.store.automationJobs.leaseNext("worker-3", new Date(), 30_000)!;
+    fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", finalLease.claimToken);
     (fixture.store as any).db.exec(`CREATE TRIGGER reject_quality_automation_abort
       BEFORE UPDATE OF status ON delivery_quality_runs
       WHEN NEW.status = 'aborted'
@@ -879,7 +884,7 @@ describe("DeliveryExecutionService", () => {
     expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "leased", attempt: 3 });
     expect((fixture.store as any).db.prepare(
       "SELECT status FROM delivery_quality_runs WHERE claim_token = ?"
-    ).get(reviewJob.id)).toEqual({ status: "running" });
+    ).get(finalLease.claimToken)).toEqual({ status: "running" });
   });
 
   it("aborts an exhausted leased quality claim during restart recovery", async () => {
@@ -892,12 +897,12 @@ describe("DeliveryExecutionService", () => {
     (fixture.store as any).db.prepare(
       "UPDATE automation_jobs SET status = 'canceled' WHERE dedupe_key = ?"
     ).run(`test:${fixture.unit.id}:v1`);
-    fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", reviewJob.id);
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       fixture.store.automationJobs.leaseNext(`worker-${attempt}`, new Date(), 30_000);
       fixture.store.automationJobs.fail(reviewJob.id, `worker-${attempt}`, "provider unavailable", true);
     }
-    fixture.store.automationJobs.leaseNext("worker-3", new Date(), 30_000);
+    const finalLease = fixture.store.automationJobs.leaseNext("worker-3", new Date(), 30_000)!;
+    fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", finalLease.claimToken);
     fixture.store.close();
     stores.splice(stores.indexOf(fixture.store), 1);
     const restarted = new WorkflowStore(path);
@@ -908,7 +913,7 @@ describe("DeliveryExecutionService", () => {
     expect(restarted.automationJobs.get(reviewJob.id)).toMatchObject({ status: "failed", attempt: 3 });
     expect((restarted as any).db.prepare(
       "SELECT status, error FROM delivery_quality_runs WHERE claim_token = ?"
-    ).get(reviewJob.id)).toEqual({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" });
+    ).get(finalLease.claimToken)).toEqual({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" });
   });
 
   it("repairs a legacy failed-job running-claim orphan during startup recovery", async () => {
@@ -1076,14 +1081,21 @@ describe("DeliveryExecutionService", () => {
   });
 
   it("completes a recovered automation job without rerunning an aborted quality claim", async () => {
-    const fixture = createFixture();
+    let now = Date.now();
+    const clock = () => new Date(now);
+    const fixture = createFixture(":memory:", clock);
     await new DeliveryExecutionService(fixture.store.deliveryExecutions, vi.fn().mockResolvedValue(codingResult()))
       .implement(fixture.unit.id);
     const reviewJob = fixture.store.automationJobs.byDedupe(`review:${fixture.unit.id}:v1`)!;
+    (fixture.store as any).db.prepare(
+      "UPDATE automation_jobs SET status = 'canceled' WHERE dedupe_key = ?"
+    ).run(`test:${fixture.unit.id}:v1`);
+    const firstLease = fixture.store.automationJobs.leaseNext("worker-before-crash", clock(), 100)!;
     const aborted = fixture.store.deliveryQuality.claim(
-      fixture.unit.id, 1, "code_review", reviewJob.id
+      fixture.unit.id, 1, "code_review", firstLease.claimToken
     );
     fixture.store.deliveryQuality.abort(aborted, "IMPLEMENTATION_EVIDENCE_STALE");
+    now += 101;
     (fixture.store as any).db.prepare(
       "UPDATE delivery_units SET status = 'returned', evidence_version = 2 WHERE id = ?"
     ).run(fixture.unit.id);
@@ -1095,7 +1107,7 @@ describe("DeliveryExecutionService", () => {
     const worker = createAutomationWorker({
       jobs: fixture.store.automationJobs,
       handlers: { ...handlers, test: async () => {} },
-      workerId: "worker-recovery"
+      workerId: "worker-recovery", clock
     });
 
     for (let drain = 0; drain < 3; drain += 1) {
@@ -1104,7 +1116,7 @@ describe("DeliveryExecutionService", () => {
     }
 
     expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({
-      status: "completed", attempt: 1, lastError: null
+      status: "completed", attempt: 2, lastError: null
     });
     expect(review).not.toHaveBeenCalled();
     expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")).toBeNull();

@@ -846,8 +846,13 @@ describe("DeliveryCoordinator", () => {
     await worker.drainOnce();
 
     expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "failed", attempt: 3 });
-    expect(fixture.database.prepare(`SELECT status, error FROM delivery_quality_runs WHERE claim_token = ?`)
-      .get(reviewJob.id)).toEqual({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" });
+    const failedAttempts = fixture.database.prepare(`SELECT claim_token, status, error FROM delivery_quality_runs
+      WHERE delivery_unit_id = ? AND evidence_version = 1 AND kind = 'code_review' ORDER BY rowid`)
+      .all(downstream!.id) as Array<{ claim_token: string; status: string; error: string | null }>;
+    expect(new Set(failedAttempts.map((attempt) => attempt.claim_token)).size).toBe(1);
+    expect(failedAttempts.map(({ status, error }) => ({ status, error }))).toEqual([
+      { status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_LEASE_STALE" }
+    ]);
     fixture.store.deliveryCoordination.resolveStale({ unitId: downstream!.id, decision: "reuse",
       reason: "quality scope remains valid", actor: "local-human" });
     for (let drain = 0; drain < 4 && fixture.store.automationJobs.get(reviewJob.id)?.status !== "completed"; drain += 1) {
@@ -861,8 +866,13 @@ describe("DeliveryCoordinator", () => {
     expect(fixture.database.prepare(`SELECT claim_token, status, error FROM delivery_quality_runs
       WHERE delivery_unit_id = ? AND evidence_version = 1 AND kind = 'code_review' ORDER BY created_at, rowid`)
       .all(downstream!.id)).toEqual([
-        { claim_token: reviewJob.id, status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" },
-        { claim_token: expect.not.stringMatching(new RegExp(`^${reviewJob.id}$`)), status: "completed", error: null }
+        { claim_token: expect.stringMatching(/^lease:/), status: "aborted",
+          error: "DELIVERY_QUALITY_AUTOMATION_LEASE_STALE" },
+        { claim_token: expect.stringMatching(/^lease:/), status: "aborted",
+          error: "DELIVERY_QUALITY_AUTOMATION_LEASE_STALE" },
+        { claim_token: expect.stringMatching(/^lease:/), status: "aborted",
+          error: "DELIVERY_QUALITY_AUTOMATION_LEASE_STALE" },
+        { claim_token: expect.stringMatching(/^lease:/), status: "completed", error: null }
       ]);
   });
 

@@ -29,7 +29,7 @@ export interface StartupOptions {
   env?: NodeJS.ProcessEnv;
   makeDirectory?: typeof mkdirSync;
   prepareDatabase?: typeof prepareCleanDatabase;
-  createStore?: (databasePath: string) => WorkflowStore;
+  createStore?: (databasePath: string, clock: () => Date) => WorkflowStore;
   writeVersionMarker?: typeof writeDatabaseVersionMarker;
   buildApplication?: (store: WorkflowStore) => Promise<StartupApp>;
   createWorker?: (options: AutomationWorkerOptions) => AutomationWorker;
@@ -47,12 +47,13 @@ export interface StartupOptions {
 
 export async function startServer(options: StartupOptions = {}) {
   const env = options.env ?? process.env;
+  const clock = options.clock ?? (() => new Date());
   const dataDir = resolve(env.DATA_DIR || "data");
   (options.makeDirectory ?? mkdirSync)(dataDir, { recursive: true, mode: 0o700 });
   const databasePath = resolve(dataDir, "workflow.db");
   env.DATABASE_PATH = databasePath;
   await (options.prepareDatabase ?? prepareCleanDatabase)(databasePath, schemaVersion);
-  const store = (options.createStore ?? ((path) => new WorkflowStore(path)))(databasePath);
+  const store = (options.createStore ?? ((path, storeClock) => new WorkflowStore(path, storeClock)))(databasePath, clock);
   let worker: AutomationWorker | undefined;
   let app: StartupApp | undefined;
   let resourcesClosed = false;
@@ -115,7 +116,6 @@ export async function startServer(options: StartupOptions = {}) {
     store.interruptActiveStageRuns();
     store.interruptActiveProjectKnowledge();
     store.recoverInterruptedRequirements();
-    const clock = options.clock ?? (() => new Date());
     store.automationJobs.recoverExpired(clock());
     store.recoverAbandonedDeliveryExecutions(clock());
     const cleanupResult = await (options.cleanupVerificationQuarantines ?? cleanupVerificationQuarantines)({

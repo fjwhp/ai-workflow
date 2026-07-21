@@ -24,7 +24,7 @@ export interface DeliveryQualityInput {
 
 interface DeliveryQualityClaimBase {
   id: string; requirementId: string; deliveryUnitId: string; evidenceVersion: number;
-  kind: DeliveryQualityKind;
+  kind: DeliveryQualityKind; claimToken: string;
 }
 
 export type DeliveryQualityClaim =
@@ -59,7 +59,10 @@ export interface DeliveryQualityPersistence {
 }
 
 export class DeliveryQualityRepository {
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly clock: () => Date = () => new Date()
+  ) {}
 
   claimInTransaction(
     unitId: string,
@@ -77,6 +80,14 @@ export class DeliveryQualityRepository {
       if (!row) throw new Error("DELIVERY_UNIT_NOT_FOUND");
       evidenceVersion = row.evidence_version;
     }
+    const now = this.now();
+    const automationLease = claimToken === undefined ? null : parseAutomationLeaseToken(claimToken);
+    if (claimToken?.startsWith("lease:") && !automationLease) {
+      throw new Error("DELIVERY_QUALITY_CLAIM_TOKEN_INVALID");
+    }
+    const automationAttempt = automationLease
+      ? this.assertLiveAutomationLease(unitId, evidenceVersion, kind, claimToken!, automationLease, now)
+      : null;
     const existingRuns = this.db.prepare(`SELECT id, requirement_id, status, claim_token, error
       FROM delivery_quality_runs WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ?
       ORDER BY created_at DESC, rowid DESC`).all(unitId, evidenceVersion, kind) as Array<{
@@ -88,7 +99,7 @@ export class DeliveryQualityRepository {
     if (existing) {
         const resumed = {
           id: existing.id, requirementId: existing.requirement_id,
-          deliveryUnitId: unitId, evidenceVersion, kind
+          deliveryUnitId: unitId, evidenceVersion, kind, claimToken: existing.claim_token
         };
         if (existing.status === "running") {
           return { ...resumed, status: "running", input: this.loadInput(unitId, evidenceVersion) };
@@ -104,11 +115,33 @@ export class DeliveryQualityRepository {
         }
         throw new Error("DELIVERY_QUALITY_RUN_STATUS_INVALID");
     }
-    if (existingRuns.some((run) => run.status === "completed" || run.status === "failed")) {
+    const terminal = existingRuns.find((run) => run.status === "completed" || run.status === "failed");
+    if (terminal && automationLease) {
+      const evidence = this.getEvidenceByRun(terminal.id);
+      if (!evidence) throw new Error("DELIVERY_QUALITY_EVIDENCE_NOT_FOUND");
+      return {
+        id: terminal.id, requirementId: terminal.requirement_id, deliveryUnitId: unitId,
+        evidenceVersion, kind, claimToken: terminal.claim_token,
+        status: terminal.status as "completed" | "failed", evidence
+      };
+    }
+    if (terminal) {
       throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
     }
+    const replayableAbort = automationLease && automationAttempt !== null && automationAttempt > 1
+      ? existingRuns.find((run) => run.status === "aborted" && run.error !== null
+        && !AUTOMATION_ATTEMPT_ABORTS.has(run.error)
+        && belongsToAutomationJob(run.claim_token, automationLease.jobId))
+      : undefined;
+    if (replayableAbort) {
+      return {
+        id: replayableAbort.id, requirementId: replayableAbort.requirement_id,
+        deliveryUnitId: unitId, evidenceVersion, kind, claimToken: replayableAbort.claim_token,
+        status: "aborted", error: replayableAbort.error!
+      };
+    }
     if (existingRuns.some((run) => run.status === "running")) throw new Error("DELIVERY_QUALITY_RUN_ACTIVE");
-    if (existingRuns.length > 0 && !this.isLiveReplacementClaim(unitId, evidenceVersion, kind, claimToken)) {
+    if (existingRuns.length > 0 && !automationLease) {
       throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
     }
     const input = this.loadInput(unitId, evidenceVersion);
@@ -118,10 +151,10 @@ export class DeliveryQualityRepository {
       (id, requirement_id, delivery_unit_id, evidence_version, kind, claim_token, status, error, created_at, completed_at)
       VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, ?, NULL)`)
       .run(id, input.codingEvidence.requirementId, unitId, evidenceVersion, kind,
-        persistedClaimToken, new Date().toISOString());
+        persistedClaimToken, now);
     return {
       id, requirementId: input.codingEvidence.requirementId, deliveryUnitId: unitId,
-      evidenceVersion, kind, input, status: "running"
+      evidenceVersion, kind, claimToken: persistedClaimToken, input, status: "running"
     };
   }
 
@@ -136,14 +169,22 @@ export class DeliveryQualityRepository {
     validateKind(claim.kind);
     if (claim.status !== "running") throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
     if (completion.result !== "passed" && completion.result !== "failed") throw new Error("DELIVERY_QUALITY_RESULT_INVALID");
-    const run = this.db.prepare(`SELECT requirement_id, delivery_unit_id, evidence_version, kind, status
+    const run = this.db.prepare(`SELECT requirement_id, delivery_unit_id, evidence_version, kind, claim_token, status
       FROM delivery_quality_runs WHERE id = ?`).get(claim.id) as {
         requirement_id: string; delivery_unit_id: string; evidence_version: number;
-        kind: DeliveryQualityKind; status: string;
+        kind: DeliveryQualityKind; claim_token: string; status: string;
       } | undefined;
     if (!run || run.requirement_id !== claim.requirementId || run.delivery_unit_id !== claim.deliveryUnitId
-      || run.evidence_version !== claim.evidenceVersion || run.kind !== claim.kind) {
+      || run.evidence_version !== claim.evidenceVersion || run.kind !== claim.kind
+      || run.claim_token !== claim.claimToken) {
       throw new Error("DELIVERY_QUALITY_RUN_STALE");
+    }
+    const now = this.now();
+    const automationLease = parseAutomationLeaseToken(run.claim_token);
+    if (automationLease) {
+      this.assertLiveAutomationLease(
+        run.delivery_unit_id, run.evidence_version, run.kind, run.claim_token, automationLease, now
+      );
     }
     if (run.status === "aborted") throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
     if (run.status === "completed" || run.status === "failed") {
@@ -162,7 +203,6 @@ export class DeliveryQualityRepository {
     const current = this.loadInput(run.delivery_unit_id, run.evidence_version);
     const expected = current.codingEvidence;
     const sanitized = sanitizeQualityCompletion(completion, current.snapshot.sensitivePatterns);
-    const now = new Date().toISOString();
     const evidenceId = randomUUID();
     this.db.prepare(`INSERT INTO delivery_quality_evidence
       (id, run_id, requirement_id, delivery_unit_id, evidence_version, kind, result,
@@ -185,7 +225,7 @@ export class DeliveryQualityRepository {
     validateKind(claim.kind);
     if (claim.status !== "running") throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
     if (!/^[A-Z][A-Z0-9_]*$/.test(error)) throw new Error("DELIVERY_QUALITY_ABORT_INVALID");
-    const now = new Date().toISOString();
+    const now = this.now();
     const settled = this.db.prepare(`UPDATE delivery_quality_runs SET status = 'aborted', error = ?, completed_at = ?
       WHERE id = ? AND delivery_unit_id = ? AND evidence_version = ? AND kind = ? AND status = 'running'`)
       .run(error, now, claim.id, claim.deliveryUnitId, claim.evidenceVersion, claim.kind);
@@ -193,21 +233,37 @@ export class DeliveryQualityRepository {
   }
 
   abortTerminalAutomationClaimsInTransaction() {
-    const now = new Date().toISOString();
+    const now = this.now();
     const settled = this.db.prepare(`UPDATE delivery_quality_runs AS quality
-      SET status = 'aborted', error = 'DELIVERY_QUALITY_AUTOMATION_FAILED', completed_at = ?
-      WHERE quality.status = 'running' AND EXISTS (
-        SELECT 1 FROM automation_jobs AS job
-        WHERE job.claim_token = quality.claim_token
-          AND job.status = 'failed'
-          AND job.owner_type = 'delivery_unit'
-          AND job.owner_id = quality.delivery_unit_id
-          AND job.evidence_version = quality.evidence_version
-          AND (
-            (job.action = 'review' AND quality.kind = 'code_review')
-            OR (job.action = 'test' AND quality.kind = 'automated_testing')
+      SET status = 'aborted', error = CASE WHEN EXISTS (
+        SELECT 1 FROM automation_jobs AS failed_job
+        WHERE failed_job.claim_token = quality.claim_token AND failed_job.status = 'failed'
+      ) THEN 'DELIVERY_QUALITY_AUTOMATION_FAILED'
+      ELSE 'DELIVERY_QUALITY_AUTOMATION_LEASE_STALE' END, completed_at = ?
+      WHERE quality.status = 'running' AND (
+        EXISTS (
+          SELECT 1 FROM automation_jobs AS inactive_job
+          WHERE inactive_job.claim_token = quality.claim_token
+            AND inactive_job.owner_type = 'delivery_unit'
+            AND inactive_job.owner_id = quality.delivery_unit_id
+            AND inactive_job.evidence_version = quality.evidence_version
+            AND inactive_job.status <> 'leased'
+            AND ((inactive_job.action = 'review' AND quality.kind = 'code_review')
+              OR (inactive_job.action = 'test' AND quality.kind = 'automated_testing'))
+        ) OR (
+          quality.claim_token LIKE 'lease:%'
+          AND NOT EXISTS (
+            SELECT 1 FROM automation_jobs AS live_job
+            WHERE live_job.claim_token = quality.claim_token
+              AND live_job.status = 'leased' AND live_job.lease_expires_at > ?
+              AND live_job.owner_type = 'delivery_unit'
+              AND live_job.owner_id = quality.delivery_unit_id
+              AND live_job.evidence_version = quality.evidence_version
+              AND ((live_job.action = 'review' AND quality.kind = 'code_review')
+                OR (live_job.action = 'test' AND quality.kind = 'automated_testing'))
           )
-      )`).run(now);
+        )
+      )`).run(now, now);
     return Number(settled.changes);
   }
 
@@ -218,17 +274,31 @@ export class DeliveryQualityRepository {
     return row ? mapEvidence(row as any) : null;
   }
 
-  private isLiveReplacementClaim(
+  private assertLiveAutomationLease(
     unitId: string,
     evidenceVersion: number,
     kind: DeliveryQualityKind,
-    claimToken: string | undefined
+    claimToken: string,
+    lease: AutomationLeaseToken,
+    now: string
   ) {
-    if (!claimToken) return false;
     const action = kind === "code_review" ? "review" : "test";
-    return Boolean(this.db.prepare(`SELECT 1 FROM automation_jobs
-      WHERE claim_token = ? AND owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ?
-        AND action = ? AND status = 'leased'`).get(claimToken, unitId, evidenceVersion, action));
+    const live = this.db.prepare(`SELECT attempt FROM automation_jobs
+      WHERE id = ? AND claim_token = ? AND owner_type = 'delivery_unit' AND owner_id = ?
+        AND evidence_version = ? AND action = ? AND status = 'leased' AND lease_owner = ?
+        AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`).get(
+      lease.jobId, claimToken, unitId, evidenceVersion, action, lease.workerId, now
+    ) as { attempt: number } | undefined;
+    if (!live) throw new Error("DELIVERY_QUALITY_AUTOMATION_LEASE_STALE");
+    return live.attempt;
+  }
+
+  private now() {
+    const now = this.clock();
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+      throw new Error("DELIVERY_QUALITY_DATE_INVALID");
+    }
+    return now.toISOString();
   }
 
   private getEvidence(id: string): DeliveryQualityEvidence | null {
@@ -290,6 +360,28 @@ export class DeliveryQualityRepository {
       }
     };
   }
+}
+
+interface AutomationLeaseToken {
+  jobId: string;
+  workerId: string;
+}
+
+const AUTOMATION_LEASE_TOKEN = /^lease:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}):([A-Za-z0-9_-]{1,128}):[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function parseAutomationLeaseToken(token: string): AutomationLeaseToken | null {
+  const match = AUTOMATION_LEASE_TOKEN.exec(token);
+  return match ? { jobId: match[1]!, workerId: match[2]! } : null;
+}
+
+const AUTOMATION_ATTEMPT_ABORTS = new Set([
+  "DELIVERY_QUALITY_AUTOMATION_FAILED",
+  "DELIVERY_QUALITY_AUTOMATION_LEASE_STALE",
+  "DELIVERY_QUALITY_AUTOMATION_ORPHANED"
+]);
+
+function belongsToAutomationJob(claimToken: string, jobId: string): boolean {
+  return claimToken === jobId || parseAutomationLeaseToken(claimToken)?.jobId === jobId;
 }
 
 const QUALITY_REDACTION_LIMITS = {

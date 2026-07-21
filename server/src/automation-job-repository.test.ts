@@ -298,15 +298,15 @@ describe("AutomationJobRepository", () => {
     const fixture = createFixture();
     const input = job(fixture.requirement.id, { action: "review" });
     const queued = fixture.first.enqueue(input);
-    fixture.first.leaseNext("worker-a", now, 30_000);
+    const leased = fixture.first.leaseNext("worker-a", now, 30_000)!;
     fixture.first.fail(queued.id, "worker-a", "provider unavailable", false);
 
     const duplicate = fixture.first.enqueue(input);
     const revived = fixture.first.enqueue(input, { reviveTerminal: true });
 
-    expect(duplicate).toMatchObject({ id: queued.id, status: "failed", claimToken: queued.id });
+    expect(duplicate).toMatchObject({ id: queued.id, status: "failed", claimToken: leased.claimToken });
     expect(revived).toMatchObject({ id: queued.id, status: "pending", attempt: 0, lastError: null });
-    expect(revived.claimToken).not.toBe(queued.id);
+    expect(revived.claimToken).not.toBe(leased.claimToken);
     expect(fixture.first.byDedupe(queued.dedupeKey)).toEqual(revived);
   });
 

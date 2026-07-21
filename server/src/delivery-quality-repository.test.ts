@@ -441,6 +441,50 @@ describe("delivery quality evidence schema", () => {
     }
   });
 
+  it("fences an expired quality completion after another worker re-leases the job", () => {
+    for (let round = 0; round < 20; round += 1) {
+      const directory = mkdtempSync(join(tmpdir(), "delivery-quality-lease-fence-"));
+      const path = join(directory, "workflow.db");
+      const { store: first, unit } = fixture(path);
+      const second = new WorkflowStore(path);
+      try {
+        (first as any).db.prepare(`UPDATE automation_jobs SET status = 'canceled'
+          WHERE owner_id = ? AND evidence_version = 1 AND action = 'test' AND status = 'pending'`).run(unit.id);
+        const leasedAt = new Date(Date.now() + round * 1_000);
+        const firstLease = first.automationJobs.leaseNext("quality-worker-a", leasedAt, 100)!;
+        const firstClaim = first.deliveryQuality.claim(
+          unit.id, 1, "code_review", firstLease.claimToken
+        );
+        if (firstClaim.status !== "running") throw new Error("expected first running claim");
+
+        const recoveredAt = new Date(leasedAt.getTime() + 101);
+        expect(second.automationJobs.recoverExpired(recoveredAt)).toBe(1);
+        const secondLease = second.automationJobs.leaseNext("quality-worker-b", recoveredAt, 30_000)!;
+        const secondClaim = second.deliveryQuality.claim(
+          unit.id, 1, "code_review", secondLease.claimToken
+        );
+        if (secondClaim.status !== "running") throw new Error("expected second running claim");
+
+        expect(() => first.deliveryQuality.complete(firstClaim, {
+          result: "passed", content: { worker: "a", round }
+        })).toThrow("DELIVERY_QUALITY_AUTOMATION_LEASE_STALE");
+        expect((first as any).db.prepare(
+          "SELECT COUNT(*) AS count FROM delivery_quality_evidence WHERE delivery_unit_id = ?"
+        ).get(unit.id)).toEqual({ count: 0 });
+        expect(secondLease).toMatchObject({ id: firstLease.id, leaseOwner: "quality-worker-b" });
+        expect(secondLease.claimToken).not.toBe(firstLease.claimToken);
+
+        expect(second.deliveryQuality.complete(secondClaim, {
+          result: "passed", content: { worker: "b", round }
+        })).toMatchObject({ result: "passed", content: { worker: "b", round } });
+      } finally {
+        second.close();
+        first.close();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("rejects evidence whose input hash does not identify its coding evidence", () => {
     const { store, requirement, unit } = fixture();
     try {

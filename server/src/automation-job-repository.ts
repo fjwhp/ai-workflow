@@ -120,8 +120,10 @@ export class AutomationJobRepository {
         this.db.exec("COMMIT");
         return null;
       }
+      const claimToken = `lease:${candidate.id}:${workerId}:${randomUUID()}`;
       const result = this.db.prepare(`UPDATE automation_jobs
-        SET status = 'leased', attempt = attempt + 1, lease_owner = ?, lease_expires_at = ?, updated_at = ?
+        SET status = 'leased', attempt = attempt + 1, claim_token = ?,
+          lease_owner = ?, lease_expires_at = ?, updated_at = ?
         WHERE id = ? AND status = 'pending' AND attempt < max_attempts
           AND NOT EXISTS (
             SELECT 1 FROM requirement_automation_state state
@@ -130,7 +132,7 @@ export class AutomationJobRepository {
               ELSE (SELECT unit.requirement_id FROM delivery_units unit WHERE unit.id = automation_jobs.owner_id)
             END
           )`)
-        .run(workerId, expiresAtIso, nowIso, candidate.id);
+        .run(claimToken, workerId, expiresAtIso, nowIso, candidate.id);
       if (Number(result.changes) !== 1) {
         this.db.exec("COMMIT");
         return null;

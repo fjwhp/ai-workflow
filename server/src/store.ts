@@ -86,16 +86,16 @@ export class WorkflowStore {
   public readonly deliveryCoordination: DeliveryCoordinationPersistence;
   public readonly automationJobs: AutomationJobPersistence;
 
-  constructor(path: string) {
+  constructor(path: string, clock: () => Date = () => new Date()) {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     createPhase2Schema(this.db);
     this.deliveryUnitRepository = new DeliveryUnitRepository(this.db);
     this.deliveryExecutionRepository = new DeliveryExecutionRepository(this.db);
-    this.deliveryQualityRepository = new DeliveryQualityRepository(this.db);
+    this.deliveryQualityRepository = new DeliveryQualityRepository(this.db, clock);
     const deliveryCoordinator = new DeliveryCoordinator(this.db, this.deliveryQualityRepository);
     this.executionRepository = new ExecutionRepository(this.db);
-    const automationJobRepository = new AutomationJobRepository(this.db);
+    const automationJobRepository = new AutomationJobRepository(this.db, clock);
     this.deliveryUnits = {
       createPlan: (input) => this.withImmediateTransaction(
         () => this.deliveryUnitRepository.createPlanInTransaction(input)
