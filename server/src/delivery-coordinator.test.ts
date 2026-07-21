@@ -602,14 +602,98 @@ describe("DeliveryCoordinator", () => {
       .toThrow("DELIVERY_CONTRACT_EVIDENCE_IMMUTABLE");
   });
 
-  it("rolls contract evidence and descendant invalidation back in one transaction", () => {
+  it("preserves source releases for contract-only fan-out while reuse and rerun both continue", () => {
+    const fixture = createFixture([[0, 1], [0, 2]], [true, true, true]);
+    const [source, reused, rerun] = fixture.units;
+    fixture.store.deliveryCoordination.completeContractEvidence({ unitId: source!.id, version: 1,
+      contractHash: "contract-v1", content: {}, actor: "solution-design" });
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, reused!.id);
+    completeImplementation(fixture.store, rerun!.id);
+
+    fixture.store.deliveryCoordination.completeContractEvidence({ unitId: source!.id, version: 2,
+      contractHash: "contract-v2", content: {}, actor: "solution-design" });
+
+    expect(fixture.store.deliveryUnits.get(source!.id)).toMatchObject({
+      status: "ready_for_acceptance", evidenceVersion: 1
+    });
+    expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)
+      .filter((edge) => edge.upstreamUnitId === source!.id))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ downstreamUnitId: reused!.id, releasedByEvidenceVersion: 1 }),
+        expect.objectContaining({ downstreamUnitId: rerun!.id, releasedByEvidenceVersion: 1 })
+      ]));
+
+    fixture.store.deliveryCoordination.resolveStale({ unitId: reused!.id, decision: "reuse",
+      actor: "local-human", reason: "contract remains compatible" });
+    fixture.store.deliveryCoordination.resolveStale({ unitId: rerun!.id, decision: "rerun",
+      actor: "local-human", reason: "contract requires implementation" });
+
+    expect(fixture.store.deliveryUnits.get(reused!.id)).toMatchObject({ status: "awaiting_gate", evidenceVersion: 1 });
+    expect(fixture.store.automationJobs.byDedupe(`review:${reused!.id}:v1`)).toMatchObject({ status: "pending" });
+    expect(fixture.store.deliveryUnits.get(rerun!.id)).toMatchObject({ status: "ready", evidenceVersion: 2 });
+    expect(fixture.store.automationJobs.byDedupe(`implement:${rerun!.id}:v2`)).toMatchObject({ status: "pending" });
+  });
+
+  it("preserves a released contract dependency while paused and defers reused actions until resume", () => {
     const fixture = createFixture([[0, 1]], [true, true]);
+    const [source, target] = fixture.units;
+    fixture.store.deliveryCoordination.completeContractEvidence({ unitId: source!.id, version: 1,
+      contractHash: "contract-v1", content: {}, actor: "solution-design" });
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, target!.id);
+    fixture.store.deliveryCoordination.pauseAutomation({ requirementId: fixture.requirement.id,
+      actor: "local-human", reason: "hold contract decisions" });
+
+    fixture.store.deliveryCoordination.completeContractEvidence({ unitId: source!.id, version: 2,
+      contractHash: "contract-v2", content: {}, actor: "solution-design" });
+    expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)[0])
+      .toMatchObject({ releasedByEvidenceVersion: 1 });
+    fixture.store.deliveryCoordination.resolveStale({ unitId: target!.id, decision: "reuse",
+      actor: "local-human", reason: "paused compatible contract" });
+
+    expect(fixture.store.deliveryUnits.get(target!.id)).toMatchObject({ status: "awaiting_gate" });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND status = 'pending'`).get(target!.id)).toEqual({ count: 0 });
+    fixture.store.deliveryCoordination.resumeAutomation({ requirementId: fixture.requirement.id,
+      actor: "local-human", reason: "continue contract work" });
+    expect(fixture.store.automationJobs.byDedupe(`review:${target!.id}:v1`)).toMatchObject({ status: "pending" });
+    expect(fixture.store.automationJobs.byDedupe(`test:${target!.id}:v1`)).toMatchObject({ status: "pending" });
+  });
+
+  it("keeps the source release but revokes a nonterminal descendant release on contract change", () => {
+    const fixture = createFixture([[0, 1], [1, 2]], [true, true, true]);
+    const [source, middle] = fixture.units;
+    fixture.store.deliveryCoordination.completeContractEvidence({ unitId: source!.id, version: 1,
+      contractHash: "contract-v1", content: {}, actor: "solution-design" });
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, middle!.id);
+    settle(fixture.store, middle!.id, "code_review", "passed");
+    settle(fixture.store, middle!.id, "automated_testing", "passed");
+
+    fixture.store.deliveryCoordination.completeContractEvidence({ unitId: source!.id, version: 2,
+      contractHash: "contract-v2", content: {}, actor: "solution-design" });
+
+    const edges = fixture.store.deliveryUnits.listDependencies(fixture.requirement.id);
+    expect(edges.find((edge) => edge.upstreamUnitId === source!.id))
+      .toMatchObject({ releasedByEvidenceVersion: 1 });
+    expect(edges.find((edge) => edge.upstreamUnitId === middle!.id))
+      .toMatchObject({ releasedByEvidenceVersion: null });
+  });
+
+  it("rolls contract evidence and descendant invalidation back in one transaction", () => {
+    const fixture = createFixture([[0, 1], [1, 2]], [true, true, true]);
     const [source, target] = fixture.units;
     const completeContract = (fixture.store.deliveryCoordination as any).completeContractEvidence;
     completeContract({ unitId: source!.id, version: 1, contractHash: "contract-v1", content: {}, actor: "design" });
     settle(fixture.store, source!.id, "code_review", "passed");
     settle(fixture.store, source!.id, "automated_testing", "passed");
     completeImplementation(fixture.store, target!.id);
+    settle(fixture.store, target!.id, "code_review", "passed");
+    settle(fixture.store, target!.id, "automated_testing", "passed");
     fixture.database.exec(`CREATE TRIGGER fail_contract_invalidation BEFORE INSERT ON delivery_evidence_invalidations
       BEGIN SELECT RAISE(ABORT, 'INJECTED_CONTRACT_INVALIDATION_FAILURE'); END;`);
 
@@ -619,6 +703,11 @@ describe("DeliveryCoordinator", () => {
     expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_contract_evidence
       WHERE delivery_unit_id = ?`).get(source!.id)).toEqual({ count: 1 });
     expect(fixture.store.deliveryUnits.get(target!.id)).not.toMatchObject({ status: "potentially_stale" });
+    expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ upstreamUnitId: source!.id, releasedByEvidenceVersion: 1 }),
+        expect.objectContaining({ upstreamUnitId: target!.id, releasedByEvidenceVersion: 1 })
+      ]));
   });
 
   it("uses sequential contract CAS with idempotent replay and conflict detection", () => {

@@ -308,12 +308,14 @@ export class DeliveryCoordinator {
     const descendants = this.descendantsFailClosed(change.sourceUnitId, change.requirementId);
     if (descendants.length === 0) return;
     const now = new Date().toISOString();
-    const affectedIds = [change.sourceUnitId, ...descendants
+    const affectedIds = [...(change.sourceKind === "implementation" ? [change.sourceUnitId] : []), ...descendants
       .filter((row) => row.status !== "skipped" && row.status !== "applied")
       .map((row) => row.id)];
-    const placeholders = affectedIds.map(() => "?").join(", ");
-    this.db.prepare(`UPDATE delivery_dependencies SET released_by_evidence_version = NULL, released_at = NULL
-      WHERE upstream_unit_id IN (${placeholders})`).run(...affectedIds);
+    if (affectedIds.length > 0) {
+      const placeholders = affectedIds.map(() => "?").join(", ");
+      this.db.prepare(`UPDATE delivery_dependencies SET released_by_evidence_version = NULL, released_at = NULL
+        WHERE upstream_unit_id IN (${placeholders})`).run(...affectedIds);
+    }
     for (const target of descendants) {
       if (target.status === "skipped" || target.status === "applied") continue;
       this.db.prepare(`UPDATE automation_jobs SET status = 'canceled', updated_at = ?
@@ -352,6 +354,16 @@ export class DeliveryCoordinator {
         .run(now, target.id, target.evidence_version, target.status);
       if (updated.changes !== 1) {
         throw new Error("DELIVERY_EVIDENCE_INVALIDATION_STALE");
+      }
+    }
+    if (change.sourceKind === "contract") {
+      const source = this.db.prepare(`SELECT requirement_id, status, evidence_version
+        FROM delivery_units WHERE id = ?`).get(change.sourceUnitId) as {
+          requirement_id: string; status: string; evidence_version: number;
+        } | undefined;
+      if (source && ["ready_for_acceptance", "applied"].includes(source.status)
+        && !this.requirementPaused(source.requirement_id)) {
+        this.releaseOutgoingInTransaction(change.sourceUnitId, source.evidence_version, now);
       }
     }
   }
