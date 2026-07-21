@@ -313,6 +313,7 @@ export class DeliveryCoordinator {
     this.db.prepare(`UPDATE delivery_dependencies SET released_by_evidence_version = NULL, released_at = NULL
       WHERE upstream_unit_id IN (${placeholders})`).run(...affectedIds);
     for (const target of descendants) {
+      if (target.status === "skipped" || target.status === "applied") continue;
       this.db.prepare(`UPDATE automation_jobs SET status = 'canceled', updated_at = ?
         WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ? AND status = 'pending'`)
         .run(now, target.id, target.evidence_version);
@@ -503,7 +504,7 @@ export class DeliveryCoordinator {
     const existing = this.getSkip(input.unitId);
     if (existing) {
       if (existing.actor !== actor || existing.reason !== reason) throw new Error("DELIVERY_UNIT_SKIP_CONFLICT");
-      return existing;
+      return this.completeSkipInTransaction(existing, new Date().toISOString());
     }
     const unit = this.db.prepare(`SELECT id, requirement_id, required, phase, status, evidence_version
       FROM delivery_units WHERE id = ?`).get(input.unitId) as {
@@ -529,14 +530,43 @@ export class DeliveryCoordinator {
       (id, requirement_id, delivery_unit_id, evidence_version, actor, reason, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run(randomUUID(), unit.requirement_id, unit.id, unit.evidence_version, actor, reason, now);
+    return this.completeSkipInTransaction(this.getSkip(input.unitId)!, now);
+  }
+
+  private completeSkipInTransaction(skip: DeliveryUnitSkip, now: string) {
+    const unit = this.db.prepare(`SELECT required, status, evidence_version FROM delivery_units WHERE id = ?`)
+      .get(skip.deliveryUnitId) as { required: number; status: string; evidence_version: number } | undefined;
+    if (!unit || unit.required === 1 || unit.status === "applied" || unit.status === "running"
+      || unit.status === "applying" || unit.evidence_version !== skip.evidenceVersion) {
+      throw new Error("DELIVERY_UNIT_SKIP_NOT_ELIGIBLE");
+    }
+    const facts = this.activeInvalidations(skip.deliveryUnitId, skip.evidenceVersion);
+    if (unit.status === "skipped" && facts.length === 0) return skip;
+    if (unit.status !== "skipped") {
+      const active = this.db.prepare(`SELECT 1
+        WHERE EXISTS (SELECT 1 FROM delivery_quality_runs quality
+          WHERE quality.delivery_unit_id = ? AND quality.evidence_version = ? AND quality.status = 'running')
+        OR EXISTS (SELECT 1 FROM automation_jobs job
+          WHERE job.owner_type = 'delivery_unit' AND job.owner_id = ? AND job.evidence_version = ?
+            AND job.status = 'leased')
+        OR EXISTS (SELECT 1 FROM stage_runs run
+          WHERE run.owner_type = 'delivery_unit' AND run.owner_id = ? AND run.evidence_version = ?
+            AND run.status = 'running')`).get(skip.deliveryUnitId, skip.evidenceVersion,
+        skip.deliveryUnitId, skip.evidenceVersion, skip.deliveryUnitId, skip.evidenceVersion);
+      if (active) throw new Error("DELIVERY_UNIT_SKIP_NOT_ELIGIBLE");
+    }
+    const insertSource = this.db.prepare(`INSERT INTO delivery_unit_skip_sources
+      (skip_id, invalidation_id, created_at) VALUES (?, ?, ?)`);
+    for (const fact of facts) insertSource.run(skip.id, fact.id, now);
+    if (unit.status === "skipped") return skip;
     const updated = this.db.prepare(`UPDATE delivery_units SET status = 'skipped', completed_at = ?, updated_at = ?
       WHERE id = ? AND evidence_version = ? AND status NOT IN ('running', 'applying', 'applied')`)
-      .run(now, now, unit.id, unit.evidence_version);
+      .run(now, now, skip.deliveryUnitId, skip.evidenceVersion);
     if (updated.changes !== 1) throw new Error("DELIVERY_UNIT_SKIP_NOT_ELIGIBLE");
     this.db.prepare(`UPDATE automation_jobs SET status = 'canceled', updated_at = ?
       WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ? AND status = 'pending'`)
-      .run(now, unit.id, unit.evidence_version);
-    return this.getSkip(input.unitId)!;
+      .run(now, skip.deliveryUnitId, skip.evidenceVersion);
+    return this.getSkip(skip.deliveryUnitId)!;
   }
 
   overrideQualityInTransaction(input: DeliveryQualityOverrideInput): DeliveryQualityOverride {
@@ -633,6 +663,8 @@ export class DeliveryCoordinator {
     return this.db.prepare(`SELECT invalidation.* FROM delivery_evidence_invalidations invalidation
       WHERE invalidation.target_unit_id = ? ${versionFilter}
         AND NOT EXISTS (SELECT 1 FROM delivery_stale_decision_sources source
+          WHERE source.invalidation_id = invalidation.id)
+        AND NOT EXISTS (SELECT 1 FROM delivery_unit_skip_sources source
           WHERE source.invalidation_id = invalidation.id)
       ORDER BY invalidation.created_at, invalidation.rowid`)
       .all(...parameters) as unknown as InvalidationRow[];
@@ -754,9 +786,12 @@ export class DeliveryCoordinator {
   }
 
   private recomputeUnitInTransaction(unitId: string, now: string, enqueue: boolean) {
-    const unit = this.db.prepare(`SELECT id, requirement_id, evidence_version FROM delivery_units WHERE id = ?`)
-      .get(unitId) as { id: string; requirement_id: string; evidence_version: number } | undefined;
+    const unit = this.db.prepare(`SELECT id, requirement_id, evidence_version, status
+      FROM delivery_units WHERE id = ?`).get(unitId) as {
+        id: string; requirement_id: string; evidence_version: number; status: string;
+      } | undefined;
     if (!unit) throw new Error("DELIVERY_UNIT_NOT_FOUND");
+    if (unit.status === "applied" || unit.status === "skipped") return;
     const codingEvidence = this.db.prepare(`SELECT 1 FROM coding_evidence
       WHERE delivery_unit_id = ? AND evidence_version = ?`).get(unit.id, unit.evidence_version);
     const jobs = new AutomationJobRepository(this.db, () => new Date(now));

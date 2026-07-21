@@ -168,7 +168,8 @@ describe("Phase 2 database schema", () => {
     expect(tableNames(db)).toEqual(expect.arrayContaining([
       "delivery_contract_evidence", "delivery_evidence_invalidations", "delivery_stale_decisions",
       "delivery_stale_decision_sources",
-      "requirement_automation_state", "requirement_automation_audit", "delivery_unit_skips"
+      "requirement_automation_state", "requirement_automation_audit",
+      "delivery_unit_skips", "delivery_unit_skip_sources"
     ]));
     const indexes = (db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all() as Array<{ name: string }>)
       .map((row) => row.name);

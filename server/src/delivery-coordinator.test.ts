@@ -295,6 +295,118 @@ describe("DeliveryCoordinator", () => {
     expect(fixture.store.deliveryUnits.get(optional!.id)).toMatchObject({ status: "skipped" });
   });
 
+  it("immutably links an optional skip to every active invalidation fact", () => {
+    const fixture = createFixture([[0, 2], [1, 2]], [true, true, false]);
+    const [first, second, optional] = fixture.units;
+    for (const source of [first!, second!]) {
+      settle(fixture.store, source.id, "code_review", "passed");
+      settle(fixture.store, source.id, "automated_testing", "passed");
+    }
+    completeImplementation(fixture.store, optional!.id);
+    advanceImplementation(fixture.store, first!.id, 2);
+    advanceImplementation(fixture.store, second!.id, 2);
+
+    const skipped = fixture.store.deliveryCoordination.skipOptional({ unitId: optional!.id,
+      actor: "local-human", reason: "optional delivery removed" });
+
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_unit_skip_sources
+      WHERE skip_id = ?`).get(skipped.id)).toEqual({ count: 2 });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_evidence_invalidations invalidation
+      WHERE target_unit_id = ?
+        AND NOT EXISTS (SELECT 1 FROM delivery_stale_decision_sources source
+          WHERE source.invalidation_id = invalidation.id)
+        AND NOT EXISTS (SELECT 1 FROM delivery_unit_skip_sources source
+          WHERE source.invalidation_id = invalidation.id)`).get(optional!.id)).toEqual({ count: 0 });
+    expect(() => fixture.database.prepare(`DELETE FROM delivery_unit_skip_sources WHERE skip_id = ?`).run(skipped.id))
+      .toThrow("DELIVERY_UNIT_SKIP_SOURCE_IMMUTABLE");
+  });
+
+  it("keeps an optional skip terminal across later upstream revisions and idempotent retries", () => {
+    const fixture = createFixture([[0, 1]], [true, false]);
+    const [source, optional] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, optional!.id);
+    advanceImplementation(fixture.store, source!.id, 2);
+    const input = { unitId: optional!.id, actor: "local-human", reason: "optional delivery removed" };
+    const first = fixture.store.deliveryCoordination.skipOptional(input);
+
+    advanceImplementation(fixture.store, source!.id, 3);
+    advanceImplementation(fixture.store, source!.id, 4);
+    const beforeReplay = fixture.store.deliveryUnits.get(optional!.id);
+    const replay = fixture.store.deliveryCoordination.skipOptional(input);
+
+    expect(replay).toEqual(first);
+    expect(fixture.store.deliveryUnits.get(optional!.id)).toEqual(beforeReplay);
+    expect(beforeReplay).toMatchObject({ status: "skipped", evidenceVersion: 1 });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_evidence_invalidations
+      WHERE target_unit_id = ?`).get(optional!.id)).toEqual({ count: 1 });
+    expect(() => fixture.store.deliveryCoordination.skipOptional({ ...input, reason: "different" }))
+      .toThrow("DELIVERY_UNIT_SKIP_CONFLICT");
+  });
+
+  it("never invalidates an applied descendant after later upstream evidence", () => {
+    const fixture = createFixture([[0, 1]], [true, true]);
+    const [source, applied] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, applied!.id);
+    settle(fixture.store, applied!.id, "code_review", "passed");
+    settle(fixture.store, applied!.id, "automated_testing", "passed");
+    fixture.database.prepare(`UPDATE delivery_units SET status = 'applied', completed_at = ? WHERE id = ?`)
+      .run(new Date().toISOString(), applied!.id);
+
+    advanceImplementation(fixture.store, source!.id, 2);
+
+    expect(fixture.store.deliveryUnits.get(applied!.id)).toMatchObject({
+      phase: "acceptance_delivery", status: "applied", evidenceVersion: 1
+    });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_evidence_invalidations
+      WHERE target_unit_id = ?`).get(applied!.id)).toEqual({ count: 0 });
+  });
+
+  it("preserves applied when reusing a legacy active invalidation", () => {
+    const fixture = createFixture([], [true, true]);
+    const [source, applied] = fixture.units;
+    settle(fixture.store, applied!.id, "code_review", "passed");
+    settle(fixture.store, applied!.id, "automated_testing", "passed");
+    fixture.database.prepare(`UPDATE delivery_units SET status = 'applied', completed_at = ? WHERE id = ?`)
+      .run(new Date().toISOString(), applied!.id);
+    fixture.database.prepare(`UPDATE automation_jobs SET status = 'canceled', updated_at = ?
+      WHERE owner_id = ? AND status = 'pending'`).run(new Date().toISOString(), applied!.id);
+    advanceImplementation(fixture.store, source!.id, 2);
+    const sourceEvidence = fixture.database.prepare(`SELECT id, evidence_version, diff_hash FROM coding_evidence
+      WHERE delivery_unit_id = ? ORDER BY evidence_version`).all(source!.id) as Array<{
+        id: string; evidence_version: number; diff_hash: string;
+      }>;
+    const now = new Date().toISOString();
+    fixture.database.prepare(`INSERT INTO delivery_dependencies
+      (id, requirement_id, upstream_unit_id, downstream_unit_id, release_condition,
+       released_by_evidence_version, released_at, created_at)
+      VALUES ('legacy-applied-edge', ?, ?, ?, 'automated_testing_passed', 2, ?, ?)`)
+      .run(fixture.requirement.id, source!.id, applied!.id, now, now);
+    fixture.database.prepare(`INSERT INTO delivery_evidence_invalidations
+      (id, requirement_id, source_unit_id, source_kind,
+       source_old_evidence_id, source_old_evidence_version, source_old_evidence_hash,
+       source_new_evidence_id, source_new_evidence_version, source_new_evidence_hash,
+       target_unit_id, target_evidence_version, prior_phase, prior_status, earliest_invalid_phase,
+       cause, actor, created_at)
+      VALUES ('legacy-applied-invalidation', ?, ?, 'implementation', ?, 1, ?, ?, 2, ?, ?, 1,
+       'acceptance_delivery', 'applied', 'implementation', 'legacy invalidation', 'automation', ?)`)
+      .run(fixture.requirement.id, source!.id, sourceEvidence[0]!.id, sourceEvidence[0]!.diff_hash,
+        sourceEvidence[1]!.id, sourceEvidence[1]!.diff_hash, applied!.id, now);
+    fixture.database.prepare(`UPDATE delivery_units SET status = 'potentially_stale' WHERE id = ?`).run(applied!.id);
+
+    fixture.store.deliveryCoordination.resolveStale({ unitId: applied!.id, decision: "reuse",
+      actor: "local-human", reason: "legacy application remains terminal" });
+
+    expect(fixture.store.deliveryUnits.get(applied!.id)).toMatchObject({
+      phase: "acceptance_delivery", status: "applied", evidenceVersion: 1
+    });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND status = 'pending'`).get(applied!.id)).toEqual({ count: 0 });
+  });
+
   it("reruns once while resolving every active source fact", () => {
     const fixture = createFixture([[0, 1]], [true, true]);
     const [source, target] = fixture.units;

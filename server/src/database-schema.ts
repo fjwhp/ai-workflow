@@ -466,6 +466,14 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(requirement_id) REFERENCES requirements(id),
       FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id)
     );
+    CREATE TABLE IF NOT EXISTS delivery_unit_skip_sources (
+      skip_id TEXT NOT NULL,
+      invalidation_id TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(skip_id, invalidation_id),
+      FOREIGN KEY(skip_id) REFERENCES delivery_unit_skips(id),
+      FOREIGN KEY(invalidation_id) REFERENCES delivery_evidence_invalidations(id)
+    );
     CREATE TABLE IF NOT EXISTS rework_contexts (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, approval_id TEXT NOT NULL UNIQUE, artifact_id TEXT,
       source_stage TEXT NOT NULL, target_stage TEXT NOT NULL, actor_type TEXT NOT NULL, decision_at TEXT NOT NULL,
@@ -912,6 +920,8 @@ export function createPhase2Schema(db: DatabaseSync) {
               AND invalidation.target_evidence_version = unit.evidence_version
               AND NOT EXISTS (SELECT 1 FROM delivery_stale_decision_sources source
                 WHERE source.invalidation_id = invalidation.id)
+              AND NOT EXISTS (SELECT 1 FROM delivery_unit_skip_sources source
+                WHERE source.invalidation_id = invalidation.id)
           )
       ) OR (NEW.decision = 'reuse' AND NEW.resulting_evidence_version <> NEW.target_evidence_version)
         OR (NEW.decision = 'rerun' AND NEW.resulting_evidence_version <> NEW.target_evidence_version + 1);
@@ -933,6 +943,8 @@ export function createPhase2Schema(db: DatabaseSync) {
           AND invalidation.target_unit_id = decision.delivery_unit_id
           AND invalidation.target_evidence_version = decision.target_evidence_version
         WHERE decision.id = NEW.decision_id
+          AND NOT EXISTS (SELECT 1 FROM delivery_unit_skip_sources skip_source
+            WHERE skip_source.invalidation_id = invalidation.id)
           AND (
             (invalidation.source_kind = 'implementation' AND EXISTS (
               SELECT 1 FROM coding_evidence current
@@ -971,7 +983,7 @@ export function createPhase2Schema(db: DatabaseSync) {
     BEGIN SELECT RAISE(ABORT, 'DELIVERY_STALE_DECISION_SOURCE_IMMUTABLE'); END;
     CREATE TRIGGER IF NOT EXISTS prevent_unresolved_delivery_stale_recovery
     BEFORE UPDATE OF status, evidence_version ON delivery_units
-    WHEN OLD.status = 'potentially_stale' AND NEW.status NOT IN ('potentially_stale', 'skipped')
+    WHEN OLD.status = 'potentially_stale' AND NEW.status <> 'potentially_stale'
     BEGIN
       SELECT RAISE(ABORT, 'DELIVERY_STALE_ACTIVE_FACTS_REMAIN')
       WHERE EXISTS (
@@ -979,6 +991,8 @@ export function createPhase2Schema(db: DatabaseSync) {
         WHERE invalidation.target_unit_id = OLD.id
           AND invalidation.target_evidence_version = OLD.evidence_version
           AND NOT EXISTS (SELECT 1 FROM delivery_stale_decision_sources source
+            WHERE source.invalidation_id = invalidation.id)
+          AND NOT EXISTS (SELECT 1 FROM delivery_unit_skip_sources source
             WHERE source.invalidation_id = invalidation.id)
       );
     END;
@@ -994,6 +1008,30 @@ export function createPhase2Schema(db: DatabaseSync) {
     CREATE TRIGGER IF NOT EXISTS delivery_unit_skip_immutable_delete
     BEFORE DELETE ON delivery_unit_skips
     BEGIN SELECT RAISE(ABORT, 'DELIVERY_UNIT_SKIP_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_unit_skip_source_insert
+    BEFORE INSERT ON delivery_unit_skip_sources
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_UNIT_SKIP_SOURCE_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_unit_skips skip
+        JOIN delivery_evidence_invalidations invalidation
+          ON invalidation.id = NEW.invalidation_id
+          AND invalidation.requirement_id = skip.requirement_id
+          AND invalidation.target_unit_id = skip.delivery_unit_id
+          AND invalidation.target_evidence_version = skip.evidence_version
+        WHERE skip.id = NEW.skip_id
+          AND NOT EXISTS (SELECT 1 FROM delivery_stale_decision_sources decision_source
+            WHERE decision_source.invalidation_id = invalidation.id)
+          AND NOT EXISTS (SELECT 1 FROM delivery_unit_skip_sources existing
+            WHERE existing.invalidation_id = invalidation.id)
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS delivery_unit_skip_source_immutable_update
+    BEFORE UPDATE ON delivery_unit_skip_sources
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_UNIT_SKIP_SOURCE_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_unit_skip_source_immutable_delete
+    BEFORE DELETE ON delivery_unit_skip_sources
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_UNIT_SKIP_SOURCE_IMMUTABLE'); END;
     CREATE TRIGGER IF NOT EXISTS validate_delivery_unit_skip_insert
     BEFORE INSERT ON delivery_unit_skips
     BEGIN
