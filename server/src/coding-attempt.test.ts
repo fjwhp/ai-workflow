@@ -100,6 +100,59 @@ describe("delivery implementation attempt workspace", () => {
     await attempt.cleanup();
   });
 
+  it("rejects an ignored environment file before publication preparation", async () => {
+    const { attempt } = await createAttemptFixture();
+    await writeFile(join(attempt.workspace.worktreePath, ".gitignore"), ".env\n");
+    await writeFile(join(attempt.workspace.worktreePath, ".env"), "TOKEN=secret\n");
+    const result = await codingResultForAttempt(attempt);
+
+    await expect(attempt.preparePublication!(result))
+      .rejects.toThrow("IMPLEMENTATION_UNPUBLISHABLE_CHANGES");
+
+    await attempt.cleanup();
+  });
+
+  it("rejects a changed path matching the frozen sensitive glob", async () => {
+    const { input } = await createCodingInputFixture();
+    input.deliveryContext.sensitivePatterns = ["secrets/**"];
+    const attempt = await prepareDeliveryImplementationAttempt(input);
+    await mkdir(join(attempt.workspace.worktreePath, "secrets"));
+    await writeFile(join(attempt.workspace.worktreePath, "secrets/token.txt"), "secret\n");
+    const result = await codingResultForAttempt(attempt);
+
+    await expect(attempt.preparePublication!(result))
+      .rejects.toThrow("IMPLEMENTATION_UNPUBLISHABLE_CHANGES");
+
+    await attempt.cleanup();
+  });
+
+  it("rejects changes that exceed the complete evidence capture limit", async () => {
+    const { attempt } = await createAttemptFixture();
+    const result = await codingResultForAttempt(attempt);
+    await writeFile(join(attempt.workspace.worktreePath, "oversized.bin"), Buffer.alloc(33 * 1024 * 1024, 1));
+
+    await expect(attempt.preparePublication!(result))
+      .rejects.toThrow("IMPLEMENTATION_UNPUBLISHABLE_CHANGES");
+
+    await attempt.cleanup();
+  });
+
+  it("replaces a custom agent hidden diff with authoritative attempt evidence", async () => {
+    const { attempt } = await createAttemptFixture();
+    const hidden = await codingResultForAttempt(attempt);
+    await writeFile(join(attempt.workspace.worktreePath, "hidden.txt"), "must publish\n");
+
+    const prepared = await attempt.preparePublication!(hidden);
+
+    expect(prepared.result.evidenceSnapshot.changedFiles).toEqual([
+      expect.objectContaining({ path: "hidden.txt", status: "added", content: "must publish\n" })
+    ]);
+    expect(prepared.result.evidenceSnapshot.manifest.entries)
+      .toContainEqual(expect.objectContaining({ path: "hidden.txt", sha256: expect.any(String) }));
+    expect(prepared.input.patch.toString("utf8")).toContain("hidden.txt");
+    await attempt.cleanup();
+  });
+
   it("fails closed without deleting a replacement at the attempt path", async () => {
     const { attempt } = await createAttemptFixture();
     const original = `${attempt.workspace.worktreePath}.original`;
@@ -144,6 +197,17 @@ describe("delivery implementation attempt workspace", () => {
 async function createAttemptFixture() {
   const { root, repo, input } = await createCodingInputFixture();
   return { root, repo, attempt: await prepareDeliveryImplementationAttempt(input) };
+}
+
+async function codingResultForAttempt(
+  attempt: Awaited<ReturnType<typeof prepareDeliveryImplementationAttempt>>
+): Promise<CodingAgentResult> {
+  const snapshot = await getWorktreeSnapshot(attempt.workspace.worktreePath);
+  return {
+    runId: "custom-run", ...attempt.workspace, summary: "custom", commands: [],
+    diff: snapshot.diff, files: snapshot.files, additions: snapshot.additions,
+    deletions: snapshot.deletions, evidenceSnapshot: snapshot
+  };
 }
 
 async function createCodingInputFixture() {

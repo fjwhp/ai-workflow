@@ -47,7 +47,9 @@ import {
   reverseImplementationPatchSync,
   validateImplementationPatch
 } from "./implementation-publication.js";
-import { cleanupCodingAttemptWorktree } from "./repository.js";
+import { cleanupJournaledCodingAttemptWorktree } from "./repository.js";
+
+const IMPLEMENTATION_PUBLICATION_LEASE_RESERVATION_MS = 60_000;
 
 export type { ExecutionInput } from "./execution-repository.js";
 
@@ -102,7 +104,11 @@ export class WorkflowStore {
   public readonly deliveryUnitDetails: DeliveryUnitDetailPersistence;
   public readonly automationJobs: AutomationJobPersistence;
 
-  constructor(path: string, private readonly clock: () => Date = () => new Date()) {
+  constructor(
+    path: string,
+    private readonly clock: () => Date = () => new Date(),
+    private readonly publicationHooks: { afterApply?: () => void } = {}
+  ) {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     createPhase2Schema(this.db);
@@ -147,6 +153,9 @@ export class WorkflowStore {
       prepareImplementationPublication: (claim, input) => this.withImmediateTransaction(
         () => this.prepareImplementationPublicationInTransaction(claim, input)
       ),
+      reconcilePreparedImplementation: async () => {
+        await this.reconcileImplementationPublications();
+      },
       publishPreparedImplementation: (claim, result) => this.withImmediateTransaction(() => {
         const lease = claim.automationLease;
         if (!lease) throw new Error("IMPLEMENTATION_PUBLICATION_AUTOMATION_REQUIRED");
@@ -185,6 +194,8 @@ export class WorkflowStore {
           throw new Error("IMPLEMENTATION_PUBLICATION_JOURNAL_INVALID");
         }
         applyImplementationPatchSync(row.authoritative_worktree_path, patch);
+        this.publicationHooks.afterApply?.();
+        this.deliveryExecutionRepository.assertImplementationLeaseInTransaction(claim);
         const published = captureImplementationPatchSync(row.authoritative_worktree_path);
         if (!published.equals(patch) || implementationPatchHash(published) !== row.published_diff_hash) {
           throw new Error("IMPLEMENTATION_PUBLICATION_DIFF_MISMATCH");
@@ -350,6 +361,22 @@ export class WorkflowStore {
     const lease = claim.automationLease;
     if (!lease) throw new Error("IMPLEMENTATION_PUBLICATION_AUTOMATION_REQUIRED");
     this.deliveryExecutionRepository.assertImplementationLeaseInTransaction(claim);
+    const reservationStart = this.clock();
+    if (!Number.isFinite(reservationStart.getTime())) {
+      throw new Error("IMPLEMENTATION_PUBLICATION_DATE_INVALID");
+    }
+    const reservationExpires = new Date(
+      reservationStart.getTime() + IMPLEMENTATION_PUBLICATION_LEASE_RESERVATION_MS
+    ).toISOString();
+    const reserved = this.db.prepare(`UPDATE automation_jobs SET
+        lease_expires_at = CASE WHEN lease_expires_at < ? THEN ? ELSE lease_expires_at END,
+        updated_at = ?
+      WHERE id = ? AND claim_token = ? AND lease_owner = ? AND status = 'leased'
+        AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`).run(
+      reservationExpires, reservationExpires, reservationStart.toISOString(),
+      lease.jobId, lease.claimToken, lease.workerId, reservationStart.toISOString()
+    );
+    if (reserved.changes !== 1) throw new Error("DELIVERY_IMPLEMENTATION_AUTOMATION_LEASE_STALE");
     validateImplementationPatch(input.patch);
     if (input.repoPath !== claim.project.repoPath
       || !Number.isSafeInteger(input.attemptDev) || input.attemptDev < 0
@@ -966,7 +993,7 @@ export class WorkflowStore {
 
   async reconcileImplementationPublications() {
     const candidates = this.db.prepare(`SELECT * FROM implementation_publication_journals
-      WHERE status IN ('prepared', 'committed') AND cleanup_status <> 'completed'
+      WHERE status IN ('prepared', 'committed', 'canceled') AND cleanup_status <> 'completed'
       ORDER BY created_at, id`).all() as any[];
     let reconciled = 0;
     for (const candidate of candidates) {
@@ -1014,7 +1041,13 @@ export class WorkflowStore {
       }
       if (manual) throw new Error("IMPLEMENTATION_PUBLICATION_MANUAL_RECOVERY_REQUIRED");
       try {
-        await cleanupCodingAttemptWorktree(candidate.repo_path, candidate.attempt_path);
+        await cleanupJournaledCodingAttemptWorktree(candidate.repo_path, candidate.attempt_path, {
+          version: 1,
+          uid: candidate.attempt_uid,
+          dev: candidate.attempt_dev,
+          ino: candidate.attempt_ino,
+          nonce: candidate.attempt_nonce
+        });
         this.updatePublicationCleanup(candidate.id, "completed");
       } catch (error) {
         this.updatePublicationCleanup(

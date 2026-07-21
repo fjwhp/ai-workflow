@@ -7,6 +7,8 @@ import {
   applyImplementationPatchSync,
   captureImplementationPatchSync,
   implementationPatchHash,
+  inspectImplementationChangedPathsSync,
+  MAX_IMPLEMENTATION_CHANGED_FILES,
   validateImplementationPatch
 } from "./implementation-publication.js";
 
@@ -49,8 +51,54 @@ describe("implementation publication primitives", () => {
     expect(implementationPatchHash(captureImplementationPatchSync(target))).toBe(expectedHash);
   });
 
+  it("does not mutate the real index while capturing untracked files", () => {
+    const { repo } = fixture();
+    writeFileSync(join(repo, "untracked.txt"), "untracked\n");
+    const before = git(repo, ["status", "--porcelain=v1"]);
+
+    captureImplementationPatchSync(repo);
+
+    expect(git(repo, ["status", "--porcelain=v1"])).toBe(before);
+  });
+
   it("rejects an oversized patch before persistence", () => {
     expect(() => validateImplementationPatch(Buffer.alloc(8 * 1024 * 1024 + 1)))
       .toThrow("IMPLEMENTATION_PUBLICATION_PATCH_TOO_LARGE");
+  });
+
+  it("captures through a fixed three-call Git sequence", () => {
+    const calls: string[][] = [];
+    const execute = ((_file: string, args: string[]) => {
+      calls.push(args);
+      return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    }) as any;
+
+    captureImplementationPatchSync("/tmp/fixed-capture", { execute });
+
+    expect(calls).toHaveLength(3);
+    expect(calls[0]).toEqual(expect.arrayContaining(["read-tree", "HEAD"]));
+    expect(calls[1]).toEqual(expect.arrayContaining(["add", "-N", "--all"]));
+    expect(calls[2]).toEqual(expect.arrayContaining(["diff", "--binary", "HEAD"]));
+  });
+
+  it("rejects a raw change set above the fixed file cap", () => {
+    const records = Array.from({ length: MAX_IMPLEMENTATION_CHANGED_FILES + 1 }, (_, index) =>
+      `?? file-${index}.txt`).join("\0") + "\0";
+    const execute = (() => ({ status: 0, stdout: Buffer.from(records), stderr: Buffer.alloc(0) })) as any;
+
+    expect(() => inspectImplementationChangedPathsSync("/tmp/file-cap", { execute }))
+      .toThrow("IMPLEMENTATION_PUBLICATION_TOO_MANY_FILES");
+  });
+
+  it("enforces a monotonic capture runtime budget", () => {
+    let now = 0;
+    const execute = (() => {
+      now = 101;
+      return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    }) as any;
+
+    expect(() => captureImplementationPatchSync("/tmp/runtime-cap", {
+      execute, monotonicNow: () => now, maxRuntimeMs: 100
+    })).toThrow("IMPLEMENTATION_PUBLICATION_RUNTIME_EXCEEDED");
   });
 });

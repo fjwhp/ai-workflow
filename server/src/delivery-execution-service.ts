@@ -187,7 +187,17 @@ export class DeliveryExecutionService {
       output: { runId: result.runId, summary }
     };
     if (journalPrepared) {
-      const completed = this.persistence.publishPreparedImplementation(claim, completion);
+      let completed;
+      try {
+        completed = this.persistence.publishPreparedImplementation(claim, completion);
+      } catch (error) {
+        try {
+          await this.persistence.reconcilePreparedImplementation(claim);
+        } catch (recoveryError) {
+          throw settlementErrorWithCause(recoveryError, error);
+        }
+        throw error;
+      }
       try {
         await attempt?.cleanup();
         this.persistence.settleImplementationPublicationCleanup(claim, "completed");

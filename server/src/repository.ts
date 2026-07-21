@@ -542,6 +542,93 @@ export async function cleanupCodingAttemptWorktree(repoPath: string, worktreePat
   });
 }
 
+export async function cleanupJournaledCodingAttemptWorktree(
+  repoPath: string,
+  worktreePath: string,
+  expected: CodingAttemptOwnership
+) {
+  repoPath = await requirementRepoPath(repoPath);
+  if (!validCodingAttemptOwnership(expected)) {
+    throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+  }
+  await withRepoWorktreeMutationLock(repoPath, async () => {
+    const id = basename(worktreePath);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) {
+      throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+    }
+    const root = resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "implementation-attempts");
+    const path = resolve(root, id);
+    if (resolve(worktreePath) !== path) throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+    const rootStatus = await lstat(root);
+    const uid = typeof process.getuid === "function" ? process.getuid() : rootStatus.uid;
+    if (!rootStatus.isDirectory() || rootStatus.isSymbolicLink() || rootStatus.uid !== uid
+      || (rootStatus.mode & 0o777) !== 0o700 || await realpath(root) !== root || expected.uid !== uid) {
+      throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+    }
+    const markerPath = codingAttemptMarkerPath(root, id);
+    const quarantine = resolve(root, `${id}.quarantine-${expected.nonce}`);
+    const pathPresent = await entryExists(path);
+    const markerPresent = await entryExists(markerPath);
+    const quarantinePresent = await entryExists(quarantine);
+    if (pathPresent) {
+      const owned = await validateCodingAttemptOwnership(repoPath, path);
+      assertCodingAttemptOwnership(owned.ownership, expected);
+      if (quarantinePresent) throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+      await rename(path, quarantine).catch((error) => {
+        throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_FAILED", { cause: error });
+      });
+    } else if (markerPresent) {
+      assertCodingAttemptOwnership(await readCodingAttemptOwnership(markerPath, uid), expected);
+    }
+    if (pathPresent || quarantinePresent) {
+      await validateCodingAttemptQuarantine(quarantine, expected, root);
+      await rm(quarantine, { recursive: true });
+    }
+    await execFileAsync("git", ["-C", repoPath, "worktree", "prune"], {
+      env: codingGitEnvironmentWithFsmonitor()
+    });
+    let registrations = await registeredWorktreePaths(repoPath);
+    if (registrations.has(path)) {
+      await execFileAsync("git", ["-C", repoPath, "worktree", "remove", "--force", path], {
+        env: codingGitEnvironmentWithFsmonitor()
+      }).catch(() => undefined);
+      await execFileAsync("git", ["-C", repoPath, "worktree", "prune"], {
+        env: codingGitEnvironmentWithFsmonitor()
+      });
+      registrations = await registeredWorktreePaths(repoPath);
+    }
+    if (registrations.has(path) || await entryExists(path) || await entryExists(quarantine)) {
+      throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_FAILED");
+    }
+    if (await entryExists(markerPath)) {
+      assertCodingAttemptOwnership(await readCodingAttemptOwnership(markerPath, uid), expected);
+      await rm(markerPath);
+    }
+  });
+}
+
+async function registeredWorktreePaths(repoPath: string) {
+  const { stdout } = await execFileAsync("git", ["-C", repoPath, "worktree", "list", "--porcelain", "-z"], {
+    env: codingGitEnvironmentWithFsmonitor()
+  });
+  return new Set(parseRegisteredWorktrees(stdout).map((item) => resolve(item.path)));
+}
+
+async function entryExists(path: string) {
+  try { await lstat(path); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function assertCodingAttemptOwnership(actual: CodingAttemptOwnership, expected: CodingAttemptOwnership) {
+  if (actual.uid !== expected.uid || actual.dev !== expected.dev || actual.ino !== expected.ino
+    || actual.nonce !== expected.nonce || actual.version !== expected.version) {
+    throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+  }
+}
+
 function codingAttemptMarkerPath(root: string, id: string) {
   return resolve(root, `${id}${CODING_ATTEMPT_OWNER_SUFFIX}`);
 }

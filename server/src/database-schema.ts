@@ -623,6 +623,28 @@ export function createPhase2Schema(db: DatabaseSync) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_implementation_publication_unit_version
       ON implementation_publication_journals(delivery_unit_id, evidence_version)
       WHERE status IN ('prepared', 'committed', 'manual');
+    CREATE TRIGGER IF NOT EXISTS implementation_publication_identity_immutable
+    BEFORE UPDATE OF id, job_id, claim_token, worker_id, delivery_unit_id, evidence_version,
+      execution_id, run_id, attempt_path, attempt_dev, attempt_ino, attempt_uid, attempt_nonce,
+      repo_path, authoritative_worktree_path, base_commit, baseline_diff_hash, patch_blob,
+      patch_sha256, patch_bytes, published_diff_hash, created_at
+    ON implementation_publication_journals
+    BEGIN SELECT RAISE(ABORT, 'IMPLEMENTATION_PUBLICATION_JOURNAL_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS implementation_publication_status_transition
+    BEFORE UPDATE OF status ON implementation_publication_journals
+    WHEN NOT (OLD.status = 'prepared' AND NEW.status IN ('committed', 'canceled', 'manual'))
+    BEGIN SELECT RAISE(ABORT, 'IMPLEMENTATION_PUBLICATION_STATUS_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS implementation_publication_cleanup_transition
+    BEFORE UPDATE OF cleanup_status ON implementation_publication_journals
+    WHEN NOT (
+      (OLD.cleanup_status = 'pending' AND NEW.cleanup_status IN ('pending', 'failed', 'completed'))
+      OR (OLD.cleanup_status = 'failed' AND NEW.cleanup_status IN ('failed', 'completed'))
+      OR (OLD.cleanup_status = 'completed' AND NEW.cleanup_status = 'completed')
+    )
+    BEGIN SELECT RAISE(ABORT, 'IMPLEMENTATION_PUBLICATION_CLEANUP_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS implementation_publication_immutable_delete
+    BEFORE DELETE ON implementation_publication_journals
+    BEGIN SELECT RAISE(ABORT, 'IMPLEMENTATION_PUBLICATION_JOURNAL_IMMUTABLE'); END;
     CREATE INDEX IF NOT EXISTS idx_automation_jobs_pending_lease
       ON automation_jobs(status, created_at, id)
       WHERE status = 'pending' AND attempt < max_attempts;

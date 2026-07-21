@@ -112,6 +112,7 @@ export interface DeliveryExecutionPersistence {
     input: DeliveryImplementationPublicationInput
   ): DeliveryImplementationPublicationJournal;
   publishPreparedImplementation(claim: DeliveryExecutionClaim, result: DeliveryExecutionSuccess): DeliveryUnit;
+  reconcilePreparedImplementation(claim: DeliveryExecutionClaim): Promise<void>;
   getCompletedImplementation(
     unitId: string,
     evidenceVersion: number,

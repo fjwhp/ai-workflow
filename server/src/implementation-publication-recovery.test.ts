@@ -11,7 +11,9 @@ import {
   applyImplementationPatchSync,
   captureImplementationPatchSync
 } from "./implementation-publication.js";
-import { createCodingAttemptWorktree, getWorktreeSnapshot } from "./repository.js";
+import {
+  cleanupCodingAttemptWorktree, createCodingAttemptWorktree, getWorktreeSnapshot
+} from "./repository.js";
 
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
@@ -38,6 +40,127 @@ describe("implementation publication startup recovery", () => {
       status: "canceled", cleanup_status: "completed"
     });
     expect(existsSync(fixture.attempt.worktreePath)).toBe(false);
+  });
+
+  it("finishes cleanup after canceled status committed before cleanup began", async () => {
+    const fixture = await preparedFixture();
+    fixture.db.prepare(`UPDATE implementation_publication_journals
+      SET status = 'canceled' WHERE delivery_unit_id = ?`).run(fixture.unit.id);
+
+    await fixture.store.reconcileImplementationPublications();
+
+    expect(existsSync(fixture.attempt.worktreePath)).toBe(false);
+    expect(fixture.db.prepare(`SELECT status, cleanup_status FROM implementation_publication_journals
+      WHERE delivery_unit_id = ?`).get(fixture.unit.id)).toEqual({
+      status: "canceled", cleanup_status: "completed"
+    });
+  });
+
+  it("settles cleanup when filesystem removal completed before status write", async () => {
+    const fixture = await preparedFixture();
+    fixture.db.prepare(`UPDATE implementation_publication_journals
+      SET status = 'canceled' WHERE delivery_unit_id = ?`).run(fixture.unit.id);
+    await cleanupCodingAttemptWorktree(fixture.repo, fixture.attempt.worktreePath);
+
+    await fixture.store.reconcileImplementationPublications();
+
+    expect(fixture.db.prepare(`SELECT status, cleanup_status FROM implementation_publication_journals
+      WHERE delivery_unit_id = ?`).get(fixture.unit.id)).toEqual({
+      status: "canceled", cleanup_status: "completed"
+    });
+  });
+
+  it("recovers after a child is SIGKILLed after canceled commit and before cleanup", async () => {
+    const fixture = await preparedFixture();
+    const barrier = join(fixture.root, "canceled-before-cleanup.marker");
+    const child = spawn(process.execPath, ["--input-type=module", "-e", `
+      import { DatabaseSync } from "node:sqlite";
+      import { writeFileSync } from "node:fs";
+      const db = new DatabaseSync(process.env.PUBLICATION_DATABASE);
+      db.prepare("UPDATE implementation_publication_journals SET status = 'canceled' WHERE status = 'prepared'").run();
+      db.close();
+      writeFileSync(process.env.PUBLICATION_BARRIER, "canceled", { flag: "wx" });
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+    `], {
+      env: { ...process.env, PUBLICATION_DATABASE: fixture.databasePath, PUBLICATION_BARRIER: barrier },
+      stdio: ["ignore", "ignore", "pipe"]
+    });
+
+    await killChildAtBarrier(child, barrier);
+    await fixture.store.reconcileImplementationPublications();
+
+    expect(existsSync(fixture.attempt.worktreePath)).toBe(false);
+    expect(fixture.db.prepare(`SELECT status, cleanup_status FROM implementation_publication_journals
+      WHERE delivery_unit_id = ?`).get(fixture.unit.id)).toEqual({
+      status: "canceled", cleanup_status: "completed"
+    });
+  }, 15_000);
+
+  it("recovers after a child is SIGKILLed after filesystem cleanup and before status write", async () => {
+    const fixture = await preparedFixture();
+    fixture.db.prepare(`UPDATE implementation_publication_journals
+      SET status = 'canceled' WHERE delivery_unit_id = ?`).run(fixture.unit.id);
+    const barrier = join(fixture.root, "filesystem-before-status.marker");
+    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+      import { writeFileSync } from "node:fs";
+      const { cleanupJournaledCodingAttemptWorktree } = await import(process.env.PUBLICATION_REPOSITORY_MODULE);
+      await cleanupJournaledCodingAttemptWorktree(process.env.PUBLICATION_REPO, process.env.PUBLICATION_ATTEMPT, {
+        version: 1,
+        uid: Number(process.env.PUBLICATION_UID),
+        dev: Number(process.env.PUBLICATION_DEV),
+        ino: Number(process.env.PUBLICATION_INO),
+        nonce: process.env.PUBLICATION_NONCE
+      });
+      writeFileSync(process.env.PUBLICATION_BARRIER, "clean", { flag: "wx" });
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+    `], {
+      env: {
+        ...process.env,
+        PUBLICATION_REPOSITORY_MODULE: new URL("./repository.ts", import.meta.url).href,
+        PUBLICATION_REPO: fixture.repo,
+        PUBLICATION_ATTEMPT: fixture.attempt.worktreePath,
+        PUBLICATION_UID: String(fixture.attempt.attemptIdentity.uid),
+        PUBLICATION_DEV: String(fixture.attempt.attemptIdentity.dev),
+        PUBLICATION_INO: String(fixture.attempt.attemptIdentity.ino),
+        PUBLICATION_NONCE: fixture.attempt.attemptIdentity.nonce,
+        PUBLICATION_BARRIER: barrier
+      },
+      stdio: ["ignore", "ignore", "pipe"]
+    });
+
+    await killChildAtBarrier(child, barrier);
+    await fixture.store.reconcileImplementationPublications();
+
+    expect(fixture.db.prepare(`SELECT status, cleanup_status FROM implementation_publication_journals
+      WHERE delivery_unit_id = ?`).get(fixture.unit.id)).toEqual({
+      status: "canceled", cleanup_status: "completed"
+    });
+  }, 15_000);
+
+  it.each([
+    ["identity", "UPDATE implementation_publication_journals SET patch_sha256 = lower(hex(randomblob(32))) WHERE delivery_unit_id = ?"],
+    ["delete", "DELETE FROM implementation_publication_journals WHERE delivery_unit_id = ?"]
+  ])("rejects direct SQL %s mutation", async (_kind, sql) => {
+    const fixture = await preparedFixture();
+
+    expect(() => fixture.db.prepare(sql).run(fixture.unit.id))
+      .toThrow("IMPLEMENTATION_PUBLICATION_JOURNAL_IMMUTABLE");
+  });
+
+  it("rejects terminal status reversal and completed cleanup downgrade", async () => {
+    const fixture = await preparedFixture();
+    fixture.db.prepare(`UPDATE implementation_publication_journals
+      SET status = 'canceled' WHERE delivery_unit_id = ?`).run(fixture.unit.id);
+    expect(() => fixture.db.prepare(`UPDATE implementation_publication_journals
+      SET status = 'prepared' WHERE delivery_unit_id = ?`).run(fixture.unit.id))
+      .toThrow("IMPLEMENTATION_PUBLICATION_STATUS_IMMUTABLE");
+    fixture.db.prepare(`UPDATE implementation_publication_journals SET
+      cleanup_status = 'completed', cleanup_completed_at = updated_at WHERE delivery_unit_id = ?`)
+      .run(fixture.unit.id);
+
+    expect(() => fixture.db.prepare(`UPDATE implementation_publication_journals SET
+      cleanup_status = 'failed', cleanup_completed_at = NULL WHERE delivery_unit_id = ?`).run(fixture.unit.id))
+      .toThrow("IMPLEMENTATION_PUBLICATION_CLEANUP_IMMUTABLE");
   });
 
   it("fails closed without reversing an ambiguous dirty authoritative worktree", async () => {
@@ -152,6 +275,33 @@ describe("implementation publication startup recovery", () => {
     expect(fixture.store.automationJobs.get(fixture.job.id)).toMatchObject({ status: "pending" });
     expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toBeNull();
   }, 15_000);
+
+  it("reserves the lease and immediately reverses an apply that crosses the final expiry fence", async () => {
+    let now = new Date("2026-07-22T00:00:00.000Z");
+    const fixture = await preparedFixture({
+      clock: () => now,
+      afterApply: () => { now = new Date(now.getTime() + 61_000); }
+    });
+    const lease = fixture.db.prepare("SELECT lease_expires_at FROM automation_jobs WHERE id = ?")
+      .get(fixture.job.id) as { lease_expires_at: string };
+    expect(new Date(lease.lease_expires_at).getTime()).toBeGreaterThanOrEqual(
+      new Date("2026-07-22T00:01:00.000Z").getTime()
+    );
+
+    await expect(Promise.resolve().then(() =>
+      fixture.store.deliveryExecutions.publishPreparedImplementation(fixture.claim, fixture.result)
+    )).rejects.toThrow("DELIVERY_IMPLEMENTATION_AUTOMATION_LEASE_STALE");
+    expect(captureImplementationPatchSync(fixture.repo).equals(fixture.patch)).toBe(true);
+
+    await fixture.store.deliveryExecutions.reconcilePreparedImplementation(fixture.claim);
+
+    expect(captureImplementationPatchSync(fixture.repo)).toHaveLength(0);
+    expect(fixture.store.automationJobs.get(fixture.job.id)).toMatchObject({ status: "pending" });
+    expect(fixture.db.prepare(`SELECT status, cleanup_status FROM implementation_publication_journals
+      WHERE delivery_unit_id = ?`).get(fixture.unit.id)).toEqual({
+      status: "canceled", cleanup_status: "completed"
+    });
+  });
 
   it("fences a stale child so the replacement child is the only publisher", async () => {
     const fixture = await preparedFixture();
@@ -268,7 +418,18 @@ function startPublisherChild(
   return { ready, result: resultPromise };
 }
 
-async function preparedFixture() {
+async function killChildAtBarrier(child: ReturnType<typeof spawn>, barrier: string) {
+  let stderr = "";
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+  for (let attempt = 0; attempt < 500 && !existsSync(barrier); attempt += 1) await delay(10);
+  expect(existsSync(barrier), stderr).toBe(true);
+  expect(child.kill("SIGKILL")).toBe(true);
+  const [code, signal] = await once(child, "exit") as [number | null, NodeJS.Signals | null];
+  expect({ code, signal }).toEqual({ code: null, signal: "SIGKILL" });
+}
+
+async function preparedFixture(options: { clock?: () => Date; afterApply?: () => void } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "implementation-publication-recovery-")));
   directories.push(root);
   const repo = join(root, "repo");
@@ -280,7 +441,7 @@ async function preparedFixture() {
   execFileSync("git", ["-C", repo, "add", "--all"]);
   execFileSync("git", ["-C", repo, "commit", "--quiet", "-m", "base"]);
   const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const store = new WorkflowStore(databasePath);
+  const store = new WorkflowStore(databasePath, options.clock, { afterApply: options.afterApply });
   stores.push(store);
   const project = store.createProject({
     name: "Recovery", repoPath: repo, defaultBranch: "main", allowedCommands: [], sensitivePatterns: []
@@ -304,7 +465,7 @@ async function preparedFixture() {
     ownerType: "delivery_unit", ownerId: unit.id, evidenceVersion: 1,
     action: "implement", payload: {}, maxAttempts: 3
   });
-  const job = store.automationJobs.leaseNext("recovery-worker", new Date(), 30_000)!;
+  const job = store.automationJobs.leaseNext("recovery-worker", options.clock?.() ?? new Date(), 30_000)!;
   expect(job.id).toBe(queued.id);
   const claim = store.deliveryExecutions.claimImplementation(
     unit.id, "test-model", { evidenceVersion: 1, claimToken: job.claimToken }

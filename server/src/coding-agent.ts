@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { posix } from "node:path";
 import {
@@ -9,9 +10,13 @@ import {
   getWorktreeSnapshot,
   publishCodingAttemptDiff
 } from "./repository.js";
-import { captureImplementationPatchSync } from "./implementation-publication.js";
+import {
+  captureImplementationPatchSync,
+  inspectImplementationChangedPathsSync,
+  type ImplementationChangedPath
+} from "./implementation-publication.js";
 import { resolveWorktreePath, safeReadWorktreeFile, safeWriteWorktreeFile } from "./worktree-file-safety.js";
-import { evidenceFingerprint, matchesSensitivePath } from "./evidence-tree.js";
+import { evidenceFingerprint, matchesSensitivePath, type EvidenceChangedFile, type EvidenceManifest } from "./evidence-tree.js";
 
 export { resolveWorktreePath } from "./worktree-file-safety.js";
 
@@ -80,21 +85,38 @@ export async function prepareDeliveryImplementationAttempt(input: CodingAgentInp
     async preparePublication(result: CodingAgentResult, publishSignal?: AbortSignal) {
       throwIfCodingAborted(publishSignal);
       validateAttemptResult(result, workspace);
+      const before = inspectImplementationChangedPathsSync(workspace.worktreePath);
+      assertPublishableChangedPaths(before, input.deliveryContext.sensitivePatterns);
+      let captured: Awaited<ReturnType<typeof getWorktreeSnapshot>>;
+      try {
+        captured = await getWorktreeSnapshot(workspace.worktreePath);
+      } catch (error) {
+        if (error instanceof Error && error.message === "CODING_EVIDENCE_SIZE_LIMIT") {
+          throw new Error("IMPLEMENTATION_UNPUBLISHABLE_CHANGES", { cause: error });
+        }
+        throw error;
+      }
+      assertPublicationEvidenceMatches(before, captured.changedFiles, captured.manifest);
       const patch = captureImplementationPatchSync(workspace.worktreePath);
+      const after = inspectImplementationChangedPathsSync(workspace.worktreePath);
+      if (JSON.stringify(after) !== JSON.stringify(before)
+        || !captureImplementationPatchSync(workspace.worktreePath).equals(patch)) {
+        throw new Error("IMPLEMENTATION_UNPUBLISHABLE_CHANGES");
+      }
       const identity = {
-        ...result.evidenceSnapshot.identity,
+        ...captured.identity,
         worktreePath: authoritative.worktreePath,
         branch: authoritative.branch,
         headCommit: authoritative.baseCommit
       };
       const evidenceSnapshot = {
-        ...result.evidenceSnapshot,
+        ...captured,
         identity,
         evidenceHash: evidenceFingerprint({
           identity,
-          manifestHash: result.evidenceSnapshot.manifestHash,
-          diff: result.evidenceSnapshot.diff,
-          changedFiles: result.evidenceSnapshot.changedFiles
+          manifestHash: captured.manifestHash,
+          diff: captured.diff,
+          changedFiles: captured.changedFiles
         })
       };
       return {
@@ -103,6 +125,10 @@ export async function prepareDeliveryImplementationAttempt(input: CodingAgentInp
           branch: authoritative.branch,
           worktreePath: authoritative.worktreePath,
           baseCommit: authoritative.baseCommit,
+          diff: captured.diff,
+          files: captured.files,
+          additions: captured.additions,
+          deletions: captured.deletions,
           evidenceSnapshot
         },
         input: {
@@ -153,6 +179,39 @@ export async function prepareDeliveryImplementationAttempt(input: CodingAgentInp
       await cleanupCodingAttemptWorktree(input.project.repoPath, workspace.worktreePath);
     }
   };
+}
+
+function assertPublishableChangedPaths(changes: ImplementationChangedPath[], sensitivePatterns: string[]) {
+  if (changes.some((change) => change.ignored
+    || matchesSensitivePath(change.path, sensitivePatterns)
+    || matchesSensitivePath(`${change.path}/__flowgate_probe__`, sensitivePatterns))) {
+    throw new Error("IMPLEMENTATION_UNPUBLISHABLE_CHANGES");
+  }
+}
+
+function assertPublicationEvidenceMatches(
+  changes: ImplementationChangedPath[],
+  changedFiles: EvidenceChangedFile[],
+  manifest: EvidenceManifest
+) {
+  const expected = changes.map(({ path, status }) => ({ path, status }));
+  const actual = changedFiles.map(({ path, status }) => ({ path, status }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error("IMPLEMENTATION_UNPUBLISHABLE_CHANGES");
+  }
+  const manifestByPath = new Map(manifest.entries.map((entry) => [entry.path, entry]));
+  for (const changed of changedFiles) {
+    const entry = manifestByPath.get(changed.path);
+    if (changed.status === "deleted") {
+      if (entry) throw new Error("IMPLEMENTATION_UNPUBLISHABLE_CHANGES");
+      continue;
+    }
+    if (!entry) throw new Error("IMPLEMENTATION_UNPUBLISHABLE_CHANGES");
+    const hash = changed.kind === "binary" ? changed.sha256
+      : createHash("sha256").update(changed.content).digest("hex");
+    if (hash !== entry.sha256) throw new Error("IMPLEMENTATION_UNPUBLISHABLE_CHANGES");
+  }
 }
 
 function validateAttemptResult(

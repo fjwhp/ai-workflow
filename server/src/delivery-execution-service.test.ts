@@ -176,6 +176,47 @@ function claimOnNextTurn(store: WorkflowStore, unitId: string) {
 }
 
 describe("DeliveryExecutionService", () => {
+  it("runs immediate publication reconciliation when final publication fails", async () => {
+    const fixture = createFixture();
+    const claimed = fixture.store.deliveryExecutions.claimImplementation(fixture.unit.id, "test-model");
+    const implementation = codingResult();
+    const publishError = new Error("DELIVERY_IMPLEMENTATION_AUTOMATION_LEASE_STALE");
+    const reconcilePreparedImplementation = vi.fn(async () => {});
+    const persistence = {
+      ...fixture.store.deliveryExecutions,
+      getCompletedImplementation: vi.fn(() => null),
+      claimImplementation: vi.fn(() => ({
+        ...claimed,
+        automationLease: {
+          jobId: randomUUID(), workerId: "runtime-worker",
+          evidenceVersion: 1, claimToken: `lease:${randomUUID()}:runtime-worker:${randomUUID()}`
+        }
+      })),
+      prepareImplementationPublication: vi.fn(),
+      publishPreparedImplementation: vi.fn(() => { throw publishError; }),
+      reconcilePreparedImplementation
+    } as any;
+    const attempt = {
+      workspace: {
+        branch: implementation.branch,
+        worktreePath: implementation.worktreePath,
+        baseCommit: implementation.baseCommit,
+        reused: false as const
+      },
+      preparePublication: vi.fn(async () => ({ result: implementation, input: {} as any })),
+      cleanup: vi.fn(async () => {})
+    };
+    const service = new RealDeliveryExecutionService(
+      persistence, vi.fn(async () => implementation), "test-model", undefined, {},
+      { prepare: vi.fn(async () => attempt) }
+    );
+
+    await expect(service.implement(fixture.unit.id, 1, "runtime-claim"))
+      .rejects.toThrow(publishError.message);
+
+    expect(reconcilePreparedImplementation).toHaveBeenCalledOnce();
+  });
+
   it("fails closed when the coding agent omits its frozen evidence snapshot", async () => {
     const fixture = createFixture();
     const implementation = { ...codingResult(), evidenceSnapshot: undefined } as any;
