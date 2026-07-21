@@ -5,6 +5,7 @@ import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it } from "vitest";
 import { WorkflowStore } from "./store.js";
 import type { DeliveryQualityKind, DeliveryQualityResult } from "./delivery-quality-repository.js";
+import type { DeliveryExecutionSuccess } from "./delivery-execution-repository.js";
 
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
@@ -60,16 +61,20 @@ function createFixture(edges: Array<[number, number]> = [[0, 1]], required: bool
 
 function completeImplementation(store: WorkflowStore, unitId: string) {
   const claim = store.deliveryExecutions.claimImplementation(unitId, "test-model");
-  store.deliveryExecutions.completeImplementation(claim, {
+  store.deliveryExecutions.completeImplementation(claim, implementationCompletion(unitId, claim.deliveryUnit.evidenceVersion));
+}
+
+function implementationCompletion(unitId: string, evidenceVersion: number): DeliveryExecutionSuccess {
+  return {
     branch: `ai/${unitId}`, worktreePath: `/tmp/${unitId}`, baseCommit: "base",
-    commands: [], diff: `diff-${unitId}`, diffHash: `hash-${unitId}`,
+    commands: [], diff: `diff-${unitId}-v${evidenceVersion}`, diffHash: `hash-${unitId}-v${evidenceVersion}`,
     changedFiles: [], identity: {
       repositoryPath: `/tmp/source-${unitId}`, gitCommonDir: `/tmp/source-${unitId}/.git`,
       worktreePath: `/tmp/${unitId}`, branch: `ai/${unitId}`, headCommit: "base"
-    }, manifest: { version: 1, entries: [] }, manifestHash: `manifest-${unitId}`,
+    }, manifest: { version: 1, entries: [] }, manifestHash: `manifest-${unitId}-v${evidenceVersion}`,
     originalChars: 4, truncated: false, files: [], additions: 1, deletions: 0,
     diagnostics: "", output: {}
-  });
+  };
 }
 
 function settle(
@@ -79,7 +84,8 @@ function settle(
   result: DeliveryQualityResult,
   token = `${kind}-${unitId}`
 ) {
-  const claim = store.deliveryQuality.claim(unitId, 1, kind, token);
+  const evidenceVersion = store.deliveryUnits.get(unitId)!.evidenceVersion;
+  const claim = store.deliveryQuality.claim(unitId, evidenceVersion, kind, `${token}-v${evidenceVersion}`);
   if (claim.status !== "running") throw new Error("expected running claim");
   return store.deliveryQuality.complete(claim, { result, content: { result } });
 }
@@ -94,6 +100,36 @@ function raceWorker() {
   });
   workers.push(worker);
   return worker;
+}
+
+function invalidationRaceWorker() {
+  const worker = new Worker(new URL("./delivery-invalidation-race-worker.ts", import.meta.url), {
+    execArgv: ["--import", "tsx"]
+  });
+  workers.push(worker);
+  return worker;
+}
+
+function invalidationRaceRound(worker: Worker, iteration: number, message: Record<string, unknown>) {
+  let readyResolve!: (value: { threadId: number }) => void;
+  let resultResolve!: (value: { threadId: number; ok: boolean; error?: string; value?: any }) => void;
+  let reject!: (error: Error) => void;
+  const ready = new Promise<{ threadId: number }>((resolve, rejectPromise) => {
+    readyResolve = resolve; reject = rejectPromise;
+  });
+  const result = new Promise<{ threadId: number; ok: boolean; error?: string; value?: any }>((resolve) => { resultResolve = resolve; });
+  const onError = (error: Error) => reject(error);
+  const onMessage = (response: any) => {
+    if (response.iteration !== iteration) return;
+    if (response.type === "ready") readyResolve(response);
+    if (response.type === "result") {
+      worker.off("message", onMessage); worker.off("error", onError); resultResolve(response);
+    }
+  };
+  worker.on("message", onMessage);
+  worker.on("error", onError);
+  worker.postMessage({ type: "prepare", iteration, ...message });
+  return { ready, result };
 }
 
 function raceRound(worker: Worker, iteration: number, message: Record<string, unknown>) {
@@ -121,7 +157,277 @@ function raceRound(worker: Worker, iteration: number, message: Record<string, un
   return { ready, result };
 }
 
+function staleFixture() {
+  const fixture = createFixture([[0, 1]], [true, true]);
+  const [source, downstream] = fixture.units;
+  settle(fixture.store, source!.id, "code_review", "passed");
+  settle(fixture.store, source!.id, "automated_testing", "passed");
+  completeImplementation(fixture.store, downstream!.id);
+  const database = (fixture.store as any).db;
+  database.prepare(`UPDATE delivery_units SET phase = 'implementation', status = 'ready', evidence_version = 2
+    WHERE id = ?`).run(source!.id);
+  completeImplementation(fixture.store, source!.id);
+  settle(fixture.store, source!.id, "code_review", "passed", "source-v2-review");
+  settle(fixture.store, source!.id, "automated_testing", "passed", "source-v2-test");
+  return { ...fixture, source: source!, downstream: downstream!, database };
+}
+
+function staleFixtureForFailure() {
+  const fixture = createFixture([[0, 1]], [true, true]);
+  const [source, downstream] = fixture.units;
+  settle(fixture.store, source!.id, "code_review", "passed");
+  settle(fixture.store, source!.id, "automated_testing", "passed");
+  completeImplementation(fixture.store, downstream!.id);
+  const database = (fixture.store as any).db;
+  database.prepare(`UPDATE delivery_units SET phase = 'implementation', status = 'ready', evidence_version = 2
+    WHERE id = ?`).run(source!.id);
+  return { ...fixture, source: source!, downstream: downstream!, database };
+}
+
 describe("DeliveryCoordinator", () => {
+  it("invalidates every started transitive descendant in the implementation completion transaction", () => {
+    const fixture = createFixture([[0, 1], [1, 2]], [true, true, true]);
+    const [source, middle, leaf] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, middle!.id);
+    settle(fixture.store, middle!.id, "code_review", "passed");
+    settle(fixture.store, middle!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, leaf!.id);
+    const database = (fixture.store as any).db;
+    database.prepare(`UPDATE delivery_units SET phase = 'implementation', status = 'ready', evidence_version = 2
+      WHERE id = ?`).run(source!.id);
+
+    completeImplementation(fixture.store, source!.id);
+
+    expect(units(fixture.store, fixture.requirement.id).map((unit) => unit.status)).toEqual([
+      "awaiting_gate", "potentially_stale", "potentially_stale"
+    ]);
+    expect(database.prepare(`SELECT source_unit_id, source_old_evidence_version, source_new_evidence_version,
+        target_unit_id, target_evidence_version, prior_phase, prior_status, earliest_invalid_phase
+      FROM delivery_evidence_invalidations ORDER BY target_unit_id`).all()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source_unit_id: source!.id, source_old_evidence_version: 1,
+        source_new_evidence_version: 2, target_unit_id: middle!.id, target_evidence_version: 1,
+        prior_phase: "acceptance_delivery", prior_status: "ready_for_acceptance",
+        earliest_invalid_phase: "implementation" }),
+      expect.objectContaining({ target_unit_id: leaf!.id, target_evidence_version: 1,
+        prior_phase: "implementation", prior_status: "awaiting_gate" })
+    ]));
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id IN (?, ?) AND evidence_version = 1 AND status = 'pending'`).get(middle!.id, leaf!.id).count).toBe(0);
+    expect(() => database.prepare(`UPDATE delivery_evidence_invalidations SET actor = 'rewrite'`).run())
+      .toThrow("DELIVERY_EVIDENCE_INVALIDATION_IMMUTABLE");
+  });
+
+  it("returns not-started descendants to dependency waiting without creating stale evidence", () => {
+    const fixture = createFixture([[0, 1]], [true, true]);
+    const [source, downstream] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    const database = (fixture.store as any).db;
+    database.prepare(`UPDATE delivery_units SET phase = 'implementation', status = 'ready', evidence_version = 2
+      WHERE id = ?`).run(source!.id);
+
+    completeImplementation(fixture.store, source!.id);
+
+    expect(units(fixture.store, fixture.requirement.id)[1]).toMatchObject({ status: "waiting_dependency" });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM delivery_evidence_invalidations
+      WHERE target_unit_id = ?`).get(downstream!.id).count).toBe(0);
+    expect(fixture.store.automationJobs.byDedupe(`implement:${downstream!.id}:v1`)).toMatchObject({ status: "canceled" });
+  });
+
+  it("reuses only an active current invalidation and records an immutable idempotent decision", () => {
+    const fixture = staleFixture();
+    const input = { unitId: fixture.downstream.id, decision: "reuse", reason: "contract remains compatible", actor: "local-human" };
+    const first = (fixture.store.deliveryCoordination as any).resolveStale(input);
+    const replays = Array.from({ length: 20 }, () =>
+      (fixture.store.deliveryCoordination as any).resolveStale(input));
+
+    expect(replays.every((replay) => replay.id === first.id)).toBe(true);
+    expect(units(fixture.store, fixture.requirement.id)[1]).toMatchObject({
+      phase: "implementation", status: "awaiting_gate", evidenceVersion: 1
+    });
+    expect(first).toMatchObject({ decision: "reuse", actor: "local-human", reason: "contract remains compatible",
+      sourceOldEvidenceVersion: 1, sourceNewEvidenceVersion: 2, targetEvidenceVersion: 1 });
+    expect(() => (fixture.store.deliveryCoordination as any).resolveStale({ ...input, reason: "different" }))
+      .toThrow("DELIVERY_STALE_RESOLUTION_CONFLICT");
+    expect(() => fixture.database.prepare(`DELETE FROM delivery_stale_decisions WHERE id = ?`).run(first.id))
+      .toThrow("DELIVERY_STALE_DECISION_IMMUTABLE");
+  });
+
+  it("reruns from implementation with a new evidence version and one exact job", () => {
+    const fixture = staleFixture();
+    const decision = (fixture.store.deliveryCoordination as any).resolveStale({
+      unitId: fixture.downstream.id, decision: "rerun", reason: "upstream API changed", actor: "local-human"
+    });
+    const replays = Array.from({ length: 20 }, () => (fixture.store.deliveryCoordination as any).resolveStale({
+      unitId: fixture.downstream.id, decision: "rerun", reason: "upstream API changed", actor: "local-human"
+    }));
+
+    expect(decision).toMatchObject({ decision: "rerun", targetEvidenceVersion: 1, resultingEvidenceVersion: 2 });
+    expect(replays.every((replay) => replay.id === decision.id)).toBe(true);
+    expect(units(fixture.store, fixture.requirement.id)[1]).toMatchObject({
+      phase: "implementation", status: "ready", evidenceVersion: 2
+    });
+    expect(fixture.store.automationJobs.byDedupe(`implement:${fixture.downstream.id}:v2`)).toMatchObject({
+      action: "implement", status: "pending"
+    });
+    expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.downstream.id, 1)).not.toBeNull();
+  });
+
+  it("persists a pause, cancels pending jobs, and excludes later jobs from leases on another connection", () => {
+    const fixture = createFixture([], [true]);
+    const unit = fixture.units[0]!;
+    const pause = (fixture.store.deliveryCoordination as any).pauseAutomation({
+      requirementId: fixture.requirement.id, actor: "local-human", reason: "investigating upstream change"
+    });
+    expect(pause).toMatchObject({ status: "paused", actor: "local-human", reason: "investigating upstream change" });
+    expect(fixture.store.automationJobs.listPending()).toEqual([]);
+    const second = new WorkflowStore(fixture.databasePath);
+    stores.push(second);
+    for (let iteration = 1; iteration <= 20; iteration += 1) {
+      fixture.store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id,
+        evidenceVersion: iteration, action: "implement", payload: {}, maxAttempts: 3 });
+      expect(second.automationJobs.leaseNext(`paused-worker-${iteration}`, new Date(), 10_000)).toBeNull();
+    }
+    expect((fixture.store.deliveryCoordination as any).pauseAutomation({
+      requirementId: fixture.requirement.id, actor: "local-human", reason: "investigating upstream change"
+    })).toEqual(pause);
+    expect(() => (fixture.store.deliveryCoordination as any).pauseAutomation({
+      requirementId: fixture.requirement.id, actor: "local-human", reason: "different reason"
+    })).toThrow("REQUIREMENT_AUTOMATION_STATE_CONFLICT");
+    expect((fixture.store as any).db.prepare(`SELECT action FROM requirement_automation_audit
+      WHERE requirement_id = ? ORDER BY created_at, rowid`).all(fixture.requirement.id)).toContainEqual({
+      action: "pause_conflict"
+    });
+  });
+
+  it("serializes pause against lease on independent connections across twenty races", { timeout: 30_000 }, async () => {
+    const pauseWorker = invalidationRaceWorker();
+    const leaseWorker = invalidationRaceWorker();
+    for (let iteration = 0; iteration < 20; iteration += 1) {
+      const fixture = createFixture([], [true]);
+      const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
+      const pause = invalidationRaceRound(pauseWorker, iteration, { databasePath: fixture.databasePath, barrier,
+        operation: { kind: "pause", input: { requirementId: fixture.requirement.id,
+          actor: "local-human", reason: `pause race ${iteration}` } } });
+      await pause.ready;
+      const lease = invalidationRaceRound(leaseWorker, iteration, { databasePath: fixture.databasePath, barrier,
+        operation: { kind: "lease", workerId: `pause-race-${iteration}`,
+          now: new Date().toISOString(), leaseMs: 10_000 } });
+      await lease.ready;
+      Atomics.store(new Int32Array(barrier), 1, 1);
+      Atomics.notify(new Int32Array(barrier), 1, 2);
+      const [pauseResult, leaseResult] = await Promise.all([pause.result, lease.result]);
+
+      expect(pauseResult.ok).toBe(true);
+      expect(leaseResult.ok).toBe(true);
+      expect(fixture.store.automationJobs.listPending()).toEqual([]);
+      if (leaseResult.value !== null) expect(leaseResult.value).toMatchObject({ status: "leased" });
+      expect((fixture.store as any).db.prepare(`SELECT status FROM requirement_automation_state
+        WHERE requirement_id = ?`).get(fixture.requirement.id)).toEqual({ status: "paused" });
+    }
+  });
+
+  it("lets a leased quality mutation finish while paused without releasing or enqueueing downstream", () => {
+    const fixture = createFixture();
+    const [source, downstream] = fixture.units;
+    const review = fixture.store.deliveryQuality.claim(source!.id, 1, "code_review", "paused-review");
+    const testing = fixture.store.deliveryQuality.claim(source!.id, 1, "automated_testing", "paused-test");
+    if (review.status !== "running" || testing.status !== "running") throw new Error("expected claims");
+    (fixture.store.deliveryCoordination as any).pauseAutomation({
+      requirementId: fixture.requirement.id, actor: "local-human", reason: "hold releases"
+    });
+
+    fixture.store.deliveryQuality.complete(review, { result: "passed", content: {} });
+    fixture.store.deliveryQuality.complete(testing, { result: "passed", content: {} });
+
+    expect(fixture.store.deliveryQuality.latest(source!.id, "code_review")).toMatchObject({ result: "passed" });
+    expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)[0]).toMatchObject({
+      releasedByEvidenceVersion: null, releasedAt: null
+    });
+    expect(fixture.store.automationJobs.byDedupe(`implement:${downstream!.id}:v1`)).toBeNull();
+  });
+
+  it("resumes by recomputing current gates and enqueues each valid action once", () => {
+    const fixture = createFixture();
+    const [source, downstream] = fixture.units;
+    (fixture.store.deliveryCoordination as any).pauseAutomation({
+      requirementId: fixture.requirement.id, actor: "local-human", reason: "hold releases"
+    });
+    settle(fixture.store, source!.id, "code_review", "passed", "resume-review");
+    settle(fixture.store, source!.id, "automated_testing", "passed", "resume-test");
+
+    const input = { requirementId: fixture.requirement.id, actor: "local-human", reason: "checks complete" };
+    const resumed = (fixture.store.deliveryCoordination as any).resumeAutomation(input);
+    expect((fixture.store.deliveryCoordination as any).resumeAutomation(input)).toEqual(resumed);
+    expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)[0]).toMatchObject({
+      releasedByEvidenceVersion: 1
+    });
+    expect(fixture.store.automationJobs.byDedupe(`implement:${downstream!.id}:v1`)).toMatchObject({ status: "pending" });
+    expect((fixture.store as any).db.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE dedupe_key = ?`).get(`implement:${downstream!.id}:v1`).count).toBe(1);
+  });
+
+  it("releases a not-started descendant when reused current evidence restores a passed middle unit", () => {
+    const fixture = createFixture([[0, 1], [1, 2]], [true, true, true]);
+    const [source, middle, leaf] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, middle!.id);
+    settle(fixture.store, middle!.id, "code_review", "passed");
+    settle(fixture.store, middle!.id, "automated_testing", "passed");
+    const database = (fixture.store as any).db;
+    database.prepare(`UPDATE delivery_units SET phase = 'implementation', status = 'ready', evidence_version = 2
+      WHERE id = ?`).run(source!.id);
+    completeImplementation(fixture.store, source!.id);
+    settle(fixture.store, source!.id, "code_review", "passed", "reuse-chain-review");
+    settle(fixture.store, source!.id, "automated_testing", "passed", "reuse-chain-test");
+
+    (fixture.store.deliveryCoordination as any).resolveStale({
+      unitId: middle!.id, decision: "reuse", reason: "compatible upstream", actor: "local-human"
+    });
+
+    expect(units(fixture.store, fixture.requirement.id)[2]).toMatchObject({ status: "ready" });
+    expect(fixture.store.automationJobs.byDedupe(`implement:${leaf!.id}:v1`)).toMatchObject({ status: "pending" });
+  });
+
+  it("rolls implementation evidence and invalidation back together on an injected audit failure", () => {
+    const fixture = staleFixtureForFailure();
+    fixture.database.exec(`CREATE TRIGGER fail_invalidation_insert BEFORE INSERT ON delivery_evidence_invalidations
+      BEGIN SELECT RAISE(ABORT, 'INJECTED_INVALIDATION_FAILURE'); END;`);
+
+    expect(() => completeImplementation(fixture.store, fixture.source.id)).toThrow("INJECTED_INVALIDATION_FAILURE");
+
+    expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.source.id, 2)).toBeNull();
+    expect(fixture.store.deliveryUnits.get(fixture.source.id)).toMatchObject({ status: "running", evidenceVersion: 2 });
+    expect(fixture.store.deliveryUnits.get(fixture.downstream.id)).not.toMatchObject({ status: "potentially_stale" });
+  });
+
+  it("fails closed and rolls back when a runtime dependency cycle reaches the changed source", () => {
+    const fixture = staleFixtureForFailure();
+    fixture.database.prepare(`INSERT INTO delivery_dependencies
+      (id, requirement_id, upstream_unit_id, downstream_unit_id, release_condition,
+       released_by_evidence_version, released_at, created_at)
+      VALUES ('runtime-cycle', ?, ?, ?, 'automated_testing_passed', NULL, NULL, ?)`)
+      .run(fixture.requirement.id, fixture.downstream.id, fixture.source.id, new Date().toISOString());
+
+    expect(() => completeImplementation(fixture.store, fixture.source.id)).toThrow("DELIVERY_DEPENDENCY_CYCLE_RUNTIME");
+    expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.source.id, 2)).toBeNull();
+    expect(fixture.store.deliveryUnits.get(fixture.downstream.id)).not.toMatchObject({ status: "potentially_stale" });
+  });
+
+  it("keeps a requirement paused after reopening the database", () => {
+    const fixture = createFixture([], [true]);
+    (fixture.store.deliveryCoordination as any).pauseAutomation({
+      requirementId: fixture.requirement.id, actor: "local-human", reason: "restart test"
+    });
+    const reopened = new WorkflowStore(fixture.databasePath);
+    stores.push(reopened);
+    reopened.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: fixture.units[0]!.id,
+      evidenceVersion: 2, action: "implement", payload: {}, maxAttempts: 3 });
+    expect(reopened.automationJobs.leaseNext("restart-worker", new Date(), 10_000)).toBeNull();
+  });
   it.each([
     ["automated_testing", "code_review"],
     ["code_review", "automated_testing"]
@@ -428,6 +734,55 @@ describe("DeliveryCoordinator", () => {
     ]);
     expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)[0]!.releasedAt).toBeNull();
     expect(fixture.store.automationJobs.byDedupe(`implement:${frontend!.id}:v1`)).toBeNull();
+  });
+
+  it("serializes upstream invalidation against downstream quality release across twenty two-connection races", { timeout: 30_000 }, async () => {
+    const implementationWorker = invalidationRaceWorker();
+    const qualityWorker = invalidationRaceWorker();
+    for (let iteration = 0; iteration < 20; iteration += 1) {
+      const fixture = createFixture([[0, 1], [1, 2]], [true, true, true]);
+      const [source, middle, leaf] = fixture.units;
+      settle(fixture.store, source!.id, "code_review", "passed");
+      settle(fixture.store, source!.id, "automated_testing", "passed");
+      completeImplementation(fixture.store, middle!.id);
+      settle(fixture.store, middle!.id, "code_review", "passed", `race-review-${iteration}`);
+      const finalQuality = fixture.store.deliveryQuality.claim(
+        middle!.id, 1, "automated_testing", `race-testing-${iteration}`
+      );
+      if (finalQuality.status !== "running") throw new Error("expected running final quality");
+      const database = (fixture.store as any).db;
+      database.prepare(`UPDATE delivery_units SET phase = 'implementation', status = 'ready', evidence_version = 2
+        WHERE id = ?`).run(source!.id);
+      const implementation = fixture.store.deliveryExecutions.claimImplementation(source!.id, "test-model");
+      const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
+      const implementationRound = invalidationRaceRound(implementationWorker, iteration, {
+        databasePath: fixture.databasePath, barrier,
+        operation: { kind: "implementation", claim: implementation,
+          completion: implementationCompletion(source!.id, 2) }
+      });
+      await implementationRound.ready;
+      const qualityRound = invalidationRaceRound(qualityWorker, iteration, {
+        databasePath: fixture.databasePath, barrier,
+        operation: { kind: "quality", claim: finalQuality, completion: { result: "passed", content: {} } }
+      });
+      await qualityRound.ready;
+      Atomics.store(new Int32Array(barrier), 1, 1);
+      Atomics.notify(new Int32Array(barrier), 1, 2);
+      const [implementationResult, qualityResult] = await Promise.all([
+        implementationRound.result, qualityRound.result
+      ]);
+
+      expect(implementationResult.ok).toBe(true);
+      if (!qualityResult.ok) expect([
+        "DELIVERY_QUALITY_CALLBACK_STALE", "DELIVERY_UNIT_NOT_AWAITING_QUALITY"
+      ]).toContain(qualityResult.error);
+      expect(fixture.store.deliveryUnits.get(middle!.id)).toMatchObject({ status: "potentially_stale" });
+      expect(fixture.store.deliveryUnits.get(leaf!.id)).toMatchObject({ status: "waiting_dependency" });
+      expect(fixture.store.deliveryUnits.listDependencies(fixture.requirement.id)
+        .find((edge) => edge.upstreamUnitId === middle!.id)).toMatchObject({ releasedByEvidenceVersion: null });
+      const leafJob = fixture.store.automationJobs.byDedupe(`implement:${leaf!.id}:v1`);
+      expect(leafJob === null || leafJob.status === "canceled").toBe(true);
+    }
   });
 
   it("settles simultaneous final callbacks on independent SQLite connections across twenty races", { timeout: 30_000 }, async () => {

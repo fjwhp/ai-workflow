@@ -14,6 +14,7 @@ import { normalizeModuleId } from "./requirement-projects.js";
 import { buildRequirementProjectContext, ProjectContextError, resolveProjectContextBudget } from "./project-context.js";
 import { registerProjectVersionRoutes } from "./project-version-routes.js";
 import { registerRequirementRoutes } from "./requirement-routes.js";
+import { registerDeliveryUnitRoutes } from "./delivery-unit-routes.js";
 
 const requirementRevisionSchema = requirementInputSchema.extend({
   clarifications: requirementInputSchema.shape.businessProblem,
@@ -25,6 +26,7 @@ export async function buildApp(store: WorkflowStore) {
   for(const item of store.listRequirements())if(item.status==="completed"&&item.projectId&&!store.getKnowledgeChangeSet(item.id).id){try{publishRequirementKnowledge(store,item.id)}catch{/* Existing completed data remains usable if backfill fails. */}}
   await app.register(cors, { origin: /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/ });
   await registerProjectVersionRoutes(app, { store });
+  await registerDeliveryUnitRoutes(app, { store });
   await registerRequirementRoutes(app, {
     store,
     onApproved: (requirementId) => { refreshRequirementKnowledge(store, requirementId); }

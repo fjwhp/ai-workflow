@@ -111,15 +111,18 @@ export class WorkflowStore {
       completeImplementation: (claim, result) => this.withImmediateTransaction(
         () => {
           const unit = this.deliveryExecutionRepository.completeImplementationInTransaction(claim, result);
-          for (const action of ["review", "test"] as const) {
-            automationJobRepository.enqueue({
-              ownerType: "delivery_unit",
-              ownerId: unit.id,
-              evidenceVersion: unit.evidenceVersion,
-              action,
-              payload: {},
-              maxAttempts: 3
-            });
+          deliveryCoordinator.recordImplementationEvidenceInTransaction(unit.id, unit.evidenceVersion);
+          if (!deliveryCoordinator.isRequirementPaused(unit.requirementId)) {
+            for (const action of ["review", "test"] as const) {
+              automationJobRepository.enqueue({
+                ownerType: "delivery_unit",
+                ownerId: unit.id,
+                evidenceVersion: unit.evidenceVersion,
+                action,
+                payload: {},
+                maxAttempts: 3
+              });
+            }
           }
           return unit;
         }
@@ -168,6 +171,32 @@ export class WorkflowStore {
     this.deliveryCoordination = {
       overrideQuality: (input) => this.withImmediateTransaction(
         () => deliveryCoordinator.overrideQualityInTransaction(input)
+      ),
+      resolveStale: (input) => this.withImmediateTransaction(
+        () => deliveryCoordinator.resolveStaleInTransaction(input)
+      ),
+      pauseAutomation: (input) => {
+        try {
+          return this.withImmediateTransaction(() => deliveryCoordinator.pauseAutomationInTransaction(input));
+        } catch (error) {
+          if (error instanceof Error && error.message === "REQUIREMENT_AUTOMATION_STATE_CONFLICT") {
+            this.withImmediateTransaction(() => deliveryCoordinator.auditAutomationConflictInTransaction(input, "pause"));
+          }
+          throw error;
+        }
+      },
+      resumeAutomation: (input) => {
+        try {
+          return this.withImmediateTransaction(() => deliveryCoordinator.resumeAutomationInTransaction(input));
+        } catch (error) {
+          if (error instanceof Error && error.message === "REQUIREMENT_AUTOMATION_STATE_CONFLICT") {
+            this.withImmediateTransaction(() => deliveryCoordinator.auditAutomationConflictInTransaction(input, "resume"));
+          }
+          throw error;
+        }
+      },
+      skipOptional: (input) => this.withImmediateTransaction(
+        () => deliveryCoordinator.skipOptionalInTransaction(input)
       ),
       listQualityOverrides: (unitId, evidenceVersion) =>
         deliveryCoordinator.listQualityOverrides(unitId, evidenceVersion)

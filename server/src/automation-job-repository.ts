@@ -72,7 +72,10 @@ export class AutomationJobRepository {
       (id, dedupe_key, owner_type, owner_id, evidence_version, action, status, attempt, max_attempts,
        lease_owner, lease_expires_at, payload_json, last_error, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL, ?, ?)
-      ON CONFLICT(dedupe_key) DO NOTHING`)
+      ON CONFLICT(dedupe_key) DO UPDATE SET
+        status = 'pending', attempt = 0, lease_owner = NULL, lease_expires_at = NULL,
+        last_error = NULL, updated_at = excluded.updated_at
+      WHERE automation_jobs.status = 'canceled'`)
       .run(randomUUID(), dedupeKey, input.ownerType, input.ownerId, input.evidenceVersion, input.action,
         input.maxAttempts, payloadJson, now, now);
     const row = this.db.prepare("SELECT * FROM automation_jobs WHERE dedupe_key = ?").get(dedupeKey);
@@ -95,6 +98,13 @@ export class AutomationJobRepository {
     try {
       const candidate = this.db.prepare(`SELECT id FROM automation_jobs
         WHERE status = 'pending' AND attempt < max_attempts
+          AND NOT EXISTS (
+            SELECT 1 FROM requirement_automation_state state
+            WHERE state.status = 'paused' AND state.requirement_id = CASE
+              WHEN automation_jobs.owner_type = 'requirement' THEN automation_jobs.owner_id
+              ELSE (SELECT unit.requirement_id FROM delivery_units unit WHERE unit.id = automation_jobs.owner_id)
+            END
+          )
         ORDER BY created_at, id LIMIT 1`).get() as { id: string } | undefined;
       if (!candidate) {
         this.db.exec("COMMIT");
@@ -102,7 +112,14 @@ export class AutomationJobRepository {
       }
       const result = this.db.prepare(`UPDATE automation_jobs
         SET status = 'leased', attempt = attempt + 1, lease_owner = ?, lease_expires_at = ?, updated_at = ?
-        WHERE id = ? AND status = 'pending' AND attempt < max_attempts`)
+        WHERE id = ? AND status = 'pending' AND attempt < max_attempts
+          AND NOT EXISTS (
+            SELECT 1 FROM requirement_automation_state state
+            WHERE state.status = 'paused' AND state.requirement_id = CASE
+              WHEN automation_jobs.owner_type = 'requirement' THEN automation_jobs.owner_id
+              ELSE (SELECT unit.requirement_id FROM delivery_units unit WHERE unit.id = automation_jobs.owner_id)
+            END
+          )`)
         .run(workerId, expiresAtIso, nowIso, candidate.id);
       if (Number(result.changes) !== 1) {
         this.db.exec("COMMIT");

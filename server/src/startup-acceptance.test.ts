@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 describe("real server startup acceptance", () => {
-  it("backs up deployed automation v4 before creating the quality coordination v10 schema", { timeout: 15_000 }, async () => {
+  it("backs up deployed automation v4 before creating the evidence invalidation v11 schema", { timeout: 15_000 }, async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "workflow-startup-acceptance-"));
     tempDirectories.push(dataDir);
     const databasePath = join(dataDir, "workflow.db");
@@ -87,7 +87,7 @@ describe("real server startup acceptance", () => {
       expect(columns(backup, "automation_jobs")).toEqual(expect.arrayContaining(["evidence_version", "max_attempts"]));
       expect(object(backup, "index", "idx_automation_jobs_pending_lease")).toBeUndefined();
       backup.close();
-      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-quality-coordination-v10");
+      await expect(readFile(`${databasePath}.schema-version`, "utf8")).resolves.toBe("phase-2-evidence-invalidation-v11");
     } finally {
       await stopChild(child);
     }

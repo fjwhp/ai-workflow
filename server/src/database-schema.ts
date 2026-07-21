@@ -369,6 +369,80 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(quality_evidence_id) REFERENCES delivery_quality_evidence(id),
       UNIQUE(delivery_unit_id, evidence_version, kind)
     );
+    CREATE TABLE IF NOT EXISTS delivery_evidence_invalidations (
+      id TEXT PRIMARY KEY,
+      requirement_id TEXT NOT NULL,
+      source_unit_id TEXT NOT NULL,
+      source_kind TEXT NOT NULL CHECK(source_kind IN ('implementation', 'contract')),
+      source_old_evidence_id TEXT NOT NULL,
+      source_old_evidence_version INTEGER NOT NULL,
+      source_old_evidence_hash TEXT NOT NULL,
+      source_new_evidence_id TEXT NOT NULL,
+      source_new_evidence_version INTEGER NOT NULL,
+      source_new_evidence_hash TEXT NOT NULL,
+      target_unit_id TEXT NOT NULL,
+      target_evidence_version INTEGER NOT NULL,
+      prior_phase TEXT NOT NULL CHECK(prior_phase IN ('implementation', 'quality_verification', 'acceptance_delivery')),
+      prior_status TEXT NOT NULL,
+      earliest_invalid_phase TEXT NOT NULL CHECK(earliest_invalid_phase IN ('implementation', 'quality_verification')),
+      cause TEXT NOT NULL CHECK(instr(cause, char(0)) = 0 AND length(trim(cause)) BETWEEN 1 AND 4096),
+      actor TEXT NOT NULL CHECK(instr(actor, char(0)) = 0 AND length(trim(actor)) BETWEEN 1 AND 256),
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+      FOREIGN KEY(source_unit_id) REFERENCES delivery_units(id),
+      FOREIGN KEY(source_old_evidence_id) REFERENCES coding_evidence(id),
+      FOREIGN KEY(source_new_evidence_id) REFERENCES coding_evidence(id),
+      FOREIGN KEY(target_unit_id) REFERENCES delivery_units(id)
+    );
+    CREATE TABLE IF NOT EXISTS delivery_stale_decisions (
+      id TEXT PRIMARY KEY,
+      invalidation_id TEXT NOT NULL UNIQUE,
+      requirement_id TEXT NOT NULL,
+      delivery_unit_id TEXT NOT NULL,
+      target_evidence_version INTEGER NOT NULL,
+      source_old_evidence_id TEXT NOT NULL,
+      source_old_evidence_version INTEGER NOT NULL,
+      source_new_evidence_id TEXT NOT NULL,
+      source_new_evidence_version INTEGER NOT NULL,
+      decision TEXT NOT NULL CHECK(decision IN ('reuse', 'rerun')),
+      resulting_evidence_version INTEGER NOT NULL,
+      actor TEXT NOT NULL CHECK(instr(actor, char(0)) = 0 AND length(trim(actor)) BETWEEN 1 AND 256),
+      reason TEXT NOT NULL CHECK(instr(reason, char(0)) = 0 AND length(trim(reason)) BETWEEN 1 AND 4096),
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(invalidation_id) REFERENCES delivery_evidence_invalidations(id),
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
+      FOREIGN KEY(source_old_evidence_id) REFERENCES coding_evidence(id),
+      FOREIGN KEY(source_new_evidence_id) REFERENCES coding_evidence(id)
+    );
+    CREATE TABLE IF NOT EXISTS requirement_automation_state (
+      requirement_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL CHECK(status IN ('active', 'paused')),
+      actor TEXT NOT NULL CHECK(instr(actor, char(0)) = 0 AND length(trim(actor)) BETWEEN 1 AND 256),
+      reason TEXT NOT NULL CHECK(instr(reason, char(0)) = 0 AND length(trim(reason)) BETWEEN 1 AND 4096),
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id)
+    );
+    CREATE TABLE IF NOT EXISTS requirement_automation_audit (
+      id TEXT PRIMARY KEY,
+      requirement_id TEXT NOT NULL,
+      action TEXT NOT NULL CHECK(action IN ('pause', 'resume', 'pause_conflict', 'resume_conflict')),
+      actor TEXT NOT NULL CHECK(instr(actor, char(0)) = 0 AND length(trim(actor)) BETWEEN 1 AND 256),
+      reason TEXT NOT NULL CHECK(instr(reason, char(0)) = 0 AND length(trim(reason)) BETWEEN 1 AND 4096),
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id)
+    );
+    CREATE TABLE IF NOT EXISTS delivery_unit_skips (
+      id TEXT PRIMARY KEY,
+      requirement_id TEXT NOT NULL,
+      delivery_unit_id TEXT NOT NULL UNIQUE,
+      evidence_version INTEGER NOT NULL,
+      actor TEXT NOT NULL CHECK(instr(actor, char(0)) = 0 AND length(trim(actor)) BETWEEN 1 AND 256),
+      reason TEXT NOT NULL CHECK(instr(reason, char(0)) = 0 AND length(trim(reason)) BETWEEN 1 AND 4096),
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id)
+    );
     CREATE TABLE IF NOT EXISTS rework_contexts (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, approval_id TEXT NOT NULL UNIQUE, artifact_id TEXT,
       source_stage TEXT NOT NULL, target_stage TEXT NOT NULL, actor_type TEXT NOT NULL, decision_at TEXT NOT NULL,
@@ -442,6 +516,8 @@ export function createPhase2Schema(db: DatabaseSync) {
       ON delivery_quality_evidence(delivery_unit_id, evidence_version, kind);
     CREATE INDEX IF NOT EXISTS idx_delivery_quality_override_unit_version
       ON delivery_quality_overrides(delivery_unit_id, evidence_version, kind);
+    CREATE INDEX IF NOT EXISTS idx_delivery_evidence_invalidation_active
+      ON delivery_evidence_invalidations(target_unit_id, target_evidence_version, created_at);
     DROP TRIGGER IF EXISTS validate_stage_run_owner_insert;
     DROP TRIGGER IF EXISTS validate_stage_run_owner_update;
     CREATE TRIGGER validate_stage_run_owner_insert
@@ -725,5 +801,107 @@ export function createPhase2Schema(db: DatabaseSync) {
     CREATE TRIGGER IF NOT EXISTS delivery_quality_override_immutable_delete
     BEFORE DELETE ON delivery_quality_overrides
     BEGIN SELECT RAISE(ABORT, 'DELIVERY_QUALITY_OVERRIDE_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_evidence_invalidation_insert
+    BEFORE INSERT ON delivery_evidence_invalidations
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_EVIDENCE_INVALIDATION_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units source
+        JOIN coding_evidence old_evidence ON old_evidence.id = NEW.source_old_evidence_id
+          AND old_evidence.delivery_unit_id = source.id
+          AND old_evidence.requirement_id = source.requirement_id
+          AND old_evidence.evidence_version = NEW.source_old_evidence_version
+          AND old_evidence.diff_hash = NEW.source_old_evidence_hash
+        JOIN coding_evidence new_evidence ON new_evidence.id = NEW.source_new_evidence_id
+          AND new_evidence.delivery_unit_id = source.id
+          AND new_evidence.requirement_id = source.requirement_id
+          AND new_evidence.evidence_version = NEW.source_new_evidence_version
+          AND new_evidence.diff_hash = NEW.source_new_evidence_hash
+        JOIN delivery_units target ON target.id = NEW.target_unit_id
+          AND target.requirement_id = source.requirement_id
+          AND target.evidence_version = NEW.target_evidence_version
+          AND target.phase = NEW.prior_phase
+          AND target.status = NEW.prior_status
+        WHERE source.id = NEW.source_unit_id
+          AND source.requirement_id = NEW.requirement_id
+          AND source.evidence_version = NEW.source_new_evidence_version
+          AND NEW.source_new_evidence_version > NEW.source_old_evidence_version
+      );
+      SELECT RAISE(ABORT, 'DELIVERY_EVIDENCE_INVALIDATION_ACTIVE_CONFLICT')
+      WHERE EXISTS (
+        SELECT 1 FROM delivery_evidence_invalidations prior
+        WHERE prior.target_unit_id = NEW.target_unit_id
+          AND prior.target_evidence_version = NEW.target_evidence_version
+          AND NOT EXISTS (
+            SELECT 1 FROM delivery_stale_decisions decision WHERE decision.invalidation_id = prior.id
+          )
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS delivery_evidence_invalidation_immutable_update
+    BEFORE UPDATE ON delivery_evidence_invalidations
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_EVIDENCE_INVALIDATION_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_evidence_invalidation_immutable_delete
+    BEFORE DELETE ON delivery_evidence_invalidations
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_EVIDENCE_INVALIDATION_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_stale_decision_insert
+    BEFORE INSERT ON delivery_stale_decisions
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_STALE_DECISION_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_evidence_invalidations invalidation
+        WHERE invalidation.id = NEW.invalidation_id
+          AND invalidation.requirement_id = NEW.requirement_id
+          AND invalidation.target_unit_id = NEW.delivery_unit_id
+          AND invalidation.target_evidence_version = NEW.target_evidence_version
+          AND invalidation.source_old_evidence_id = NEW.source_old_evidence_id
+          AND invalidation.source_old_evidence_version = NEW.source_old_evidence_version
+          AND invalidation.source_new_evidence_id = NEW.source_new_evidence_id
+          AND invalidation.source_new_evidence_version = NEW.source_new_evidence_version
+          AND NOT EXISTS (
+            SELECT 1 FROM delivery_stale_decisions existing WHERE existing.invalidation_id = invalidation.id
+          )
+      ) OR (NEW.decision = 'reuse' AND NEW.resulting_evidence_version <> NEW.target_evidence_version)
+        OR (NEW.decision = 'rerun' AND NEW.resulting_evidence_version <> NEW.target_evidence_version + 1);
+    END;
+    CREATE TRIGGER IF NOT EXISTS delivery_stale_decision_immutable_update
+    BEFORE UPDATE ON delivery_stale_decisions
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_STALE_DECISION_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_stale_decision_immutable_delete
+    BEFORE DELETE ON delivery_stale_decisions
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_STALE_DECISION_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS requirement_automation_audit_immutable_update
+    BEFORE UPDATE ON requirement_automation_audit
+    BEGIN SELECT RAISE(ABORT, 'REQUIREMENT_AUTOMATION_AUDIT_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS requirement_automation_audit_immutable_delete
+    BEFORE DELETE ON requirement_automation_audit
+    BEGIN SELECT RAISE(ABORT, 'REQUIREMENT_AUTOMATION_AUDIT_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_unit_skip_immutable_update
+    BEFORE UPDATE ON delivery_unit_skips
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_UNIT_SKIP_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_unit_skip_immutable_delete
+    BEFORE DELETE ON delivery_unit_skips
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_UNIT_SKIP_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_unit_skip_insert
+    BEFORE INSERT ON delivery_unit_skips
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_UNIT_SKIP_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units unit
+        WHERE unit.id = NEW.delivery_unit_id
+          AND unit.requirement_id = NEW.requirement_id
+          AND unit.evidence_version = NEW.evidence_version
+          AND unit.required = 0
+          AND unit.status NOT IN ('running', 'applying', 'applied')
+          AND NOT EXISTS (SELECT 1 FROM delivery_quality_runs quality
+            WHERE quality.delivery_unit_id = unit.id
+              AND quality.evidence_version = unit.evidence_version AND quality.status = 'running')
+          AND NOT EXISTS (SELECT 1 FROM automation_jobs job
+            WHERE job.owner_type = 'delivery_unit' AND job.owner_id = unit.id
+              AND job.evidence_version = unit.evidence_version AND job.status = 'leased')
+          AND NOT EXISTS (SELECT 1 FROM stage_runs run
+            WHERE run.owner_type = 'delivery_unit' AND run.owner_id = unit.id
+              AND run.evidence_version = unit.evidence_version AND run.status = 'running')
+      );
+    END;
   `);
 }
