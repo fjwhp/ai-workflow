@@ -4,10 +4,10 @@
   "type": "module",
   "workspaces": ["shared", "server", "web"],
   "scripts": {
-    "predev": "npm run build -w shared",
+    "predev": "npm run build -w shared && npm run build:pilot-helper -w server",
     "dev": "concurrently -n server,web -c green,cyan \"npm run dev -w server\" \"npm run dev -w web\"",
     "build": "npm run build -w shared && npm run build -w server && npm run build -w web",
-    "pretest": "npm run build -w shared",
+    "pretest": "npm run build -w shared && npm run build:pilot-helper -w server",
     "test": "vitest run",
     "typecheck": "npm run build -w shared && npm run typecheck -w server && npm run typecheck -w web"
   },

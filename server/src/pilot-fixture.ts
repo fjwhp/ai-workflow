@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import {
-  closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, rmSync
+  closeSync, fsyncSync, lstatSync, mkdirSync, openSync, rmSync
 } from "node:fs";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DeliveryExecutionSuccess } from "./delivery-execution-repository.js";
 import { writeDatabaseVersionMarker } from "./database-reset.js";
 import { currentSchemaVersion } from "./schema-version.js";
+import { atomicPilotPublish } from "./pilot-atomic-publish.js";
 import { WorkflowStore } from "./store.js";
 
 export interface DeliveryPilotFixture {
@@ -21,7 +22,7 @@ export interface DeliveryPilotFixtureOptions {
   afterFirstMutation?: () => void;
   writeMarker?: typeof writeDatabaseVersionMarker;
   beforePublish?: () => void;
-  publish?: (stagingDir: string, dataDir: string) => Promise<void> | void;
+  beforeAtomicPublish?: (stagingDir: string, dataDir: string) => Promise<void> | void;
 }
 
 export async function seedDeliveryPilot(
@@ -34,7 +35,7 @@ export async function seedDeliveryPilot(
   const dataDir = resolve(inputDataDir);
   const parentDir = resolve(dataDir, "..");
   mkdirSync(parentDir, { recursive: true, mode: 0o700 });
-  assertEmptyPilotTarget(dataDir, "PILOT_DATA_DIR_NOT_EMPTY");
+  assertPilotTargetAbsent(dataDir);
 
   const stagingDir = resolve(parentDir, `.${basename(dataDir)}.pilot-staging-${randomUUID()}`);
   mkdirSync(stagingDir, { mode: 0o700 });
@@ -52,17 +53,18 @@ export async function seedDeliveryPilot(
 
     options.beforePublish?.();
     try {
-      assertEmptyPilotTarget(dataDir, "PILOT_PUBLISH_CONFLICT");
+      assertPilotTargetAbsent(dataDir, "PILOT_PUBLISH_CONFLICT");
     } catch (error) {
       throw new Error("PILOT_PUBLISH_CONFLICT", { cause: error });
     }
+    await options.beforeAtomicPublish?.(stagingDir, dataDir);
     try {
-      await (options.publish ?? defaultPublish)(stagingDir, dataDir);
+      await atomicPilotPublish(stagingDir, dataDir);
     } catch (error) {
-      if (pilotErrorCode(error) !== "PILOT_PUBLISH_INJECTED") {
-        throw new Error("PILOT_PUBLISH_CONFLICT", { cause: error });
-      }
-      throw error;
+      const code = pilotErrorCode(error);
+      if (code === "PILOT_PUBLISH_CONFLICT" || code === "PILOT_ATOMIC_PUBLISH_UNAVAILABLE"
+        || code === "PILOT_PUBLISH_FAILED") throw error;
+      throw new Error("PILOT_PUBLISH_FAILED", { cause: error });
     }
     published = true;
     try { fsyncPath(parentDir); } catch {}
@@ -164,16 +166,21 @@ function seedPilotStore(
   }
 }
 
-function assertEmptyPilotTarget(dataDir: string, nonemptyCode: string) {
-  if (!existsSync(dataDir)) return;
-  const stat = lstatSync(dataDir);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("PILOT_DATA_DIR_INVALID");
-  if (existsSync(resolve(dataDir, "workflow.db"))) throw new Error("PILOT_DATABASE_EXISTS");
-  if (readdirSync(dataDir).length > 0) throw new Error(nonemptyCode);
-}
-
-function defaultPublish(stagingDir: string, dataDir: string) {
-  renameSync(stagingDir, dataDir);
+function assertPilotTargetAbsent(dataDir: string, existsCode = "PILOT_DATA_DIR_EXISTS") {
+  try {
+    lstatSync(dataDir);
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  try {
+    lstatSync(resolve(dataDir, "workflow.db"));
+    throw new Error("PILOT_DATABASE_EXISTS");
+  } catch (error: any) {
+    if (error?.message === "PILOT_DATABASE_EXISTS") throw error;
+    if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+  }
+  throw new Error(existsCode);
 }
 
 function fsyncPath(path: string) {

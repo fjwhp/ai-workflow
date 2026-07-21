@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -16,8 +18,9 @@ afterEach(() => {
 
 describe("delivery pilot fixture", () => {
   it("creates an isolated two-unit paused and stale workflow through real repositories", async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), "flowgate-pilot-"));
-    directories.push(dataDir);
+    const parent = mkdtempSync(join(tmpdir(), "flowgate-pilot-"));
+    directories.push(parent);
+    const dataDir = join(parent, "pilot-data");
 
     const seeded = await seedDeliveryPilot(dataDir);
     const store = new WorkflowStore(seeded.databasePath);
@@ -62,8 +65,9 @@ describe("delivery pilot fixture", () => {
   });
 
   it("refuses to overwrite a previously seeded database", async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), "flowgate-pilot-existing-"));
-    directories.push(dataDir);
+    const parent = mkdtempSync(join(tmpdir(), "flowgate-pilot-existing-"));
+    directories.push(parent);
+    const dataDir = join(parent, "pilot-data");
     const seeded = await seedDeliveryPilot(dataDir);
 
     await expect(seedDeliveryPilot(dataDir)).rejects.toThrow("PILOT_DATABASE_EXISTS");
@@ -88,7 +92,7 @@ describe("delivery pilot fixture", () => {
     const original = Buffer.from("original-user-bytes");
     writeFileSync(path, original);
 
-    await expect(seedDeliveryPilot(dataDir)).rejects.toThrow("PILOT_DATA_DIR_NOT_EMPTY");
+    await expect(seedDeliveryPilot(dataDir)).rejects.toThrow("PILOT_DATA_DIR_EXISTS");
 
     expect(readFileSync(path)).toEqual(original);
     expect(readdirSync(dataDir)).toEqual([entry]);
@@ -110,16 +114,15 @@ describe("delivery pilot fixture", () => {
   it.each([
     ["mutation", { afterFirstMutation: () => { throw new Error("PILOT_MUTATION_INJECTED"); } }],
     ["marker", { writeMarker: async () => { throw new Error("PILOT_MARKER_INJECTED"); } }],
-    ["publish", { publish: async () => { throw new Error("PILOT_PUBLISH_INJECTED"); } }]
+    ["publish", { beforeAtomicPublish: async () => { throw new Error("PILOT_PUBLISH_INJECTED"); } }]
   ] as const)("cleans owned staging after a %s failure and remains retryable", async (_label, fault) => {
     const parent = mkdtempSync(join(tmpdir(), "flowgate-pilot-fault-"));
     directories.push(parent);
     const dataDir = join(parent, "pilot-data");
-    mkdirSync(dataDir);
 
     await expect(seedDeliveryPilot(dataDir, fault as any)).rejects.toThrow(/PILOT_.*_INJECTED/);
 
-    expect(readdirSync(dataDir)).toEqual([]);
+    expect(() => lstatSync(dataDir)).toThrow();
     expect(readdirSync(parent).filter((entry) => entry.includes("pilot-staging"))).toEqual([]);
     await expect(seedDeliveryPilot(dataDir)).resolves.toMatchObject({ dataDir });
   });
@@ -128,11 +131,13 @@ describe("delivery pilot fixture", () => {
     const parent = mkdtempSync(join(tmpdir(), "flowgate-pilot-race-"));
     directories.push(parent);
     const dataDir = join(parent, "pilot-data");
-    mkdirSync(dataDir);
     const racedFile = join(dataDir, "arrived-during-seed.txt");
 
     await expect(seedDeliveryPilot(dataDir, {
-      beforePublish: () => writeFileSync(racedFile, "user-race")
+      beforePublish: () => {
+        mkdirSync(dataDir);
+        writeFileSync(racedFile, "user-race");
+      }
     })).rejects.toThrow("PILOT_PUBLISH_CONFLICT");
 
     expect(readFileSync(racedFile, "utf8")).toBe("user-race");
@@ -144,14 +149,61 @@ describe("delivery pilot fixture", () => {
     const parent = mkdtempSync(join(tmpdir(), "flowgate-pilot-database-race-"));
     directories.push(parent);
     const dataDir = join(parent, "pilot-data");
-    mkdirSync(dataDir);
     const racedDatabase = join(dataDir, "workflow.db");
 
     await expect(seedDeliveryPilot(dataDir, {
-      beforePublish: () => writeFileSync(racedDatabase, "user-database-race")
+      beforePublish: () => {
+        mkdirSync(dataDir);
+        writeFileSync(racedDatabase, "user-database-race");
+      }
     })).rejects.toThrow("PILOT_PUBLISH_CONFLICT");
 
     expect(readFileSync(racedDatabase, "utf8")).toBe("user-database-race");
+    expect(readdirSync(parent).filter((entry) => entry.includes("pilot-staging"))).toEqual([]);
+  });
+
+  it("never replaces an empty directory that takes ownership before publish", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "flowgate-pilot-empty-owner-race-"));
+    directories.push(parent);
+    const dataDir = join(parent, "pilot-data");
+    let replacement!: { dev: number; ino: number; entries: string[] };
+
+    await expect(seedDeliveryPilot(dataDir, {
+      beforePublish: () => {
+        mkdirSync(dataDir);
+        const stat = lstatSync(dataDir);
+        replacement = { dev: stat.dev, ino: stat.ino, entries: readdirSync(dataDir) };
+      }
+    })).rejects.toThrow("PILOT_PUBLISH_CONFLICT");
+
+    const preserved = lstatSync(dataDir);
+    expect({ dev: preserved.dev, ino: preserved.ino, entries: readdirSync(dataDir) }).toEqual(replacement);
+    expect(readdirSync(parent).filter((entry) => entry.includes("pilot-staging"))).toEqual([]);
+    rmSync(dataDir, { recursive: true });
+    await expect(seedDeliveryPilot(dataDir)).resolves.toMatchObject({ dataDir });
+  });
+
+  it("never replaces a symlink that takes ownership after target validation", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "flowgate-pilot-symlink-owner-race-"));
+    directories.push(parent);
+    const dataDir = join(parent, "pilot-data");
+    const replacementTarget = join(parent, "replacement-target");
+    mkdirSync(replacementTarget);
+    writeFileSync(join(replacementTarget, "owner.txt"), "replacement-owner");
+    let replacement!: { dev: number; ino: number };
+
+    await expect(seedDeliveryPilot(dataDir, {
+      beforeAtomicPublish: async () => {
+        symlinkSync(replacementTarget, dataDir);
+        const stat = lstatSync(dataDir);
+        replacement = { dev: stat.dev, ino: stat.ino };
+      }
+    })).rejects.toThrow("PILOT_PUBLISH_CONFLICT");
+
+    const preserved = lstatSync(dataDir);
+    expect(preserved.isSymbolicLink()).toBe(true);
+    expect({ dev: preserved.dev, ino: preserved.ino }).toEqual(replacement);
+    expect(readFileSync(join(dataDir, "owner.txt"), "utf8")).toBe("replacement-owner");
     expect(readdirSync(parent).filter((entry) => entry.includes("pilot-staging"))).toEqual([]);
   });
 

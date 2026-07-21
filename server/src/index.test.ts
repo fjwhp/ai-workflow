@@ -259,6 +259,14 @@ describe("server entry point", () => {
       WHERE delivery_unit_id = ? AND evidence_version = 1`).get(seeded.unitId)).toEqual({ count: 1 });
     expect(runtime.store.automationJobs.byDedupe(`review:${seeded.unitId}:v1`)).toMatchObject({ status: "pending" });
     expect(runtime.store.automationJobs.byDedupe(`test:${seeded.unitId}:v1`)).toMatchObject({ status: "pending" });
+    expect((runtime.store as any).db.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE dedupe_key = ? AND status = 'pending' AND evidence_version = 1`).get(
+      `review:${seeded.unitId}:v1`
+    )).toEqual({ count: 1 });
+    expect((runtime.store as any).db.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE dedupe_key = ? AND status = 'pending' AND evidence_version = 1`).get(
+      `test:${seeded.unitId}:v1`
+    )).toEqual({ count: 1 });
     await runtime.close();
   });
 
@@ -292,6 +300,14 @@ describe("server entry point", () => {
     });
     expect((runtime.store as any).db.prepare(`SELECT COUNT(*) AS count FROM coding_evidence
       WHERE delivery_unit_id = ? AND evidence_version = 1`).get(seeded.unitId)).toEqual({ count: 1 });
+    expect((runtime.store as any).db.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE dedupe_key = ? AND status = 'pending' AND evidence_version = 1`).get(
+      `review:${seeded.unitId}:v1`
+    )).toEqual({ count: 1 });
+    expect((runtime.store as any).db.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE dedupe_key = ? AND status = 'pending' AND evidence_version = 1`).get(
+      `test:${seeded.unitId}:v1`
+    )).toEqual({ count: 1 });
     await runtime.close();
   });
 

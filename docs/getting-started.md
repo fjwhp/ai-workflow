@@ -61,14 +61,14 @@ npm run dev
 
 ## 浏览器验收 pilot
 
-使用专用空目录生成真实仓储数据，不会向正常 UI 注入静态 fixture：
+使用尚不存在的专用目录生成真实仓储数据，不会向正常 UI 注入静态 fixture：
 
 ```bash
 PILOT_DATA_DIR="$PWD/.local/delivery-pilot" npm run pilot:seed -w server
 DATA_DIR="$PWD/.local/delivery-pilot" AUTOMATION_WORKER_ENABLED=false npm run dev
 ```
 
-seed 先在目标同级的 owned `sibling staging` 完成数据库、marker 和 fsync，再向明确为空的目标目录原子发布；mutation、marker 或 rename 失败只清理 staging，不修改目标或用户文件。CLI 失败固定输出 `FLOWGATE_PILOT_ERROR` 及结构化错误码并以状态 1 退出。
+seed 要求目标目录尚不存在。它先在目标同级的 owned `sibling staging` 完成数据库、marker 和 fsync，再通过内核 no-replace rename 原子发布；macOS 使用 `RENAME_EXCL`，Linux 使用 `RENAME_NOREPLACE`。并发 owner 会得到 `PILOT_PUBLISH_CONFLICT`，原子能力不可用会得到 `PILOT_ATOMIC_PUBLISH_UNAVAILABLE`；失败只清理 staging，不修改目标或用户文件。CLI 失败固定输出 `FLOWGATE_PILOT_ERROR` 及结构化错误码并以状态 1 退出。
 
 打开 `REQ-0001` 可查看 backend/frontend 两个单元、独立 evidence、已释放依赖、frontend stale、需求 paused 和服务端返回的 resume action。seed 拒绝覆盖已有数据库；重建前先停止服务并删除整个 `.local/delivery-pilot` 目录。
 

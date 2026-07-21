@@ -41,6 +41,9 @@ describe("continuous delivery documentation", () => {
 
   it("documents atomic pilot publication and stable CLI failures", () => {
     const pilotGuides = `${document("docs/getting-started.md")}\n${document("docs/workflow-sop.md")}`;
-    expectTerms(pilotGuides, ["sibling staging", "原子发布", "FLOWGATE_PILOT_ERROR"]);
+    expectTerms(pilotGuides, [
+      "sibling staging", "原子发布", "RENAME_EXCL", "RENAME_NOREPLACE",
+      "PILOT_ATOMIC_PUBLISH_UNAVAILABLE", "FLOWGATE_PILOT_ERROR"
+    ]);
   });
 });
