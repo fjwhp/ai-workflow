@@ -106,4 +106,38 @@ describe("delivery live refresh", () => {
     expect(accepted).toEqual(["requirement-b"]);
     disposeB();
   });
+
+  it("continues polling when each SSE reconnect fails before opening", async () => {
+    const { subscribeDeliveryLiveRefresh } = await import("./delivery-live-refresh.js");
+    const sources: FakeEventSource[] = [];
+    let tick: (() => void) | undefined;
+    let refreshes = 0;
+    const dispose = subscribeDeliveryLiveRefresh({
+      requirementId: "requirement-a",
+      refresh: async () => { refreshes += 1; },
+      createEventSource: () => {
+        const source = new FakeEventSource();
+        sources.push(source);
+        return source;
+      },
+      setInterval: (callback: () => void) => { tick = callback; return 1; },
+      clearInterval: () => undefined
+    });
+
+    sources[0]!.onerror?.();
+    tick?.();
+    expect(sources).toHaveLength(2);
+    expect(refreshes).toBe(0);
+    sources[1]!.onerror?.();
+    tick?.();
+    await Promise.resolve();
+    expect(refreshes).toBe(1);
+    expect(sources).toHaveLength(2);
+    tick?.();
+    expect(sources).toHaveLength(3);
+    sources[2]!.emit("delivery-change");
+    await Promise.resolve();
+    expect(refreshes).toBe(2);
+    dispose();
+  });
 });

@@ -24,6 +24,7 @@ export function subscribeDeliveryLiveRefresh(input: {
   let fallbackTimer: TimerHandle | null = null;
   let refreshing = false;
   let refreshPending = false;
+  let pollBeforeReconnect = false;
 
   const refresh = async () => {
     if (!active) return;
@@ -58,6 +59,7 @@ export function subscribeDeliveryLiveRefresh(input: {
     next.addEventListener("delivery-change", () => { if (active && source === next) void refresh(); });
     next.onopen = () => {
       if (!active || source !== next) return;
+      pollBeforeReconnect = false;
       clearFallback();
     };
     next.onerror = () => {
@@ -67,8 +69,16 @@ export function subscribeDeliveryLiveRefresh(input: {
       if (fallbackTimer !== null) return;
       fallbackTimer = schedule(() => {
         if (!active) return;
-        if (source) void refresh();
-        else connect();
+        if (source) {
+          pollBeforeReconnect = false;
+          void refresh();
+        } else if (pollBeforeReconnect) {
+          pollBeforeReconnect = false;
+          void refresh();
+        } else {
+          connect();
+          pollBeforeReconnect = true;
+        }
       }, input.fallbackMs ?? 2_000);
     };
   };
