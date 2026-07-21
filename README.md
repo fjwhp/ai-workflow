@@ -1,6 +1,6 @@
 # Flowgate 五阶段研发工作流
 
-Flowgate 是本地优先的 AI 研发工作台。当前 foundation 使用五个职责互斥的阶段：
+Flowgate 是本地优先的 AI 研发工作台，使用五个职责互斥的阶段：
 
 | 阶段 | 唯一职责 |
 |---|---|
@@ -14,13 +14,15 @@ Flowgate 是本地优先的 AI 研发工作台。当前 foundation 使用五个�
 
 ## 当前交付范围
 
-- **Phase 1（当前）**：批准方案后创建并展示状态为 `ready` 或 `waiting_dependency` 的交付单元。`implementation`、`quality_verification`、`acceptance_delivery` 的 `/run` 是只读查询，不启动 AI，不创建自动化队列，不运行 Git 任务，也不修改目标 worktree。
-- **Phase 2**：激活交付单元队列、worker、独立 Review 和自动化测试。Phase 1 不预实现这些执行器。
-- **Phase 3**：提供总体业务验收，以及按依赖顺序执行的 no-commit 本地应用。应用 owner 是交付单元，不是需求记录。
+- 方案批准后创建多项目 delivery plan，并为 root unit 创建持久化自动化任务。
+- worker 执行 implementation、独立 Review 和独立自动化测试；两条质量证据均通过后才释放下游。
+- 上游实现或契约变化会传播 stale evidence；人工可 pause/resume、reuse/rerun、override、optional skip 或 retry，所有操作保留审计。
+- 详情 API 提供 server-owned `allowedActions`，Web 通过 SSE generation 实时刷新，并在连接失败时退回有界轮询。
+- 总体业务验收及验收后的 dependency-ordered no-commit local application 属于下一阶段，不能由当前自动化替代。
 
-自动化 worker 生命周期已经接入服务启动，但 `AUTOMATION_WORKER_ENABLED` 当前默认关闭。在 Phase 2 action handlers 完整注册前不要启用；启动仍会恢复过期 lease，但不会消费 pending job。
+自动化 worker 生命周期已经接入服务启动，`AUTOMATION_WORKER_ENABLED` 默认关闭。需要执行 pending job 时显式设为 `true`；只浏览状态或运行 pilot 时可保持关闭。
 
-任何阶段都不得在目标项目自动执行 commit、push、tag 或创建 PR。Phase 3 的本地应用也只允许留下未提交改动，必须由人工检查和决定后续处理。
+任何阶段都不得在目标项目自动执行 commit、merge、push、tag 或创建 PR。后续本地应用也只允许留下未提交改动，必须由人工检查和决定后续处理。
 
 ## 数据基线
 

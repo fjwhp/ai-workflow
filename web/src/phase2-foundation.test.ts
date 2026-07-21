@@ -31,7 +31,7 @@ describe("Phase 2 foundation UI", () => {
     }));
 
     expect(markup).toContain(stageLabel);
-    expect(markup).toContain("自动化待接管");
+    expect(markup).toContain("交付进行中");
     expect(markup).toContain("项目交付进度");
     expect(markup).not.toContain("只读");
     expect(markup).not.toContain("启动 AI");
@@ -56,7 +56,7 @@ describe("Phase 2 foundation UI", () => {
       onApprove: () => undefined, onRefresh: async () => undefined, onManageProjects: () => undefined
     }));
 
-    expect(markup).toContain("自动化待接管");
+    expect(markup).toContain("交付进行中");
     expect(markup).not.toContain("查看 AI 执行详情");
     expect(markup).not.toContain("查看实时执行");
     expect(markup).not.toContain("执行记录");

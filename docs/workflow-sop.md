@@ -2,57 +2,72 @@
 
 ## 角色责任
 
-| 角色 | 责任 |
+| 角色 | 唯一责任 |
 |---|---|
 | 业务负责人 | 提交问题、确认目标、执行总体业务验收 |
 | 产品负责人 | 审核 `definition` 的范围、规则和验收标准 |
 | 方案负责人 | 审核 `solution_design` 的交付单元、依赖、接口和风险 |
-| 实现 AI / 工程师 | 在 `implementation` 完成交付单元实现与自检证据 |
-| Review AI / Reviewer | 在 `quality_verification` 独立检查实现，不执行测试来替代审查 |
-| 测试 worker / 测试负责人 | 在 `quality_verification` 独立执行自动化测试，不用 Review 结论替代测试 |
+| 实现 AI / 工程师 | 生成 implementation evidence，不判定质量 |
+| Review AI / Reviewer | 独立审查实现，不用测试替代 Review |
+| 测试 worker / 测试负责人 | 独立执行冻结的测试计划，不用 Review 替代测试 |
 
-总体业务验收必须由人工完成。安全且确定的检查可以自动化，但自动结论不能越过所属阶段或替代人工验收。
+总体业务验收必须由人工完成。职责之间不得共享结论来跳过另一个节点。
 
 ## 标准流程
 
-1. 在 `definition` 澄清真实业务目标、目标用户、范围、非目标、约束和验收标准。
-2. 人工批准定义后进入 `solution_design`，设计跨项目方案、每项目交付单元、依赖、接口、回滚和验证策略。
-3. 人工批准方案。系统冻结项目快照，并为每个交付项目创建 `ready` 或 `waiting_dependency` 的交付单元。
-4. 在 `implementation` 按交付单元实现并保存差异、自检和诊断证据。
-5. 在 `quality_verification` 分别完成独立 Review 和自动化测试。两条活动各自记录输入、输出、失败原因和证据版本。
-6. 所有必需交付单元质量通过后进入 `acceptance_delivery`，由人工执行总体业务验收。
-7. Phase 3 中，验收通过后才可按依赖顺序执行 no-commit 本地应用；人工检查目标 worktree 后自行决定提交或撤销。
+1. 在 `definition` 澄清业务目标、目标用户、范围、非目标、约束和验收标准，由人工批准。
+2. 在 `solution_design` 冻结项目与版本关联，定义每个交付单元、依赖、接口契约、回滚和验证策略，由人工批准。
+3. 系统创建 delivery plan。无上游依赖的 root unit 为 `ready`，其余为 `waiting_dependency`，并以 dedupe key 创建 root implementation job。
+4. worker 使用持久化 lease 和每 lease fencing token 执行实现；成功后保存不可变 implementation evidence，并分别创建 Review 与测试任务。
+5. Review 与自动化测试各自领取 claim generation，分别保存不可变证据。只有当前 evidence version 的 Review 与自动化测试均通过，系统才释放下游依赖。
+6. 上游实现或契约变化时，系统聚合 fan-in 失效并暂停受影响后代。人工选择 reuse 或 rerun 后，系统重新计算 gate 和任务。
+7. 所有必需交付单元达到 `ready_for_acceptance` 后进入 `acceptance_delivery`。人工完成总体业务验收；后续按依赖顺序执行 no-commit local application。
 
-## 分期执行约束
+## Worker 运行与恢复
 
-### Phase 1（foundation）
+- 生产式本地运行需要显式设置 `AUTOMATION_WORKER_ENABLED=true`；默认关闭可用于只观察数据或浏览 pilot。
+- worker heartbeat 必须在 lease 到期前续租。续租失败立即 abort handler，旧 token 不能落证据。
+- 服务启动时恢复过期 automation job、遗留 implementation run 和中断的需求级 run；运行中还会周期恢复过期 lease。
+- 同一 dedupe key 或 claim generation 的重复请求必须收敛为一个任务/事实。禁止通过增加 worker 数量绕过 claim owner。
+- 关闭服务时先停止轮询、abort active handler，并在有界时间内等待 settlement；超时保持 lease 供下次恢复。
 
-- 创建、持久化、读取和展示 delivery plan、交付单元及依赖。
-- `/run` 在 `implementation`、`quality_verification`、`acceptance_delivery` 只返回只读数据和待自动化标记。
-- 不执行 AI、编码、Review、测试、队列 worker 或 Git job。
-- 不修改任何目标项目 worktree。
+## 质量与放行
 
-### Phase 2（automation）
+- Review 和测试只读冻结的 implementation evidence tree 与 toolchain identity，分别记录输入 hash、输出、命令结果、验收追踪和终态。
+- 两条质量活动独立执行、独立失败、独立 retry。任一 evidence 缺失、failed、aborted 或 stale 都不得 release。
+- final callback、release edge 和下游 enqueue 位于一个权威事务内；并发 callback 最多生成一条 release 和一个下游 job。
+- failed evidence 的 override 是人工风险接受，不是改写 evidence；服务端校验资格并保存 actor、reason、accepted risk。
 
-- 激活 delivery-unit queue 和 worker。
-- 执行实现、独立 Review、自动化测试及证据过期处理。
-- 不提供总体业务验收后的本地应用。
+## 失效、暂停与人工恢复
 
-### Phase 3（acceptance and application）
+- implementation/contract 变化撤销非终态后代的旧 release，取消未开始任务，已开始后代标记 `potentially_stale`。
+- fan-in 的全部 active invalidation 必须由同一次 reuse、rerun 或 optional skip 决定覆盖，不能留下无人拥有的来源事实。
+- `pause` 取消 pending job 并阻止新 lease；leased/running 可以完成，但暂停期间不释放依赖。`resume` 重算 gate、dependency 和 current jobs。
+- optional unit 在无 active work 时可 `optional skip`；required unit 在 API 和数据库层都拒绝 skip。
+- failed job 的 `retry` 只重建服务端确认仍有效的当前 action。terminal `applied`/`skipped` 不提供恢复动作。
+- 所有 pause/resume/reuse/rerun/override/skip/retry 都需要原因；HTTP actor 固定为 `local-human`，不能接受客户端伪造。
 
-- 提供总体业务验收记录。
-- 以交付单元为 owner，按依赖顺序执行 no-commit local application。
-- 不在目标项目自动 commit、push、tag 或创建 PR。
+## UI 与实时更新
+
+- 详情 API 是操作资格的唯一权威，前端只能展示 server-owned `allowedActions`。
+- SSE 发送单调 `generation`，不在事件中复制业务详情。客户端收到新 generation 后重读 detail。
+- SSE 重连保留最后 generation；连续失败进入定时轮询 fallback，SSE 恢复后清除 fallback timer，避免重复请求和 open handle。
+
+## 本地 pilot
+
+pilot 数据必须写入专用空目录，命令拒绝覆盖已有数据库，也不会向生产 UI 注入静态数据：
+
+```bash
+PILOT_DATA_DIR="$PWD/.local/delivery-pilot" npm run pilot:seed -w server
+DATA_DIR="$PWD/.local/delivery-pilot" AUTOMATION_WORKER_ENABLED=false npm run dev
+```
+
+生成的 `REQ-0001` 包含 backend 与 frontend 两个 delivery unit、已释放依赖、独立 Review/测试 evidence、frontend stale、需求 paused，以及 API 计算的 resume `allowedActions`。需要重建时停止服务并删除整个专用 pilot 目录，再重新执行 seed；不要指向正常 `DATA_DIR`。
 
 ## 数据重建 SOP
 
-升级到 `phase-2-quality-attempt-v14` 前停止服务。服务识别 `phase-2-terminal-resolution-v13` 或其他旧 live DB 后，先备份主文件及现有 WAL/SHM，再创建空的新库。旧 history 只保存在 backup；没有 row migration、dual read/write 或 fallback。重新登记项目、版本和需求，以新跑结果作为当前事实；用户已授权旧数据以新跑为准。
+升级到 `phase-2-quality-attempt-v14` 前停止服务。旧 live DB 先备份主文件及现有 WAL/SHM，再创建空的新库。旧 history 只保存在 backup；没有 row migration、dual read/write 或 schema fallback。
 
-## 异常处理
+## 安全边界
 
-- 输入缺失、证据冲突、风险不可接受或置信度不足时转 `blocked` 或打回责任阶段。
-- Review 与自动化测试必须分别重跑和分别关闭问题。
-- 未产出业务质量证据的终止运行记录为 `aborted`。同一 job token 的 lease 恢复只复用该终止结果并结束 job，不重跑质量；`aborted` 不得充当通过或失败 evidence。
-- 人工确认 stale evidence 可复用时，系统为无终态 evidence 的质量任务创建新的 claim token；旧 `aborted` attempt 保持只读，新 attempt 独立重跑 review/test。
-- 依赖未释放时，下游交付单元保持 `waiting_dependency`。
-- 任何代码路径若尝试自动 commit、push、tag 或创建 PR，必须立即停止并作为安全缺陷处理。
+系统不得在目标项目自动 commit、merge、push、tag 或创建 PR。总体业务验收必须人工签署；本地 application 只能留下未提交改动，由人工检查后决定后续 Git 操作。

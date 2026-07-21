@@ -3,11 +3,11 @@ import { requirementStatusLabel } from "./workflow-presentation.js";
 
 describe("requirement workflow presentation", () => {
   it.each(["implementation", "quality_verification", "acceptance_delivery"] as const)(
-    "labels downstream %s work as automation pending instead of requirement AI work",
+    "labels downstream %s work as active delivery instead of requirement AI work",
     (stage) => {
-      expect(requirementStatusLabel(stage, "ai_ready")).toBe("自动化待接管");
-      expect(requirementStatusLabel(stage, "ai_running")).toBe("自动化待接管");
-      expect(requirementStatusLabel(stage, "awaiting_approval")).toBe("自动化待接管");
+      expect(requirementStatusLabel(stage, "ai_ready")).toBe("交付进行中");
+      expect(requirementStatusLabel(stage, "ai_running")).toBe("交付进行中");
+      expect(requirementStatusLabel(stage, "awaiting_approval")).toBe("交付进行中");
     }
   );
 

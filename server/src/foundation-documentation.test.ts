@@ -2,12 +2,12 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-describe("Phase 2 foundation documentation contract", () => {
+describe("delivery automation documentation contract", () => {
   const root = resolve(import.meta.dirname, "../..");
   const documentationFiles = ["README.md", "docs/states-and-gates.md", "docs/workflow-sop.md", "docs/getting-started.md"];
   const documentation = documentationFiles.map((file) => readFileSync(join(root, file), "utf8")).join("\n");
 
-  it("documents the automation fresh reset and the staged delivery roadmap", () => {
+  it("documents the automation fresh reset and current delivery boundary", () => {
     for (const file of documentationFiles) {
       expect(readFileSync(join(root, file), "utf8"), file).toContain("phase-2-quality-attempt-v14");
     }
@@ -16,19 +16,20 @@ describe("Phase 2 foundation documentation contract", () => {
     expect(documentation).toContain("implementation");
     expect(documentation).toContain("quality_verification");
     expect(documentation).toContain("acceptance_delivery");
-    expect(documentation).toContain("Phase 1");
-    expect(documentation).toContain("Phase 2");
-    expect(documentation).toContain("Phase 3");
     expect(documentation).toContain("dual read/write");
     expect(documentation).toContain("no-commit");
     expect(documentation).toContain("AUTOMATION_WORKER_ENABLED");
     expect(documentation).toContain("默认关闭");
+    expect(documentation).toContain("allowedActions");
+    expect(documentation).toContain("SSE generation");
+    expect(documentation).toContain("总体业务验收必须由人工完成");
   });
 
-  it("documents downstream runs as an automatic read-only view", () => {
+  it("documents live delivery automation and the isolated browser pilot", () => {
     const gettingStarted = readFileSync(join(root, "docs/getting-started.md"), "utf8");
-    expect(gettingStarted).toContain("自动显示只读交付矩阵");
-    expect(gettingStarted).not.toMatch(/点击 `\/run`/);
+    expect(gettingStarted).toContain("PILOT_DATA_DIR");
+    expect(gettingStarted).toContain("Review 与自动化测试分别运行");
+    expect(gettingStarted).not.toContain("自动显示只读交付矩阵");
     expect(gettingStarted).toContain("phase-2-quality-attempt-v14");
     expect(gettingStarted).toContain("phase-2-quality-coordination-v10");
     expect(gettingStarted).toContain("phase-2-automation-v4");

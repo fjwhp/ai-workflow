@@ -16,8 +16,7 @@ import {
   DeliveryExecutionService
 } from "./delivery-execution-service.js";
 import { cleanupVerificationQuarantines } from "./verification-cleanup.js";
-
-const schemaVersion = "phase-2-quality-attempt-v14";
+import { currentSchemaVersion } from "./schema-version.js";
 
 interface StartupApp {
   addHook(name: "onClose", hook: () => Promise<void> | void): unknown;
@@ -52,7 +51,7 @@ export async function startServer(options: StartupOptions = {}) {
   (options.makeDirectory ?? mkdirSync)(dataDir, { recursive: true, mode: 0o700 });
   const databasePath = resolve(dataDir, "workflow.db");
   env.DATABASE_PATH = databasePath;
-  await (options.prepareDatabase ?? prepareCleanDatabase)(databasePath, schemaVersion);
+  await (options.prepareDatabase ?? prepareCleanDatabase)(databasePath, currentSchemaVersion);
   const store = (options.createStore ?? ((path, storeClock) => new WorkflowStore(path, storeClock)))(databasePath, clock);
   let worker: AutomationWorker | undefined;
   let app: StartupApp | undefined;
@@ -112,7 +111,7 @@ export async function startServer(options: StartupOptions = {}) {
   }
 
   try {
-    await (options.writeVersionMarker ?? writeDatabaseVersionMarker)(databasePath, schemaVersion);
+    await (options.writeVersionMarker ?? writeDatabaseVersionMarker)(databasePath, currentSchemaVersion);
     store.interruptActiveStageRuns();
     store.interruptActiveProjectKnowledge();
     store.recoverInterruptedRequirements();

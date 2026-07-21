@@ -42,10 +42,12 @@ npm run dev
 3. 创建需求并选择主项目和版本；随后可配置多个上下文项目和多个交付项目。
 4. 运行 `definition`，人工确认业务定义。
 5. 运行 `solution_design`，人工确认交付单元、依赖和接口。
-6. 批准方案后查看 delivery matrix。Phase 1 只会显示 `ready` 与 `waiting_dependency`。
-7. 进入 `implementation`、`quality_verification` 或 `acceptance_delivery` 后，页面自动显示只读交付矩阵，不会执行 AI 或 Git job。兼容接口 `/run` 也只执行同一只读查询。
+6. 批准方案后查看 delivery matrix。系统创建 root implementation job；有未释放上游的单元保持 `waiting_dependency`。
+7. 使用 `AUTOMATION_WORKER_ENABLED=true npm run dev` 启动交付 worker。实现完成后，Review 与自动化测试分别运行并保存 evidence；两者均通过才释放下游。
+8. 在详情页根据 server-owned `allowedActions` 执行 pause/resume、stale reuse/rerun、override、optional skip 或 retry。页面不能自行推断操作资格。
+9. 所有必需单元通过后，由人工执行总体业务验收。当前版本不自动执行验收后的本地应用。
 
-不存在单项目真实编码限制或单项目 executor fallback。Phase 1 对所有下游交付都保持只读；多项目 queue/worker 在 Phase 2 统一实现。
+不存在单项目 executor fallback。一个需求可以关联多个项目与版本，queue/worker 按 delivery unit 和依赖图并行推进。
 
 ## 五阶段职责
 
@@ -55,18 +57,30 @@ npm run dev
 - `quality_verification`：独立 Review 和独立自动化测试；两者互不替代。
 - `acceptance_delivery`：成果汇总与人工总体业务验收。
 
-Phase 2 才激活 queue、worker、Review 和测试。Phase 3 才提供 overall acceptance 与 dependency-ordered no-commit local application，且 application owner 是交付单元。
+当前 queue、worker、Review、测试、失效传播和人工恢复操作已生效。overall acceptance 仍由人工完成；dependency-ordered no-commit local application 尚未开放，未来 application owner 是交付单元。
+
+## 浏览器验收 pilot
+
+使用专用空目录生成真实仓储数据，不会向正常 UI 注入静态 fixture：
+
+```bash
+PILOT_DATA_DIR="$PWD/.local/delivery-pilot" npm run pilot:seed -w server
+DATA_DIR="$PWD/.local/delivery-pilot" AUTOMATION_WORKER_ENABLED=false npm run dev
+```
+
+打开 `REQ-0001` 可查看 backend/frontend 两个单元、独立 evidence、已释放依赖、frontend stale、需求 paused 和服务端返回的 resume action。seed 拒绝覆盖已有数据库；重建前先停止服务并删除整个 `.local/delivery-pilot` 目录。
 
 ## Git 安全保证
 
-项目验证、知识读取和 Phase 1 下游页面不会修改目标仓库。系统在任何阶段都绝不对目标项目自动执行：
+项目验证、知识读取和交付详情不会自行修改目标仓库。系统在任何阶段都绝不对目标项目自动执行：
 
 - commit
+- merge
 - push
 - tag
 - 创建 PR
 
-Phase 3 的本地应用也只能产生未提交改动，并由人工检查。Phase 1 当前没有任何本地应用 UI 或 requirement-level HTTP 入口。
+后续本地应用也只能产生未提交改动，并由人工检查。当前没有总体业务验收后的本地应用 UI 或 requirement-level HTTP 入口。
 
 ## 验证开发环境
 

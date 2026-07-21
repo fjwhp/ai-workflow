@@ -20,6 +20,8 @@ describe("dashboard stats layout", () => {
       onQueue: () => undefined, onClearFilter: () => undefined, onOpen: () => undefined
     }));
     expect(markup.match(/class="stat"/g)).toHaveLength(5);
+    expect(markup).toContain("交付自动化");
+    expect(markup).not.toContain("自动化待接管");
 
     const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
     const tabletRule = css.split("\n").find((line) => line.startsWith("@media(max-width:900px){") && line.includes(".stats{"));
