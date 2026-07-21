@@ -28,7 +28,9 @@ describe("delivery pilot fixture", () => {
     try {
       const requirements = store.listRequirements();
       expect(requirements).toHaveLength(1);
-      expect(requirements[0]).toMatchObject({ id: seeded.requirementId, code: "REQ-0001" });
+      expect(requirements[0]).toMatchObject({
+        id: seeded.requirementId, code: "REQ-0001", stage: "implementation", status: "ai_ready"
+      });
 
       const detail = store.deliveryUnitDetails.getForRequirement(seeded.requirementId);
       expect(detail.automation).toMatchObject({
@@ -58,6 +60,15 @@ describe("delivery pilot fixture", () => {
           releasedByEvidenceVersion: 1
         })
       ]);
+      const persistedPaths = [
+        ...store.listProjects().map((project) => project.repoPath),
+        ...store.listProjects().flatMap((project) => store.listProjectVersions(project.id, "all")
+          .map((version) => version.worktreePath)),
+        ...(store as any).db.prepare("SELECT repo_path, worktree_path FROM delivery_unit_snapshots").all()
+          .flatMap((row: { repo_path: string; worktree_path: string }) => [row.repo_path, row.worktree_path])
+      ];
+      expect(persistedPaths.every((path) => path.startsWith(`${dataDir}/`))).toBe(true);
+      expect(persistedPaths.every((path) => lstatSync(path).isDirectory())).toBe(true);
       expect(readFileSync(`${seeded.databasePath}.schema-version`, "utf8"))
         .toBe("phase-2-quality-attempt-v14");
     } finally {

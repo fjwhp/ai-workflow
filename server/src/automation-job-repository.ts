@@ -58,6 +58,32 @@ const MAX_LEASE_MS = 86_400_000;
 const MAX_ERROR_LENGTH = 4096;
 const OWNER_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 const WORKER_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+const DELIVERY_JOB_LEASE_ELIGIBLE_SQL = `(
+  automation_jobs.owner_type = 'requirement'
+  OR EXISTS (
+    SELECT 1 FROM delivery_units unit
+    WHERE unit.id = automation_jobs.owner_id
+      AND unit.evidence_version = automation_jobs.evidence_version
+      AND (
+        (automation_jobs.action = 'implement'
+          AND unit.phase = 'implementation' AND unit.status = 'ready'
+          AND NOT EXISTS (
+            SELECT 1 FROM coding_evidence coding
+            WHERE coding.delivery_unit_id = unit.id
+              AND coding.evidence_version = unit.evidence_version
+          ))
+        OR (automation_jobs.action IN ('review', 'test')
+          AND unit.status IN ('awaiting_gate', 'returned', 'failed')
+          AND EXISTS (
+            SELECT 1 FROM coding_evidence coding
+            WHERE coding.delivery_unit_id = unit.id
+              AND coding.evidence_version = unit.evidence_version
+          ))
+        OR (automation_jobs.action = 'apply'
+          AND unit.phase = 'acceptance_delivery' AND unit.status = 'ready_for_acceptance')
+      )
+  )
+)`;
 
 export class AutomationJobRepository {
   constructor(
@@ -108,6 +134,7 @@ export class AutomationJobRepository {
     try {
       const candidate = this.db.prepare(`SELECT id FROM automation_jobs
         WHERE status = 'pending' AND attempt < max_attempts
+          AND ${DELIVERY_JOB_LEASE_ELIGIBLE_SQL}
           AND NOT EXISTS (
             SELECT 1 FROM requirement_automation_state state
             WHERE state.status = 'paused' AND state.requirement_id = CASE
@@ -125,6 +152,7 @@ export class AutomationJobRepository {
         SET status = 'leased', attempt = attempt + 1, claim_token = ?,
           lease_owner = ?, lease_expires_at = ?, updated_at = ?
         WHERE id = ? AND status = 'pending' AND attempt < max_attempts
+          AND ${DELIVERY_JOB_LEASE_ELIGIBLE_SQL}
           AND NOT EXISTS (
             SELECT 1 FROM requirement_automation_state state
             WHERE state.status = 'paused' AND state.requirement_id = CASE
@@ -187,7 +215,17 @@ export class AutomationJobRepository {
     const lastError = sanitizeFailureError(error);
     const settleNow = validateDate(this.clock());
     const result = this.db.prepare(`UPDATE automation_jobs
-      SET status = CASE WHEN ? = 1 AND attempt < max_attempts THEN 'pending' ELSE 'failed' END,
+      SET status = CASE
+        WHEN owner_type = 'delivery_unit' AND EXISTS (
+          SELECT 1 FROM delivery_units unit
+          WHERE unit.id = automation_jobs.owner_id
+            AND unit.evidence_version = automation_jobs.evidence_version
+            AND unit.status = 'potentially_stale'
+        ) THEN 'canceled'
+        WHEN ? = 1 AND attempt < max_attempts AND ${DELIVERY_JOB_LEASE_ELIGIBLE_SQL}
+          THEN 'pending'
+        ELSE 'failed'
+      END,
         lease_owner = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ?
       WHERE id = ? AND status = 'leased' AND lease_owner = ?
         AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`)
@@ -216,7 +254,23 @@ export class AutomationJobRepository {
   recoverExpired(now: Date): number {
     const nowIso = validateDate(now);
     const result = this.db.prepare(`UPDATE automation_jobs
-      SET status = CASE WHEN attempt < max_attempts THEN 'pending' ELSE 'failed' END,
+      SET status = CASE
+        WHEN owner_type = 'delivery_unit' AND (
+          NOT EXISTS (
+            SELECT 1 FROM delivery_units unit
+            WHERE unit.id = automation_jobs.owner_id
+              AND unit.evidence_version = automation_jobs.evidence_version
+          )
+          OR EXISTS (
+            SELECT 1 FROM delivery_units unit
+            WHERE unit.id = automation_jobs.owner_id
+              AND unit.evidence_version = automation_jobs.evidence_version
+              AND unit.status = 'potentially_stale'
+          )
+        ) THEN 'canceled'
+        WHEN attempt < max_attempts THEN 'pending'
+        ELSE 'failed'
+      END,
         lease_owner = NULL, lease_expires_at = NULL,
         last_error = CASE WHEN attempt >= max_attempts THEN COALESCE(last_error, 'Lease expired') ELSE last_error END,
         updated_at = ?

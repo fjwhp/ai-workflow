@@ -52,7 +52,7 @@ export async function seedDeliveryPilot(
   const stagingIdentity = readPilotStagingIdentity(stagingDir);
   let published = false;
   try {
-    const staged = seedPilotStore(stagingDir, options);
+    const staged = seedPilotStore(stagingDir, dataDir, options);
     const stagedDatabasePath = resolve(stagingDir, "workflow.db");
     const markerPath = await (options.writeMarker ?? writeDatabaseVersionMarker)(
       stagedDatabasePath,
@@ -156,15 +156,18 @@ async function cleanupPilotStaging(
 
 function seedPilotStore(
   stagingDir: string,
+  dataDir: string,
   options: DeliveryPilotFixtureOptions
 ): Omit<DeliveryPilotFixture, "dataDir" | "databasePath"> {
   const databasePath = resolve(stagingDir, "workflow.db");
-  const repositoriesDir = resolve(stagingDir, "pilot-repositories");
+  const stagedRepositoriesDir = resolve(stagingDir, "pilot-repositories");
+  const repositoriesDir = resolve(dataDir, "pilot-repositories");
   const backendRepo = resolve(repositoriesDir, "backend");
   const frontendRepo = resolve(repositoriesDir, "frontend");
   const backendWorktree = resolve(repositoriesDir, "backend-worktree");
   const frontendWorktree = resolve(repositoriesDir, "frontend-worktree");
-  for (const path of [backendRepo, frontendRepo, backendWorktree, frontendWorktree]) {
+  for (const path of ["backend", "frontend", "backend-worktree", "frontend-worktree"]
+    .map((entry) => resolve(stagedRepositoriesDir, entry))) {
     mkdirSync(path, { recursive: true, mode: 0o700 });
   }
 
@@ -213,6 +216,7 @@ function seedPilotStore(
     });
     const backendUnit = plan.units.find((unit) => unit.projectId === backend.id)!;
     const frontendUnit = plan.units.find((unit) => unit.projectId === frontend.id)!;
+    store.updateRequirementState(requirement.id, "implementation", "ai_ready");
 
     store.deliveryCoordination.completeContractEvidence({
       unitId: backendUnit.id, version: 1, contractHash: "pilot-contract-v1",

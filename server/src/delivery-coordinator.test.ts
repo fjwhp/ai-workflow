@@ -830,7 +830,6 @@ describe("DeliveryCoordinator", () => {
         startFirstReview();
         return firstReview;
       }
-      if (reviewCalls < 4) throw new Error("provider unavailable");
       return { conclusion: "pass" as const, confidence: 0.9, summary: "reused evidence is valid",
         facts: [], assumptions: [], openQuestions: [], risks: [], findings: [] };
     };
@@ -849,10 +848,9 @@ describe("DeliveryCoordinator", () => {
     finishFirstReview({ conclusion: "pass", confidence: 0.9, summary: "old callback",
       facts: [], assumptions: [], openQuestions: [], risks: [], findings: [] });
     await staleCallback;
-    await worker.drainOnce();
-    await worker.drainOnce();
 
-    expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "failed", attempt: 3 });
+    expect(await worker.drainOnce()).toBe(false);
+    expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "canceled", attempt: 1 });
     const failedAttempts = fixture.database.prepare(`SELECT claim_token, status, error FROM delivery_quality_runs
       WHERE delivery_unit_id = ? AND evidence_version = 1 AND kind = 'code_review' ORDER BY rowid`)
       .all(downstream!.id) as Array<{ claim_token: string; status: string; error: string | null }>;
@@ -862,21 +860,16 @@ describe("DeliveryCoordinator", () => {
     ]);
     fixture.store.deliveryCoordination.resolveStale({ unitId: downstream!.id, decision: "reuse",
       reason: "quality scope remains valid", actor: "local-human" });
-    for (let drain = 0; drain < 4 && fixture.store.automationJobs.get(reviewJob.id)?.status !== "completed"; drain += 1) {
-      await worker.drainOnce();
-    }
+    await worker.drainOnce();
+    await worker.drainOnce();
 
-    expect(reviewCalls).toBe(4);
-    expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "completed" });
+    expect(reviewCalls).toBe(2);
+    expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "completed", attempt: 1 });
     expect(fixture.store.deliveryQuality.latest(downstream!.id, "code_review")).toMatchObject({ result: "passed" });
     expect(fixture.store.deliveryUnits.get(downstream!.id)).toMatchObject({ status: "awaiting_gate" });
     expect(fixture.database.prepare(`SELECT claim_token, status, error FROM delivery_quality_runs
       WHERE delivery_unit_id = ? AND evidence_version = 1 AND kind = 'code_review' ORDER BY created_at, rowid`)
       .all(downstream!.id)).toEqual([
-        { claim_token: expect.stringMatching(/^lease:/), status: "aborted",
-          error: "DELIVERY_QUALITY_AUTOMATION_LEASE_STALE" },
-        { claim_token: expect.stringMatching(/^lease:/), status: "aborted",
-          error: "DELIVERY_QUALITY_AUTOMATION_LEASE_STALE" },
         { claim_token: expect.stringMatching(/^lease:/), status: "aborted",
           error: "DELIVERY_QUALITY_AUTOMATION_LEASE_STALE" },
         { claim_token: expect.stringMatching(/^lease:/), status: "completed", error: null }

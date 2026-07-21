@@ -1353,13 +1353,10 @@ describe("DeliveryExecutionService", () => {
       workerId: "worker-recovery", clock
     });
 
-    for (let drain = 0; drain < 3; drain += 1) {
-      if (fixture.store.automationJobs.get(reviewJob.id)?.status === "completed") break;
-      await worker.drainOnce();
-    }
+    expect(await worker.drainOnce()).toBe(false);
 
     expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({
-      status: "completed", attempt: 2, lastError: null
+      status: "canceled", attempt: 1, lastError: null
     });
     expect(review).not.toHaveBeenCalled();
     expect(fixture.store.deliveryQuality.latest(fixture.unit.id, "code_review")).toBeNull();

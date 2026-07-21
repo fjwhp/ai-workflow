@@ -759,9 +759,7 @@ describe("live delivery unit detail", () => {
       completeImplementation(fixture.store, fixture.primary.id);
       passQuality(fixture.store, fixture.primary.id, 1);
       const db = (fixture.store as any).db;
-      if (target === "implementation") {
-        db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id = ?").run(fixture.secondary.id);
-      } else {
+      if (target === "code_review") {
         completeImplementation(fixture.store, fixture.secondary.id);
         fixture.store.automationJobs.cancelByOwnerVersion(fixture.secondary.id, 1);
       }
@@ -770,6 +768,9 @@ describe("live delivery unit detail", () => {
         evidenceVersion: 1, action, payload: {}, maxAttempts: 1 });
       const job = fixture.store.automationJobs.leaseNext(`worker-${target}`, new Date(), 30_000)!;
       expect(fixture.store.automationJobs.fail(job.id, job.leaseOwner!, `${target} failed`, false)).toBe(true);
+      if (target === "implementation") {
+        db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id = ?").run(fixture.secondary.id);
+      }
       db.prepare("UPDATE delivery_units SET evidence_version = 2 WHERE id = ?").run(fixture.primary.id);
       const app = await buildApp(fixture.store);
 
@@ -887,13 +888,14 @@ describe("live delivery unit detail", () => {
   it("exposes only the failed job retry and optional skip, then enforces reason and fixed actor", async () => {
     const { store, requirement, primary, secondary } = createDeliveryFixture({ optional: true });
     const db = (store as any).db;
-    db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id IN (?, ?)").run(primary.id, secondary.id);
+    db.prepare("UPDATE delivery_units SET status = 'ready' WHERE id = ?").run(secondary.id);
     for (const unit of [primary, secondary]) {
       store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id, evidenceVersion: 1,
         action: "implement", payload: {}, maxAttempts: 1 });
       const job = store.automationJobs.leaseNext(`worker-${unit.id.slice(0, 8)}`, new Date(), 30_000)!;
       expect(store.automationJobs.fail(job.id, job.leaseOwner!, "terminal implementation failure", false)).toBe(true);
     }
+    db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id IN (?, ?)").run(primary.id, secondary.id);
     const app = await buildApp(store);
 
     const detail = (await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` })).json();
