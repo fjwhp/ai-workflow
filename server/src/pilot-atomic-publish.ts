@@ -1,15 +1,23 @@
 import { execFile } from "node:child_process";
 import { lstatSync } from "node:fs";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+
+export interface PilotFilesystemIdentity {
+  dev: number;
+  ino: number;
+  uid: number;
+}
 
 export interface AtomicPilotPublishOptions {
   platform?: NodeJS.Platform;
   helperPath?: string;
   trustedRoot?: string;
   inspectPath?: typeof lstatSync;
+  parentIdentity?: PilotFilesystemIdentity;
+  sourceIdentity?: PilotFilesystemIdentity;
   execute?: (
     file: string,
     args: string[],
@@ -35,8 +43,25 @@ export async function atomicPilotPublish(
     ? resolve(helper, "..")
     : resolve(import.meta.dirname, ".."));
   assertTrustedHelper(helper, trustedRoot, options.inspectPath ?? lstatSync);
+  const inspectPath = options.inspectPath ?? lstatSync;
+  const parent = dirname(source);
+  if (dirname(target) !== parent || resolve(parent, basename(source)) !== source
+    || resolve(parent, basename(target)) !== target || basename(source) === basename(target)) {
+    throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+  }
+  const parentIdentity = options.parentIdentity ?? inspectPath(parent);
+  const sourceIdentity = options.sourceIdentity ?? inspectPath(source);
+  assertTrustedMoveIdentity(parent, source, parentIdentity, sourceIdentity, inspectPath);
   try {
-    await (options.execute ?? execFileAsync)(helper, [source, target], {
+    await (options.execute ?? execFileAsync)(helper, [
+      parent,
+      String(parentIdentity.dev),
+      String(parentIdentity.ino),
+      basename(source),
+      String(sourceIdentity.dev),
+      String(sourceIdentity.ino),
+      basename(target)
+    ], {
       timeout: 10_000,
       maxBuffer: 4096,
       windowsHide: true,
@@ -49,6 +74,32 @@ export async function atomicPilotPublish(
       throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE", { cause: error });
     }
     throw new Error("PILOT_PUBLISH_FAILED", { cause: error });
+  }
+}
+
+function assertTrustedMoveIdentity(
+  parentPath: string,
+  sourcePath: string,
+  expectedParent: PilotFilesystemIdentity,
+  expectedSource: PilotFilesystemIdentity,
+  inspectPath: typeof lstatSync
+) {
+  try {
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+    const parent = inspectPath(parentPath);
+    const source = inspectPath(sourcePath);
+    if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== uid
+      || (parent.mode & 0o022) !== 0 || parent.dev !== expectedParent.dev
+      || parent.ino !== expectedParent.ino || parent.uid !== expectedParent.uid
+      || !source.isDirectory() || source.isSymbolicLink() || source.uid !== uid
+      || (source.mode & 0o777) !== 0o700 || source.dev !== expectedSource.dev
+      || source.ino !== expectedSource.ino || source.uid !== expectedSource.uid) {
+      throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === "PILOT_ATOMIC_PUBLISH_UNAVAILABLE") throw error;
+    throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE", { cause: error });
   }
 }
 

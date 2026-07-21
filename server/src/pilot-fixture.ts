@@ -23,6 +23,7 @@ export interface DeliveryPilotFixtureOptions {
   writeMarker?: typeof writeDatabaseVersionMarker;
   beforePublish?: () => void;
   beforeAtomicPublish?: (stagingDir: string, dataDir: string) => Promise<void> | void;
+  beforeCleanupAtomicMove?: (stagingDir: string, quarantineDir: string) => Promise<void> | void;
 }
 
 interface PilotStagingIdentity {
@@ -30,6 +31,8 @@ interface PilotStagingIdentity {
   dev: number;
   ino: number;
 }
+
+type PilotParentIdentity = PilotStagingIdentity;
 
 export async function seedDeliveryPilot(
   inputDataDir: string,
@@ -41,6 +44,7 @@ export async function seedDeliveryPilot(
   const dataDir = resolve(inputDataDir);
   const parentDir = resolve(dataDir, "..");
   mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+  const parentIdentity = readPilotParentIdentity(parentDir);
   assertPilotTargetAbsent(dataDir);
 
   const stagingDir = resolve(parentDir, `.${basename(dataDir)}.pilot-staging-${randomUUID()}`);
@@ -68,7 +72,10 @@ export async function seedDeliveryPilot(
     await options.beforeAtomicPublish?.(stagingDir, dataDir);
     assertPilotStagingIdentity(stagingDir, stagingIdentity);
     try {
-      await atomicPilotPublish(stagingDir, dataDir);
+      await atomicPilotPublish(stagingDir, dataDir, {
+        parentIdentity,
+        sourceIdentity: stagingIdentity
+      });
     } catch (error) {
       const code = pilotErrorCode(error);
       if (code === "PILOT_PUBLISH_CONFLICT" || code === "PILOT_ATOMIC_PUBLISH_UNAVAILABLE"
@@ -84,7 +91,23 @@ export async function seedDeliveryPilot(
       ...staged
     };
   } finally {
-    if (!published) cleanupPilotStaging(stagingDir, stagingIdentity);
+    if (!published) {
+      await cleanupPilotStaging(stagingDir, stagingIdentity, parentDir, parentIdentity, options);
+    }
+  }
+}
+
+function readPilotParentIdentity(parentDir: string): PilotParentIdentity {
+  try {
+    const stat = lstatSync(parentDir);
+    const uid = typeof process.getuid === "function" ? process.getuid() : stat.uid;
+    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o022) !== 0) {
+      throw new Error("PILOT_PARENT_UNTRUSTED");
+    }
+    return { uid, dev: stat.dev, ino: stat.ino };
+  } catch (error) {
+    if (error instanceof Error && error.message === "PILOT_PARENT_UNTRUSTED") throw error;
+    throw new Error("PILOT_PARENT_UNTRUSTED", { cause: error });
   }
 }
 
@@ -109,10 +132,26 @@ function assertPilotStagingIdentity(stagingDir: string, expected: PilotStagingId
   }
 }
 
-function cleanupPilotStaging(stagingDir: string, expected: PilotStagingIdentity) {
-  assertPilotStagingIdentity(stagingDir, expected);
-  try { rmSync(stagingDir, { recursive: true }); }
-  catch (error) { throw new Error("PILOT_STAGING_CLEANUP_FAILED", { cause: error }); }
+async function cleanupPilotStaging(
+  stagingDir: string,
+  expected: PilotStagingIdentity,
+  parentDir: string,
+  parentIdentity: PilotParentIdentity,
+  options: DeliveryPilotFixtureOptions
+) {
+  const quarantine = resolve(parentDir, `.${basename(stagingDir)}.quarantine-${randomUUID()}`);
+  try {
+    await options.beforeCleanupAtomicMove?.(stagingDir, quarantine);
+    await atomicPilotPublish(stagingDir, quarantine, {
+      parentIdentity,
+      sourceIdentity: expected
+    });
+    assertPilotStagingIdentity(quarantine, expected);
+    rmSync(quarantine, { recursive: true });
+    try { fsyncPath(parentDir); } catch {}
+  } catch (error) {
+    throw new Error("PILOT_STAGING_CLEANUP_FAILED", { cause: error });
+  }
 }
 
 function seedPilotStore(

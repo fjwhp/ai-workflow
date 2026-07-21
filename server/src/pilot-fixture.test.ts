@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import {
-  lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync
+  chmodSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync,
+  symlinkSync, writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -220,7 +221,7 @@ describe("delivery pilot fixture", () => {
         replacementPath = join(stagingDir, "important.txt");
         writeFileSync(replacementPath, "keep replacement");
       }
-    })).rejects.toThrow("PILOT_STAGING_IDENTITY_MISMATCH");
+    })).rejects.toThrow("PILOT_STAGING_CLEANUP_FAILED");
 
     expect(readFileSync(replacementPath, "utf8")).toBe("keep replacement");
     expect(() => lstatSync(dataDir)).toThrow();
@@ -229,6 +230,37 @@ describe("delivery pilot fixture", () => {
   it("requires an explicit nonempty target before any filesystem access", async () => {
     await expect(seedDeliveryPilot("")).rejects.toThrow("PILOT_DATA_DIR_REQUIRED");
     await expect(seedDeliveryPilot("   ")).rejects.toThrow("PILOT_DATA_DIR_REQUIRED");
+  });
+
+  it("rejects an existing group-writable direct parent before creating staging", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "flowgate-pilot-untrusted-parent-"));
+    directories.push(parent);
+    chmodSync(parent, 0o770);
+    const dataDir = join(parent, "pilot-data");
+
+    await expect(seedDeliveryPilot(dataDir)).rejects.toThrow("PILOT_PARENT_UNTRUSTED");
+
+    expect(readdirSync(parent)).toEqual([]);
+  });
+
+  it("quarantines by identity and never removes a cleanup-time replacement", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "flowgate-pilot-cleanup-race-"));
+    directories.push(parent);
+    const dataDir = join(parent, "pilot-data");
+    let replacementPath = "";
+
+    await expect(seedDeliveryPilot(dataDir, {
+      beforeAtomicPublish: async () => { throw new Error("PILOT_PUBLISH_INJECTED"); },
+      beforeCleanupAtomicMove: (stagingDir: string) => {
+        renameSync(stagingDir, `${stagingDir}.original`);
+        mkdirSync(stagingDir, { mode: 0o700 });
+        replacementPath = join(stagingDir, "important.txt");
+        writeFileSync(replacementPath, "keep replacement");
+      }
+    } as any)).rejects.toThrow("PILOT_STAGING_CLEANUP_FAILED");
+
+    expect(readFileSync(replacementPath, "utf8")).toBe("keep replacement");
+    expect(() => lstatSync(dataDir)).toThrow();
   });
 
   it("emits a stable CLI error and never falls back to cwd/data", async () => {

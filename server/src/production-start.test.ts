@@ -17,15 +17,19 @@ afterEach(() => {
 });
 
 describe("production server package runtime", () => {
+  it("installs a clean source workspace with lifecycle scripts enabled", { timeout: 45_000 }, async () => {
+    const workspace = copyCleanWorkspace("flowgate-source-install-");
+
+    await execFileAsync("npm", ["install", "--offline", "--no-audit", "--no-fund"], {
+      cwd: workspace, timeout: 30_000
+    });
+
+    expect(readFileSync(resolve(workspace, "server/dist/native/pilot-atomic-publish.c"), "utf8"))
+      .toContain("publish_no_replace");
+  });
+
   it("starts from a clean build through the published shared runtime", { timeout: 45_000 }, async () => {
-    const workspace = mkdtempSync(resolve(tmpdir(), "flowgate-production-workspace-"));
-    directories.push(workspace);
-    for (const path of ["package.json", "package-lock.json", "tsconfig.base.json", "shared", "server", "web"]) {
-      cpSync(resolve(root, path), resolve(workspace, path), {
-        recursive: true,
-        filter: (source) => !source.split("/").some((segment) => segment === "dist" || segment === "node_modules")
-      });
-    }
+    const workspace = copyCleanWorkspace("flowgate-production-workspace-");
     await execFileAsync("npm", ["install", "--ignore-scripts", "--offline", "--no-audit", "--no-fund"], {
       cwd: workspace, timeout: 30_000
     });
@@ -65,7 +69,9 @@ describe("production server package runtime", () => {
     expect(serverFiles).toContain("dist/native/pilot-atomic-publish");
     expect(serverFiles).toContain("dist/native/pilot-atomic-publish.c");
     expect(serverFiles).toContain("dist/native/install-pilot-atomic-publish.mjs");
-    expect(serverFiles.every((path) => path === "package.json" || path.startsWith("dist/"))).toBe(true);
+    expect(serverFiles).toContain("install-pilot-atomic-publish.mjs");
+    expect(serverFiles.every((path) => path === "package.json"
+      || path === "install-pilot-atomic-publish.mjs" || path.startsWith("dist/"))).toBe(true);
     expect(serverFiles.some((path) => path.startsWith("src/") || path.startsWith("scripts/")
       || path.startsWith("native/"))).toBe(false);
 
@@ -167,6 +173,18 @@ printf 'installed-target-helper' > "$out"
     children.splice(children.indexOf(child), 1);
   });
 });
+
+function copyCleanWorkspace(prefix: string) {
+  const workspace = mkdtempSync(resolve(tmpdir(), prefix));
+  directories.push(workspace);
+  for (const path of ["package.json", "package-lock.json", "tsconfig.base.json", "shared", "server", "web"]) {
+    cpSync(resolve(root, path), resolve(workspace, path), {
+      recursive: true,
+      filter: (source) => !source.split("/").some((segment) => segment === "dist" || segment === "node_modules")
+    });
+  }
+  return workspace;
+}
 
 async function packWorkspace(workspace: string, destination: string, name: "shared" | "server") {
   const { stdout } = await execFileAsync(

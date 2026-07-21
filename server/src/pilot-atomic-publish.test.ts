@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import {
-  chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync
+  chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync,
+  writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -22,14 +23,14 @@ describe("atomic pilot publisher", () => {
       const parent = temporaryDirectory("flowgate-atomic-publish-real-");
       const source = join(parent, "source");
       const target = join(parent, "target");
-      mkdirSync(source);
+      mkdirSync(source, { mode: 0o700 });
       writeFileSync(join(source, "ready.txt"), "ready");
 
       await atomicPilotPublish(source, target);
       expect(readFileSync(join(target, "ready.txt"), "utf8")).toBe("ready");
 
       const second = join(parent, "second");
-      mkdirSync(second);
+      mkdirSync(second, { mode: 0o700 });
       const owned = lstatSync(target);
       await expect(atomicPilotPublish(second, target)).rejects.toThrow("PILOT_PUBLISH_CONFLICT");
       expect(lstatSync(target)).toMatchObject({ dev: owned.dev, ino: owned.ino });
@@ -44,10 +45,82 @@ describe("atomic pilot publisher", () => {
     const helper = trustedFakeHelper(parent);
     const execute = vi.fn(async () => {});
 
-    await atomicPilotPublish(source, target, { platform: "linux", helperPath: helper, execute });
+    mkdirSync(source, { mode: 0o700 });
+    const parentIdentity = lstatSync(parent);
+    const sourceIdentity = lstatSync(source);
+    await atomicPilotPublish(source, target, {
+      platform: "linux", helperPath: helper, execute,
+      parentIdentity, sourceIdentity
+    } as any);
 
-    expect(execute).toHaveBeenCalledWith(helper, [source, target], expect.objectContaining({ shell: false }));
+    expect(execute).toHaveBeenCalledWith(helper, [
+      parent,
+      String(parentIdentity.dev),
+      String(parentIdentity.ino),
+      "source",
+      String(sourceIdentity.dev),
+      String(sourceIdentity.ino),
+      "target"
+    ], expect.objectContaining({ shell: false }));
   });
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "does not publish a source replacement introduced immediately before native execution",
+    async () => {
+      const parent = temporaryDirectory("flowgate-atomic-source-race-");
+      const source = join(parent, "source");
+      const original = join(parent, "source-original");
+      const target = join(parent, "target");
+      mkdirSync(source, { mode: 0o700 });
+      writeFileSync(join(source, "owned.txt"), "owned");
+      const parentIdentity = lstatSync(parent);
+      const sourceIdentity = lstatSync(source);
+      const execute = async (file: string, args: string[], options: any) => {
+        renameSync(source, original);
+        mkdirSync(source, { mode: 0o700 });
+        writeFileSync(join(source, "replacement.txt"), "replacement");
+        return execFileAsync(file, args, options);
+      };
+
+      await expect(atomicPilotPublish(source, target, {
+        parentIdentity, sourceIdentity, execute
+      } as any)).rejects.toThrow("PILOT_PUBLISH_FAILED");
+
+      expect(readFileSync(join(source, "replacement.txt"), "utf8")).toBe("replacement");
+      expect(readFileSync(join(original, "owned.txt"), "utf8")).toBe("owned");
+      expect(() => lstatSync(target)).toThrow();
+    }
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "does not publish through a parent replacement introduced before native execution",
+    async () => {
+      const parent = temporaryDirectory("flowgate-atomic-parent-race-");
+      const original = `${parent}-original`;
+      directories.push(original);
+      const source = join(parent, "source");
+      const target = join(parent, "target");
+      mkdirSync(source, { mode: 0o700 });
+      writeFileSync(join(source, "owned.txt"), "owned");
+      const parentIdentity = lstatSync(parent);
+      const sourceIdentity = lstatSync(source);
+      const execute = async (file: string, args: string[], options: any) => {
+        renameSync(parent, original);
+        mkdirSync(parent, { mode: 0o700 });
+        mkdirSync(join(parent, "source"), { mode: 0o700 });
+        writeFileSync(join(parent, "source", "replacement.txt"), "replacement");
+        return execFileAsync(file, args, options);
+      };
+
+      await expect(atomicPilotPublish(source, target, {
+        parentIdentity, sourceIdentity, execute
+      } as any)).rejects.toThrow("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+
+      expect(readFileSync(join(parent, "source", "replacement.txt"), "utf8")).toBe("replacement");
+      expect(readFileSync(join(original, "source", "owned.txt"), "utf8")).toBe("owned");
+      expect(() => lstatSync(target)).toThrow();
+    }
+  );
 
   it.each([
     [10, "PILOT_PUBLISH_CONFLICT"],
@@ -56,10 +129,12 @@ describe("atomic pilot publisher", () => {
     [64, "PILOT_ATOMIC_PUBLISH_UNAVAILABLE"]
   ])("maps helper exit %i to %s", async (exitCode, expected) => {
     const parent = temporaryDirectory("flowgate-atomic-publish-exit-");
+    const source = join(parent, "source");
     const helper = trustedFakeHelper(parent);
     const execute = vi.fn(async () => { throw Object.assign(new Error("helper failed"), { code: exitCode }); });
+    mkdirSync(source, { mode: 0o700 });
 
-    await expect(atomicPilotPublish(join(parent, "source"), join(parent, "target"), {
+    await expect(atomicPilotPublish(source, join(parent, "target"), {
       platform: "linux", helperPath: helper, execute
     })).rejects.toThrow(expected);
   });
