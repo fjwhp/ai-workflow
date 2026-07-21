@@ -1,5 +1,10 @@
 import { buildCodingEvidence } from "./coding-evidence.js";
-import { runCodingAgent, type CodingAgentInput, type CodingAgentResult } from "./coding-agent.js";
+import {
+  prepareDeliveryImplementationAttempt,
+  runCodingAgent,
+  type CodingAgentInput,
+  type CodingAgentResult
+} from "./coding-agent.js";
 import type { DeliveryExecutionPersistence } from "./delivery-execution-repository.js";
 import {
   codeReviewDecision,
@@ -24,7 +29,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-export type CodingAgent = (input: CodingAgentInput) => Promise<CodingAgentResult>;
+export type CodingAgent = (input: CodingAgentInput, signal?: AbortSignal) => Promise<CodingAgentResult>;
 type WorktreeSnapshot = Awaited<ReturnType<typeof getWorktreeSnapshot>>;
 type TargetState = { head: string; refsHash: string; diffHash: string; gitCommonDir: string };
 export interface DeliveryQualityDependencies {
@@ -32,6 +37,17 @@ export interface DeliveryQualityDependencies {
   testing?: (input: AutomatedTestingInput, signal?: AbortSignal) => Promise<AutomatedTestingResult>;
   inspectTarget?: (worktreePath: string) => Promise<TargetState>;
   reviewTimeoutMs?: number;
+}
+
+export interface DeliveryImplementationAttempt {
+  workspace: NonNullable<CodingAgentInput["attemptWorkspace"]>;
+  publish(result: CodingAgentResult, signal?: AbortSignal): Promise<CodingAgentResult>;
+  rollback?(): Promise<void>;
+  cleanup(): Promise<void>;
+}
+
+export interface DeliveryImplementationDependencies {
+  prepare(input: CodingAgentInput, signal?: AbortSignal): Promise<DeliveryImplementationAttempt>;
 }
 
 export type QualityStatus = "running" | "passed" | "failed";
@@ -48,7 +64,8 @@ export class DeliveryExecutionService {
     private readonly codingAgent: CodingAgent = runCodingAgent,
     private readonly model = process.env.OPENAI_CODING_MODEL || process.env.OPENAI_MODEL || "gpt-5.5",
     private readonly qualityPersistence?: DeliveryQualityPersistence,
-    private readonly qualityDependencies: DeliveryQualityDependencies = {}
+    private readonly qualityDependencies: DeliveryQualityDependencies = {},
+    private readonly implementationDependencies?: DeliveryImplementationDependencies
   ) {
     const reviewTimeoutMs = qualityDependencies.reviewTimeoutMs ?? 300_000;
     if (!Number.isSafeInteger(reviewTimeoutMs) || reviewTimeoutMs < 1 || reviewTimeoutMs > 86_400_000) {
@@ -70,27 +87,53 @@ export class DeliveryExecutionService {
     const claim = this.persistence.claimImplementation(unitId, this.model, hasAutomationInput
       ? { evidenceVersion: evidenceVersion!, claimToken: claimToken! }
       : undefined);
+    const input: CodingAgentInput = {
+      requirement: claim.requirement,
+      artifacts: claim.artifacts,
+      project: claim.project,
+      version: claim.version,
+      deliveryContext: claim.deliveryContext
+    };
+    let attempt: DeliveryImplementationAttempt | undefined;
+    let published = false;
     let result: CodingAgentResult;
     let snapshot: WorktreeSnapshot;
     try {
+      const implementationDependencies = this.implementationDependencies
+        ?? { prepare: prepareDeliveryImplementationAttempt };
+      attempt = await implementationDependencies.prepare(input, signal);
       result = await this.codingAgent({
-        requirement: claim.requirement,
-        artifacts: claim.artifacts,
-        project: claim.project,
-        version: claim.version,
-        deliveryContext: claim.deliveryContext
-      });
+        ...input,
+        ...(attempt ? { attemptWorkspace: attempt.workspace } : {})
+      }, signal);
+      throwIfImplementationSignalAborted(signal);
+      if (attempt) {
+        this.persistence.assertImplementationLease(claim);
+        result = await attempt.publish(result, signal);
+        published = true;
+        this.persistence.assertImplementationLease(claim);
+      }
       if (!result.evidenceSnapshot) throw new Error("IMPLEMENTATION_EVIDENCE_REQUIRED");
       snapshot = result.evidenceSnapshot;
       validateImplementationIdentity(claim, result, snapshot);
       throwIfImplementationSignalAborted(signal);
     } catch (error) {
+      let failure: unknown = error;
       try {
         this.persistence.failImplementation(claim, errorText(error));
       } catch (settlementError) {
-        throw settlementErrorWithCause(settlementError, error);
+        failure = settlementErrorWithCause(settlementError, failure);
       }
-      throw error;
+      if (published) {
+        try { await attempt?.rollback?.(); }
+        catch (rollbackError) { failure = settlementErrorWithCause(rollbackError, failure); }
+      }
+      try {
+        await attempt?.cleanup();
+      } catch (cleanupError) {
+        failure = settlementErrorWithCause(cleanupError, failure);
+      }
+      throw failure;
     }
 
     const evidence = buildCodingEvidence({
@@ -102,7 +145,8 @@ export class DeliveryExecutionService {
       : String(result.diagnostics ?? ""), claim.deliveryContext.sensitivePatterns);
     const events = redactSensitive(result.events ?? [], claim.deliveryContext.sensitivePatterns);
     const summary = redactSensitive(String(result.summary ?? ""), claim.deliveryContext.sensitivePatterns);
-    return this.persistence.completeImplementation(claim, {
+    try {
+      return this.persistence.completeImplementation(claim, {
       branch: result.branch,
       worktreePath: result.worktreePath,
       baseCommit: result.baseCommit,
@@ -121,8 +165,14 @@ export class DeliveryExecutionService {
       diagnostics,
       codexThreadId: result.codexThreadId,
       events,
-      output: { runId: result.runId, summary }
-    });
+        output: { runId: result.runId, summary }
+      });
+    } catch (error) {
+      if (published) await attempt?.rollback?.();
+      throw error;
+    } finally {
+      await attempt?.cleanup();
+    }
   }
 
   async review(unitId: string, evidenceVersion?: number, claimToken?: string, signal?: AbortSignal) {

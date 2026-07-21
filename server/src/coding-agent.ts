@@ -2,7 +2,13 @@ import OpenAI from "openai";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { posix } from "node:path";
-import { createOrReuseRequirementWorktree, getWorktreeSnapshot } from "./repository.js";
+import {
+  cleanupCodingAttemptWorktree,
+  createCodingAttemptWorktree,
+  createOrReuseRequirementWorktree,
+  getWorktreeSnapshot,
+  publishCodingAttemptDiff
+} from "./repository.js";
 import { resolveWorktreePath, safeReadWorktreeFile, safeWriteWorktreeFile } from "./worktree-file-safety.js";
 import { matchesSensitivePath } from "./evidence-tree.js";
 
@@ -28,6 +34,12 @@ export interface CodingAgentInput {
   project: CodingProject;
   version: CodingVersion;
   deliveryContext: CodingDeliveryContext;
+  attemptWorkspace?: {
+    branch: string;
+    worktreePath: string;
+    baseCommit: string;
+    reused: false;
+  };
 }
 export interface CodingAgentResult {
   runId: string;
@@ -53,11 +65,67 @@ export async function prepareCodingWorktree(project: CodingProject, version: Cod
   return createOrReuseRequirementWorktree(project.repoPath, version.branch, requirementCode, version.headCommit);
 }
 
-export async function runCodingAgent(input: CodingAgentInput): Promise<CodingAgentResult> {
+export async function prepareDeliveryImplementationAttempt(input: CodingAgentInput, signal?: AbortSignal) {
+  throwIfCodingAborted(signal);
+  const authoritative = await prepareCodingWorktree(input.project, input.version, input.requirement.code);
+  const workspace = await createCodingAttemptWorktree(
+    input.project.repoPath,
+    input.version.headCommit ?? authoritative.baseCommit,
+    signal
+  );
+  let publication: Awaited<ReturnType<typeof publishCodingAttemptDiff>> | undefined;
+  return {
+    workspace,
+    async publish(result: CodingAgentResult, publishSignal?: AbortSignal) {
+      throwIfCodingAborted(publishSignal);
+      if (result.worktreePath !== workspace.worktreePath || result.baseCommit !== workspace.baseCommit
+        || result.evidenceSnapshot.identity.worktreePath !== workspace.worktreePath
+        || result.evidenceSnapshot.identity.headCommit !== workspace.baseCommit) {
+        throw new Error("IMPLEMENTATION_ATTEMPT_IDENTITY_MISMATCH");
+      }
+      publication = await publishCodingAttemptDiff({
+        repoPath: input.project.repoPath,
+        authoritativeWorktreePath: authoritative.worktreePath,
+        baseCommit: authoritative.baseCommit,
+        diff: result.evidenceSnapshot.diff,
+        signal: publishSignal
+      });
+      try {
+        throwIfCodingAborted(publishSignal);
+      } catch (error) {
+        await publication.rollback();
+        throw error;
+      }
+      return {
+        ...result,
+        branch: authoritative.branch,
+        worktreePath: authoritative.worktreePath,
+        baseCommit: authoritative.baseCommit,
+        diff: publication.snapshot.diff,
+        files: publication.snapshot.files,
+        additions: publication.snapshot.additions,
+        deletions: publication.snapshot.deletions,
+        evidenceSnapshot: publication.snapshot
+      };
+    },
+    async rollback() {
+      await publication?.rollback();
+    },
+    async cleanup() {
+      await publication?.discard();
+      await cleanupCodingAttemptWorktree(input.project.repoPath, workspace.worktreePath);
+    }
+  };
+}
+
+export async function runCodingAgent(input: CodingAgentInput, signal?: AbortSignal): Promise<CodingAgentResult> {
+  throwIfCodingAborted(signal);
   if (!process.env.OPENAI_API_KEY) throw new Error("未配置 OPENAI_API_KEY");
   if (process.env.OPENAI_API_MODE !== "chat") throw new Error("编码代理当前要求 OPENAI_API_MODE=chat");
   const runId = crypto.randomUUID();
-  const worktree = await prepareCodingWorktree(input.project, input.version, input.requirement.code);
+  const worktree = input.attemptWorkspace
+    ?? await prepareCodingWorktree(input.project, input.version, input.requirement.code);
+  throwIfCodingAborted(signal);
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.OPENAI_BASE_URL || undefined });
   const tools: any[] = [
     tool("search_code", "在仓库中搜索文本", { query: { type: "string" } }, ["query"]),
@@ -74,7 +142,11 @@ export async function runCodingAgent(input: CodingAgentInput): Promise<CodingAge
   }];
 
   for (let round = 0; round < 16; round++) {
-    const response = await client.chat.completions.create({ model: process.env.OPENAI_CODING_MODEL || process.env.OPENAI_MODEL!, messages, tools, tool_choice: "auto" });
+    const response = await client.chat.completions.create(
+      { model: process.env.OPENAI_CODING_MODEL || process.env.OPENAI_MODEL!, messages, tools, tool_choice: "auto" },
+      { signal }
+    );
+    throwIfCodingAborted(signal);
     const message: any = response.choices[0]?.message;
     if (!message) throw new Error("编码模型未返回消息");
     messages.push(message);
@@ -82,6 +154,7 @@ export async function runCodingAgent(input: CodingAgentInput): Promise<CodingAge
       const snapshot = await getWorktreeSnapshot(worktree.worktreePath, {
         sensitivePatterns: input.deliveryContext.sensitivePatterns
       });
+      throwIfCodingAborted(signal);
       return {
         ...worktree, diff: snapshot.diff, files: snapshot.files, additions: snapshot.additions,
         deletions: snapshot.deletions, evidenceSnapshot: snapshot,
@@ -92,9 +165,12 @@ export async function runCodingAgent(input: CodingAgentInput): Promise<CodingAge
       let result: unknown;
       try {
         result = await executeTool(call.function.name, JSON.parse(call.function.arguments || "{}"),
-          worktree.worktreePath, input.deliveryContext.sensitivePatterns);
+          worktree.worktreePath, input.deliveryContext.sensitivePatterns, signal);
       }
-      catch (error) { result = { error: error instanceof Error ? error.message : "工具执行失败" }; }
+      catch (error) {
+        throwIfCodingAborted(signal);
+        result = { error: error instanceof Error ? error.message : "工具执行失败" };
+      }
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
     }
   }
@@ -105,22 +181,46 @@ function tool(name: string, description: string, properties: any, required: stri
   return { type: "function", function: { name, description, parameters: { type: "object", properties, required, additionalProperties: false } } };
 }
 
-async function executeTool(name: string, args: any, worktree: string, sensitivePatterns: string[]) {
+async function executeTool(
+  name: string,
+  args: any,
+  worktree: string,
+  sensitivePatterns: string[],
+  signal?: AbortSignal
+) {
+  throwIfCodingAborted(signal);
   if (name === "search_code") {
     const exclusions = sensitivePatterns.flatMap((pattern) => ["-g", `!${pattern}`]);
     const { stdout } = await execFileAsync("rg", ["-n", "--hidden", "-g", "!.git", "-g", "!target",
-      ...exclusions, "-F", "--", String(args.query), "."], { cwd: worktree, maxBuffer: 1024 * 1024 });
+      ...exclusions, "-F", "--", String(args.query), "."], {
+      cwd: worktree, maxBuffer: 1024 * 1024, signal
+    });
+    throwIfCodingAborted(signal);
     return stdout.split("\n").slice(0, 120).join("\n");
   }
   const requestedPath = typeof args.path === "string" ? posix.normalize(args.path.replaceAll("\\", "/")) : "";
   if ((name === "read_file" || name === "write_file") && matchesSensitivePath(requestedPath, sensitivePatterns)) {
     throw new Error("CODING_FILE_PATH_SENSITIVE");
   }
-  if (name === "read_file") return (await safeReadWorktreeFile(worktree, String(args.path))).slice(0, 60000);
+  if (name === "read_file") {
+    const content = await safeReadWorktreeFile(worktree, String(args.path));
+    throwIfCodingAborted(signal);
+    return content.slice(0, 60000);
+  }
   if (name === "write_file") {
     await safeWriteWorktreeFile(worktree, String(args.path), String(args.content));
+    throwIfCodingAborted(signal);
     return { written: args.path };
   }
-  if (name === "git_diff") return (await getWorktreeSnapshot(worktree, { sensitivePatterns })).diff.slice(0, 80000);
+  if (name === "git_diff") {
+    const snapshot = await getWorktreeSnapshot(worktree, { sensitivePatterns });
+    throwIfCodingAborted(signal);
+    return snapshot.diff.slice(0, 80000);
+  }
   throw new Error("未知工具");
+}
+
+function throwIfCodingAborted(signal: AbortSignal | undefined) {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("DELIVERY_IMPLEMENTATION_ABORTED");
 }

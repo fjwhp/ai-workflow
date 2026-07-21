@@ -25,6 +25,12 @@ export interface DeliveryPilotFixtureOptions {
   beforeAtomicPublish?: (stagingDir: string, dataDir: string) => Promise<void> | void;
 }
 
+interface PilotStagingIdentity {
+  uid: number;
+  dev: number;
+  ino: number;
+}
+
 export async function seedDeliveryPilot(
   inputDataDir: string,
   options: DeliveryPilotFixtureOptions = {}
@@ -39,6 +45,7 @@ export async function seedDeliveryPilot(
 
   const stagingDir = resolve(parentDir, `.${basename(dataDir)}.pilot-staging-${randomUUID()}`);
   mkdirSync(stagingDir, { mode: 0o700 });
+  const stagingIdentity = readPilotStagingIdentity(stagingDir);
   let published = false;
   try {
     const staged = seedPilotStore(stagingDir, options);
@@ -50,6 +57,7 @@ export async function seedDeliveryPilot(
     fsyncPath(stagedDatabasePath);
     fsyncPath(markerPath);
     fsyncPath(stagingDir);
+    assertPilotStagingIdentity(stagingDir, stagingIdentity);
 
     options.beforePublish?.();
     try {
@@ -58,6 +66,7 @@ export async function seedDeliveryPilot(
       throw new Error("PILOT_PUBLISH_CONFLICT", { cause: error });
     }
     await options.beforeAtomicPublish?.(stagingDir, dataDir);
+    assertPilotStagingIdentity(stagingDir, stagingIdentity);
     try {
       await atomicPilotPublish(stagingDir, dataDir);
     } catch (error) {
@@ -66,6 +75,7 @@ export async function seedDeliveryPilot(
         || code === "PILOT_PUBLISH_FAILED") throw error;
       throw new Error("PILOT_PUBLISH_FAILED", { cause: error });
     }
+    assertPilotStagingIdentity(dataDir, stagingIdentity);
     published = true;
     try { fsyncPath(parentDir); } catch {}
     return {
@@ -74,8 +84,35 @@ export async function seedDeliveryPilot(
       ...staged
     };
   } finally {
-    if (!published) rmSync(stagingDir, { recursive: true, force: true });
+    if (!published) cleanupPilotStaging(stagingDir, stagingIdentity);
   }
+}
+
+function readPilotStagingIdentity(stagingDir: string): PilotStagingIdentity {
+  const stat = lstatSync(stagingDir);
+  const uid = typeof process.getuid === "function" ? process.getuid() : stat.uid;
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o777) !== 0o700) {
+    throw new Error("PILOT_STAGING_IDENTITY_MISMATCH");
+  }
+  return { uid, dev: stat.dev, ino: stat.ino };
+}
+
+function assertPilotStagingIdentity(stagingDir: string, expected: PilotStagingIdentity) {
+  try {
+    const actual = readPilotStagingIdentity(stagingDir);
+    if (actual.uid !== expected.uid || actual.dev !== expected.dev || actual.ino !== expected.ino) {
+      throw new Error("PILOT_STAGING_IDENTITY_MISMATCH");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === "PILOT_STAGING_IDENTITY_MISMATCH") throw error;
+    throw new Error("PILOT_STAGING_IDENTITY_MISMATCH", { cause: error });
+  }
+}
+
+function cleanupPilotStaging(stagingDir: string, expected: PilotStagingIdentity) {
+  assertPilotStagingIdentity(stagingDir, expected);
+  try { rmSync(stagingDir, { recursive: true }); }
+  catch (error) { throw new Error("PILOT_STAGING_CLEANUP_FAILED", { cause: error }); }
 }
 
 function seedPilotStore(

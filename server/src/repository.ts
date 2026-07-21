@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -7,7 +9,16 @@ import { captureCommitEvidence, captureWorktreeEvidence, type EvidenceOptions } 
 
 const execFileAsync = promisify(execFile);
 const protectedBranches=new Set(["prod","production","main","master"]);
+const CODING_ATTEMPT_OWNER_SUFFIX = ".owner.json";
 type GitConfigEntry = readonly [key: string, value: string];
+
+interface CodingAttemptOwnership {
+  version: 1;
+  uid: number;
+  nonce: string;
+  dev: number;
+  ino: number;
+}
 
 function codingGitEnvironment(config: readonly GitConfigEntry[] = []) {
   const env = { ...process.env };
@@ -211,17 +222,17 @@ function isInside(root: string, candidate: string) {
   return pathFromRoot === "" || (pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot));
 }
 
-async function ensureRequirementDirectory(parent: string, segments: string[]) {
+async function ensureRequirementDirectory(parent: string, segments: string[], finalMode?: number) {
   let path = resolve(parent);
   let canonicalPath = await realpath(path);
-  for (const segment of segments) {
+  for (const [index, segment] of segments.entries()) {
     path = resolve(path, segment);
     canonicalPath = resolve(canonicalPath, segment);
     let entry;
     try { entry = await lstat(path); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE");
-      try { await mkdir(path); }
+      try { await mkdir(path, index === segments.length - 1 && finalMode ? { mode: finalMode } : undefined); }
       catch (mkdirError) {
         if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE");
       }
@@ -230,6 +241,12 @@ async function ensureRequirementDirectory(parent: string, segments: string[]) {
     }
     if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE");
     if (await realpath(path) !== canonicalPath) throw new Error("REQUIREMENT_WORKTREE_PATH_ESCAPE");
+    if (index === segments.length - 1 && finalMode !== undefined) {
+      const uid = typeof process.getuid === "function" ? process.getuid() : entry.uid;
+      if (entry.uid !== uid || (entry.mode & 0o777) !== finalMode) {
+        throw new Error("IMPLEMENTATION_ATTEMPT_ROOT_UNSAFE");
+      }
+    }
   }
   return { path, canonicalPath };
 }
@@ -445,6 +462,219 @@ export async function createOrReuseRequirementWorktree(
       });
       if(cause instanceof Error&&(cause.message==="REQUIREMENT_BASE_COMMIT_UNAVAILABLE"||cause.message==="DELIVERY_UNIT_SNAPSHOT_HEAD_MISMATCH"))throw cause;
       throw new Error("REQUIREMENT_WORKTREE_CREATE_FAILED", { cause });
+    }
+  });
+}
+
+export async function createCodingAttemptWorktree(
+  repoPath: string,
+  baseCommit: string,
+  signal?: AbortSignal
+) {
+  repoPath = await requirementRepoPath(repoPath);
+  await validateSnapshotCommit(repoPath, baseCommit);
+  const id = randomUUID();
+  const root = resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "implementation-attempts");
+  const worktreePath = resolve(root, id);
+  await ensureRequirementDirectory(resolve(repoPath, ".."), [
+    ".ai-workflow-worktrees", basename(repoPath), "implementation-attempts"
+  ], 0o700);
+  await withRepoWorktreeMutationLock(repoPath, async () => {
+    await mkdir(worktreePath, { mode: 0o700 });
+    const hooksPath = await mkdtemp(join(tmpdir(), "ai-workflow-empty-hooks-"));
+    try {
+      const filterOverrides = await codingFilterOverrides(repoPath);
+      await execFileAsync("git", ["-C", repoPath, "worktree", "add", "--detach", worktreePath, baseCommit], {
+        env: codingGitEnvironmentWithFsmonitor([["core.hooksPath", hooksPath], ...filterOverrides]), signal
+      });
+      const status = await lstat(worktreePath);
+      const uid = typeof process.getuid === "function" ? process.getuid() : status.uid;
+      if (!status.isDirectory() || status.isSymbolicLink() || status.uid !== uid
+        || (status.mode & 0o777) !== 0o700) {
+        throw new Error("IMPLEMENTATION_ATTEMPT_ROOT_UNSAFE");
+      }
+      const ownership: CodingAttemptOwnership = {
+        version: 1, uid, nonce: randomUUID(), dev: status.dev, ino: status.ino
+      };
+      await writeFile(codingAttemptMarkerPath(root, id), JSON.stringify(ownership), {
+        encoding: "utf8", flag: "wx", mode: 0o600
+      });
+    } catch (error) {
+      await rm(worktreePath, { recursive: true, force: true }).catch(() => undefined);
+      await rm(codingAttemptMarkerPath(root, id), { force: true }).catch(() => undefined);
+      throw error;
+    } finally {
+      await rm(hooksPath, { recursive: true, force: true });
+    }
+  });
+  return { branch: "HEAD", worktreePath, baseCommit, reused: false as const };
+}
+
+export async function cleanupCodingAttemptWorktree(repoPath: string, worktreePath: string) {
+  repoPath = await requirementRepoPath(repoPath);
+  await withRepoWorktreeMutationLock(repoPath, async () => {
+    const owned = await validateCodingAttemptOwnership(repoPath, worktreePath);
+    const quarantine = resolve(owned.root, `${owned.id}.quarantine-${owned.ownership.nonce}`);
+    try {
+      await rename(owned.path, quarantine);
+    } catch (error) {
+      throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_FAILED", { cause: error });
+    }
+    let pruneError: unknown;
+    try {
+      await execFileAsync("git", ["-C", repoPath, "worktree", "prune"], {
+        env: codingGitEnvironmentWithFsmonitor()
+      });
+    } catch (error) {
+      pruneError = error;
+    }
+    try {
+      await validateCodingAttemptQuarantine(quarantine, owned.ownership, owned.root);
+      await rm(quarantine, { recursive: true });
+      await rm(owned.markerPath);
+    } catch (error) {
+      throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_FAILED", { cause: error });
+    }
+    if (pruneError) throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_FAILED", { cause: pruneError });
+  });
+}
+
+function codingAttemptMarkerPath(root: string, id: string) {
+  return resolve(root, `${id}${CODING_ATTEMPT_OWNER_SUFFIX}`);
+}
+
+async function validateCodingAttemptOwnership(repoPath: string, worktreePath: string) {
+  const id = basename(worktreePath);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) {
+    throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+  }
+  const root = resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "implementation-attempts");
+  const expectedPath = resolve(root, id);
+  if (resolve(worktreePath) !== expectedPath) throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+  try {
+    const [rootStatus, canonicalRoot, status, canonicalPath] = await Promise.all([
+      lstat(root), realpath(root), lstat(expectedPath), realpath(expectedPath)
+    ]);
+    const uid = typeof process.getuid === "function" ? process.getuid() : status.uid;
+    if (!rootStatus.isDirectory() || rootStatus.isSymbolicLink() || rootStatus.uid !== uid
+      || (rootStatus.mode & 0o777) !== 0o700 || canonicalRoot !== root
+      || !status.isDirectory() || status.isSymbolicLink() || status.uid !== uid
+      || (status.mode & 0o777) !== 0o700 || canonicalPath !== expectedPath) {
+      throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+    }
+    const markerPath = codingAttemptMarkerPath(root, id);
+    const ownership = await readCodingAttemptOwnership(markerPath, uid);
+    if (ownership.dev !== status.dev || ownership.ino !== status.ino) {
+      throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+    }
+    const candidateCommonDir = await canonicalGitCommonDir(expectedPath);
+    if (candidateCommonDir !== await canonicalGitCommonDir(repoPath)) {
+      throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+    }
+    return { id, root, path: expectedPath, markerPath, ownership };
+  } catch (error) {
+    if (error instanceof Error && error.message === "IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID") throw error;
+    throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID", { cause: error });
+  }
+}
+
+async function validateCodingAttemptQuarantine(
+  quarantine: string,
+  ownership: CodingAttemptOwnership,
+  root: string
+) {
+  const [status, canonical] = await Promise.all([lstat(quarantine), realpath(quarantine)]);
+  if (!status.isDirectory() || status.isSymbolicLink() || status.uid !== ownership.uid
+    || (status.mode & 0o777) !== 0o700 || status.dev !== ownership.dev || status.ino !== ownership.ino
+    || canonical !== quarantine || resolve(quarantine, "..") !== root) {
+    throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+  }
+}
+
+async function readCodingAttemptOwnership(markerPath: string, uid: number): Promise<CodingAttemptOwnership> {
+  let handle;
+  try {
+    handle = await open(markerPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const status = await handle.stat();
+    if (!status.isFile() || status.uid !== uid || (status.mode & 0o777) !== 0o600 || status.size > 4096) {
+      throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+    }
+    const parsed: unknown = JSON.parse(await handle.readFile({ encoding: "utf8" }));
+    if (!validCodingAttemptOwnership(parsed) || parsed.uid !== uid) {
+      throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID");
+    }
+    return parsed;
+  } catch (error) {
+    if (error instanceof Error && error.message === "IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID") throw error;
+    throw new Error("IMPLEMENTATION_ATTEMPT_CLEANUP_PATH_INVALID", { cause: error });
+  } finally {
+    await handle?.close();
+  }
+}
+
+function validCodingAttemptOwnership(value: unknown): value is CodingAttemptOwnership {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const marker = value as Record<string, unknown>;
+  return Object.keys(marker).sort().join(",") === "dev,ino,nonce,uid,version"
+    && marker.version === 1
+    && [marker.uid, marker.dev, marker.ino].every((item) => Number.isSafeInteger(item) && Number(item) >= 0)
+    && typeof marker.nonce === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(marker.nonce);
+}
+
+export async function publishCodingAttemptDiff(input: {
+  repoPath: string;
+  authoritativeWorktreePath: string;
+  baseCommit: string;
+  diff: string;
+  signal?: AbortSignal;
+}) {
+  return withRepoWorktreeMutationLock(input.repoPath, async () => {
+    const before = await getWorktreeSnapshot(input.authoritativeWorktreePath);
+    if (before.identity.headCommit !== input.baseCommit || before.diff !== "") {
+      throw new Error("IMPLEMENTATION_AUTHORITATIVE_WORKTREE_DIRTY");
+    }
+    if (!input.diff) return { snapshot: before, rollback: async () => {}, discard: async () => {} };
+    const patchRoot = await mkdtemp(join(tmpdir(), "ai-workflow-implementation-patch-"));
+    const patchPath = join(patchRoot, "attempt.patch");
+    await writeFile(patchPath, input.diff, { mode: 0o600 });
+    let applied = false;
+    try {
+      const args = ["-C", input.authoritativeWorktreePath, "apply", "--binary", "--whitespace=nowarn"];
+      await execFileAsync("git", [...args, "--check", patchPath], {
+        env: codingGitEnvironmentWithFsmonitor(), signal: input.signal
+      });
+      await execFileAsync("git", [...args, patchPath], {
+        env: codingGitEnvironmentWithFsmonitor(), signal: input.signal
+      });
+      applied = true;
+      const snapshot = await getWorktreeSnapshot(input.authoritativeWorktreePath);
+      return {
+        snapshot,
+        rollback: async () => {
+          if (!applied) return;
+          await withRepoWorktreeMutationLock(input.repoPath, async () => {
+            await execFileAsync("git", [...args, "--reverse", patchPath], {
+              env: codingGitEnvironmentWithFsmonitor()
+            });
+            applied = false;
+          });
+          await rm(patchRoot, { recursive: true, force: true });
+        },
+        discard: async () => {
+          await rm(patchRoot, { recursive: true, force: true });
+        }
+      };
+    } catch (error) {
+      if (applied) {
+        await execFileAsync("git", ["-C", input.authoritativeWorktreePath, "apply", "--binary",
+          "--whitespace=nowarn", "--reverse", patchPath], {
+          env: codingGitEnvironmentWithFsmonitor()
+        }).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      if (!applied) await rm(patchRoot, { recursive: true, force: true });
     }
   });
 }

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import {
-  chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
+  chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -77,6 +77,61 @@ describe("atomic pilot publisher", () => {
     await expect(atomicPilotPublish(join(parent, "source"), join(parent, "target"), {
       platform: "linux", helperPath: helper, execute
     })).rejects.toThrow("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects a helper reached through a symlinked ancestor", async () => {
+    const root = temporaryDirectory("flowgate-helper-symlink-root-");
+    const actual = join(root, "actual");
+    mkdirSync(actual, { mode: 0o700 });
+    const helper = trustedFakeHelper(actual);
+    const linked = join(root, "linked");
+    symlinkSync(actual, linked);
+    const execute = vi.fn(async () => {});
+
+    await expect(atomicPilotPublish(join(root, "source"), join(root, "target"), {
+      platform: "linux", helperPath: join(linked, "helper"), trustedRoot: root, execute
+    } as any)).rejects.toThrow("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(readFileSync(helper, "utf8")).toBe("fake helper");
+  });
+
+  it("rejects an executable helper inside a group-writable ancestor", async () => {
+    const root = temporaryDirectory("flowgate-helper-writable-root-");
+    const writable = join(root, "writable");
+    mkdirSync(writable, { mode: 0o770 });
+    chmodSync(writable, 0o770);
+    const helper = trustedFakeHelper(writable);
+    const execute = vi.fn(async () => {});
+
+    await expect(atomicPilotPublish(join(root, "source"), join(root, "target"), {
+      platform: "linux", helperPath: helper, trustedRoot: root, execute
+    } as any)).rejects.toThrow("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects a helper path component reported as foreign-owned", async () => {
+    const root = temporaryDirectory("flowgate-helper-foreign-root-");
+    const native = join(root, "native");
+    mkdirSync(native, { mode: 0o700 });
+    const helper = trustedFakeHelper(native);
+    const execute = vi.fn(async () => {});
+    const inspectPath = (path: string) => {
+      const stat = lstatSync(path);
+      if (path !== native) return stat;
+      return {
+        ...stat, uid: stat.uid + 1,
+        isDirectory: () => stat.isDirectory(), isFile: () => stat.isFile(),
+        isSymbolicLink: () => stat.isSymbolicLink()
+      };
+    };
+
+    await expect(atomicPilotPublish(join(root, "source"), join(root, "target"), {
+      platform: "linux", helperPath: helper, trustedRoot: root, inspectPath, execute
+    } as any)).rejects.toThrow("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+
     expect(execute).not.toHaveBeenCalled();
   });
 

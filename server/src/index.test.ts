@@ -10,6 +10,17 @@ import type { CodingAgentInput } from "./coding-agent.js";
 import { evidenceFingerprint, evidenceManifestHash } from "./evidence-tree.js";
 
 const directories: string[] = [];
+const controlledImplementationDependencies = {
+  prepare: async (input: CodingAgentInput) => ({
+    workspace: {
+      branch: "HEAD", worktreePath: `${input.version.worktreePath}/.isolated-test-attempt`,
+      baseCommit: input.version.headCommit!, reused: false as const
+    },
+    publish: async (result: any) => result,
+    rollback: async () => {},
+    cleanup: async () => {}
+  })
+};
 
 afterEach(() => {
   directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true }));
@@ -242,7 +253,8 @@ describe("server entry point", () => {
         return store;
       },
       createDeliveryService: (store) => new DeliveryExecutionService(
-        store.deliveryExecutions, coding, "production-test-model", store.deliveryQuality
+        store.deliveryExecutions, coding, "production-test-model", store.deliveryQuality,
+        {}, controlledImplementationDependencies
       ),
       buildApplication: async () => fakeApp([]),
       writeListening: () => {}
@@ -288,7 +300,8 @@ describe("server entry point", () => {
         AUTOMATION_WORKER_POLL_MS: "10", AUTOMATION_WORKER_LEASE_MS: "30000" },
       clock: () => recoveredAt,
       createDeliveryService: (store) => new DeliveryExecutionService(
-        store.deliveryExecutions, coding, "production-recovery-model", store.deliveryQuality
+        store.deliveryExecutions, coding, "production-recovery-model", store.deliveryQuality,
+        {}, controlledImplementationDependencies
       ),
       buildApplication: async () => fakeApp([]), writeListening: () => {}
     });

@@ -91,6 +91,7 @@ export interface DeliveryExecutionPersistence {
   ): DeliveryExecutionClaim;
   completeImplementation(claim: DeliveryExecutionClaim, result: DeliveryExecutionSuccess): DeliveryUnit;
   failImplementation(claim: DeliveryExecutionClaim, error: string): DeliveryUnit;
+  assertImplementationLease(claim: DeliveryExecutionClaim): void;
   listExecutions(deliveryUnitId: string, evidenceVersion?: number): unknown[];
   getCodingEvidence(deliveryUnitId: string, evidenceVersion: number): unknown | null;
 }
@@ -264,6 +265,10 @@ export class DeliveryExecutionRepository {
     if (execution.changes !== 1 || run.changes !== 1) throw new Error("DELIVERY_UNIT_RUN_STALE");
     this.insertRunEvent(claim.runId, 2, "run.failed", { error }, now);
     return this.getUnit(unitId)!;
+  }
+
+  assertImplementationLeaseInTransaction(claim: DeliveryExecutionClaim) {
+    this.assertClaimAutomationLease(claim);
   }
 
   listExecutions(deliveryUnitId: string, evidenceVersion?: number) {

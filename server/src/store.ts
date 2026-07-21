@@ -137,6 +137,9 @@ export class WorkflowStore {
       failImplementation: (claim, error) => this.withImmediateTransaction(
         () => this.deliveryExecutionRepository.failImplementationInTransaction(claim, error)
       ),
+      assertImplementationLease: (claim) => this.withImmediateTransaction(
+        () => this.deliveryExecutionRepository.assertImplementationLeaseInTransaction(claim)
+      ),
       listExecutions: (deliveryUnitId, evidenceVersion) =>
         this.deliveryExecutionRepository.listExecutions(deliveryUnitId, evidenceVersion),
       getCodingEvidence: (deliveryUnitId, evidenceVersion) =>

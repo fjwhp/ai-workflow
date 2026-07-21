@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import {
-  lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync
+  lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -205,6 +205,25 @@ describe("delivery pilot fixture", () => {
     expect({ dev: preserved.dev, ino: preserved.ino }).toEqual(replacement);
     expect(readFileSync(join(dataDir, "owner.txt"), "utf8")).toBe("replacement-owner");
     expect(readdirSync(parent).filter((entry) => entry.includes("pilot-staging"))).toEqual([]);
+  });
+
+  it("rejects a replaced staging identity without deleting or publishing the replacement", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "flowgate-pilot-staging-replaced-"));
+    directories.push(parent);
+    const dataDir = join(parent, "pilot-data");
+    let replacementPath = "";
+
+    await expect(seedDeliveryPilot(dataDir, {
+      beforeAtomicPublish: (stagingDir) => {
+        renameSync(stagingDir, `${stagingDir}.original`);
+        mkdirSync(stagingDir, { mode: 0o700 });
+        replacementPath = join(stagingDir, "important.txt");
+        writeFileSync(replacementPath, "keep replacement");
+      }
+    })).rejects.toThrow("PILOT_STAGING_IDENTITY_MISMATCH");
+
+    expect(readFileSync(replacementPath, "utf8")).toBe("keep replacement");
+    expect(() => lstatSync(dataDir)).toThrow();
   });
 
   it("requires an explicit nonempty target before any filesystem access", async () => {

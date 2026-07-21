@@ -121,10 +121,10 @@ async function buildEvidenceSnapshot(
 
 async function readEvidenceIdentity(worktreePath: string, env: NodeJS.ProcessEnv): Promise<WorktreeEvidenceIdentity> {
   const canonicalWorktree = await realpath(resolve(worktreePath));
-  const [{ stdout: topLevel }, { stdout: common }, { stdout: branch }] = await Promise.all([
+  const [{ stdout: topLevel }, { stdout: common }, branch] = await Promise.all([
     execFileAsync("git", ["-C", canonicalWorktree, "rev-parse", "--show-toplevel"], { env }),
     execFileAsync("git", ["-C", canonicalWorktree, "rev-parse", "--git-common-dir"], { env }),
-    execFileAsync("git", ["-C", canonicalWorktree, "symbolic-ref", "--quiet", "--short", "HEAD"], { env })
+    readEvidenceBranch(canonicalWorktree, env)
   ]);
   if (await realpath(resolve(canonicalWorktree, topLevel.trim())) !== canonicalWorktree) {
     throw new Error("CODING_EVIDENCE_REPOSITORY_MISMATCH");
@@ -139,8 +139,21 @@ async function readEvidenceIdentity(worktreePath: string, env: NodeJS.ProcessEnv
   const gitCommonDir = await realpath(resolve(canonicalWorktree, common.trim()));
   return {
     repositoryPath: resolve(gitCommonDir, ".."), gitCommonDir, worktreePath: canonicalWorktree,
-    branch: branch.trim(), headCommit
+    branch, headCommit
   };
+}
+
+async function readEvidenceBranch(worktreePath: string, env: NodeJS.ProcessEnv) {
+  try {
+    return (await execFileAsync("git", ["-C", worktreePath, "symbolic-ref", "--quiet", "--short", "HEAD"], {
+      env
+    })).stdout.trim();
+  } catch (error) {
+    if ((error as { code?: unknown; signal?: unknown }).code === 1 && !(error as { signal?: unknown }).signal) {
+      return "HEAD";
+    }
+    throw error;
+  }
 }
 
 async function readIgnoredPaths(worktreePath: string, env: NodeJS.ProcessEnv) {

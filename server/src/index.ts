@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WorkflowStore } from "./store.js";
@@ -188,7 +188,9 @@ function formatError(error: unknown) {
 }
 
 function isDirectExecution() {
-  return process.argv[1] !== undefined && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+  if (process.argv[1] === undefined) return false;
+  try { return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1])); }
+  catch { return false; }
 }
 
 if (isDirectExecution()) await startServer({ installSignalHandlers: true });

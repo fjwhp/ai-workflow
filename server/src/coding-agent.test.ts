@@ -184,6 +184,45 @@ describe("runCodingAgent tool boundary", () => {
     expect(toolNames).toEqual(["search_code", "read_file", "write_file", "git_diff"]);
   });
 
+  it("does not execute a late tool call after an abort-ignoring provider returns", async () => {
+    const worktree = await temporaryWorktree();
+    const controller = new AbortController();
+    let releaseProvider!: () => void;
+    let providerSignal: AbortSignal | undefined;
+    const provider = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    mocks.chatCreate
+      .mockImplementation(async () => ({
+        choices: [{ message: { role: "assistant", content: "unexpected second provider call" } }]
+      }))
+      .mockImplementationOnce(async (_request: unknown, options?: { signal?: AbortSignal }) => {
+        providerSignal = options?.signal;
+        await provider;
+        return { choices: [{ message: {
+          role: "assistant",
+          tool_calls: [{
+            id: "late-write",
+            function: { name: "write_file", arguments: JSON.stringify({
+              path: "late.txt", content: "stale worker write"
+            }) }
+          }]
+        } }] };
+      });
+
+    const running = runCodingAgent(codingInput([]), controller.signal);
+    await vi.waitFor(() => expect(mocks.chatCreate).toHaveBeenCalledOnce());
+    controller.abort(new Error("AUTOMATION_WORKER_LEASE_LOST"));
+    releaseProvider();
+
+    try {
+      await expect(running).rejects.toThrow("AUTOMATION_WORKER_LEASE_LOST");
+      expect(providerSignal).toBe(controller.signal);
+      await expect(readFile(join(worktree, "late.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(mocks.chatCreate).toHaveBeenCalledOnce();
+    } finally {
+      mocks.chatCreate.mockReset();
+    }
+  });
+
   it("captures final evidence with the frozen sensitive path policy", async () => {
     mocks.chatCreate.mockResolvedValueOnce({ choices: [{ message: { role: "assistant", content: "done" } }] });
     const input = codingInput([]);

@@ -1,10 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  DeliveryExecutionService,
+  DeliveryExecutionService as RealDeliveryExecutionService,
   createDeliveryAutomationHandlers,
   createDeliveryQualityAutomationHandlers,
   qualityGitEnvironment,
@@ -17,6 +17,28 @@ import { createAutomationWorker } from "./automation-worker.js";
 
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
+
+const testImplementationDependencies = {
+  prepare: async (input: any) => ({
+    workspace: {
+      branch: "HEAD", worktreePath: `${input.version.worktreePath}/.isolated-test-attempt`,
+      baseCommit: input.version.headCommit, reused: false as const
+    },
+    publish: async (result: any) => result,
+    rollback: async () => {},
+    cleanup: async () => {}
+  })
+};
+
+class DeliveryExecutionService extends RealDeliveryExecutionService {
+  constructor(...args: ConstructorParameters<typeof RealDeliveryExecutionService>) {
+    const [persistence, codingAgent, model, qualityPersistence, qualityDependencies, implementationDependencies] = args;
+    super(
+      persistence, codingAgent, model, qualityPersistence, qualityDependencies,
+      implementationDependencies ?? testImplementationDependencies
+    );
+  }
+}
 
 afterEach(() => {
   stores.splice(0).forEach((store) => store.close());
@@ -422,7 +444,7 @@ describe("DeliveryExecutionService", () => {
 
     const first = service.implement(fixture.unit.id);
 
-    expect(codingAgent).toHaveBeenCalledWith(expect.objectContaining({
+    await vi.waitFor(() => expect(codingAgent).toHaveBeenCalledWith(expect.objectContaining({
       project: expect.objectContaining({
         id: fixture.project.id,
         repoPath: "/tmp/frozen-project-old",
@@ -440,7 +462,7 @@ describe("DeliveryExecutionService", () => {
         acceptanceCriteria: ["Order contract tests pass"],
         allowedCommands: [{ command: "npm", argsPrefix: ["test"] }]
       })
-    }));
+    }), undefined));
     await expect(service.implement(fixture.unit.id)).rejects.toThrow("DELIVERY_UNIT_RUN_ACTIVE");
 
     (fixture.store as any).db.prepare("DELETE FROM requirement_projects WHERE requirement_id = ?")
@@ -538,6 +560,7 @@ describe("DeliveryExecutionService", () => {
     const codingAgent = vi.fn(() => new Promise<ReturnType<typeof codingResult>>((resolve) => { finish = resolve; }));
     const service = new DeliveryExecutionService(fixture.store.deliveryExecutions, codingAgent);
     const implementation = service.implement(fixture.unit.id);
+    await vi.waitFor(() => expect(codingAgent).toHaveBeenCalledOnce());
     (fixture.store as any).db.prepare(`UPDATE delivery_units
       SET status = 'returned', evidence_version = 2 WHERE id = ?`).run(fixture.unit.id);
 
@@ -568,6 +591,44 @@ describe("DeliveryExecutionService", () => {
 
     expect(settlementFailure.cause).toBe(codingFailure);
     expect(failImplementation).toHaveBeenCalledOnce();
+  });
+
+  it("still cleans the attempt when a post-publish lease failure also makes rollback fail", async () => {
+    const fixture = createFixture();
+    const leaseFailure = new Error("DELIVERY_IMPLEMENTATION_AUTOMATION_LEASE_STALE");
+    const rollbackFailure = new Error("IMPLEMENTATION_PUBLISH_ROLLBACK_FAILED");
+    let fenceCalls = 0;
+    const persistence = {
+      ...fixture.store.deliveryExecutions,
+      assertImplementationLease: vi.fn(() => {
+        fenceCalls += 1;
+        if (fenceCalls === 2) throw leaseFailure;
+      })
+    };
+    const rollback = vi.fn().mockRejectedValue(rollbackFailure);
+    const cleanup = vi.fn().mockResolvedValue(undefined);
+    const implementationDependencies = {
+      prepare: vi.fn().mockResolvedValue({
+        workspace: {
+          branch: "HEAD", worktreePath: "/tmp/isolated-attempt",
+          baseCommit: "0123456789abcdef0123456789abcdef01234567", reused: false as const
+        },
+        publish: vi.fn().mockResolvedValue(codingResult()),
+        rollback,
+        cleanup
+      })
+    };
+    const service = new DeliveryExecutionService(
+      persistence, vi.fn().mockResolvedValue(codingResult()), "test-model", fixture.store.deliveryQuality,
+      {}, implementationDependencies
+    );
+
+    await expect(service.implement(fixture.unit.id)).rejects.toBe(rollbackFailure);
+
+    expect(rollback).toHaveBeenCalledOnce();
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(rollbackFailure.cause).toBe(leaseFailure);
+    expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toBeNull();
   });
 
   it("runs review and testing against the same immutable implementation evidence", async () => {
@@ -1203,5 +1264,89 @@ describe("DeliveryExecutionService", () => {
     expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toBeNull();
     expect(fixture.store.deliveryUnits.get(fixture.unit.id)).toMatchObject({ status: "ready" });
     expect(fixture.store.automationJobs.get(job.id)).toMatchObject({ status: "pending", attempt: 1 });
+  });
+
+  it("isolates an aborted partial write while a second worker retries the same implementation", async () => {
+    vi.useFakeTimers({ now: new Date("2026-07-22T08:00:00.000Z") });
+    const path = fileBackedDatabase();
+    const fixture = createFixture(path);
+    const authoritative = mkdtempSync(join(tmpdir(), "delivery-authoritative-"));
+    directories.push(authoritative);
+    fixture.store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: fixture.unit.id,
+      evidenceVersion: 1, action: "implement", payload: {}, maxAttempts: 3 });
+    let releaseOld!: () => void;
+    const oldProvider = new Promise<void>((resolve) => { releaseOld = resolve; });
+    let calls = 0;
+    let oldSignal: AbortSignal | undefined;
+    const attemptPaths: string[] = [];
+    const coding = vi.fn(async (input: any, signal?: AbortSignal) => {
+      calls += 1;
+      const attemptPath = input.attemptWorkspace?.worktreePath ?? authoritative;
+      attemptPaths.push(attemptPath);
+      if (calls === 1) {
+        oldSignal = signal;
+        writeFileSync(join(attemptPath, "old-partial.txt"), "stale partial");
+        await oldProvider;
+      } else {
+        writeFileSync(join(attemptPath, "new-final.txt"), "retry result");
+      }
+      return codingResult();
+    });
+    const implementationDependencies = {
+      prepare: vi.fn(async () => {
+        const worktreePath = mkdtempSync(join(tmpdir(), "delivery-attempt-"));
+        directories.push(worktreePath);
+        return {
+          workspace: {
+            branch: `attempt-${calls + 1}`, worktreePath,
+            baseCommit: "0123456789abcdef0123456789abcdef01234567", reused: false as const
+          },
+          publish: async (result: ReturnType<typeof codingResult>) => {
+            if (existsSync(join(worktreePath, "new-final.txt"))) {
+              writeFileSync(join(authoritative, "new-final.txt"), "retry result");
+            }
+            return result;
+          },
+          cleanup: async () => { rmSync(worktreePath, { recursive: true, force: true }); }
+        };
+      })
+    };
+    const firstService = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, coding as any, "test-model", fixture.store.deliveryQuality,
+      {}, implementationDependencies
+    );
+    const first = createAutomationWorker({
+      jobs: { ...fixture.store.automationJobs, renew: () => false },
+      handlers: createDeliveryAutomationHandlers(firstService),
+      workerId: "implementation-worker-old", leaseMs: 300
+    });
+
+    const firstDrain = first.drainOnce();
+    await vi.waitFor(() => expect(coding).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(100);
+    expect(oldSignal?.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(200);
+
+    const retryStore = new WorkflowStore(path);
+    stores.push(retryStore);
+    const retryService = new DeliveryExecutionService(
+      retryStore.deliveryExecutions, coding as any, "test-model", retryStore.deliveryQuality,
+      {}, implementationDependencies
+    );
+    const retry = createAutomationWorker({
+      jobs: retryStore.automationJobs,
+      handlers: createDeliveryAutomationHandlers(retryService),
+      workerId: "implementation-worker-retry", leaseMs: 300
+    });
+    await expect(retry.drainOnce()).resolves.toBe(true);
+    expect(coding).toHaveBeenCalledTimes(2);
+    expect(new Set(attemptPaths).size).toBe(2);
+    expect(attemptPaths).not.toContain(authoritative);
+
+    releaseOld();
+    await expect(firstDrain).resolves.toBe(true);
+    expect(existsSync(join(authoritative, "old-partial.txt"))).toBe(false);
+    expect(existsSync(join(authoritative, "new-final.txt"))).toBe(true);
+    expect(retryStore.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toEqual(expect.any(Object));
   });
 });

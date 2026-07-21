@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { lstatSync } from "node:fs";
-import { basename, isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -8,6 +8,8 @@ const execFileAsync = promisify(execFile);
 export interface AtomicPilotPublishOptions {
   platform?: NodeJS.Platform;
   helperPath?: string;
+  trustedRoot?: string;
+  inspectPath?: typeof lstatSync;
   execute?: (
     file: string,
     args: string[],
@@ -29,7 +31,10 @@ export async function atomicPilotPublish(
   const helper = options.helperPath ?? resolve(import.meta.dirname, basename(import.meta.dirname) === "dist"
     ? "native/pilot-atomic-publish"
     : "../dist/native/pilot-atomic-publish");
-  assertTrustedHelper(helper);
+  const trustedRoot = options.trustedRoot ?? (options.helperPath
+    ? resolve(helper, "..")
+    : resolve(import.meta.dirname, ".."));
+  assertTrustedHelper(helper, trustedRoot, options.inspectPath ?? lstatSync);
   try {
     await (options.execute ?? execFileAsync)(helper, [source, target], {
       timeout: 10_000,
@@ -53,14 +58,33 @@ function validatePath(path: string) {
   }
 }
 
-function assertTrustedHelper(path: string) {
+function assertTrustedHelper(path: string, trustedRoot: string, inspectPath: typeof lstatSync) {
   try {
-    const stat = lstatSync(path);
-    const getuid = process.getuid?.();
-    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o111) === 0
-      || (stat.mode & 0o022) !== 0 || (getuid !== undefined && stat.uid !== getuid)) {
+    const root = resolve(trustedRoot);
+    const helper = resolve(path);
+    const pathFromRoot = relative(root, helper);
+    if (!pathFromRoot || pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`)
+      || isAbsolute(pathFromRoot)) {
       throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
     }
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+    const segments = pathFromRoot.split(sep);
+    let current = root;
+    for (const segment of segments.slice(0, -1)) {
+      const stat = inspectPath(current);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o022) !== 0) {
+        throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+      }
+      current = resolve(current, segment);
+    }
+    const parent = inspectPath(current);
+    if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== uid || (parent.mode & 0o022) !== 0) {
+      throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
+    }
+    const stat = inspectPath(helper);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o111) === 0
+      || (stat.mode & 0o022) !== 0) throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE");
   } catch (error) {
     if (error instanceof Error && error.message === "PILOT_ATOMIC_PUBLISH_UNAVAILABLE") throw error;
     throw new Error("PILOT_ATOMIC_PUBLISH_UNAVAILABLE", { cause: error });

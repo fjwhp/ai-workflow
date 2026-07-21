@@ -2,12 +2,17 @@
   "name": "@ai-workflow/server",
   "version": "0.1.0",
   "type": "module",
+  "main": "./dist/index.js",
+  "files": ["dist"],
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "prepilot:seed": "npm run build:pilot-helper",
     "pilot:seed": "tsx src/pilot-fixture.ts",
-    "build": "tsc -p tsconfig.json && npm run build:pilot-helper",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json && npm run build:pilot-helper",
     "build:pilot-helper": "node scripts/build-pilot-atomic-publish.mjs",
+    "prepack": "npm run build",
+    "postinstall": "node dist/native/install-pilot-atomic-publish.mjs",
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
