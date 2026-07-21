@@ -1,5 +1,8 @@
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
-import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, rmSync
+} from "node:fs";
+import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DeliveryExecutionSuccess } from "./delivery-execution-repository.js";
 import { writeDatabaseVersionMarker } from "./database-reset.js";
@@ -14,20 +17,71 @@ export interface DeliveryPilotFixture {
   frontendUnitId: string;
 }
 
-export async function seedDeliveryPilot(inputDataDir: string): Promise<DeliveryPilotFixture> {
+export interface DeliveryPilotFixtureOptions {
+  afterFirstMutation?: () => void;
+  writeMarker?: typeof writeDatabaseVersionMarker;
+  beforePublish?: () => void;
+  publish?: (stagingDir: string, dataDir: string) => Promise<void> | void;
+}
+
+export async function seedDeliveryPilot(
+  inputDataDir: string,
+  options: DeliveryPilotFixtureOptions = {}
+): Promise<DeliveryPilotFixture> {
   if (typeof inputDataDir !== "string" || inputDataDir.trim() === "") {
     throw new Error("PILOT_DATA_DIR_REQUIRED");
   }
   const dataDir = resolve(inputDataDir);
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  const databasePath = resolve(dataDir, "workflow.db");
-  if ([databasePath, `${databasePath}-wal`, `${databasePath}-shm`, `${databasePath}.schema-version`]
-    .some((path) => existsSync(path))) {
-    throw new Error("PILOT_DATABASE_EXISTS");
-  }
-  if (readdirSync(dataDir).length > 0) throw new Error("PILOT_DATA_DIR_NOT_EMPTY");
+  const parentDir = resolve(dataDir, "..");
+  mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+  assertEmptyPilotTarget(dataDir, "PILOT_DATA_DIR_NOT_EMPTY");
 
-  const repositoriesDir = resolve(dataDir, "pilot-repositories");
+  const stagingDir = resolve(parentDir, `.${basename(dataDir)}.pilot-staging-${randomUUID()}`);
+  mkdirSync(stagingDir, { mode: 0o700 });
+  let published = false;
+  try {
+    const staged = seedPilotStore(stagingDir, options);
+    const stagedDatabasePath = resolve(stagingDir, "workflow.db");
+    const markerPath = await (options.writeMarker ?? writeDatabaseVersionMarker)(
+      stagedDatabasePath,
+      currentSchemaVersion
+    );
+    fsyncPath(stagedDatabasePath);
+    fsyncPath(markerPath);
+    fsyncPath(stagingDir);
+
+    options.beforePublish?.();
+    try {
+      assertEmptyPilotTarget(dataDir, "PILOT_PUBLISH_CONFLICT");
+    } catch (error) {
+      throw new Error("PILOT_PUBLISH_CONFLICT", { cause: error });
+    }
+    try {
+      await (options.publish ?? defaultPublish)(stagingDir, dataDir);
+    } catch (error) {
+      if (pilotErrorCode(error) !== "PILOT_PUBLISH_INJECTED") {
+        throw new Error("PILOT_PUBLISH_CONFLICT", { cause: error });
+      }
+      throw error;
+    }
+    published = true;
+    try { fsyncPath(parentDir); } catch {}
+    return {
+      dataDir,
+      databasePath: resolve(dataDir, "workflow.db"),
+      ...staged
+    };
+  } finally {
+    if (!published) rmSync(stagingDir, { recursive: true, force: true });
+  }
+}
+
+function seedPilotStore(
+  stagingDir: string,
+  options: DeliveryPilotFixtureOptions
+): Omit<DeliveryPilotFixture, "dataDir" | "databasePath"> {
+  const databasePath = resolve(stagingDir, "workflow.db");
+  const repositoriesDir = resolve(stagingDir, "pilot-repositories");
   const backendRepo = resolve(repositoriesDir, "backend");
   const frontendRepo = resolve(repositoriesDir, "frontend");
   const backendWorktree = resolve(repositoriesDir, "backend-worktree");
@@ -37,12 +91,12 @@ export async function seedDeliveryPilot(inputDataDir: string): Promise<DeliveryP
   }
 
   const store = new WorkflowStore(databasePath);
-  let fixture: Omit<DeliveryPilotFixture, "dataDir" | "databasePath">;
   try {
     const backend = store.createProject({
       name: "Pilot Backend", repoPath: backendRepo, defaultBranch: "main",
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], sensitivePatterns: []
     });
+    options.afterFirstMutation?.();
     const frontend = store.createProject({
       name: "Pilot Frontend", repoPath: frontendRepo, defaultBranch: "main",
       allowedCommands: [{ command: "npm", argsPrefix: ["test"] }], sensitivePatterns: []
@@ -100,7 +154,7 @@ export async function seedDeliveryPilot(inputDataDir: string): Promise<DeliveryP
       requirementId: requirement.id, actor: "local-pilot",
       reason: "Pilot pause exposes stale evidence and server-owned recovery actions"
     });
-    fixture = {
+    return {
       requirementId: requirement.id,
       backendUnitId: backendUnit.id,
       frontendUnitId: frontendUnit.id
@@ -108,8 +162,24 @@ export async function seedDeliveryPilot(inputDataDir: string): Promise<DeliveryP
   } finally {
     store.close();
   }
-  await writeDatabaseVersionMarker(databasePath, currentSchemaVersion);
-  return { dataDir, databasePath, ...fixture };
+}
+
+function assertEmptyPilotTarget(dataDir: string, nonemptyCode: string) {
+  if (!existsSync(dataDir)) return;
+  const stat = lstatSync(dataDir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("PILOT_DATA_DIR_INVALID");
+  if (existsSync(resolve(dataDir, "workflow.db"))) throw new Error("PILOT_DATABASE_EXISTS");
+  if (readdirSync(dataDir).length > 0) throw new Error(nonemptyCode);
+}
+
+function defaultPublish(stagingDir: string, dataDir: string) {
+  renameSync(stagingDir, dataDir);
+}
+
+function fsyncPath(path: string) {
+  const descriptor = openSync(path, "r");
+  try { fsyncSync(descriptor); }
+  finally { closeSync(descriptor); }
 }
 
 function completeImplementation(
@@ -154,11 +224,21 @@ function completeQuality(
   });
 }
 
+function pilotErrorCode(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^PILOT_[A-Z0-9_]+$/.test(message) ? message : "PILOT_SEED_FAILED";
+}
+
 function isDirectExecution() {
   return process.argv[1] !== undefined && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
 }
 
 if (isDirectExecution()) {
-  const fixture = await seedDeliveryPilot(process.env.PILOT_DATA_DIR ?? "");
-  process.stdout.write(`FLOWGATE_PILOT_READY ${JSON.stringify(fixture)}\n`);
+  try {
+    const fixture = await seedDeliveryPilot(process.env.PILOT_DATA_DIR ?? "");
+    process.stdout.write(`FLOWGATE_PILOT_READY ${JSON.stringify(fixture)}\n`);
+  } catch (error) {
+    process.stderr.write(`FLOWGATE_PILOT_ERROR ${JSON.stringify({ code: pilotErrorCode(error) })}\n`);
+    process.exitCode = 1;
+  }
 }

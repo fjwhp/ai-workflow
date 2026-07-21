@@ -1,9 +1,13 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startServer } from "./index.js";
 import { WorkflowStore } from "./store.js";
+import { DeliveryExecutionService } from "./delivery-execution-service.js";
+import type { CodingAgentInput } from "./coding-agent.js";
+import { evidenceFingerprint, evidenceManifestHash } from "./evidence-tree.js";
 
 const directories: string[] = [];
 
@@ -222,6 +226,75 @@ describe("server entry point", () => {
     await runtime.close();
   });
 
+  it("runs a root implementation through the production handler factory exactly once", async () => {
+    vi.useFakeTimers();
+    const directory = mkdtempSync(join(tmpdir(), "production-implementation-handler-"));
+    directories.push(directory);
+    let seeded!: ReturnType<typeof seedRootPlan>;
+    const coding = vi.fn(async (input: CodingAgentInput) => controlledCodingResult(input));
+
+    const runtime = await startServer({
+      env: { DATA_DIR: directory, PORT: "0", AUTOMATION_WORKER_ENABLED: "true",
+        AUTOMATION_WORKER_POLL_MS: "10", AUTOMATION_WORKER_LEASE_MS: "30000" },
+      createStore: (databasePath, clock) => {
+        const store = new WorkflowStore(databasePath, clock);
+        seeded = seedRootPlan(store, directory);
+        return store;
+      },
+      createDeliveryService: (store) => new DeliveryExecutionService(
+        store.deliveryExecutions, coding, "production-test-model", store.deliveryQuality
+      ),
+      buildApplication: async () => fakeApp([]),
+      writeListening: () => {}
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(coding).toHaveBeenCalledOnce();
+    expect(runtime.store.automationJobs.byDedupe(`implement:${seeded.unitId}:v1`)).toMatchObject({
+      status: "completed", attempt: 1, ownerType: "delivery_unit", action: "implement", evidenceVersion: 1,
+      lastError: null
+    });
+    expect(runtime.store.deliveryExecutions.getCodingEvidence(seeded.unitId, 1)).toEqual(expect.any(Object));
+    expect((runtime.store as any).db.prepare(`SELECT COUNT(*) AS count FROM coding_evidence
+      WHERE delivery_unit_id = ? AND evidence_version = 1`).get(seeded.unitId)).toEqual({ count: 1 });
+    expect(runtime.store.automationJobs.byDedupe(`review:${seeded.unitId}:v1`)).toMatchObject({ status: "pending" });
+    expect(runtime.store.automationJobs.byDedupe(`test:${seeded.unitId}:v1`)).toMatchObject({ status: "pending" });
+    await runtime.close();
+  });
+
+  it("recovers an expired root lease and runs production implementation only once", async () => {
+    vi.useFakeTimers();
+    const directory = mkdtempSync(join(tmpdir(), "production-implementation-restart-"));
+    directories.push(directory);
+    const startedAt = new Date("2026-07-22T00:00:00.000Z");
+    const seedStore = new WorkflowStore(join(directory, "workflow.db"), () => startedAt);
+    const seeded = seedRootPlan(seedStore, directory);
+    expect(seedStore.automationJobs.leaseNext("crashed-worker", startedAt, 100)).toMatchObject({ attempt: 1 });
+    seedStore.close();
+    writeFileSync(join(directory, "workflow.db.schema-version"), "phase-2-quality-attempt-v14");
+    const recoveredAt = new Date(startedAt.getTime() + 101);
+    const coding = vi.fn(async (input: CodingAgentInput) => controlledCodingResult(input));
+
+    const runtime = await startServer({
+      env: { DATA_DIR: directory, PORT: "0", AUTOMATION_WORKER_ENABLED: "true",
+        AUTOMATION_WORKER_POLL_MS: "10", AUTOMATION_WORKER_LEASE_MS: "30000" },
+      clock: () => recoveredAt,
+      createDeliveryService: (store) => new DeliveryExecutionService(
+        store.deliveryExecutions, coding, "production-recovery-model", store.deliveryQuality
+      ),
+      buildApplication: async () => fakeApp([]), writeListening: () => {}
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(coding).toHaveBeenCalledOnce();
+    expect(runtime.store.automationJobs.byDedupe(`implement:${seeded.unitId}:v1`)).toMatchObject({
+      status: "completed", attempt: 2, lastError: null
+    });
+    expect((runtime.store as any).db.prepare(`SELECT COUNT(*) AS count FROM coding_evidence
+      WHERE delivery_unit_id = ? AND evidence_version = 1`).get(seeded.unitId)).toEqual({ count: 1 });
+    await runtime.close();
+  });
+
   it("builds but does not start the worker when enablement is absent", async () => {
     const directory = mkdtempSync(join(tmpdir(), "automation-startup-disabled-"));
     directories.push(directory);
@@ -278,6 +351,7 @@ describe("server entry point", () => {
   it("registers Store-backed quality handlers and preserves explicit handler overrides", async () => {
     const directory = mkdtempSync(join(tmpdir(), "automation-startup-handlers-"));
     directories.push(directory);
+    const implement = vi.fn(async () => ({} as any));
     const review = vi.fn(async () => ({} as any));
     const test = vi.fn(async () => ({} as any));
     const overrideTest = vi.fn(async () => {});
@@ -289,7 +363,7 @@ describe("server entry point", () => {
 
     const runtime = await startServer({
       env: { DATA_DIR: directory, PORT: "0" },
-      createDeliveryService: (store) => { serviceStore = store; return { review, test }; },
+      createDeliveryService: (store) => { serviceStore = store; return { implement, review, test }; },
       automationHandlers: { test: overrideTest },
       createWorker: (options) => { workerOptions = options; return worker; },
       buildApplication: async () => fakeApp([]),
@@ -427,6 +501,68 @@ function fakeApp(events: string[]) {
         closePromise = Promise.resolve(onClose?.()).then(() => undefined);
       }
       return closePromise;
+    }
+  };
+}
+
+function seedRootPlan(store: WorkflowStore, directory: string) {
+  const project = store.createProject({
+    name: "Production handler", repoPath: join(directory, "repo"), defaultBranch: "main",
+    allowedCommands: [], sensitivePatterns: []
+  });
+  const version = store.createProjectVersion({
+    projectId: project.id, name: "v1", branch: "feature/v1", baseBranch: "main",
+    worktreePath: join(directory, "worktree"), headCommit: "0123456789abcdef0123456789abcdef01234567"
+  });
+  const requirement = store.createRequirement({
+    title: "Production implementation", businessProblem: "Root delivery needs a production handler",
+    expectedOutcome: "Implementation runs once", priority: "high",
+    primaryProjectId: project.id, primaryProjectVersionId: version.id
+  });
+  store.replaceRequirementProjects(requirement.id, [{
+    projectId: project.id, projectVersionId: version.id, role: "primary", usage: "delivery",
+    deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0
+  }]);
+  const plan = store.deliveryUnits.createPlan({
+    requirementId: requirement.id, snapshot: store.createRequirementProjectSnapshot(requirement.id),
+    plan: { units: [{ projectId: project.id, moduleIds: [], acceptanceCriteria: ["implemented"] }], dependencies: [] }
+  });
+  const unitId = plan.units[0]!.id;
+  store.automationJobs.enqueue({
+    ownerType: "delivery_unit", ownerId: unitId, evidenceVersion: 1,
+    action: "implement", payload: {}, maxAttempts: 3
+  });
+  return { requirementId: requirement.id, unitId };
+}
+
+function controlledCodingResult(input: CodingAgentInput) {
+  const content = Buffer.from("export const implemented = true;\n");
+  const diff = "diff --git a/index.ts b/index.ts\n+export const implemented = true;";
+  const identity = {
+    repositoryPath: input.project.repoPath,
+    gitCommonDir: join(input.project.repoPath, ".git"),
+    worktreePath: resolve(input.project.repoPath, "..", ".ai-workflow-worktrees",
+      basename(input.project.repoPath), "requirements", input.requirement.code),
+    branch: `ai/${input.requirement.code}`,
+    headCommit: input.version.headCommit!
+  };
+  const changedFiles = [{
+    path: "index.ts", status: "modified" as const, kind: "text" as const, content: content.toString("utf8")
+  }];
+  const manifest = { version: 1 as const, entries: [{
+    path: "index.ts", type: "file" as const, mode: "100644" as const,
+    size: content.length, sha256: createHash("sha256").update(content).digest("hex"),
+    contentBase64: content.toString("base64")
+  }] };
+  const manifestHash = evidenceManifestHash(manifest);
+  return {
+    runId: "controlled-production-run", branch: identity.branch, worktreePath: identity.worktreePath,
+    baseCommit: identity.headCommit, reused: false, summary: "implemented", diff,
+    commands: [] as const, files: ["index.ts"], additions: 1, deletions: 0, diagnostics: [],
+    evidenceSnapshot: {
+      diff, files: ["index.ts"], additions: 1, deletions: 0, changedFiles,
+      identity, manifest, manifestHash,
+      evidenceHash: evidenceFingerprint({ identity, manifestHash, diff, changedFiles })
     }
   };
 }

@@ -12,7 +12,7 @@ import {
   type AutomationWorkerOptions
 } from "./automation-worker.js";
 import {
-  createDeliveryQualityAutomationHandlers,
+  createDeliveryAutomationHandlers,
   DeliveryExecutionService
 } from "./delivery-execution-service.js";
 import { cleanupVerificationQuarantines } from "./verification-cleanup.js";
@@ -32,7 +32,9 @@ export interface StartupOptions {
   writeVersionMarker?: typeof writeDatabaseVersionMarker;
   buildApplication?: (store: WorkflowStore) => Promise<StartupApp>;
   createWorker?: (options: AutomationWorkerOptions) => AutomationWorker;
-  createDeliveryService?: (store: WorkflowStore) => Pick<DeliveryExecutionService, "review" | "test">;
+  createDeliveryService?: (
+    store: WorkflowStore
+  ) => Pick<DeliveryExecutionService, "implement" | "review" | "test">;
   automationHandlers?: Partial<AutomationHandlers>;
   clock?: () => Date;
   onWorkerEvent?: (event: AutomationWorkerEvent) => void;
@@ -129,7 +131,7 @@ export async function startServer(options: StartupOptions = {}) {
     const workerOptions: AutomationWorkerOptions = {
       jobs: store.automationJobs,
       handlers: {
-        ...createDeliveryQualityAutomationHandlers(deliveryService),
+        ...createDeliveryAutomationHandlers(deliveryService),
         ...options.automationHandlers
       },
       clock,

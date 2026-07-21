@@ -55,7 +55,7 @@
 
 ## 本地 pilot
 
-pilot 数据必须写入专用空目录，命令拒绝覆盖已有数据库，也不会向生产 UI 注入静态数据：
+pilot 数据必须写入专用空目录，命令拒绝覆盖已有数据库，也不会向生产 UI 注入静态数据。生成过程在同级 owned `sibling staging` 完成并 fsync 后原子发布；失败只清 staging，CLI 用 `FLOWGATE_PILOT_ERROR` 返回稳定错误码：
 
 ```bash
 PILOT_DATA_DIR="$PWD/.local/delivery-pilot" npm run pilot:seed -w server

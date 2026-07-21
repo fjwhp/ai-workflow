@@ -97,7 +97,7 @@ export class WorkflowStore {
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     createPhase2Schema(this.db);
     this.deliveryUnitRepository = new DeliveryUnitRepository(this.db);
-    this.deliveryExecutionRepository = new DeliveryExecutionRepository(this.db);
+    this.deliveryExecutionRepository = new DeliveryExecutionRepository(this.db, clock);
     this.deliveryQualityRepository = new DeliveryQualityRepository(this.db, clock);
     const deliveryCoordinator = new DeliveryCoordinator(this.db, this.deliveryQualityRepository);
     const deliveryUnitDetails = new DeliveryUnitDetailRepository(this.db, this.deliveryUnitRepository);
@@ -112,8 +112,8 @@ export class WorkflowStore {
       listDependencies: (requirementId) => this.deliveryUnitRepository.listDependencies(requirementId)
     };
     this.deliveryExecutions = {
-      claimImplementation: (unitId, model) => this.withImmediateTransaction(
-        () => this.deliveryExecutionRepository.claimImplementationInTransaction(unitId, model)
+      claimImplementation: (unitId, model, automation) => this.withImmediateTransaction(
+        () => this.deliveryExecutionRepository.claimImplementationInTransaction(unitId, model, automation)
       ),
       completeImplementation: (claim, result) => this.withImmediateTransaction(
         () => {

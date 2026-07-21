@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DeliveryExecutionService,
+  createDeliveryAutomationHandlers,
   createDeliveryQualityAutomationHandlers,
   qualityGitEnvironment,
   qualityGate,
@@ -1137,5 +1138,70 @@ describe("DeliveryExecutionService", () => {
       .toThrow("AUTOMATION_INPUT_INVALID");
     await handlers.review!({ ...baseJob, action: "review" }, context);
     expect(service.review).toHaveBeenCalledWith(fixture.unit.id, 1, "quality-claim", context.signal);
+  });
+
+  it("validates and forwards a leased implementation job through the unified handler factory", async () => {
+    const fixture = createFixture();
+    fixture.store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: fixture.unit.id,
+      evidenceVersion: 1, action: "implement", payload: {}, maxAttempts: 3 });
+    const job = fixture.store.automationJobs.leaseNext("implementation-handler", new Date(), 30_000)!;
+    const implement = vi.fn(async () => {});
+    const service = { implement, review: vi.fn(), test: vi.fn() } as any;
+    const handlers = createDeliveryAutomationHandlers(service);
+    const context = { signal: new AbortController().signal };
+
+    await handlers.implement!(job, context);
+
+    expect(implement).toHaveBeenCalledWith(
+      fixture.unit.id, 1, job.claimToken, context.signal
+    );
+    for (const invalid of [
+      { ...job, ownerType: "requirement" },
+      { ...job, action: "review" },
+      { ...job, evidenceVersion: 0 },
+      { ...job, claimToken: job.id },
+      { ...job, leaseOwner: "another-worker" }
+    ]) {
+      await expect(handlers.implement!(invalid as any, context)).rejects
+        .toThrow("AUTOMATION_INPUT_INVALID");
+    }
+    expect(implement).toHaveBeenCalledOnce();
+
+    const coding = vi.fn();
+    const realHandlers = createDeliveryAutomationHandlers(new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, coding, "test-model", fixture.store.deliveryQuality
+    ));
+    await expect(realHandlers.implement!({ ...job, evidenceVersion: 2 }, context)).rejects
+      .toThrow("DELIVERY_IMPLEMENTATION_AUTOMATION_LEASE_STALE");
+    expect(coding).not.toHaveBeenCalled();
+  });
+
+  it("fences implementation evidence after its exact automation lease expires", async () => {
+    let now = Date.now();
+    const clock = () => new Date(now);
+    const path = fileBackedDatabase();
+    const fixture = createFixture(path, clock);
+    fixture.store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: fixture.unit.id,
+      evidenceVersion: 1, action: "implement", payload: {}, maxAttempts: 3 });
+    const job = fixture.store.automationJobs.leaseNext("implementation-fence", clock(), 100)!;
+    let release!: (value: ReturnType<typeof codingResult>) => void;
+    const coding = vi.fn(() => new Promise<ReturnType<typeof codingResult>>((resolve) => { release = resolve; }));
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, coding, "test-model", fixture.store.deliveryQuality
+    );
+    const handlers = createDeliveryAutomationHandlers(service);
+    const running = handlers.implement!(job, { signal: new AbortController().signal });
+    await vi.waitFor(() => expect(coding).toHaveBeenCalledOnce());
+
+    now += 101;
+    const recovery = new WorkflowStore(path, clock);
+    stores.push(recovery);
+    expect(recovery.automationJobs.recoverExpired(clock())).toBe(1);
+    release(codingResult());
+
+    await expect(running).rejects.toThrow("DELIVERY_IMPLEMENTATION_AUTOMATION_LEASE_STALE");
+    expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toBeNull();
+    expect(fixture.store.deliveryUnits.get(fixture.unit.id)).toMatchObject({ status: "ready" });
+    expect(fixture.store.automationJobs.get(job.id)).toMatchObject({ status: "pending", attempt: 1 });
   });
 });

@@ -48,6 +48,17 @@ export interface DeliveryExecutionClaim {
     allowedCommands: Array<{ command: string; argsPrefix?: string[] }>;
     projectKnowledgeVersionId: string | null;
   };
+  automationLease?: DeliveryImplementationAutomationLease;
+}
+
+export interface DeliveryImplementationAutomationInput {
+  evidenceVersion: number;
+  claimToken: string;
+}
+
+export interface DeliveryImplementationAutomationLease extends DeliveryImplementationAutomationInput {
+  jobId: string;
+  workerId: string;
 }
 
 export interface DeliveryExecutionSuccess {
@@ -73,7 +84,11 @@ export interface DeliveryExecutionSuccess {
 }
 
 export interface DeliveryExecutionPersistence {
-  claimImplementation(unitId: string, model: string): DeliveryExecutionClaim;
+  claimImplementation(
+    unitId: string,
+    model: string,
+    automation?: DeliveryImplementationAutomationInput
+  ): DeliveryExecutionClaim;
   completeImplementation(claim: DeliveryExecutionClaim, result: DeliveryExecutionSuccess): DeliveryUnit;
   failImplementation(claim: DeliveryExecutionClaim, error: string): DeliveryUnit;
   listExecutions(deliveryUnitId: string, evidenceVersion?: number): unknown[];
@@ -81,9 +96,16 @@ export interface DeliveryExecutionPersistence {
 }
 
 export class DeliveryExecutionRepository {
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly clock: () => Date = () => new Date()
+  ) {}
 
-  claimImplementationInTransaction(unitId: string, model: string): DeliveryExecutionClaim {
+  claimImplementationInTransaction(
+    unitId: string,
+    model: string,
+    automation?: DeliveryImplementationAutomationInput
+  ): DeliveryExecutionClaim {
     const row = this.db.prepare(`SELECT
         du.*, dus.repo_path, dus.branch AS snapshot_branch, dus.base_branch,
         dus.worktree_path AS snapshot_worktree_path, dus.head_commit,
@@ -95,6 +117,8 @@ export class DeliveryExecutionRepository {
       JOIN requirements r ON r.id = du.requirement_id
       WHERE du.id = ?`).get(unitId) as any;
     if (!row) throw new Error("DELIVERY_UNIT_NOT_FOUND");
+    const automationLease = automation === undefined ? undefined
+      : this.assertLiveAutomationLease(unitId, row.evidence_version, automation);
     if (row.status === "running") throw new Error("DELIVERY_UNIT_RUN_ACTIVE");
     if (row.phase !== "implementation" || row.status !== "ready") throw new Error("DELIVERY_UNIT_NOT_READY");
 
@@ -179,7 +203,8 @@ export class DeliveryExecutionRepository {
         status: "active",
         headCommit: row.head_commit
       },
-      deliveryContext
+      deliveryContext,
+      ...(automationLease ? { automationLease } : {})
     };
   }
 
@@ -187,6 +212,7 @@ export class DeliveryExecutionRepository {
     const now = new Date().toISOString();
     const unitId = claim.deliveryUnit.id;
     const evidenceVersion = claim.deliveryUnit.evidenceVersion;
+    this.assertClaimAutomationLease(claim);
     const settled = this.db.prepare(`UPDATE delivery_units SET status = 'awaiting_gate', updated_at = ?
       WHERE id = ? AND phase = 'implementation' AND status = 'running' AND evidence_version = ?`)
       .run(now, unitId, evidenceVersion);
@@ -223,6 +249,7 @@ export class DeliveryExecutionRepository {
     const now = new Date().toISOString();
     const unitId = claim.deliveryUnit.id;
     const evidenceVersion = claim.deliveryUnit.evidenceVersion;
+    this.assertClaimAutomationLease(claim);
     const settled = this.db.prepare(`UPDATE delivery_units SET status = 'failed', updated_at = ?
       WHERE id = ? AND phase = 'implementation' AND status = 'running' AND evidence_version = ?`)
       .run(now, unitId, evidenceVersion);
@@ -264,6 +291,51 @@ export class DeliveryExecutionRepository {
       (id, run_id, sequence, type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
       .run(randomUUID(), runId, sequence, type, JSON.stringify(payload), createdAt);
   }
+
+  private assertClaimAutomationLease(claim: DeliveryExecutionClaim) {
+    if (!claim.automationLease) return;
+    this.assertLiveAutomationLease(
+      claim.deliveryUnit.id,
+      claim.deliveryUnit.evidenceVersion,
+      claim.automationLease
+    );
+  }
+
+  private assertLiveAutomationLease(
+    unitId: string,
+    currentEvidenceVersion: number,
+    input: DeliveryImplementationAutomationInput
+  ): DeliveryImplementationAutomationLease {
+    if (!Number.isSafeInteger(input.evidenceVersion) || input.evidenceVersion < 1
+      || input.evidenceVersion !== currentEvidenceVersion || typeof input.claimToken !== "string") {
+      throw new Error("DELIVERY_IMPLEMENTATION_AUTOMATION_LEASE_STALE");
+    }
+    const parsed = parseImplementationLeaseToken(input.claimToken);
+    if (!parsed) throw new Error("DELIVERY_IMPLEMENTATION_AUTOMATION_LEASE_STALE");
+    const live = this.db.prepare(`SELECT id FROM automation_jobs
+      WHERE id = ? AND claim_token = ? AND owner_type = 'delivery_unit' AND owner_id = ?
+        AND evidence_version = ? AND action = 'implement' AND status = 'leased'
+        AND lease_owner = ? AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`).get(
+      parsed.jobId, input.claimToken, unitId, input.evidenceVersion, parsed.workerId, this.now()
+    );
+    if (!live) throw new Error("DELIVERY_IMPLEMENTATION_AUTOMATION_LEASE_STALE");
+    return { ...input, ...parsed };
+  }
+
+  private now() {
+    const now = this.clock();
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+      throw new Error("DELIVERY_IMPLEMENTATION_DATE_INVALID");
+    }
+    return now.toISOString();
+  }
+}
+
+const IMPLEMENTATION_LEASE_TOKEN = /^lease:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}):([A-Za-z0-9_-]{1,128}):[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function parseImplementationLeaseToken(token: string) {
+  const match = IMPLEMENTATION_LEASE_TOKEN.exec(token);
+  return match ? { jobId: match[1]!, workerId: match[2]! } : null;
 }
 
 function parseStringArray(value: string): string[] {

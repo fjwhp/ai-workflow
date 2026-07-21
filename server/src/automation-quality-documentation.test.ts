@@ -38,4 +38,9 @@ describe("continuous delivery documentation", () => {
     expect(currentGuides).not.toContain("Phase 1 对所有下游交付都保持只读");
     expect(currentGuides).not.toContain("Phase 2 才能推进实现、独立 Review 和自动化测试");
   });
+
+  it("documents atomic pilot publication and stable CLI failures", () => {
+    const pilotGuides = `${document("docs/getting-started.md")}\n${document("docs/workflow-sop.md")}`;
+    expectTerms(pilotGuides, ["sibling staging", "原子发布", "FLOWGATE_PILOT_ERROR"]);
+  });
 });

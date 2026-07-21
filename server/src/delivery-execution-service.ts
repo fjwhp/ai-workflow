@@ -56,8 +56,20 @@ export class DeliveryExecutionService {
     }
   }
 
-  async implement(unitId: string) {
-    const claim = this.persistence.claimImplementation(unitId, this.model);
+  async implement(
+    unitId: string,
+    evidenceVersion?: number,
+    claimToken?: string,
+    signal?: AbortSignal
+  ) {
+    const hasAutomationInput = evidenceVersion !== undefined || claimToken !== undefined;
+    if (hasAutomationInput && (evidenceVersion === undefined || claimToken === undefined)) {
+      throw new Error("AUTOMATION_INPUT_INVALID");
+    }
+    throwIfImplementationSignalAborted(signal);
+    const claim = this.persistence.claimImplementation(unitId, this.model, hasAutomationInput
+      ? { evidenceVersion: evidenceVersion!, claimToken: claimToken! }
+      : undefined);
     let result: CodingAgentResult;
     let snapshot: WorktreeSnapshot;
     try {
@@ -71,6 +83,7 @@ export class DeliveryExecutionService {
       if (!result.evidenceSnapshot) throw new Error("IMPLEMENTATION_EVIDENCE_REQUIRED");
       snapshot = result.evidenceSnapshot;
       validateImplementationIdentity(claim, result, snapshot);
+      throwIfImplementationSignalAborted(signal);
     } catch (error) {
       try {
         this.persistence.failImplementation(claim, errorText(error));
@@ -317,6 +330,18 @@ export function createDeliveryQualityAutomationHandlers(
   };
 }
 
+export function createDeliveryAutomationHandlers(
+  service: Pick<DeliveryExecutionService, "implement" | "review" | "test">
+): Pick<AutomationHandlers, "implement" | "review" | "test"> {
+  return {
+    implement: async (job, context) => {
+      validateImplementationJob(job);
+      await service.implement(job.ownerId, job.evidenceVersion, job.claimToken, context.signal);
+    },
+    ...createDeliveryQualityAutomationHandlers(service)
+  };
+}
+
 function qualityDeadlineSignal(parent: AbortSignal | undefined, timeoutMs: number) {
   const controller = new AbortController();
   const abortFromParent = () => controller.abort(parent?.reason);
@@ -346,6 +371,23 @@ function validateQualityJob(job: AutomationJob, action: "review" | "test") {
     || job.claimToken.length > 256 || job.claimToken.includes("\0")) {
     throw new Error("AUTOMATION_INPUT_INVALID");
   }
+}
+
+function validateImplementationJob(job: AutomationJob) {
+  const match = typeof job.claimToken === "string" ? IMPLEMENTATION_JOB_LEASE_TOKEN.exec(job.claimToken) : null;
+  if (job.ownerType !== "delivery_unit" || job.action !== "implement" || job.status !== "leased"
+    || !Number.isSafeInteger(job.evidenceVersion) || job.evidenceVersion < 1
+    || typeof job.leaseOwner !== "string" || typeof job.leaseExpiresAt !== "string"
+    || !match || match[1] !== job.id || match[2] !== job.leaseOwner) {
+    throw new Error("AUTOMATION_INPUT_INVALID");
+  }
+}
+
+const IMPLEMENTATION_JOB_LEASE_TOKEN = /^lease:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}):([A-Za-z0-9_-]{1,128}):[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function throwIfImplementationSignalAborted(signal: AbortSignal | undefined) {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new Error("DELIVERY_IMPLEMENTATION_ABORTED");
 }
 
 async function inspectTargetState(worktreePath: string): Promise<TargetState> {
