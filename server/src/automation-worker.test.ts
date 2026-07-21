@@ -187,14 +187,17 @@ describe("automation worker lease ownership", () => {
     const complete = vi.fn(store.automationJobs.complete);
     const fail = vi.fn(store.automationJobs.fail);
     const events: AutomationWorkerEvent[] = [];
+    let signal: AbortSignal | undefined;
     const worker = createAutomationWorker({
       jobs: { ...store.automationJobs, renew: () => false, complete, fail },
-      handlers: { review: () => handler.promise }, workerId: "worker-a", leaseMs: 300,
+      handlers: { review: (_job, context) => { signal = context.signal; return handler.promise; } },
+      workerId: "worker-a", leaseMs: 300,
       onEvent: (event) => events.push(event)
     });
 
     const drain = worker.drainOnce();
     await vi.advanceTimersByTimeAsync(100);
+    expect(signal?.aborted).toBe(true);
     handler.resolve();
     await expect(drain).resolves.toBe(true);
 
@@ -202,6 +205,55 @@ describe("automation worker lease ownership", () => {
     expect(fail).not.toHaveBeenCalled();
     expect(store.automationJobs.get(job.id)?.status).toBe("leased");
     expect(events).toContainEqual(expect.objectContaining({ type: "heartbeat_lost", jobId: job.id }));
+  });
+
+  it("aborts the handler and reports the renewal error when a heartbeat throws", async () => {
+    vi.useFakeTimers({ now: new Date("2026-07-20T08:00:00.000Z") });
+    const { store, job } = createFixture("review");
+    const handler = deferred();
+    const renewalError = new Error("database unavailable");
+    const events: AutomationWorkerEvent[] = [];
+    let signal: AbortSignal | undefined;
+    const worker = createAutomationWorker({
+      jobs: { ...store.automationJobs, renew: () => { throw renewalError; } },
+      handlers: { review: (_job, context) => { signal = context.signal; return handler.promise; } },
+      workerId: "worker-a", leaseMs: 300, onEvent: (event) => events.push(event)
+    });
+
+    const drain = worker.drainOnce();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(signal?.aborted).toBe(true);
+    handler.resolve();
+    await expect(drain).resolves.toBe(true);
+    expect(events).toContainEqual({ type: "heartbeat_lost", jobId: job.id, error: renewalError });
+    expect(store.automationJobs.get(job.id)).toMatchObject({ status: "leased", leaseOwner: "worker-a" });
+  });
+
+  it("aborts the old handler before another worker recovers and starts the same job", async () => {
+    vi.useFakeTimers({ now: new Date("2026-07-20T08:00:00.000Z") });
+    const { store, job } = createFixture("implement");
+    const order: string[] = [];
+    const first = createAutomationWorker({
+      jobs: { ...store.automationJobs, renew: () => false },
+      handlers: { implement: async (_job, context) => {
+        await new Promise<void>((resolve) => context.signal.addEventListener("abort", () => {
+          order.push("old-aborted"); resolve();
+        }, { once: true }));
+      } },
+      workerId: "worker-a", leaseMs: 300
+    });
+
+    const firstDrain = first.drainOnce();
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(firstDrain).resolves.toBe(true);
+    await vi.advanceTimersByTimeAsync(200);
+    const second = createAutomationWorker({ jobs: store.automationJobs,
+      handlers: { implement: async () => { order.push("retry-started"); } },
+      workerId: "worker-b", leaseMs: 300 });
+    await expect(second.drainOnce()).resolves.toBe(true);
+
+    expect(order).toEqual(["old-aborted", "retry-started"]);
+    expect(store.automationJobs.get(job.id)).toMatchObject({ status: "completed", attempt: 2 });
   });
 
   it("reports a rejected completion without trying a second settlement", async () => {

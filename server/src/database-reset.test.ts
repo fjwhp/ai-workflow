@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { prepareCleanDatabase, writeDatabaseVersionMarker } from "./database-reset.js";
 
 const directories: string[] = [];
-const currentSchemaVersion = "phase-2-terminal-resolution-v13";
+const currentSchemaVersion = "phase-2-quality-attempt-v14";
 
 afterEach(async () => {
   const { rm } = await import("node:fs/promises");
@@ -20,7 +20,7 @@ async function databasePath() {
 }
 
 describe("prepareCleanDatabase", () => {
-  it("backs up an evidence aggregation v12 database before creating the v13 schema", async () => {
+  it("backs up an evidence aggregation v12 database before creating the v14 schema", async () => {
     const path = await databasePath();
     await writeFile(path, "evidence aggregation v12 database");
     await writeFile(`${path}.schema-version`, "phase-2-evidence-aggregation-v12");

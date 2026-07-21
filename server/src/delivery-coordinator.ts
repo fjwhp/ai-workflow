@@ -426,7 +426,7 @@ export class DeliveryCoordinator {
         WHERE id = ? AND evidence_version = ? AND status = 'potentially_stale'`)
         .run(active[0]!.prior_phase, active[0]!.prior_status, now, unit.id, unit.evidence_version);
       if (restored.changes !== 1) throw new Error("DELIVERY_STALE_RESOLUTION_STALE");
-      this.recomputeUnitInTransaction(unit.id, now, !this.requirementPaused(unit.requirement_id));
+      this.recomputeUnitInTransaction(unit.id, now, !this.requirementPaused(unit.requirement_id), true);
     } else {
       this.db.prepare(`UPDATE automation_jobs SET status = 'canceled', updated_at = ?
         WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ? AND status = 'pending'`)
@@ -804,7 +804,12 @@ export class DeliveryCoordinator {
     for (const unit of candidates) this.recomputeUnitInTransaction(unit.id, now, true);
   }
 
-  private recomputeUnitInTransaction(unitId: string, now: string, enqueue: boolean) {
+  private recomputeUnitInTransaction(
+    unitId: string,
+    now: string,
+    enqueue: boolean,
+    reviveTerminalQuality = false
+  ) {
     const unit = this.db.prepare(`SELECT id, requirement_id, evidence_version, status
       FROM delivery_units WHERE id = ?`).get(unitId) as {
         id: string; requirement_id: string; evidence_version: number; status: string;
@@ -840,11 +845,26 @@ export class DeliveryCoordinator {
     for (const [kind, action] of [["code_review", "review"], ["automated_testing", "test"]] as const) {
       const settled = this.db.prepare(`SELECT 1 FROM delivery_quality_evidence
         WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ?`).get(unit.id, unit.evidence_version, kind);
-      const running = this.db.prepare(`SELECT 1 FROM delivery_quality_runs
+      let running = this.db.prepare(`SELECT id, claim_token FROM delivery_quality_runs
         WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ? AND status = 'running'`)
-        .get(unit.id, unit.evidence_version, kind);
+        .get(unit.id, unit.evidence_version, kind) as { id: string; claim_token: string } | undefined;
+      if (running && reviveTerminalQuality) {
+        const liveJob = this.db.prepare(`SELECT 1 FROM automation_jobs
+          WHERE claim_token = ? AND owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ?
+            AND action = ? AND status IN ('pending', 'leased')`).get(
+          running.claim_token, unit.id, unit.evidence_version, action
+        );
+        if (!liveJob) {
+          this.db.prepare(`UPDATE delivery_quality_runs SET status = 'aborted',
+            error = 'DELIVERY_QUALITY_AUTOMATION_ORPHANED', completed_at = ?
+            WHERE id = ? AND status = 'running'`).run(now, running.id);
+          running = undefined;
+        }
+      }
       if (!settled && !running) jobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id,
-        evidenceVersion: unit.evidence_version, action, payload: {}, maxAttempts: 3 });
+        evidenceVersion: unit.evidence_version, action, payload: {}, maxAttempts: 3 }, {
+          reviveTerminal: reviveTerminalQuality
+        });
     }
   }
 

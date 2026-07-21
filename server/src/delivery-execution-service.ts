@@ -308,11 +308,11 @@ export function createDeliveryQualityAutomationHandlers(
   return {
     review: async (job, context) => {
       validateQualityJob(job, "review");
-      await service.review(job.ownerId, job.evidenceVersion, job.id, context?.signal);
+      await service.review(job.ownerId, job.evidenceVersion, job.claimToken, context?.signal);
     },
     test: async (job, context) => {
       validateQualityJob(job, "test");
-      await service.test(job.ownerId, job.evidenceVersion, job.id, context?.signal);
+      await service.test(job.ownerId, job.evidenceVersion, job.claimToken, context?.signal);
     }
   };
 }
@@ -341,7 +341,9 @@ function throwIfQualitySignalAborted(signal: AbortSignal | undefined): void {
 
 function validateQualityJob(job: AutomationJob, action: "review" | "test") {
   if (job.ownerType !== "delivery_unit" || job.action !== action
-    || !Number.isSafeInteger(job.evidenceVersion) || job.evidenceVersion < 1) {
+    || !Number.isSafeInteger(job.evidenceVersion) || job.evidenceVersion < 1
+    || typeof job.claimToken !== "string" || job.claimToken.length < 1
+    || job.claimToken.length > 256 || job.claimToken.includes("\0")) {
     throw new Error("AUTOMATION_INPUT_INVALID");
   }
 }

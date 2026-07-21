@@ -177,8 +177,7 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(requirement_id) REFERENCES requirements(id),
       FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
       FOREIGN KEY(project_id) REFERENCES projects(id),
-      FOREIGN KEY(project_version_id) REFERENCES project_versions(id),
-      UNIQUE(delivery_unit_id, evidence_version)
+      FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
     );
     CREATE TABLE IF NOT EXISTS requirement_revisions (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, version INTEGER NOT NULL,
@@ -195,6 +194,9 @@ export function createPhase2Schema(db: DatabaseSync) {
         instr(id, char(0)) = 0
         AND length(id) BETWEEN 1 AND 256
         AND id = trim(id, char(9) || char(10) || char(11) || char(12) || char(13) || ' ')
+      ),
+      claim_token TEXT NOT NULL UNIQUE CHECK(
+        instr(claim_token, char(0)) = 0 AND length(claim_token) BETWEEN 1 AND 256
       ),
       dedupe_key TEXT NOT NULL CHECK(
         instr(dedupe_key, char(0)) = 0 AND length(dedupe_key) BETWEEN 1 AND 512
@@ -304,7 +306,7 @@ export function createPhase2Schema(db: DatabaseSync) {
         typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND ${MAX_AUTOMATION_EVIDENCE_VERSION}
       ),
       kind TEXT NOT NULL CHECK(kind IN ('code_review', 'automated_testing')),
-      claim_token TEXT NOT NULL CHECK(instr(claim_token, char(0)) = 0 AND length(claim_token) BETWEEN 1 AND 256),
+      claim_token TEXT NOT NULL UNIQUE CHECK(instr(claim_token, char(0)) = 0 AND length(claim_token) BETWEEN 1 AND 256),
       status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'aborted')),
       error TEXT,
       created_at TEXT NOT NULL,
@@ -315,8 +317,7 @@ export function createPhase2Schema(db: DatabaseSync) {
         OR (status = 'aborted' AND error IS NOT NULL AND completed_at IS NOT NULL)
       ),
       FOREIGN KEY(requirement_id) REFERENCES requirements(id),
-      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
-      UNIQUE(delivery_unit_id, evidence_version, kind)
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id)
     );
     CREATE TABLE IF NOT EXISTS delivery_quality_evidence (
       id TEXT PRIMARY KEY,
@@ -545,6 +546,8 @@ export function createPhase2Schema(db: DatabaseSync) {
       ON coding_evidence(delivery_unit_id, evidence_version);
     CREATE INDEX IF NOT EXISTS idx_delivery_quality_evidence_unit_version
       ON delivery_quality_evidence(delivery_unit_id, evidence_version, kind);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_quality_run_active
+      ON delivery_quality_runs(delivery_unit_id, evidence_version, kind) WHERE status = 'running';
     CREATE INDEX IF NOT EXISTS idx_delivery_quality_override_unit_version
       ON delivery_quality_overrides(delivery_unit_id, evidence_version, kind);
     CREATE INDEX IF NOT EXISTS idx_delivery_evidence_invalidation_active
@@ -756,6 +759,12 @@ export function createPhase2Schema(db: DatabaseSync) {
     BEGIN
       SELECT RAISE(ABORT, 'DELIVERY_QUALITY_RUN_IDENTITY_IMMUTABLE');
     END;
+    CREATE TRIGGER IF NOT EXISTS delivery_quality_run_terminal_update
+    BEFORE UPDATE ON delivery_quality_runs WHEN OLD.status <> 'running'
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_QUALITY_RUN_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_quality_run_immutable_delete
+    BEFORE DELETE ON delivery_quality_runs
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_QUALITY_RUN_IMMUTABLE'); END;
     CREATE TRIGGER IF NOT EXISTS validate_delivery_quality_evidence_insert
     BEFORE INSERT ON delivery_quality_evidence
     BEGIN

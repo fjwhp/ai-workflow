@@ -148,7 +148,13 @@ export class WorkflowStore {
       cancelByOwnerVersion: (ownerId, evidenceVersion, ownerType) =>
         automationJobRepository.cancelByOwnerVersion(ownerId, evidenceVersion, ownerType),
       recoverExpired: (now) => this.withImmediateTransaction(() => {
+        if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error("AUTOMATION_JOB_DATE_INVALID");
+        const expiredImplementations = this.db.prepare(`SELECT id, owner_id, evidence_version
+          FROM automation_jobs WHERE owner_type = 'delivery_unit' AND action = 'implement'
+            AND status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`)
+          .all(now.toISOString()) as Array<{ id: string; owner_id: string; evidence_version: number }>;
         const recovered = automationJobRepository.recoverExpired(now);
+        this.settleExpiredImplementationsInTransaction(expiredImplementations, now.toISOString());
         this.deliveryQualityRepository.abortTerminalAutomationClaimsInTransaction();
         return recovered;
       }),
@@ -763,9 +769,72 @@ export class WorkflowStore {
   }
 
   interruptActiveStageRuns() {
-    const rows = this.db.prepare("SELECT id FROM stage_runs WHERE status = 'running'").all() as { id: string }[];
+    const rows = this.db.prepare(`SELECT id FROM stage_runs WHERE status = 'running'
+      AND NOT (owner_type = 'delivery_unit' AND stage = 'implementation')`).all() as { id: string }[];
     rows.forEach(({ id }) => this.failStageRun(id, "服务进程已重启，运行被中断", "interrupted"));
     return rows.length;
+  }
+
+  recoverAbandonedDeliveryExecutions(now: Date) {
+    if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error("AUTOMATION_JOB_DATE_INVALID");
+    const nowIso = now.toISOString();
+    return this.withImmediateTransaction(() => {
+      const candidates = this.db.prepare(`SELECT run.id, run.owner_id, run.evidence_version
+        FROM stage_runs run WHERE run.owner_type = 'delivery_unit' AND run.stage = 'implementation'
+          AND run.status = 'running' AND NOT EXISTS (
+            SELECT 1 FROM automation_jobs job WHERE job.owner_type = 'delivery_unit'
+              AND job.owner_id = run.owner_id AND job.evidence_version = run.evidence_version
+              AND job.action = 'implement' AND job.status = 'leased'
+          )`).all() as Array<{ id: string; owner_id: string; evidence_version: number }>;
+      const jobs = new AutomationJobRepository(this.db, () => now);
+      for (const candidate of candidates) {
+        const existing = jobs.byDedupe(`implement:${candidate.owner_id}:v${candidate.evidence_version}`);
+        const retryable = existing?.status !== "failed";
+        const error = "服务进程已重启，运行被中断";
+        this.db.prepare(`UPDATE stage_runs SET status = 'interrupted', error = ?, completed_at = ?
+          WHERE id = ? AND status = 'running'`).run(error, nowIso, candidate.id);
+        this.appendStageRunEvent(candidate.id, "run.interrupted", { error });
+        this.db.prepare(`UPDATE executions SET status = 'failed', error = ?, completed_at = ?
+          WHERE delivery_unit_id = ? AND evidence_version = ? AND stage = 'implementation' AND status = 'running'`)
+          .run(error, nowIso, candidate.owner_id, candidate.evidence_version);
+        this.db.prepare(`UPDATE delivery_units SET status = ?, updated_at = ?
+          WHERE id = ? AND evidence_version = ? AND phase = 'implementation' AND status = 'running'`)
+          .run(retryable ? "ready" : "failed", nowIso, candidate.owner_id, candidate.evidence_version);
+        if (retryable) jobs.enqueue({ ownerType: "delivery_unit", ownerId: candidate.owner_id,
+          evidenceVersion: candidate.evidence_version, action: "implement", payload: {}, maxAttempts: 3 },
+        { reviveTerminal: true });
+      }
+      return candidates.length;
+    });
+  }
+
+  private settleExpiredImplementationsInTransaction(
+    candidates: Array<{ id: string; owner_id: string; evidence_version: number }>,
+    now: string
+  ) {
+    const error = "服务进程已重启，运行被中断";
+    for (const candidate of candidates) {
+      const job = this.db.prepare("SELECT status FROM automation_jobs WHERE id = ?").get(candidate.id) as
+        { status: "pending" | "failed" } | undefined;
+      if (!job || (job.status !== "pending" && job.status !== "failed")) continue;
+      const runs = this.db.prepare(`SELECT id FROM stage_runs
+        WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ?
+          AND stage = 'implementation' AND status = 'running'`).all(
+        candidate.owner_id, candidate.evidence_version
+      ) as Array<{ id: string }>;
+      for (const run of runs) {
+        this.db.prepare(`UPDATE stage_runs SET status = 'interrupted', error = ?, completed_at = ?
+          WHERE id = ? AND status = 'running'`).run(error, now, run.id);
+        this.appendStageRunEvent(run.id, "run.interrupted", { error });
+      }
+      this.db.prepare(`UPDATE executions SET status = 'failed', error = ?, completed_at = ?
+        WHERE delivery_unit_id = ? AND evidence_version = ? AND stage = 'implementation' AND status = 'running'`)
+        .run(error, now, candidate.owner_id, candidate.evidence_version);
+      this.db.prepare(`UPDATE delivery_units SET status = ?, updated_at = ?
+        WHERE id = ? AND evidence_version = ? AND phase = 'implementation' AND status = 'running'`)
+        .run(job.status === "pending" ? "ready" : "failed", now,
+          candidate.owner_id, candidate.evidence_version);
+    }
   }
 
   recoverInterruptedRequirements() {

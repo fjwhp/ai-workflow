@@ -95,7 +95,7 @@ function coordinationError(reply: FastifyReply, error: unknown) {
   if (code.endsWith("_NOT_FOUND")) return notFound(reply, code);
   if (code.includes("CONFLICT") || code.includes("NOT_ACTIVE") || code.includes("NOT_PAUSED")
     || code.includes("NOT_ELIGIBLE") || code.includes("STALE") || code.includes("UNSATISFIED")
-    || code.includes("REQUIRED") || code.includes("LIMIT")) {
+    || code.includes("REQUIRED") || code.includes("LIMIT") || code.endsWith("_NOT_FAILED")) {
     return reply.code(409).send({ error: code });
   }
   throw error;

@@ -17,7 +17,7 @@ import {
 } from "./delivery-execution-service.js";
 import { cleanupVerificationQuarantines } from "./verification-cleanup.js";
 
-const schemaVersion = "phase-2-terminal-resolution-v13";
+const schemaVersion = "phase-2-quality-attempt-v14";
 
 interface StartupApp {
   addHook(name: "onClose", hook: () => Promise<void> | void): unknown;
@@ -117,6 +117,7 @@ export async function startServer(options: StartupOptions = {}) {
     store.recoverInterruptedRequirements();
     const clock = options.clock ?? (() => new Date());
     store.automationJobs.recoverExpired(clock());
+    store.recoverAbandonedDeliveryExecutions(clock());
     const cleanupResult = await (options.cleanupVerificationQuarantines ?? cleanupVerificationQuarantines)({
       maxEntries: 4, maxScannedEntries: 4096
     });

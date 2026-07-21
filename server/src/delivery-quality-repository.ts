@@ -77,11 +77,15 @@ export class DeliveryQualityRepository {
       if (!row) throw new Error("DELIVERY_UNIT_NOT_FOUND");
       evidenceVersion = row.evidence_version;
     }
-    const existing = this.db.prepare(`SELECT id, requirement_id, status, claim_token, error FROM delivery_quality_runs
-      WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ?`).get(unitId, evidenceVersion, kind) as
-      { id: string; requirement_id: string; status: string; claim_token: string; error: string | null } | undefined;
+    const existingRuns = this.db.prepare(`SELECT id, requirement_id, status, claim_token, error
+      FROM delivery_quality_runs WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ?
+      ORDER BY created_at DESC, rowid DESC`).all(unitId, evidenceVersion, kind) as Array<{
+        id: string; requirement_id: string; status: string; claim_token: string; error: string | null;
+      }>;
+    const existing = claimToken === undefined
+      ? undefined
+      : existingRuns.find((run) => run.claim_token === claimToken);
     if (existing) {
-      if (claimToken !== undefined && existing.claim_token === claimToken) {
         const resumed = {
           id: existing.id, requirementId: existing.requirement_id,
           deliveryUnitId: unitId, evidenceVersion, kind
@@ -99,8 +103,13 @@ export class DeliveryQualityRepository {
           return { ...resumed, status: existing.status, evidence };
         }
         throw new Error("DELIVERY_QUALITY_RUN_STATUS_INVALID");
-      }
-      throw new Error(existing.status === "running" ? "DELIVERY_QUALITY_RUN_ACTIVE" : "DELIVERY_QUALITY_RUN_SETTLED");
+    }
+    if (existingRuns.some((run) => run.status === "completed" || run.status === "failed")) {
+      throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
+    }
+    if (existingRuns.some((run) => run.status === "running")) throw new Error("DELIVERY_QUALITY_RUN_ACTIVE");
+    if (existingRuns.length > 0 && !this.isLiveReplacementClaim(unitId, evidenceVersion, kind, claimToken)) {
+      throw new Error("DELIVERY_QUALITY_RUN_SETTLED");
     }
     const input = this.loadInput(unitId, evidenceVersion);
     const id = randomUUID();
@@ -189,7 +198,7 @@ export class DeliveryQualityRepository {
       SET status = 'aborted', error = 'DELIVERY_QUALITY_AUTOMATION_FAILED', completed_at = ?
       WHERE quality.status = 'running' AND EXISTS (
         SELECT 1 FROM automation_jobs AS job
-        WHERE job.id = quality.claim_token
+        WHERE job.claim_token = quality.claim_token
           AND job.status = 'failed'
           AND job.owner_type = 'delivery_unit'
           AND job.owner_id = quality.delivery_unit_id
@@ -207,6 +216,19 @@ export class DeliveryQualityRepository {
     const row = this.db.prepare(`SELECT * FROM delivery_quality_evidence
       WHERE delivery_unit_id = ? AND kind = ? ORDER BY evidence_version DESC LIMIT 1`).get(unitId, kind);
     return row ? mapEvidence(row as any) : null;
+  }
+
+  private isLiveReplacementClaim(
+    unitId: string,
+    evidenceVersion: number,
+    kind: DeliveryQualityKind,
+    claimToken: string | undefined
+  ) {
+    if (!claimToken) return false;
+    const action = kind === "code_review" ? "review" : "test";
+    return Boolean(this.db.prepare(`SELECT 1 FROM automation_jobs
+      WHERE claim_token = ? AND owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ?
+        AND action = ? AND status = 'leased'`).get(claimToken, unitId, evidenceVersion, action));
   }
 
   private getEvidence(id: string): DeliveryQualityEvidence | null {

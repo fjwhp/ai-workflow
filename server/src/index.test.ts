@@ -9,6 +9,7 @@ const directories: string[] = [];
 
 afterEach(() => {
   directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true }));
+  vi.useRealTimers();
 });
 
 describe("server entry point", () => {
@@ -69,6 +70,156 @@ describe("server entry point", () => {
     ]);
     await runtime.close();
     expect(events.slice(-3)).toEqual(["app:close", "worker:stop", "store:close"]);
+  });
+
+  it("atomically settles an expired implementation claim before making its job retryable", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "implementation-startup-recovery-"));
+    directories.push(directory);
+    const startedAt = new Date(Date.now() + 1_000);
+    const seeded = seedLeasedImplementation(directory, startedAt, 100);
+
+    const runtime = await startServer({
+      env: { DATA_DIR: directory, PORT: "0" },
+      clock: () => new Date(startedAt.getTime() + 101),
+      buildApplication: async () => fakeApp([]),
+      writeListening: () => {}
+    });
+
+    expect(runtime.store.automationJobs.get(seeded.jobId)).toMatchObject({ status: "pending", attempt: 1 });
+    expect(runtime.store.getStageRun(seeded.runId)).toMatchObject({
+      status: "interrupted", error: "服务进程已重启，运行被中断"
+    });
+    expect(runtime.store.deliveryExecutions.listExecutions(seeded.unitId, 1)).toContainEqual(
+      expect.objectContaining({ id: seeded.executionId, status: "failed", error: "服务进程已重启，运行被中断" })
+    );
+    expect(runtime.store.deliveryUnits.get(seeded.unitId)).toMatchObject({ phase: "implementation", status: "ready" });
+    await runtime.close();
+  });
+
+  it("rolls back expired implementation recovery when one execution settlement fails", () => {
+    const directory = mkdtempSync(join(tmpdir(), "implementation-recovery-rollback-"));
+    directories.push(directory);
+    const startedAt = new Date(Date.now() + 1_000);
+    const seeded = seedLeasedImplementation(directory, startedAt, 100);
+    const store = new WorkflowStore(join(directory, "workflow.db"));
+    const database = (store as any).db;
+    database.exec(`CREATE TRIGGER reject_recovered_execution BEFORE UPDATE OF status ON executions
+      WHEN OLD.id = '${seeded.executionId}' BEGIN SELECT RAISE(ABORT, 'RECOVERY_EXECUTION_WRITE_FAILED'); END;`);
+
+    expect(() => store.automationJobs.recoverExpired(new Date(startedAt.getTime() + 101)))
+      .toThrow("RECOVERY_EXECUTION_WRITE_FAILED");
+
+    expect(store.automationJobs.get(seeded.jobId)).toMatchObject({ status: "leased", attempt: 1 });
+    expect(store.getStageRun(seeded.runId)).toMatchObject({ status: "running", error: null });
+    expect(store.deliveryExecutions.listExecutions(seeded.unitId, 1)).toContainEqual(
+      expect.objectContaining({ id: seeded.executionId, status: "running", error: null })
+    );
+    expect(store.deliveryUnits.get(seeded.unitId)).toMatchObject({ status: "running" });
+    store.close();
+  });
+
+  it("recovers an ownerless implementation claim during startup", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "implementation-ownerless-recovery-"));
+    directories.push(directory);
+    const startedAt = new Date(Date.now() + 1_000);
+    const seeded = seedLeasedImplementation(directory, startedAt, 1_000);
+    const abandoned = new WorkflowStore(join(directory, "workflow.db"));
+    (abandoned as any).db.prepare(`UPDATE automation_jobs SET status = 'canceled',
+      lease_owner = NULL, lease_expires_at = NULL WHERE id = ?`).run(seeded.jobId);
+    abandoned.close();
+
+    const runtime = await startServer({ env: { DATA_DIR: directory, PORT: "0" },
+      clock: () => new Date(startedAt.getTime() + 100),
+      buildApplication: async () => fakeApp([]), writeListening: () => {} });
+
+    expect(runtime.store.getStageRun(seeded.runId)).toMatchObject({ status: "interrupted" });
+    expect(runtime.store.deliveryExecutions.listExecutions(seeded.unitId, 1)).toContainEqual(
+      expect.objectContaining({ id: seeded.executionId, status: "failed" })
+    );
+    expect(runtime.store.deliveryUnits.get(seeded.unitId)).toMatchObject({ status: "ready" });
+    expect(runtime.store.automationJobs.get(seeded.jobId)).toMatchObject({ status: "pending" });
+    await runtime.close();
+  });
+
+  it.each([
+    ["completed", "ready", "pending"],
+    ["failed", "failed", "failed"],
+    ["missing", "ready", "pending"]
+  ] as const)("settles an ownerless implementation backed by a %s job", async (jobState, unitStatus, jobStatus) => {
+    const directory = mkdtempSync(join(tmpdir(), `implementation-${jobState}-recovery-`));
+    directories.push(directory);
+    const startedAt = new Date(Date.now() + 1_000);
+    const seeded = seedLeasedImplementation(directory, startedAt, 1_000);
+    const abandoned = new WorkflowStore(join(directory, "workflow.db"));
+    if (jobState === "missing") {
+      (abandoned as any).db.prepare("DELETE FROM automation_jobs WHERE id = ?").run(seeded.jobId);
+    } else {
+      (abandoned as any).db.prepare(`UPDATE automation_jobs SET status = ?,
+        lease_owner = NULL, lease_expires_at = NULL WHERE id = ?`).run(jobState, seeded.jobId);
+    }
+    abandoned.close();
+
+    const runtime = await startServer({ env: { DATA_DIR: directory, PORT: "0" },
+      clock: () => new Date(startedAt.getTime() + 100),
+      buildApplication: async () => fakeApp([]), writeListening: () => {} });
+
+    expect(runtime.store.getStageRun(seeded.runId)).toMatchObject({ status: "interrupted" });
+    expect(runtime.store.deliveryExecutions.listExecutions(seeded.unitId, 1)).toContainEqual(
+      expect.objectContaining({ id: seeded.executionId, status: "failed" })
+    );
+    expect(runtime.store.deliveryUnits.get(seeded.unitId)).toMatchObject({ status: unitStatus });
+    expect(runtime.store.automationJobs.byDedupe(`implement:${seeded.unitId}:v1`)).toMatchObject({ status: jobStatus });
+    await runtime.close();
+  });
+
+  it("periodically recovers a lease that expires after startup and claims implementation exactly once", async () => {
+    vi.useFakeTimers();
+    const directory = mkdtempSync(join(tmpdir(), "implementation-periodic-recovery-"));
+    directories.push(directory);
+    const startedAt = new Date(Date.now() + 1_000);
+    const seeded = seedLeasedImplementation(directory, startedAt, 100);
+    let now = startedAt.getTime() + 50;
+    let runtimeStore: WorkflowStore | undefined;
+    const claimed: string[] = [];
+
+    const runtime = await startServer({
+      env: { DATA_DIR: directory, PORT: "0", AUTOMATION_WORKER_ENABLED: "true",
+        AUTOMATION_WORKER_LEASE_MS: "100", AUTOMATION_WORKER_POLL_MS: "10" },
+      clock: () => new Date(now),
+      createStore: (databasePath) => {
+        runtimeStore = new WorkflowStore(databasePath);
+        return runtimeStore;
+      },
+      automationHandlers: {
+        implement: async (job) => {
+          const claim = runtimeStore!.deliveryExecutions.claimImplementation(job.ownerId, "recovery-model");
+          claimed.push(claim.runId);
+          runtimeStore!.deliveryExecutions.failImplementation(claim, "test settlement");
+        }
+      },
+      buildApplication: async () => fakeApp([]),
+      writeListening: () => {}
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(claimed).toEqual([]);
+    expect(runtime.store.automationJobs.get(seeded.jobId)).toMatchObject({ status: "leased", attempt: 1 });
+    expect(runtime.store.getStageRun(seeded.runId)).toMatchObject({ status: "running" });
+    expect(runtime.store.deliveryExecutions.listExecutions(seeded.unitId, 1)).toContainEqual(
+      expect.objectContaining({ id: seeded.executionId, status: "running" })
+    );
+    expect(runtime.store.deliveryUnits.get(seeded.unitId)).toMatchObject({ status: "running" });
+
+    now = startedAt.getTime() + 101;
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(claimed).toHaveLength(1);
+    expect(runtime.store.automationJobs.get(seeded.jobId)).toMatchObject({ status: "completed", attempt: 2 });
+    expect(runtime.store.getStageRun(seeded.runId)).toMatchObject({ status: "interrupted" });
+    expect(runtime.store.deliveryExecutions.listExecutions(seeded.unitId, 1)).toContainEqual(
+      expect.objectContaining({ id: seeded.executionId, status: "failed" })
+    );
+    await runtime.close();
   });
 
   it("builds but does not start the worker when enablement is absent", async () => {
@@ -145,7 +296,7 @@ describe("server entry point", () => {
       writeListening: () => {}
     });
     const reviewJob = {
-      id: "review-job", ownerType: "delivery_unit", ownerId: "unit-1",
+      id: "review-job", claimToken: "review-job", ownerType: "delivery_unit", ownerId: "unit-1",
       evidenceVersion: 3, action: "review"
     } as any;
 
@@ -206,9 +357,34 @@ async function seedExpiredJob(directory: string) {
   });
   store.automationJobs.leaseNext("old-worker", new Date(), 1);
   store.close();
-  writeFileSync(`${databasePath}.schema-version`, "phase-2-terminal-resolution-v13");
+  writeFileSync(`${databasePath}.schema-version`, "phase-2-quality-attempt-v14");
   await new Promise((resolve) => setTimeout(resolve, 5));
   return { jobId: queued.id };
+}
+
+function seedLeasedImplementation(directory: string, now: Date, leaseMs: number) {
+  const databasePath = join(directory, "workflow.db");
+  const store = new WorkflowStore(databasePath);
+  const project = store.createProject({ name: "Implementation restart", repoPath: join(directory, "repo"),
+    defaultBranch: "main", allowedCommands: [], sensitivePatterns: [] });
+  const version = store.createProjectVersion({ projectId: project.id, name: "v1", branch: "feature/v1",
+    baseBranch: "main", worktreePath: join(directory, "worktree"), headCommit: "abc123" });
+  const requirement = store.createRequirement({ title: "Recover implementation",
+    businessProblem: "A process stopped while implementing", expectedOutcome: "Retry from a consistent state",
+    priority: "high", primaryProjectId: project.id, primaryProjectVersionId: version.id });
+  store.replaceRequirementProjects(requirement.id, [{ projectId: project.id, projectVersionId: version.id,
+    role: "primary", usage: "delivery", deliveryRequired: true, moduleMode: "all", moduleIds: [], position: 0 }]);
+  const plan = store.deliveryUnits.createPlan({ requirementId: requirement.id,
+    snapshot: store.createRequirementProjectSnapshot(requirement.id),
+    plan: { units: [{ projectId: project.id, moduleIds: [], acceptanceCriteria: ["done"] }], dependencies: [] } });
+  const unit = plan.units[0]!;
+  const job = store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id,
+    evidenceVersion: 1, action: "implement", payload: {}, maxAttempts: 3 });
+  store.automationJobs.leaseNext("old-worker", now, leaseMs);
+  const claim = store.deliveryExecutions.claimImplementation(unit.id, "old-model");
+  store.close();
+  writeFileSync(`${databasePath}.schema-version`, "phase-2-quality-attempt-v14");
+  return { jobId: job.id, unitId: unit.id, runId: claim.runId, executionId: claim.executionId };
 }
 
 function observedStore(databasePath: string, events: string[]) {

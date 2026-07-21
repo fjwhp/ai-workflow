@@ -6,6 +6,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { WorkflowStore } from "./store.js";
 import type { DeliveryQualityKind, DeliveryQualityResult } from "./delivery-quality-repository.js";
 import type { DeliveryExecutionSuccess } from "./delivery-execution-repository.js";
+import { DeliveryExecutionService, createDeliveryQualityAutomationHandlers } from "./delivery-execution-service.js";
+import { createAutomationWorker } from "./automation-worker.js";
+import { evidenceFingerprint, evidenceManifestHash } from "./evidence-tree.js";
 
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
@@ -62,6 +65,27 @@ function createFixture(edges: Array<[number, number]> = [[0, 1]], required: bool
 function completeImplementation(store: WorkflowStore, unitId: string) {
   const claim = store.deliveryExecutions.claimImplementation(unitId, "test-model");
   store.deliveryExecutions.completeImplementation(claim, implementationCompletion(unitId, claim.deliveryUnit.evidenceVersion));
+}
+
+function completeVerifiableImplementation(store: WorkflowStore, unitId: string) {
+  const claim = store.deliveryExecutions.claimImplementation(unitId, "test-model");
+  const identity = {
+    repositoryPath: claim.project.repoPath,
+    gitCommonDir: `${claim.project.repoPath}/.git`,
+    worktreePath: claim.version.worktreePath,
+    branch: claim.version.branch,
+    headCommit: claim.version.headCommit
+  };
+  const manifest = { version: 1 as const, entries: [] };
+  const manifestHash = evidenceManifestHash(manifest);
+  const diff = `diff-${unitId}-v${claim.deliveryUnit.evidenceVersion}`;
+  store.deliveryExecutions.completeImplementation(claim, {
+    branch: identity.branch, worktreePath: identity.worktreePath, baseCommit: identity.headCommit,
+    commands: [], diff, changedFiles: [], identity, manifest, manifestHash,
+    diffHash: evidenceFingerprint({ identity, manifestHash, diff, changedFiles: [] }),
+    originalChars: diff.length, truncated: false, files: [], additions: 1, deletions: 0,
+    diagnostics: "", output: {}
+  });
 }
 
 function implementationCompletion(unitId: string, evidenceVersion: number): DeliveryExecutionSuccess {
@@ -754,6 +778,92 @@ describe("DeliveryCoordinator", () => {
     expect((fixture.store as any).db.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
       WHERE owner_id = ? AND evidence_version = 1 AND status = 'pending'`).get(fixture.downstream.id))
       .toEqual({ count: 2 });
+  });
+
+  it("replaces an orphan running quality attempt when stale evidence is reused", () => {
+    const fixture = staleFixture();
+    const job = fixture.store.automationJobs.byDedupe(`review:${fixture.downstream.id}:v1`)!;
+    const now = new Date().toISOString();
+    fixture.database.prepare(`INSERT INTO delivery_quality_runs
+      (id, requirement_id, delivery_unit_id, evidence_version, kind, claim_token, status, error, created_at, completed_at)
+      VALUES ('orphan-review', ?, ?, 1, 'code_review', ?, 'running', NULL, ?, NULL)`)
+      .run(fixture.requirement.id, fixture.downstream.id, job.claimToken, now);
+
+    fixture.store.deliveryCoordination.resolveStale({ unitId: fixture.downstream.id,
+      decision: "reuse", reason: "quality work remains valid", actor: "local-human" });
+
+    expect(fixture.database.prepare("SELECT status, error FROM delivery_quality_runs WHERE id = 'orphan-review'").get())
+      .toEqual({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_ORPHANED" });
+    expect(fixture.store.automationJobs.get(job.id)).toMatchObject({ status: "pending" });
+    expect(fixture.store.automationJobs.get(job.id)!.claimToken).not.toBe(job.claimToken);
+  });
+
+  it("retries failed quality work after stale evidence is explicitly reused", async () => {
+    const fixture = createFixture([[0, 1]], [true, true]);
+    const [source, downstream] = fixture.units;
+    fixture.store.deliveryCoordination.completeContractEvidence({ unitId: source!.id, version: 1,
+      contractHash: "contract-v1", content: {}, actor: "solution-design" });
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    fixture.store.automationJobs.cancelByOwnerVersion(source!.id, 1);
+    completeVerifiableImplementation(fixture.store, downstream!.id);
+    fixture.database.prepare(`UPDATE automation_jobs SET status = 'canceled'
+      WHERE owner_id = ? AND evidence_version = 1 AND action = 'implement' AND status = 'pending'`).run(downstream!.id);
+    const reviewJob = fixture.store.automationJobs.byDedupe(`review:${downstream!.id}:v1`)!;
+    const testJob = fixture.store.automationJobs.byDedupe(`test:${downstream!.id}:v1`)!;
+    fixture.database.prepare("UPDATE automation_jobs SET status = 'canceled' WHERE id = ?").run(testJob.id);
+    let startFirstReview!: () => void;
+    const firstReviewStarted = new Promise<void>((resolve) => { startFirstReview = resolve; });
+    let finishFirstReview!: (result: any) => void;
+    const firstReview = new Promise<any>((resolve) => { finishFirstReview = resolve; });
+    let reviewCalls = 0;
+    const review = async () => {
+      reviewCalls += 1;
+      if (reviewCalls === 1) {
+        startFirstReview();
+        return firstReview;
+      }
+      if (reviewCalls < 4) throw new Error("provider unavailable");
+      return { conclusion: "pass" as const, confidence: 0.9, summary: "reused evidence is valid",
+        facts: [], assumptions: [], openQuestions: [], risks: [], findings: [] };
+    };
+    const service = new DeliveryExecutionService(
+      fixture.store.deliveryExecutions, async () => { throw new Error("unused"); }, "test-model",
+      fixture.store.deliveryQuality, { review }
+    );
+    const worker = createAutomationWorker({ jobs: fixture.store.automationJobs,
+      handlers: { ...createDeliveryQualityAutomationHandlers(service), test: async () => {} },
+      workerId: "reuse-quality-worker" });
+
+    const staleCallback = worker.drainOnce();
+    await firstReviewStarted;
+    fixture.store.deliveryCoordination.completeContractEvidence({ unitId: source!.id, version: 2,
+      contractHash: "contract-v2", content: {}, actor: "solution-design" });
+    finishFirstReview({ conclusion: "pass", confidence: 0.9, summary: "old callback",
+      facts: [], assumptions: [], openQuestions: [], risks: [], findings: [] });
+    await staleCallback;
+    await worker.drainOnce();
+    await worker.drainOnce();
+
+    expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "failed", attempt: 3 });
+    expect(fixture.database.prepare(`SELECT status, error FROM delivery_quality_runs WHERE claim_token = ?`)
+      .get(reviewJob.id)).toEqual({ status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" });
+    fixture.store.deliveryCoordination.resolveStale({ unitId: downstream!.id, decision: "reuse",
+      reason: "quality scope remains valid", actor: "local-human" });
+    for (let drain = 0; drain < 4 && fixture.store.automationJobs.get(reviewJob.id)?.status !== "completed"; drain += 1) {
+      await worker.drainOnce();
+    }
+
+    expect(reviewCalls).toBe(4);
+    expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "completed" });
+    expect(fixture.store.deliveryQuality.latest(downstream!.id, "code_review")).toMatchObject({ result: "passed" });
+    expect(fixture.store.deliveryUnits.get(downstream!.id)).toMatchObject({ status: "awaiting_gate" });
+    expect(fixture.database.prepare(`SELECT claim_token, status, error FROM delivery_quality_runs
+      WHERE delivery_unit_id = ? AND evidence_version = 1 AND kind = 'code_review' ORDER BY created_at, rowid`)
+      .all(downstream!.id)).toEqual([
+        { claim_token: reviewJob.id, status: "aborted", error: "DELIVERY_QUALITY_AUTOMATION_FAILED" },
+        { claim_token: expect.not.stringMatching(new RegExp(`^${reviewJob.id}$`)), status: "completed", error: null }
+      ]);
   });
 
   it("never restores an ownerless running status and re-enqueues implementation when reusable", () => {

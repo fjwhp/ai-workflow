@@ -109,6 +109,10 @@ describe("delivery quality evidence schema", () => {
       expect(store.deliveryQuality.latest(unit.id, "code_review")).toBeNull();
       expect(() => store.deliveryQuality.claim(unit.id, 1, "code_review", "other-job"))
         .toThrow("DELIVERY_QUALITY_RUN_SETTLED");
+      expect(() => (store as any).db.prepare(`UPDATE delivery_quality_runs SET error = 'REWRITTEN'
+        WHERE id = ?`).run(first.id)).toThrow("DELIVERY_QUALITY_RUN_IMMUTABLE");
+      expect(() => (store as any).db.prepare("DELETE FROM delivery_quality_runs WHERE id = ?").run(first.id))
+        .toThrow("DELIVERY_QUALITY_RUN_IMMUTABLE");
     } finally {
       store.close();
     }

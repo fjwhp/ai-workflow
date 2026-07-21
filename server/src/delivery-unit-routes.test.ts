@@ -120,6 +120,29 @@ describe("delivery unit control routes", () => {
     await app.close();
   });
 
+  it("returns a stable conflict without mutating state when overriding passed evidence", async () => {
+    const { store, unit } = fixture(true);
+    completeImplementation(store, unit.id);
+    const review = store.deliveryQuality.claim(unit.id, 1, "code_review", "route-passed-review");
+    if (review.status !== "running") throw new Error("expected running review");
+    store.deliveryQuality.complete(review, { result: "passed", content: { summary: "approved" } });
+    const before = store.deliveryUnits.get(unit.id);
+    const releasedBefore = (store as any).db.prepare(`SELECT COUNT(*) AS count FROM delivery_dependencies
+      WHERE upstream_unit_id = ? AND released_by_evidence_version IS NOT NULL`).get(unit.id);
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "POST", url: `/api/delivery-units/${unit.id}/quality-override`,
+      payload: { kind: "code_review", reason: "not applicable", acceptedRisk: "none" } });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: "DELIVERY_QUALITY_OVERRIDE_EVIDENCE_NOT_FAILED" });
+    expect(store.deliveryCoordination.listQualityOverrides(unit.id, 1)).toEqual([]);
+    expect(store.deliveryUnits.get(unit.id)).toEqual(before);
+    expect((store as any).db.prepare(`SELECT COUNT(*) AS count FROM delivery_dependencies
+      WHERE upstream_unit_id = ? AND released_by_evidence_version IS NOT NULL`).get(unit.id)).toEqual(releasedBefore);
+    await app.close();
+  });
+
   it("rejects skipping an optional unit with a current running quality activity", async () => {
     const { store, unit } = fixture(false);
     completeImplementation(store, unit.id);

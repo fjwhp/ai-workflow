@@ -145,6 +145,7 @@ function insertAutomationJob(db: DatabaseSync, input: {
   dedupeKey?: string;
   createdAt?: string;
   updatedAt?: string;
+  claimToken?: string;
 }) {
   const ownerType = input.ownerType ?? "requirement";
   const ownerId = input.ownerId ?? "r1";
@@ -152,10 +153,11 @@ function insertAutomationJob(db: DatabaseSync, input: {
   const action = input.action ?? "implement";
   const ownerKey = ownerType === "delivery_unit" ? ownerId : `requirement:${ownerId}`;
   db.prepare(`INSERT INTO automation_jobs
-    (id, dedupe_key, owner_type, owner_id, evidence_version, action, status, attempt, max_attempts,
+    (id, claim_token, dedupe_key, owner_type, owner_id, evidence_version, action, status, attempt, max_attempts,
       lease_owner, lease_expires_at, payload_json, last_error, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(input.id, input.dedupeKey ?? `${action}:${ownerKey}:v${evidenceVersion}`, ownerType, ownerId,
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(input.id, input.claimToken ?? input.id,
+      input.dedupeKey ?? `${action}:${ownerKey}:v${evidenceVersion}`, ownerType, ownerId,
       evidenceVersion, action, input.status ?? "pending",
       input.attempt ?? 0, input.maxAttempts ?? 3, input.leaseOwner ?? null, input.leaseExpiresAt ?? null,
       input.payloadJson ?? "{}", input.lastError ?? null,
@@ -186,6 +188,7 @@ describe("Phase 2 database schema", () => {
     expect(columns(db, "artifacts")).toEqual(expect.arrayContaining(["owner_type", "owner_id"]));
     expect(columns(db, "delivery_unit_snapshots")).toContain("acceptance_criteria_json");
     expect(columns(db, "executions")).toEqual(expect.arrayContaining(["delivery_unit_id", "evidence_version"]));
+    expect(columns(db, "automation_jobs")).toContain("claim_token");
     expect(columns(db, "coding_evidence")).toEqual(expect.arrayContaining(["delivery_unit_id", "evidence_version"]));
     expect(tableSql(db, "delivery_quality_runs")).toMatch(
       /status TEXT NOT NULL CHECK\(status IN \('running', 'completed', 'failed', 'aborted'\)\)/i
@@ -199,6 +202,9 @@ describe("Phase 2 database schema", () => {
     ]));
     expect(indexSql(db, "idx_delivery_quality_override_unit_version")).toMatch(
       /delivery_quality_overrides\s*\(delivery_unit_id,\s*evidence_version,\s*kind\)/i
+    );
+    expect(indexSql(db, "idx_delivery_quality_run_active")).toMatch(
+      /delivery_quality_runs\s*\(delivery_unit_id,\s*evidence_version,\s*kind\)\s+WHERE status = 'running'/i
     );
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_stage_runs_running'").get()).toBeUndefined();
     db.close();

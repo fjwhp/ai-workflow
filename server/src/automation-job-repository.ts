@@ -20,6 +20,7 @@ export interface AutomationJobInput {
 
 export interface AutomationJob {
   id: string;
+  claimToken: string;
   dedupeKey: string;
   ownerType: AutomationJobOwnerType;
   ownerId: string;
@@ -64,20 +65,29 @@ export class AutomationJobRepository {
     private readonly clock: () => Date = () => new Date()
   ) {}
 
-  enqueue(input: AutomationJobInput): AutomationJob {
+  enqueue(input: AutomationJobInput, options: { reviveTerminal?: boolean } = {}): AutomationJob {
     const payloadJson = validateEnqueueInput(input);
+    if (typeof options.reviveTerminal !== "boolean" && options.reviveTerminal !== undefined) {
+      throw new Error("AUTOMATION_JOB_REVIVE_INVALID");
+    }
     const dedupeKey = canonicalDedupeKey(input);
     const now = validateDate(this.clock());
+    const id = randomUUID();
     this.db.prepare(`INSERT INTO automation_jobs
-      (id, dedupe_key, owner_type, owner_id, evidence_version, action, status, attempt, max_attempts,
+      (id, claim_token, dedupe_key, owner_type, owner_id, evidence_version, action, status, attempt, max_attempts,
        lease_owner, lease_expires_at, payload_json, last_error, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL, ?, ?)
       ON CONFLICT(dedupe_key) DO UPDATE SET
-        status = 'pending', attempt = 0, lease_owner = NULL, lease_expires_at = NULL,
+        status = 'pending', attempt = 0, claim_token = CASE
+          WHEN automation_jobs.status = 'canceled' AND ? = 0
+            THEN automation_jobs.claim_token ELSE excluded.claim_token END,
+        lease_owner = NULL, lease_expires_at = NULL,
         last_error = NULL, updated_at = excluded.updated_at
-      WHERE automation_jobs.status = 'canceled'`)
-      .run(randomUUID(), dedupeKey, input.ownerType, input.ownerId, input.evidenceVersion, input.action,
-        input.maxAttempts, payloadJson, now, now);
+      WHERE automation_jobs.status = 'canceled'
+        OR (? = 1 AND automation_jobs.status IN ('failed', 'completed'))`)
+      .run(id, id, dedupeKey, input.ownerType, input.ownerId, input.evidenceVersion, input.action,
+        input.maxAttempts, payloadJson, now, now,
+        options.reviveTerminal ? 1 : 0, options.reviveTerminal ? 1 : 0);
     const row = this.db.prepare("SELECT * FROM automation_jobs WHERE dedupe_key = ?").get(dedupeKey);
     if (!row) throw new Error("AUTOMATION_JOB_ENQUEUE_FAILED");
     const persisted = decodeAutomationJobRow(row);
@@ -376,6 +386,7 @@ function decodeAutomationJobRow(row: unknown): AutomationJob {
   try {
     if (!isRecord(row)) throw new Error("invalid row");
     const id = decodeStoredString(row.id, MAX_OWNER_ID_LENGTH, true);
+    const claimToken = decodeStoredString(row.claim_token, MAX_OWNER_ID_LENGTH, true);
     const dedupeKey = decodeStoredString(row.dedupe_key, 512, false);
     if (row.owner_type !== "requirement" && row.owner_type !== "delivery_unit") {
       throw new Error("invalid owner type");
@@ -441,7 +452,7 @@ function decodeAutomationJobRow(row: unknown): AutomationJob {
     }
 
     return {
-      id, dedupeKey, ownerType, ownerId, evidenceVersion, action, status, attempt, maxAttempts,
+      id, claimToken, dedupeKey, ownerType, ownerId, evidenceVersion, action, status, attempt, maxAttempts,
       leaseOwner, leaseExpiresAt, payload, lastError, createdAt, updatedAt
     };
   } catch {

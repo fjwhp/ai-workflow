@@ -1114,13 +1114,16 @@ describe("DeliveryExecutionService", () => {
     const fixture = createFixture();
     const service = { review: vi.fn(), test: vi.fn() } as any;
     const handlers = createDeliveryQualityAutomationHandlers(service);
-    const baseJob = { ownerType: "delivery_unit", ownerId: fixture.unit.id, evidenceVersion: 1 } as any;
+    const baseJob = { claimToken: "quality-claim", ownerType: "delivery_unit",
+      ownerId: fixture.unit.id, evidenceVersion: 1 } as any;
     const context = { signal: new AbortController().signal };
     await expect(handlers.review!({ ...baseJob, action: "test" }, context)).rejects
       .toThrow("AUTOMATION_INPUT_INVALID");
     await expect(handlers.test!({ ...baseJob, action: "test", evidenceVersion: 0 }, context)).rejects
       .toThrow("AUTOMATION_INPUT_INVALID");
+    await expect(handlers.review!({ ...baseJob, action: "review", claimToken: "" }, context)).rejects
+      .toThrow("AUTOMATION_INPUT_INVALID");
     await handlers.review!({ ...baseJob, action: "review" }, context);
-    expect(service.review).toHaveBeenCalledWith(fixture.unit.id, 1, undefined, context.signal);
+    expect(service.review).toHaveBeenCalledWith(fixture.unit.id, 1, "quality-claim", context.signal);
   });
 });

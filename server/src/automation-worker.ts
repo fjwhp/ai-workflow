@@ -98,6 +98,7 @@ export function createAutomationWorker(options: AutomationWorkerOptions): Automa
   };
 
   const runOnce = async (): Promise<boolean> => {
+    options.jobs.recoverExpired(clock());
     const job = options.jobs.leaseNext(workerId, clock(), leaseMs);
     if (!job) return false;
     const handler = options.handlers[job.action];
@@ -127,12 +128,14 @@ export function createAutomationWorker(options: AutomationWorkerOptions): Automa
         if (!options.jobs.renew(job.id, workerId, clock(), leaseMs)) {
           ownershipLost = true;
           heartbeatActive = false;
+          controller.abort(new Error("AUTOMATION_WORKER_LEASE_LOST"));
           report({ type: "heartbeat_lost", jobId: job.id });
           return;
         }
       } catch (error) {
         ownershipLost = true;
         heartbeatActive = false;
+        controller.abort(new Error("AUTOMATION_WORKER_LEASE_LOST", { cause: error }));
         report({ type: "heartbeat_lost", jobId: job.id, error });
         return;
       }
