@@ -293,6 +293,36 @@ describe("deliveryMatrixRowViews", () => {
 });
 
 describe("DeliveryMatrix", () => {
+  it("keeps legacy requirement evidence available only outside current delivery ownership", async () => {
+    const module = await import("./requirement-detail.js");
+    const shouldShowLegacyDeliveryEvidence = (module as any).shouldShowLegacyDeliveryEvidence;
+    const RequirementLevelDeliveryEvidence = (module as any).RequirementLevelDeliveryEvidence;
+    expect(shouldShowLegacyDeliveryEvidence).toBeTypeOf("function");
+    expect(RequirementLevelDeliveryEvidence).toBeTypeOf("function");
+    if (!shouldShowLegacyDeliveryEvidence || !RequirementLevelDeliveryEvidence) return;
+
+    expect(shouldShowLegacyDeliveryEvidence("solution_design", "implementation")).toBe(true);
+    expect(shouldShowLegacyDeliveryEvidence("implementation", "implementation")).toBe(false);
+    expect(shouldShowLegacyDeliveryEvidence("solution_design", "solution_design")).toBe(false);
+    const legacyItem = {
+      stage: "solution_design", codingEvidence: { status: "valid", diffHash: "legacy-hash",
+        fileCount: 1, additions: 2, deletions: 0, branch: "legacy", executionId: "legacy-execution",
+        diff: "legacy diff" },
+      executions: [{ status: "completed", branch: "legacy", worktreePath: "/tmp/legacy",
+        diff: "legacy execution diff" }]
+    };
+    const legacyMarkup = renderToStaticMarkup(React.createElement(RequirementLevelDeliveryEvidence, {
+      item: legacyItem, viewStage: "implementation"
+    }));
+    const deliveryMarkup = renderToStaticMarkup(React.createElement(RequirementLevelDeliveryEvidence, {
+      item: { ...legacyItem, stage: "implementation" }, viewStage: "implementation"
+    }));
+    expect(legacyMarkup).toContain("legacy-hash");
+    expect(legacyMarkup).toContain("独立 Codex 编码会话");
+    expect(deliveryMarkup).not.toContain("legacy-hash");
+    expect(deliveryMarkup).not.toContain("独立 Codex 编码会话");
+  });
+
   it("does not render superseded requirement-level delivery evidence", () => {
     const supersededHash = "superseded-v1-hash";
     const markup = renderToStaticMarkup(React.createElement(RequirementDetail, {
