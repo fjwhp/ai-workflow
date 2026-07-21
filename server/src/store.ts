@@ -175,6 +175,9 @@ export class WorkflowStore {
       resolveStale: (input) => this.withImmediateTransaction(
         () => deliveryCoordinator.resolveStaleInTransaction(input)
       ),
+      completeContractEvidence: (input) => this.withImmediateTransaction(
+        () => deliveryCoordinator.completeContractEvidenceInTransaction(input)
+      ),
       pauseAutomation: (input) => {
         try {
           return this.withImmediateTransaction(() => deliveryCoordinator.pauseAutomationInTransaction(input));

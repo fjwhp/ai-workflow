@@ -14,6 +14,9 @@ type RaceMessage = {
     | { kind: "implementation"; claim: DeliveryExecutionClaim; completion: DeliveryExecutionSuccess }
     | { kind: "quality"; claim: DeliveryQualityClaim; completion: DeliveryQualityCompletion }
     | { kind: "pause"; input: { requirementId: string; actor: string; reason: string } }
+    | { kind: "stale_resolution"; input: {
+        unitId: string; decision: "reuse" | "rerun"; actor: string; reason: string;
+      } }
     | { kind: "lease"; workerId: string; now: string; leaseMs: number };
 };
 
@@ -36,6 +39,8 @@ parentPort.on("message", (message: RaceMessage) => {
       store.deliveryQuality.complete(message.operation.claim, message.operation.completion);
     } else if (message.operation.kind === "pause") {
       value = store.deliveryCoordination.pauseAutomation(message.operation.input);
+    } else if (message.operation.kind === "stale_resolution") {
+      value = store.deliveryCoordination.resolveStale(message.operation.input);
     } else {
       value = store.automationJobs.leaseNext(message.operation.workerId, new Date(message.operation.now),
         message.operation.leaseMs);

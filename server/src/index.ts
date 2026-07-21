@@ -17,7 +17,7 @@ import {
 } from "./delivery-execution-service.js";
 import { cleanupVerificationQuarantines } from "./verification-cleanup.js";
 
-const schemaVersion = "phase-2-evidence-invalidation-v11";
+const schemaVersion = "phase-2-evidence-aggregation-v12";
 
 interface StartupApp {
   addHook(name: "onClose", hook: () => Promise<void> | void): unknown;

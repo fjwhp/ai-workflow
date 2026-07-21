@@ -56,7 +56,7 @@ function createFixture(edges: Array<[number, number]> = [[0, 1]], required: bool
     }
   });
   for (const unit of plan.units.filter((item) => item.status === "ready")) completeImplementation(store, unit.id);
-  return { store, requirement, units: plan.units, databasePath };
+  return { store, requirement, units: plan.units, databasePath, database: (store as any).db };
 }
 
 function completeImplementation(store: WorkflowStore, unitId: string) {
@@ -184,7 +184,296 @@ function staleFixtureForFailure() {
   return { ...fixture, source: source!, downstream: downstream!, database };
 }
 
+function advanceImplementation(store: WorkflowStore, unitId: string, evidenceVersion: number) {
+  (store as any).db.prepare(`UPDATE delivery_units
+    SET phase = 'implementation', status = 'ready', evidence_version = ? WHERE id = ?`)
+    .run(evidenceVersion, unitId);
+  completeImplementation(store, unitId);
+}
+
 describe("DeliveryCoordinator", () => {
+  it("preserves every fan-in upstream change as an independently auditable active invalidation", () => {
+    const fixture = createFixture([[0, 2], [1, 2]], [true, true, true]);
+    const [first, second, target] = fixture.units;
+    for (const source of [first!, second!]) {
+      settle(fixture.store, source.id, "code_review", "passed");
+      settle(fixture.store, source.id, "automated_testing", "passed");
+    }
+    completeImplementation(fixture.store, target!.id);
+
+    advanceImplementation(fixture.store, first!.id, 2);
+    advanceImplementation(fixture.store, second!.id, 2);
+
+    const database = (fixture.store as any).db;
+    const active = database.prepare(`SELECT source_unit_id, source_new_evidence_version
+      FROM delivery_evidence_invalidations WHERE target_unit_id = ? ORDER BY source_unit_id`).all(target!.id);
+    expect(active).toEqual([
+      { source_unit_id: [first!.id, second!.id].sort()[0], source_new_evidence_version: 2 },
+      { source_unit_id: [first!.id, second!.id].sort()[1], source_new_evidence_version: 2 }
+    ]);
+    expect(fixture.store.deliveryUnits.get(target!.id)).toMatchObject({ status: "potentially_stale" });
+  });
+
+  it("aggregates consecutive v2 and v3 invalidations from one upstream into one reuse decision", () => {
+    const fixture = createFixture([[0, 1]], [true, true]);
+    const [source, target] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, target!.id);
+    advanceImplementation(fixture.store, source!.id, 2);
+    advanceImplementation(fixture.store, source!.id, 3);
+    settle(fixture.store, source!.id, "code_review", "passed", "source-v3-review");
+    settle(fixture.store, source!.id, "automated_testing", "passed", "source-v3-test");
+
+    const decision = (fixture.store.deliveryCoordination as any).resolveStale({
+      unitId: target!.id, decision: "reuse", reason: "reviewed both upstream revisions", actor: "local-human"
+    });
+
+    expect(decision).toMatchObject({ decision: "reuse", targetEvidenceVersion: 1 });
+    expect(decision.sources.map((item: any) => item.sourceNewEvidenceVersion)).toEqual([2, 3]);
+    expect((fixture.store as any).db.prepare(`SELECT COUNT(*) AS count FROM delivery_stale_decision_sources
+      WHERE decision_id = ?`).get(decision.id)).toEqual({ count: 2 });
+    expect(fixture.store.deliveryUnits.get(target!.id)).not.toMatchObject({ status: "potentially_stale" });
+  });
+
+  it("covers every fan-in invalidation with immutable source snapshots and replays the aggregate decision", () => {
+    const fixture = createFixture([[0, 2], [1, 2]], [true, true, true]);
+    const [first, second, target] = fixture.units;
+    for (const source of [first!, second!]) {
+      settle(fixture.store, source.id, "code_review", "passed");
+      settle(fixture.store, source.id, "automated_testing", "passed");
+    }
+    completeImplementation(fixture.store, target!.id);
+    advanceImplementation(fixture.store, first!.id, 2);
+    advanceImplementation(fixture.store, second!.id, 2);
+    for (const source of [first!, second!]) {
+      settle(fixture.store, source.id, "code_review", "passed", `fan-in-review-${source.id}`);
+      settle(fixture.store, source.id, "automated_testing", "passed", `fan-in-test-${source.id}`);
+    }
+    const input = { unitId: target!.id, decision: "reuse" as const,
+      reason: "both upstream changes reviewed", actor: "local-human" };
+
+    const firstDecision = fixture.store.deliveryCoordination.resolveStale(input);
+    const replay = fixture.store.deliveryCoordination.resolveStale(input);
+
+    expect(replay).toEqual(firstDecision);
+    expect(firstDecision.sources).toHaveLength(2);
+    expect(firstDecision.sources.map((source) => source.sourceUnitId).sort())
+      .toEqual([first!.id, second!.id].sort());
+    expect(firstDecision.sources.every((source) => source.sourceCurrentEvidenceVersion === 2)).toBe(true);
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_stale_decision_sources
+      WHERE decision_id = ?`).get(firstDecision.id)).toEqual({ count: 2 });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_evidence_invalidations invalidation
+      WHERE target_unit_id = ? AND NOT EXISTS (SELECT 1 FROM delivery_stale_decision_sources source
+        WHERE source.invalidation_id = invalidation.id)`).get(target!.id)).toEqual({ count: 0 });
+    expect(() => fixture.database.prepare(`UPDATE delivery_stale_decision_sources
+      SET source_current_evidence_version = 99 WHERE decision_id = ?`).run(firstDecision.id))
+      .toThrow("DELIVERY_STALE_DECISION_SOURCE_IMMUTABLE");
+  });
+
+  it("prevents a target from recovering while any active invalidation fact remains uncovered", () => {
+    const fixture = staleFixture();
+
+    expect(() => fixture.database.prepare(`UPDATE delivery_units SET status = 'awaiting_gate'
+      WHERE id = ? AND status = 'potentially_stale'`).run(fixture.downstream.id))
+      .toThrow("DELIVERY_STALE_ACTIVE_FACTS_REMAIN");
+    expect(fixture.store.deliveryUnits.get(fixture.downstream.id)).toMatchObject({ status: "potentially_stale" });
+  });
+
+  it("preserves audited optional skip as a terminal path from potentially stale", () => {
+    const fixture = createFixture([[0, 1]], [true, false]);
+    const [source, optional] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, optional!.id);
+    advanceImplementation(fixture.store, source!.id, 2);
+
+    const skipped = fixture.store.deliveryCoordination.skipOptional({ unitId: optional!.id,
+      actor: "local-human", reason: "optional delivery no longer required" });
+
+    expect(skipped).toMatchObject({ deliveryUnitId: optional!.id, evidenceVersion: 1 });
+    expect(fixture.store.deliveryUnits.get(optional!.id)).toMatchObject({ status: "skipped" });
+  });
+
+  it("reruns once while resolving every active source fact", () => {
+    const fixture = createFixture([[0, 1]], [true, true]);
+    const [source, target] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, target!.id);
+    advanceImplementation(fixture.store, source!.id, 2);
+    advanceImplementation(fixture.store, source!.id, 3);
+    settle(fixture.store, source!.id, "code_review", "passed", "rerun-source-v3-review");
+    settle(fixture.store, source!.id, "automated_testing", "passed", "rerun-source-v3-test");
+
+    const decision = fixture.store.deliveryCoordination.resolveStale({ unitId: target!.id, decision: "rerun",
+      reason: "implementation must follow current upstream", actor: "local-human" });
+
+    expect(decision).toMatchObject({ decision: "rerun", resultingEvidenceVersion: 2 });
+    expect(decision.sources).toHaveLength(2);
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND evidence_version = 2 AND action = 'implement'`).get(target!.id)).toEqual({ count: 1 });
+  });
+
+  it("serializes aggregate stale-resolution replay on two connections", { timeout: 30_000 }, async () => {
+    const firstWorker = invalidationRaceWorker();
+    const secondWorker = invalidationRaceWorker();
+    for (let iteration = 0; iteration < 20; iteration += 1) {
+      const fixture = staleFixture();
+      const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
+      const operation = { kind: "stale_resolution", input: { unitId: fixture.downstream.id,
+        decision: "rerun", reason: `concurrent replay ${iteration}`, actor: "local-human" } };
+      const first = invalidationRaceRound(firstWorker, iteration, {
+        databasePath: fixture.databasePath, barrier, operation
+      });
+      await first.ready;
+      const second = invalidationRaceRound(secondWorker, iteration, {
+        databasePath: fixture.databasePath, barrier, operation
+      });
+      await second.ready;
+      Atomics.store(new Int32Array(barrier), 1, 1);
+      Atomics.notify(new Int32Array(barrier), 1, 2);
+      const results = await Promise.all([first.result, second.result]);
+
+      expect(results.every((result) => result.ok)).toBe(true);
+      expect(new Set(results.map((result) => result.value.id)).size).toBe(1);
+      expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_stale_decisions
+        WHERE delivery_unit_id = ?`).get(fixture.downstream.id)).toEqual({ count: 1 });
+      expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+        WHERE owner_id = ? AND evidence_version = 2 AND action = 'implement'`)
+        .get(fixture.downstream.id)).toEqual({ count: 1 });
+    }
+  });
+
+  it("persists contract evidence through an authoritative transaction and invalidates descendants", () => {
+    const fixture = createFixture([[0, 1]], [true, true]);
+    const [source, target] = fixture.units;
+    const completeContract = (fixture.store.deliveryCoordination as any).completeContractEvidence;
+    const first = completeContract({ unitId: source!.id, version: 1, contractHash: "contract-v1",
+      content: { endpoints: ["GET /v1/orders"] }, actor: "solution-design" });
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, target!.id);
+
+    const second = completeContract({ unitId: source!.id, version: 2, contractHash: "contract-v2",
+      content: { endpoints: ["GET /v2/orders"] }, actor: "solution-design" });
+
+    expect(first).toMatchObject({ version: 1, contractHash: "contract-v1" });
+    expect(second).toMatchObject({ version: 2, contractHash: "contract-v2" });
+    expect(fixture.store.deliveryUnits.get(target!.id)).toMatchObject({ status: "potentially_stale" });
+    expect(fixture.database.prepare(`SELECT source_kind, source_old_evidence_version, source_new_evidence_version
+      FROM delivery_evidence_invalidations WHERE target_unit_id = ?`).get(target!.id)).toEqual({
+      source_kind: "contract", source_old_evidence_version: 1, source_new_evidence_version: 2
+    });
+    expect(() => fixture.database.prepare(`UPDATE delivery_contract_evidence SET contract_hash = 'rewrite'`).run())
+      .toThrow("DELIVERY_CONTRACT_EVIDENCE_IMMUTABLE");
+  });
+
+  it("rolls contract evidence and descendant invalidation back in one transaction", () => {
+    const fixture = createFixture([[0, 1]], [true, true]);
+    const [source, target] = fixture.units;
+    const completeContract = (fixture.store.deliveryCoordination as any).completeContractEvidence;
+    completeContract({ unitId: source!.id, version: 1, contractHash: "contract-v1", content: {}, actor: "design" });
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    completeImplementation(fixture.store, target!.id);
+    fixture.database.exec(`CREATE TRIGGER fail_contract_invalidation BEFORE INSERT ON delivery_evidence_invalidations
+      BEGIN SELECT RAISE(ABORT, 'INJECTED_CONTRACT_INVALIDATION_FAILURE'); END;`);
+
+    expect(() => completeContract({ unitId: source!.id, version: 2, contractHash: "contract-v2",
+      content: {}, actor: "design" })).toThrow("INJECTED_CONTRACT_INVALIDATION_FAILURE");
+
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_contract_evidence
+      WHERE delivery_unit_id = ?`).get(source!.id)).toEqual({ count: 1 });
+    expect(fixture.store.deliveryUnits.get(target!.id)).not.toMatchObject({ status: "potentially_stale" });
+  });
+
+  it("uses sequential contract CAS with idempotent replay and conflict detection", () => {
+    const fixture = createFixture([], [true]);
+    const unit = fixture.units[0]!;
+    const input = { unitId: unit.id, version: 1, contractHash: "contract-v1",
+      content: { endpoints: ["GET /v1/orders"] }, actor: "solution-design" };
+
+    const first = fixture.store.deliveryCoordination.completeContractEvidence(input);
+    expect(fixture.store.deliveryCoordination.completeContractEvidence(input)).toEqual(first);
+    expect(() => fixture.store.deliveryCoordination.completeContractEvidence({ ...input, contractHash: "changed" }))
+      .toThrow("DELIVERY_CONTRACT_EVIDENCE_CONFLICT");
+    expect(() => fixture.store.deliveryCoordination.completeContractEvidence({ ...input, version: 3,
+      contractHash: "contract-v3" })).toThrow("DELIVERY_CONTRACT_EVIDENCE_SEQUENCE_INVALID");
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM delivery_contract_evidence
+      WHERE delivery_unit_id = ?`).get(unit.id)).toEqual({ count: 1 });
+  });
+
+  it("rejects coding evidence ids for a contract invalidation at the database boundary", () => {
+    const fixture = staleFixture();
+
+    expect(() => fixture.database.prepare(`INSERT INTO delivery_evidence_invalidations
+      (id, requirement_id, source_unit_id, source_kind,
+       source_old_evidence_id, source_old_evidence_version, source_old_evidence_hash,
+       source_new_evidence_id, source_new_evidence_version, source_new_evidence_hash,
+       target_unit_id, target_evidence_version, prior_phase, prior_status, earliest_invalid_phase,
+       cause, actor, created_at)
+      SELECT 'forged-contract', requirement_id, source_unit_id, 'contract',
+       source_old_evidence_id, source_old_evidence_version, source_old_evidence_hash,
+       source_new_evidence_id, source_new_evidence_version, source_new_evidence_hash,
+       target_unit_id, target_evidence_version, prior_phase, prior_status, earliest_invalid_phase,
+       cause, actor, created_at FROM delivery_evidence_invalidations LIMIT 1`).run())
+      .toThrow("DELIVERY_EVIDENCE_INVALIDATION_OWNER_MISMATCH");
+  });
+
+  it("restores missing quality jobs exactly once when reusing awaiting-gate evidence", () => {
+    const fixture = staleFixture();
+
+    (fixture.store.deliveryCoordination as any).resolveStale({ unitId: fixture.downstream.id,
+      decision: "reuse", reason: "quality work remains valid", actor: "local-human" });
+
+    expect(fixture.store.automationJobs.byDedupe(`review:${fixture.downstream.id}:v1`)).toMatchObject({ status: "pending" });
+    expect(fixture.store.automationJobs.byDedupe(`test:${fixture.downstream.id}:v1`)).toMatchObject({ status: "pending" });
+    expect((fixture.store as any).db.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND evidence_version = 1 AND status = 'pending'`).get(fixture.downstream.id))
+      .toEqual({ count: 2 });
+  });
+
+  it("never restores an ownerless running status and re-enqueues implementation when reusable", () => {
+    const fixture = createFixture([[0, 1]], [true, true]);
+    const [source, target] = fixture.units;
+    settle(fixture.store, source!.id, "code_review", "passed");
+    settle(fixture.store, source!.id, "automated_testing", "passed");
+    fixture.store.deliveryExecutions.claimImplementation(target!.id, "running-model");
+    advanceImplementation(fixture.store, source!.id, 2);
+    const now = new Date().toISOString();
+    const database = (fixture.store as any).db;
+    database.prepare(`UPDATE executions SET status = 'failed', error = 'interrupted', completed_at = ?
+      WHERE delivery_unit_id = ? AND evidence_version = 1`).run(now, target!.id);
+    database.prepare(`UPDATE stage_runs SET status = 'interrupted', error = 'interrupted', completed_at = ?
+      WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = 1`).run(now, target!.id);
+    settle(fixture.store, source!.id, "code_review", "passed", "running-source-review");
+    settle(fixture.store, source!.id, "automated_testing", "passed", "running-source-test");
+
+    (fixture.store.deliveryCoordination as any).resolveStale({ unitId: target!.id,
+      decision: "reuse", reason: "discard interrupted attempt", actor: "local-human" });
+
+    expect(fixture.store.deliveryUnits.get(target!.id)).toMatchObject({ phase: "implementation", status: "ready" });
+    expect(fixture.store.automationJobs.byDedupe(`implement:${target!.id}:v1`)).toMatchObject({ status: "pending" });
+  });
+
+  it("defers reusable actions while paused and uses the same recompute on resume", () => {
+    const fixture = staleFixture();
+    fixture.store.deliveryCoordination.pauseAutomation({ requirementId: fixture.requirement.id,
+      actor: "local-human", reason: "inspect stale evidence" });
+
+    fixture.store.deliveryCoordination.resolveStale({ unitId: fixture.downstream.id,
+      decision: "reuse", reason: "quality work remains valid", actor: "local-human" });
+
+    expect(fixture.store.deliveryUnits.get(fixture.downstream.id)).toMatchObject({
+      phase: "quality_verification", status: "awaiting_gate"
+    });
+    expect(fixture.store.automationJobs.byDedupe(`review:${fixture.downstream.id}:v1`)).toMatchObject({ status: "canceled" });
+    fixture.store.deliveryCoordination.resumeAutomation({ requirementId: fixture.requirement.id,
+      actor: "local-human", reason: "continue current actions" });
+    expect(fixture.store.automationJobs.byDedupe(`review:${fixture.downstream.id}:v1`)).toMatchObject({ status: "pending" });
+    expect(fixture.store.automationJobs.byDedupe(`test:${fixture.downstream.id}:v1`)).toMatchObject({ status: "pending" });
+  });
   it("invalidates every started transitive descendant in the implementation completion transaction", () => {
     const fixture = createFixture([[0, 1], [1, 2]], [true, true, true]);
     const [source, middle, leaf] = fixture.units;
@@ -245,7 +534,7 @@ describe("DeliveryCoordinator", () => {
 
     expect(replays.every((replay) => replay.id === first.id)).toBe(true);
     expect(units(fixture.store, fixture.requirement.id)[1]).toMatchObject({
-      phase: "implementation", status: "awaiting_gate", evidenceVersion: 1
+      phase: "quality_verification", status: "awaiting_gate", evidenceVersion: 1
     });
     expect(first).toMatchObject({ decision: "reuse", actor: "local-human", reason: "contract remains compatible",
       sourceOldEvidenceVersion: 1, sourceNewEvidenceVersion: 2, targetEvidenceVersion: 1 });

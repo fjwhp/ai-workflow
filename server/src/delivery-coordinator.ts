@@ -71,9 +71,29 @@ export interface DeliveryCoordinationPersistence {
   overrideQuality(input: DeliveryQualityOverrideInput): DeliveryQualityOverride;
   listQualityOverrides(unitId: string, evidenceVersion?: number): DeliveryQualityOverride[];
   resolveStale(input: DeliveryStaleResolutionInput): DeliveryStaleDecision;
+  completeContractEvidence(input: DeliveryContractEvidenceInput): DeliveryContractEvidence;
   pauseAutomation(input: RequirementAutomationInput): RequirementAutomationState;
   resumeAutomation(input: RequirementAutomationInput): RequirementAutomationState;
   skipOptional(input: DeliverySkipInput): DeliveryUnitSkip;
+}
+
+export interface DeliveryContractEvidenceInput {
+  unitId: string;
+  version: number;
+  contractHash: string;
+  content: unknown;
+  actor: string;
+}
+
+export interface DeliveryContractEvidence {
+  id: string;
+  requirementId: string;
+  deliveryUnitId: string;
+  version: number;
+  contractHash: string;
+  content: unknown;
+  actor: string;
+  createdAt: string;
 }
 
 export interface RequirementAutomationInput {
@@ -118,16 +138,35 @@ export interface DeliveryStaleDecision {
   actor: string;
   reason: string;
   createdAt: string;
+  sources: DeliveryStaleDecisionSource[];
+}
+
+export interface DeliveryStaleDecisionSource {
+  invalidationId: string;
+  sourceUnitId: string;
+  sourceKind: "implementation" | "contract";
+  sourceOldEvidenceId: string;
+  sourceOldEvidenceVersion: number;
+  sourceOldEvidenceHash: string;
+  sourceNewEvidenceId: string;
+  sourceNewEvidenceVersion: number;
+  sourceNewEvidenceHash: string;
+  sourceCurrentEvidenceId: string;
+  sourceCurrentEvidenceVersion: number;
+  sourceCurrentEvidenceHash: string;
 }
 
 interface InvalidationRow {
   id: string;
   requirement_id: string;
   source_unit_id: string;
+  source_kind: "implementation" | "contract";
   source_old_evidence_id: string;
   source_old_evidence_version: number;
+  source_old_evidence_hash: string;
   source_new_evidence_id: string;
   source_new_evidence_version: number;
+  source_new_evidence_hash: string;
   target_unit_id: string;
   target_evidence_version: number;
   prior_phase: string;
@@ -137,18 +176,31 @@ interface InvalidationRow {
 
 interface StaleDecisionRow {
   id: string;
-  invalidation_id: string;
   requirement_id: string;
   delivery_unit_id: string;
   target_evidence_version: number;
-  source_old_evidence_id: string;
-  source_old_evidence_version: number;
-  source_new_evidence_id: string;
-  source_new_evidence_version: number;
   decision: "reuse" | "rerun";
   resulting_evidence_version: number;
   actor: string;
   reason: string;
+  created_at: string;
+}
+
+interface StaleDecisionSourceRow extends InvalidationRow {
+  decision_id: string;
+  source_current_evidence_id: string;
+  source_current_evidence_version: number;
+  source_current_evidence_hash: string;
+}
+
+interface ContractEvidenceRow {
+  id: string;
+  requirement_id: string;
+  delivery_unit_id: string;
+  evidence_version: number;
+  contract_hash: string;
+  content_json: string;
+  actor: string;
   created_at: string;
 }
 
@@ -168,6 +220,53 @@ export class DeliveryCoordinator {
     return evidence;
   }
 
+  completeContractEvidenceInTransaction(input: DeliveryContractEvidenceInput): DeliveryContractEvidence {
+    const contentJson = validateContractEvidenceInput(input);
+    const actor = input.actor.trim();
+    const existing = this.contractEvidence(input.unitId, input.version);
+    if (existing) {
+      if (existing.contractHash !== input.contractHash.trim() || existing.actor !== actor
+        || JSON.stringify(existing.content) !== contentJson) {
+        throw new Error("DELIVERY_CONTRACT_EVIDENCE_CONFLICT");
+      }
+      return existing;
+    }
+    const unit = this.db.prepare(`SELECT id, requirement_id FROM delivery_units WHERE id = ?`).get(input.unitId) as {
+      id: string; requirement_id: string;
+    } | undefined;
+    if (!unit) throw new Error("DELIVERY_UNIT_NOT_FOUND");
+    const latest = this.db.prepare(`SELECT MAX(evidence_version) AS version FROM delivery_contract_evidence
+      WHERE delivery_unit_id = ?`).get(unit.id) as { version: number | null };
+    const expectedVersion = latest.version === null ? 1 : latest.version + 1;
+    if (input.version !== expectedVersion) throw new Error("DELIVERY_CONTRACT_EVIDENCE_SEQUENCE_INVALID");
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    this.db.prepare(`INSERT INTO delivery_contract_evidence
+      (id, requirement_id, delivery_unit_id, evidence_version, contract_hash, content_json, actor, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, unit.requirement_id, unit.id, input.version,
+      input.contractHash.trim(), contentJson, actor, now);
+    const persisted = this.contractEvidence(unit.id, input.version)!;
+    if (input.version > 1) {
+      const oldEvidence = this.db.prepare(`SELECT id, evidence_version, contract_hash
+        FROM delivery_contract_evidence WHERE delivery_unit_id = ? AND evidence_version = ?`)
+        .get(unit.id, input.version - 1) as { id: string; evidence_version: number; contract_hash: string } | undefined;
+      if (!oldEvidence) throw new Error("DELIVERY_CONTRACT_EVIDENCE_SEQUENCE_INVALID");
+      this.invalidateDescendantsInTransaction({
+        requirementId: unit.requirement_id,
+        sourceUnitId: unit.id,
+        sourceKind: "contract",
+        oldEvidenceId: oldEvidence.id,
+        oldEvidenceVersion: oldEvidence.evidence_version,
+        oldEvidenceHash: oldEvidence.contract_hash,
+        newEvidenceId: persisted.id,
+        newEvidenceVersion: persisted.version,
+        newEvidenceHash: persisted.contractHash,
+        actor
+      });
+    }
+    return persisted;
+  }
+
   recordImplementationEvidenceInTransaction(unitId: string, evidenceVersion: number, actor = "automation") {
     if (evidenceVersion <= 1) return;
     const evidence = this.db.prepare(`SELECT id, requirement_id, delivery_unit_id, evidence_version, diff_hash
@@ -180,10 +279,36 @@ export class DeliveryCoordinator {
       throw new Error("DELIVERY_IMPLEMENTATION_EVIDENCE_CHAIN_INVALID");
     }
     const [oldEvidence, newEvidence] = evidence;
-    const descendants = this.descendantsFailClosed(unitId, newEvidence!.requirement_id);
+    this.invalidateDescendantsInTransaction({
+      requirementId: newEvidence!.requirement_id,
+      sourceUnitId: unitId,
+      sourceKind: "implementation",
+      oldEvidenceId: oldEvidence!.id,
+      oldEvidenceVersion: oldEvidence!.evidence_version,
+      oldEvidenceHash: oldEvidence!.diff_hash,
+      newEvidenceId: newEvidence!.id,
+      newEvidenceVersion: newEvidence!.evidence_version,
+      newEvidenceHash: newEvidence!.diff_hash,
+      actor
+    });
+  }
+
+  private invalidateDescendantsInTransaction(change: {
+    requirementId: string;
+    sourceUnitId: string;
+    sourceKind: "implementation" | "contract";
+    oldEvidenceId: string;
+    oldEvidenceVersion: number;
+    oldEvidenceHash: string;
+    newEvidenceId: string;
+    newEvidenceVersion: number;
+    newEvidenceHash: string;
+    actor: string;
+  }) {
+    const descendants = this.descendantsFailClosed(change.sourceUnitId, change.requirementId);
     if (descendants.length === 0) return;
     const now = new Date().toISOString();
-    const affectedIds = [unitId, ...descendants.map((row) => row.id)];
+    const affectedIds = [change.sourceUnitId, ...descendants.map((row) => row.id)];
     const placeholders = affectedIds.map(() => "?").join(", ");
     this.db.prepare(`UPDATE delivery_dependencies SET released_by_evidence_version = NULL, released_at = NULL
       WHERE upstream_unit_id IN (${placeholders})`).run(...affectedIds);
@@ -201,25 +326,28 @@ export class DeliveryCoordinator {
             AND status IN ('waiting_dependency', 'ready')`).run(now, target.id, target.evidence_version);
         continue;
       }
-      const active = this.activeInvalidation(target.id, target.evidence_version);
-      if (!active) {
-        this.db.prepare(`INSERT INTO delivery_evidence_invalidations
-          (id, requirement_id, source_unit_id, source_kind,
-           source_old_evidence_id, source_old_evidence_version, source_old_evidence_hash,
-           source_new_evidence_id, source_new_evidence_version, source_new_evidence_hash,
-           target_unit_id, target_evidence_version, prior_phase, prior_status, earliest_invalid_phase,
-           cause, actor, created_at)
-          VALUES (?, ?, ?, 'implementation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'implementation', ?, ?, ?)`)
-          .run(randomUUID(), newEvidence!.requirement_id, unitId,
-            oldEvidence!.id, oldEvidence!.evidence_version, oldEvidence!.diff_hash,
-            newEvidence!.id, newEvidence!.evidence_version, newEvidence!.diff_hash,
-            target.id, target.evidence_version, target.phase, target.status,
-            `Upstream implementation evidence changed from v${oldEvidence!.evidence_version} to v${newEvidence!.evidence_version}`,
-            actor, now);
-      }
+      const prior = this.activeInvalidations(target.id, target.evidence_version)[0];
+      const priorPhase = prior?.prior_phase ?? target.phase;
+      const priorStatus = prior?.prior_status ?? target.status;
+      this.db.prepare(`INSERT INTO delivery_evidence_invalidations
+        (id, requirement_id, source_unit_id, source_kind,
+         source_old_evidence_id, source_old_evidence_version, source_old_evidence_hash,
+         source_new_evidence_id, source_new_evidence_version, source_new_evidence_hash,
+         target_unit_id, target_evidence_version, prior_phase, prior_status, earliest_invalid_phase,
+         cause, actor, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'implementation', ?, ?, ?)
+        ON CONFLICT(source_kind, source_unit_id, source_new_evidence_id,
+          source_new_evidence_version, target_unit_id, target_evidence_version) DO NOTHING`)
+        .run(randomUUID(), change.requirementId, change.sourceUnitId, change.sourceKind,
+          change.oldEvidenceId, change.oldEvidenceVersion, change.oldEvidenceHash,
+          change.newEvidenceId, change.newEvidenceVersion, change.newEvidenceHash,
+          target.id, target.evidence_version, priorPhase, priorStatus,
+          `Upstream ${change.sourceKind} evidence changed from v${change.oldEvidenceVersion} to v${change.newEvidenceVersion}`,
+          change.actor, now);
       const updated = this.db.prepare(`UPDATE delivery_units SET status = 'potentially_stale', updated_at = ?
-        WHERE id = ? AND evidence_version = ? AND status = ?`).run(now, target.id, target.evidence_version, target.status);
-      if (updated.changes !== 1 && target.status !== "potentially_stale") {
+        WHERE id = ? AND evidence_version = ? AND status IN (?, 'potentially_stale')`)
+        .run(now, target.id, target.evidence_version, target.status);
+      if (updated.changes !== 1) {
         throw new Error("DELIVERY_EVIDENCE_INVALIDATION_STALE");
       }
     }
@@ -229,8 +357,8 @@ export class DeliveryCoordinator {
     validateStaleResolutionInput(input);
     const actor = input.actor.trim();
     const reason = input.reason.trim();
-    const active = this.activeInvalidation(input.unitId);
-    if (!active) {
+    const active = this.activeInvalidations(input.unitId);
+    if (active.length === 0) {
       const existing = this.latestStaleDecision(input.unitId);
       if (!existing) throw new Error("DELIVERY_STALE_RESOLUTION_NOT_ACTIVE");
       if (existing.decision !== input.decision || existing.actor !== actor || existing.reason !== reason) {
@@ -242,17 +370,13 @@ export class DeliveryCoordinator {
       FROM delivery_units WHERE id = ?`).get(input.unitId) as {
         id: string; requirement_id: string; phase: string; status: string; evidence_version: number;
       } | undefined;
-    if (!unit || unit.status !== "potentially_stale" || unit.evidence_version !== active.target_evidence_version) {
+    const targetVersion = active[0]!.target_evidence_version;
+    if (!unit || unit.status !== "potentially_stale" || unit.evidence_version !== targetVersion
+      || active.some((fact) => fact.requirement_id !== unit.requirement_id
+        || fact.target_evidence_version !== targetVersion)) {
       throw new Error("DELIVERY_STALE_RESOLUTION_STALE");
     }
-    const sourceCurrent = this.db.prepare(`SELECT du.evidence_version, ce.id
-      FROM delivery_units du JOIN coding_evidence ce
-        ON ce.delivery_unit_id = du.id AND ce.evidence_version = du.evidence_version
-      WHERE du.id = ?`).get(active.source_unit_id) as { evidence_version: number; id: string } | undefined;
-    if (!sourceCurrent || sourceCurrent.evidence_version !== active.source_new_evidence_version
-      || sourceCurrent.id !== active.source_new_evidence_id) {
-      throw new Error("DELIVERY_STALE_SOURCE_CHANGED");
-    }
+    const sourceSnapshots = active.map((fact) => ({ fact, current: this.currentSourceEvidence(fact) }));
     const liveJob = this.db.prepare(`SELECT 1 FROM automation_jobs WHERE owner_type = 'delivery_unit'
       AND owner_id = ? AND evidence_version = ? AND status IN ('pending', 'leased') LIMIT 1`)
       .get(unit.id, unit.evidence_version);
@@ -270,22 +394,24 @@ export class DeliveryCoordinator {
     const now = new Date().toISOString();
     const decisionId = randomUUID();
     this.db.prepare(`INSERT INTO delivery_stale_decisions
-      (id, invalidation_id, requirement_id, delivery_unit_id, target_evidence_version,
-       source_old_evidence_id, source_old_evidence_version, source_new_evidence_id, source_new_evidence_version,
+      (id, requirement_id, delivery_unit_id, target_evidence_version,
        decision, resulting_evidence_version, actor, reason, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(decisionId, active.id, active.requirement_id, unit.id, active.target_evidence_version,
-        active.source_old_evidence_id, active.source_old_evidence_version,
-        active.source_new_evidence_id, active.source_new_evidence_version,
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(decisionId, unit.requirement_id, unit.id, targetVersion,
         input.decision, resultingVersion, actor, reason, now);
+    const insertSource = this.db.prepare(`INSERT INTO delivery_stale_decision_sources
+      (decision_id, invalidation_id, source_current_evidence_id,
+       source_current_evidence_version, source_current_evidence_hash, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)`);
+    for (const { fact, current } of sourceSnapshots) {
+      insertSource.run(decisionId, fact.id, current.id, current.version, current.hash, now);
+    }
     if (input.decision === "reuse") {
       const restored = this.db.prepare(`UPDATE delivery_units SET phase = ?, status = ?, updated_at = ?
         WHERE id = ? AND evidence_version = ? AND status = 'potentially_stale'`)
-        .run(active.prior_phase, active.prior_status, now, unit.id, unit.evidence_version);
+        .run(active[0]!.prior_phase, active[0]!.prior_status, now, unit.id, unit.evidence_version);
       if (restored.changes !== 1) throw new Error("DELIVERY_STALE_RESOLUTION_STALE");
-      if (active.prior_status === "ready_for_acceptance") {
-        this.releaseOutgoingInTransaction(unit.id, unit.evidence_version, now);
-      }
+      this.recomputeUnitInTransaction(unit.id, now, !this.requirementPaused(unit.requirement_id));
     } else {
       this.db.prepare(`UPDATE automation_jobs SET status = 'canceled', updated_at = ?
         WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ? AND status = 'pending'`)
@@ -303,7 +429,7 @@ export class DeliveryCoordinator {
           evidenceVersion: resultingVersion, action: "implement", payload: {}, maxAttempts: 3 });
       }
     }
-    return this.latestStaleDecision(input.unitId)!;
+    return this.getStaleDecision(decisionId)!;
   }
 
   pauseAutomationInTransaction(input: RequirementAutomationInput): RequirementAutomationState {
@@ -501,21 +627,79 @@ export class DeliveryCoordinator {
     return [...unique.values()];
   }
 
-  private activeInvalidation(unitId: string, evidenceVersion?: number) {
+  private activeInvalidations(unitId: string, evidenceVersion?: number) {
     const versionFilter = evidenceVersion === undefined ? "" : "AND invalidation.target_evidence_version = ?";
     const parameters = evidenceVersion === undefined ? [unitId] : [unitId, evidenceVersion];
     return this.db.prepare(`SELECT invalidation.* FROM delivery_evidence_invalidations invalidation
       WHERE invalidation.target_unit_id = ? ${versionFilter}
-        AND NOT EXISTS (SELECT 1 FROM delivery_stale_decisions decision
-          WHERE decision.invalidation_id = invalidation.id)
-      ORDER BY invalidation.created_at DESC, invalidation.rowid DESC LIMIT 1`)
-      .get(...parameters) as unknown as InvalidationRow | undefined;
+        AND NOT EXISTS (SELECT 1 FROM delivery_stale_decision_sources source
+          WHERE source.invalidation_id = invalidation.id)
+      ORDER BY invalidation.created_at, invalidation.rowid`)
+      .all(...parameters) as unknown as InvalidationRow[];
   }
 
   private latestStaleDecision(unitId: string) {
     const row = this.db.prepare(`SELECT * FROM delivery_stale_decisions
       WHERE delivery_unit_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(unitId) as StaleDecisionRow | undefined;
-    return row ? mapStaleDecision(row) : null;
+    return row ? this.getStaleDecision(row.id) : null;
+  }
+
+  private getStaleDecision(decisionId: string) {
+    const row = this.db.prepare(`SELECT * FROM delivery_stale_decisions WHERE id = ?`)
+      .get(decisionId) as StaleDecisionRow | undefined;
+    if (!row) return null;
+    const sources = this.db.prepare(`SELECT invalidation.*, source.decision_id,
+        source.source_current_evidence_id, source.source_current_evidence_version,
+        source.source_current_evidence_hash
+      FROM delivery_stale_decision_sources source
+      JOIN delivery_evidence_invalidations invalidation ON invalidation.id = source.invalidation_id
+      WHERE source.decision_id = ? ORDER BY invalidation.created_at, invalidation.rowid`)
+      .all(decisionId) as unknown as StaleDecisionSourceRow[];
+    if (sources.length === 0) throw new Error("DELIVERY_STALE_DECISION_SOURCE_REQUIRED");
+    return mapStaleDecision(row, sources);
+  }
+
+  private currentSourceEvidence(fact: InvalidationRow) {
+    if (fact.source_kind === "implementation") {
+      const row = this.db.prepare(`SELECT current.id, current.evidence_version AS version, current.diff_hash AS hash
+        FROM delivery_units unit
+        JOIN coding_evidence old_evidence ON old_evidence.id = ?
+          AND old_evidence.delivery_unit_id = unit.id
+          AND old_evidence.requirement_id = unit.requirement_id
+          AND old_evidence.evidence_version = ? AND old_evidence.diff_hash = ?
+        JOIN coding_evidence new_evidence ON new_evidence.id = ?
+          AND new_evidence.delivery_unit_id = unit.id
+          AND new_evidence.requirement_id = unit.requirement_id
+          AND new_evidence.evidence_version = ? AND new_evidence.diff_hash = ?
+        JOIN coding_evidence current ON current.delivery_unit_id = unit.id
+          AND current.requirement_id = unit.requirement_id AND current.evidence_version = unit.evidence_version
+        WHERE unit.id = ? AND unit.requirement_id = ? AND current.evidence_version >= new_evidence.evidence_version`)
+        .get(fact.source_old_evidence_id, fact.source_old_evidence_version, fact.source_old_evidence_hash,
+          fact.source_new_evidence_id, fact.source_new_evidence_version, fact.source_new_evidence_hash,
+          fact.source_unit_id, fact.requirement_id) as { id: string; version: number; hash: string } | undefined;
+      if (!row) throw new Error("DELIVERY_STALE_SOURCE_CHANGED");
+      return row;
+    }
+    const row = this.db.prepare(`SELECT current.id, current.evidence_version AS version,
+        current.contract_hash AS hash
+      FROM delivery_contract_evidence old_evidence
+      JOIN delivery_contract_evidence new_evidence ON new_evidence.id = ?
+        AND new_evidence.delivery_unit_id = old_evidence.delivery_unit_id
+        AND new_evidence.requirement_id = old_evidence.requirement_id
+        AND new_evidence.evidence_version = ? AND new_evidence.contract_hash = ?
+      JOIN delivery_contract_evidence current ON current.delivery_unit_id = old_evidence.delivery_unit_id
+        AND current.evidence_version = (SELECT MAX(latest.evidence_version)
+          FROM delivery_contract_evidence latest WHERE latest.delivery_unit_id = old_evidence.delivery_unit_id)
+      WHERE old_evidence.id = ? AND old_evidence.delivery_unit_id = ?
+        AND old_evidence.requirement_id = ? AND old_evidence.evidence_version = ?
+        AND old_evidence.contract_hash = ? AND current.evidence_version >= new_evidence.evidence_version`)
+      .get(fact.source_new_evidence_id, fact.source_new_evidence_version, fact.source_new_evidence_hash,
+        fact.source_old_evidence_id, fact.source_unit_id, fact.requirement_id,
+        fact.source_old_evidence_version, fact.source_old_evidence_hash) as {
+          id: string; version: number; hash: string;
+        } | undefined;
+    if (!row) throw new Error("DELIVERY_STALE_SOURCE_CHANGED");
+    return row;
   }
 
   private dependenciesSatisfied(unitId: string) {
@@ -556,45 +740,57 @@ export class DeliveryCoordinator {
       evidenceVersion: row.evidence_version, actor: row.actor, reason: row.reason, createdAt: row.created_at } : null;
   }
 
+  private contractEvidence(unitId: string, version: number): DeliveryContractEvidence | null {
+    const row = this.db.prepare(`SELECT * FROM delivery_contract_evidence
+      WHERE delivery_unit_id = ? AND evidence_version = ?`).get(unitId, version) as ContractEvidenceRow | undefined;
+    return row ? mapContractEvidence(row) : null;
+  }
+
   private recomputeRequirementInTransaction(requirementId: string, now: string) {
+    const candidates = this.db.prepare(`SELECT id FROM delivery_units
+      WHERE requirement_id = ? AND status NOT IN ('potentially_stale', 'skipped', 'applying', 'applied')
+      ORDER BY position, created_at, rowid`).all(requirementId) as Array<{ id: string }>;
+    for (const unit of candidates) this.recomputeUnitInTransaction(unit.id, now, true);
+  }
+
+  private recomputeUnitInTransaction(unitId: string, now: string, enqueue: boolean) {
+    const unit = this.db.prepare(`SELECT id, requirement_id, evidence_version FROM delivery_units WHERE id = ?`)
+      .get(unitId) as { id: string; requirement_id: string; evidence_version: number } | undefined;
+    if (!unit) throw new Error("DELIVERY_UNIT_NOT_FOUND");
+    const codingEvidence = this.db.prepare(`SELECT 1 FROM coding_evidence
+      WHERE delivery_unit_id = ? AND evidence_version = ?`).get(unit.id, unit.evidence_version);
     const jobs = new AutomationJobRepository(this.db, () => new Date(now));
-    const qualityCandidates = this.db.prepare(`SELECT id, evidence_version, status FROM delivery_units
-      WHERE requirement_id = ? AND status IN ('awaiting_gate', 'returned', 'failed', 'ready_for_acceptance')
-      ORDER BY position, created_at, rowid`).all(requirementId) as Array<{
-        id: string; evidence_version: number; status: string;
-      }>;
-    for (const unit of qualityCandidates) {
-      if (unit.status === "ready_for_acceptance") {
-        this.releaseOutgoingInTransaction(unit.id, unit.evidence_version, now);
-      } else {
-        this.settleUnitInTransaction(unit.id, unit.evidence_version);
-      }
-      const current = this.db.prepare("SELECT status FROM delivery_units WHERE id = ?").get(unit.id) as { status: string };
-      if (current.status === "ready_for_acceptance") continue;
-      for (const [kind, action] of [["code_review", "review"], ["automated_testing", "test"]] as const) {
-        const alreadySettled = this.db.prepare(`SELECT 1 FROM delivery_quality_evidence
-          WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ?`).get(unit.id, unit.evidence_version, kind);
-        const running = this.db.prepare(`SELECT 1 FROM delivery_quality_runs
-          WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ? AND status = 'running'`)
-          .get(unit.id, unit.evidence_version, kind);
-        if (!alreadySettled && !running) jobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id,
-          evidenceVersion: unit.evidence_version, action, payload: {}, maxAttempts: 3 });
-      }
-    }
-    const implementation = this.db.prepare(`SELECT id, evidence_version FROM delivery_units
-      WHERE requirement_id = ? AND phase = 'implementation'
-        AND status IN ('waiting_dependency', 'ready')
-        AND NOT EXISTS (SELECT 1 FROM coding_evidence evidence
-          WHERE evidence.delivery_unit_id = delivery_units.id
-            AND evidence.evidence_version = delivery_units.evidence_version)
-      ORDER BY position, created_at, rowid`).all(requirementId) as Array<{ id: string; evidence_version: number }>;
-    for (const unit of implementation) {
+    if (!codingEvidence) {
+      const activeOwner = this.db.prepare(`SELECT 1 WHERE EXISTS (
+          SELECT 1 FROM executions WHERE delivery_unit_id = ? AND evidence_version = ? AND status = 'running'
+        ) OR EXISTS (
+          SELECT 1 FROM stage_runs WHERE owner_type = 'delivery_unit' AND owner_id = ?
+            AND evidence_version = ? AND status = 'running'
+        ) OR EXISTS (
+          SELECT 1 FROM automation_jobs WHERE owner_type = 'delivery_unit' AND owner_id = ?
+            AND evidence_version = ? AND status = 'leased'
+        )`).get(unit.id, unit.evidence_version, unit.id, unit.evidence_version, unit.id, unit.evidence_version);
       const ready = this.dependenciesSatisfied(unit.id);
-      this.db.prepare(`UPDATE delivery_units SET status = ?, updated_at = ? WHERE id = ? AND evidence_version = ?
-        AND status IN ('waiting_dependency', 'ready')`).run(ready ? "ready" : "waiting_dependency", now,
-        unit.id, unit.evidence_version);
-      if (ready) jobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id,
+      const status = activeOwner ? "running" : ready ? "ready" : "waiting_dependency";
+      this.db.prepare(`UPDATE delivery_units SET phase = 'implementation', status = ?, updated_at = ?
+        WHERE id = ? AND evidence_version = ?`).run(status, now, unit.id, unit.evidence_version);
+      if (!activeOwner && ready && enqueue) jobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id,
         evidenceVersion: unit.evidence_version, action: "implement", payload: {}, maxAttempts: 3 });
+      return;
+    }
+    this.db.prepare(`UPDATE delivery_units SET phase = 'quality_verification', status = 'awaiting_gate', updated_at = ?
+      WHERE id = ? AND evidence_version = ?`).run(now, unit.id, unit.evidence_version);
+    this.settleUnitInTransaction(unit.id, unit.evidence_version);
+    const current = this.db.prepare(`SELECT status FROM delivery_units WHERE id = ?`).get(unit.id) as { status: string };
+    if (!enqueue || current.status === "ready_for_acceptance") return;
+    for (const [kind, action] of [["code_review", "review"], ["automated_testing", "test"]] as const) {
+      const settled = this.db.prepare(`SELECT 1 FROM delivery_quality_evidence
+        WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ?`).get(unit.id, unit.evidence_version, kind);
+      const running = this.db.prepare(`SELECT 1 FROM delivery_quality_runs
+        WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ? AND status = 'running'`)
+        .get(unit.id, unit.evidence_version, kind);
+      if (!settled && !running) jobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id,
+        evidenceVersion: unit.evidence_version, action, payload: {}, maxAttempts: 3 });
     }
   }
 
@@ -726,6 +922,22 @@ function validateStaleResolutionInput(input: DeliveryStaleResolutionInput) {
   }
 }
 
+function validateContractEvidenceInput(input: DeliveryContractEvidenceInput) {
+  const validText = (value: unknown, max: number) => typeof value === "string"
+    && value.trim().length > 0 && value.length <= max && !value.includes("\0");
+  if (!input || typeof input !== "object" || !validText(input.unitId, 256)
+    || !Number.isSafeInteger(input.version) || input.version < 1 || input.version > MAX_AUTOMATION_EVIDENCE_VERSION
+    || !validText(input.contractHash, 256) || !validText(input.actor, 256)) {
+    throw new Error("DELIVERY_CONTRACT_EVIDENCE_INVALID");
+  }
+  let contentJson: string;
+  try { contentJson = JSON.stringify(input.content); } catch { throw new Error("DELIVERY_CONTRACT_EVIDENCE_INVALID"); }
+  if (contentJson === undefined || Buffer.byteLength(contentJson, "utf8") > 1_048_576) {
+    throw new Error("DELIVERY_CONTRACT_EVIDENCE_INVALID");
+  }
+  return contentJson;
+}
+
 function validateAutomationInput(input: RequirementAutomationInput) {
   const validText = (value: unknown, max: number) => typeof value === "string"
     && value.trim().length > 0 && value.length <= max && !value.includes("\0");
@@ -744,16 +956,46 @@ function validateSkipInput(input: DeliverySkipInput) {
   }
 }
 
-function mapStaleDecision(row: StaleDecisionRow): DeliveryStaleDecision {
+function mapStaleDecision(row: StaleDecisionRow, sourceRows: StaleDecisionSourceRow[]): DeliveryStaleDecision {
+  const sources = sourceRows.map((source) => ({
+    invalidationId: source.id,
+    sourceUnitId: source.source_unit_id,
+    sourceKind: source.source_kind,
+    sourceOldEvidenceId: source.source_old_evidence_id,
+    sourceOldEvidenceVersion: source.source_old_evidence_version,
+    sourceOldEvidenceHash: source.source_old_evidence_hash,
+    sourceNewEvidenceId: source.source_new_evidence_id,
+    sourceNewEvidenceVersion: source.source_new_evidence_version,
+    sourceNewEvidenceHash: source.source_new_evidence_hash,
+    sourceCurrentEvidenceId: source.source_current_evidence_id,
+    sourceCurrentEvidenceVersion: source.source_current_evidence_version,
+    sourceCurrentEvidenceHash: source.source_current_evidence_hash
+  }));
+  const first = sources[0]!;
   return {
-    id: row.id, invalidationId: row.invalidation_id, requirementId: row.requirement_id,
+    id: row.id, invalidationId: first.invalidationId, requirementId: row.requirement_id,
     deliveryUnitId: row.delivery_unit_id, targetEvidenceVersion: row.target_evidence_version,
-    sourceOldEvidenceId: row.source_old_evidence_id,
-    sourceOldEvidenceVersion: row.source_old_evidence_version,
-    sourceNewEvidenceId: row.source_new_evidence_id,
-    sourceNewEvidenceVersion: row.source_new_evidence_version,
+    sourceOldEvidenceId: first.sourceOldEvidenceId,
+    sourceOldEvidenceVersion: first.sourceOldEvidenceVersion,
+    sourceNewEvidenceId: first.sourceNewEvidenceId,
+    sourceNewEvidenceVersion: first.sourceNewEvidenceVersion,
     decision: row.decision, resultingEvidenceVersion: row.resulting_evidence_version,
-    actor: row.actor, reason: row.reason, createdAt: row.created_at
+    actor: row.actor, reason: row.reason, createdAt: row.created_at, sources
+  };
+}
+
+function mapContractEvidence(row: ContractEvidenceRow): DeliveryContractEvidence {
+  let content: unknown;
+  try { content = JSON.parse(row.content_json); } catch { throw new Error("DELIVERY_CONTRACT_EVIDENCE_INVALID"); }
+  return {
+    id: row.id,
+    requirementId: row.requirement_id,
+    deliveryUnitId: row.delivery_unit_id,
+    version: row.evidence_version,
+    contractHash: row.contract_hash,
+    content,
+    actor: row.actor,
+    createdAt: row.created_at
   };
 }
 
