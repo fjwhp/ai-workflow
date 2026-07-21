@@ -944,4 +944,15 @@ describe("AutomationJobRepository", () => {
     expect(() => fixture.first.recoverExpired(new Date(Number.NaN))).toThrow("AUTOMATION_JOB_DATE_INVALID");
     expect(fixture.first.get(queued.id)?.status).toBe("leased");
   });
+
+  it("accepts repeated completion only for the exact claim token already committed", () => {
+    const fixture = createFixture();
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    const leased = fixture.first.leaseNext("worker-a", now, 30_000)!;
+
+    expect(fixture.first.complete(queued.id, "worker-a", leased.claimToken)).toBe(true);
+    expect(fixture.first.complete(queued.id, "worker-a", leased.claimToken)).toBe(true);
+    expect(fixture.first.complete(queued.id, "worker-b", leased.claimToken)).toBe(false);
+    expect(fixture.first.complete(queued.id, "worker-a", `${leased.claimToken}-stale`)).toBe(false);
+  });
 });

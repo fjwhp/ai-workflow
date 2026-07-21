@@ -114,6 +114,7 @@ export async function startServer(options: StartupOptions = {}) {
 
   try {
     await (options.writeVersionMarker ?? writeDatabaseVersionMarker)(databasePath, currentSchemaVersion);
+    await store.reconcileImplementationPublications();
     store.interruptActiveStageRuns();
     store.interruptActiveProjectKnowledge();
     store.recoverInterruptedRequirements();

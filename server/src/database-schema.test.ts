@@ -605,4 +605,28 @@ describe("Phase 2 database schema", () => {
       .not.toContain("DROP TRIGGER IF EXISTS validate_delivery_quality_override_insert");
     database.close();
   });
+
+  it("binds each implementation publication journal to one exact lease, attempt, and bounded patch", () => {
+    const database = openFreshStoreDatabase();
+    expect(tableNames(database)).toContain("implementation_publication_journals");
+    expect(columns(database, "implementation_publication_journals")).toEqual([
+      "id", "job_id", "claim_token", "worker_id", "delivery_unit_id", "evidence_version",
+      "execution_id", "run_id", "attempt_path", "attempt_dev", "attempt_ino", "attempt_uid",
+      "attempt_nonce", "repo_path", "authoritative_worktree_path", "base_commit",
+      "baseline_diff_hash", "patch_blob", "patch_sha256", "patch_bytes", "published_diff_hash",
+      "status", "cleanup_status", "last_error", "created_at", "updated_at", "committed_at",
+      "cleanup_completed_at"
+    ]);
+    const sql = tableSql(database, "implementation_publication_journals");
+    expect(sql).toContain("length(patch_blob) = patch_bytes");
+    expect(sql).toContain("patch_bytes BETWEEN 0 AND 8388608");
+    expect(sql).toContain("status IN ('prepared', 'committed', 'canceled', 'manual')");
+    expect(sql).toContain("cleanup_status IN ('pending', 'completed', 'failed')");
+    expect(indexSql(database, "idx_implementation_publication_claim")).toContain("job_id, claim_token");
+    expect(indexSql(database, "idx_implementation_publication_unit_version"))
+      .toContain("delivery_unit_id, evidence_version");
+    expect(indexSql(database, "idx_implementation_publication_unit_version"))
+      .toContain("WHERE status IN ('prepared', 'committed', 'manual')");
+    database.close();
+  });
 });

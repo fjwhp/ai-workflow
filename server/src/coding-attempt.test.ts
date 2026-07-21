@@ -73,6 +73,33 @@ describe("delivery implementation attempt workspace", () => {
     await attempt.cleanup();
   });
 
+  it("prepares a journal-bound patch without mutating the authoritative worktree", async () => {
+    const { attempt, repo } = await createAttemptFixture();
+    await writeFile(join(attempt.workspace.worktreePath, "journaled.txt"), "prepared\n");
+    const snapshot = await getWorktreeSnapshot(attempt.workspace.worktreePath);
+    const result: CodingAgentResult = {
+      runId: "journal-run", ...attempt.workspace, summary: "prepared", commands: [],
+      diff: snapshot.diff, files: snapshot.files, additions: snapshot.additions,
+      deletions: snapshot.deletions, evidenceSnapshot: snapshot
+    };
+
+    const prepared = await attempt.preparePublication!(result);
+
+    expect(prepared.input).toMatchObject({
+      repoPath: repo,
+      attemptPath: attempt.workspace.worktreePath,
+      attemptDev: expect.any(Number),
+      attemptIno: expect.any(Number),
+      attemptUid: expect.any(Number),
+      attemptNonce: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      patch: expect.any(Buffer)
+    });
+    expect(prepared.result.worktreePath).not.toBe(attempt.workspace.worktreePath);
+    expect(prepared.result.evidenceSnapshot.identity.worktreePath).toBe(prepared.result.worktreePath);
+    expect(existsSync(join(prepared.result.worktreePath, "journaled.txt"))).toBe(false);
+    await attempt.cleanup();
+  });
+
   it("fails closed without deleting a replacement at the attempt path", async () => {
     const { attempt } = await createAttemptFixture();
     const original = `${attempt.workspace.worktreePath}.original`;

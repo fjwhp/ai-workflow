@@ -5,7 +5,10 @@ import {
   type CodingAgentInput,
   type CodingAgentResult
 } from "./coding-agent.js";
-import type { DeliveryExecutionPersistence } from "./delivery-execution-repository.js";
+import type {
+  DeliveryExecutionPersistence,
+  DeliveryImplementationPublicationInput
+} from "./delivery-execution-repository.js";
 import {
   codeReviewDecision,
   runCodeReview,
@@ -41,7 +44,11 @@ export interface DeliveryQualityDependencies {
 
 export interface DeliveryImplementationAttempt {
   workspace: NonNullable<CodingAgentInput["attemptWorkspace"]>;
-  publish(result: CodingAgentResult, signal?: AbortSignal): Promise<CodingAgentResult>;
+  publish?(result: CodingAgentResult, signal?: AbortSignal): Promise<CodingAgentResult>;
+  preparePublication?(result: CodingAgentResult, signal?: AbortSignal): Promise<{
+    result: CodingAgentResult;
+    input: DeliveryImplementationPublicationInput;
+  }>;
   rollback?(): Promise<void>;
   cleanup(): Promise<void>;
 }
@@ -84,6 +91,10 @@ export class DeliveryExecutionService {
       throw new Error("AUTOMATION_INPUT_INVALID");
     }
     throwIfImplementationSignalAborted(signal);
+    if (hasAutomationInput) {
+      const completed = this.persistence.getCompletedImplementation(unitId, evidenceVersion!, claimToken!);
+      if (completed) return completed;
+    }
     const claim = this.persistence.claimImplementation(unitId, this.model, hasAutomationInput
       ? { evidenceVersion: evidenceVersion!, claimToken: claimToken! }
       : undefined);
@@ -96,6 +107,7 @@ export class DeliveryExecutionService {
     };
     let attempt: DeliveryImplementationAttempt | undefined;
     let published = false;
+    let journalPrepared = false;
     let result: CodingAgentResult;
     let snapshot: WorktreeSnapshot;
     try {
@@ -107,7 +119,14 @@ export class DeliveryExecutionService {
         ...(attempt ? { attemptWorkspace: attempt.workspace } : {})
       }, signal);
       throwIfImplementationSignalAborted(signal);
-      if (attempt) {
+      if (claim.automationLease && attempt?.preparePublication) {
+        const prepared = await attempt.preparePublication(result, signal);
+        result = prepared.result;
+        if (!result.evidenceSnapshot) throw new Error("IMPLEMENTATION_EVIDENCE_REQUIRED");
+        validateImplementationIdentity(claim, result, result.evidenceSnapshot);
+        this.persistence.prepareImplementationPublication(claim, prepared.input);
+        journalPrepared = true;
+      } else if (attempt?.publish) {
         this.persistence.assertImplementationLease(claim);
         result = await attempt.publish(result, signal);
         published = true;
@@ -119,6 +138,7 @@ export class DeliveryExecutionService {
       throwIfImplementationSignalAborted(signal);
     } catch (error) {
       let failure: unknown = error;
+      if (journalPrepared) throw error;
       try {
         this.persistence.failImplementation(claim, errorText(error));
       } catch (settlementError) {
@@ -145,12 +165,11 @@ export class DeliveryExecutionService {
       : String(result.diagnostics ?? ""), claim.deliveryContext.sensitivePatterns);
     const events = redactSensitive(result.events ?? [], claim.deliveryContext.sensitivePatterns);
     const summary = redactSensitive(String(result.summary ?? ""), claim.deliveryContext.sensitivePatterns);
-    try {
-      return this.persistence.completeImplementation(claim, {
+    const completion = {
       branch: result.branch,
       worktreePath: result.worktreePath,
       baseCommit: result.baseCommit,
-      commands: [],
+      commands: [] as const,
       diff: evidence.diff,
       diffHash: snapshot.evidenceHash,
       changedFiles: snapshot.changedFiles,
@@ -165,8 +184,20 @@ export class DeliveryExecutionService {
       diagnostics,
       codexThreadId: result.codexThreadId,
       events,
-        output: { runId: result.runId, summary }
-      });
+      output: { runId: result.runId, summary }
+    };
+    if (journalPrepared) {
+      const completed = this.persistence.publishPreparedImplementation(claim, completion);
+      try {
+        await attempt?.cleanup();
+        this.persistence.settleImplementationPublicationCleanup(claim, "completed");
+      } catch (cleanupError) {
+        this.persistence.settleImplementationPublicationCleanup(claim, "failed", errorText(cleanupError));
+      }
+      return completed;
+    }
+    try {
+      return this.persistence.completeImplementation(claim, completion);
     } catch (error) {
       if (published) await attempt?.rollback?.();
       throw error;

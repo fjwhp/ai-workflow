@@ -1,5 +1,6 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { existsSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -14,6 +15,8 @@ import {
 import { WorkflowStore } from "./store.js";
 import { evidenceFingerprint, evidenceManifestHash } from "./evidence-tree.js";
 import { createAutomationWorker } from "./automation-worker.js";
+import { captureImplementationPatchSync } from "./implementation-publication.js";
+import { getWorktreeSnapshot } from "./repository.js";
 
 const stores: WorkflowStore[] = [];
 const directories: string[] = [];
@@ -629,6 +632,64 @@ describe("DeliveryExecutionService", () => {
     expect(cleanup).toHaveBeenCalledOnce();
     expect(rollbackFailure.cause).toBe(leaseFailure);
     expect(fixture.store.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toBeNull();
+  });
+
+  it("keeps an atomically committed implementation successful when attempt cleanup fails", async () => {
+    const fixture = createFixture();
+    fixture.store.automationJobs.enqueue({
+      ownerType: "delivery_unit", ownerId: fixture.unit.id, evidenceVersion: 1,
+      action: "implement", payload: {}, maxAttempts: 3
+    });
+    const job = fixture.store.automationJobs.leaseNext("cleanup-worker", new Date(), 30_000)!;
+    const completedUnit = { ...fixture.unit, status: "awaiting_gate" as const };
+    const failImplementation = vi.fn();
+    const prepareImplementationPublication = vi.fn();
+    const publishPreparedImplementation = vi.fn(() => completedUnit);
+    const settleImplementationPublicationCleanup = vi.fn();
+    const persistence = {
+      ...fixture.store.deliveryExecutions,
+      failImplementation,
+      prepareImplementationPublication,
+      publishPreparedImplementation,
+      settleImplementationPublicationCleanup,
+      getCompletedImplementation: vi.fn(() => null)
+    } as any;
+    const cleanup = vi.fn().mockRejectedValue(new Error("cleanup rejected"));
+    const implementation = codingResult();
+    const implementationDependencies = {
+      prepare: vi.fn().mockResolvedValue({
+        workspace: {
+          branch: "HEAD", worktreePath: "/tmp/isolated-attempt",
+          baseCommit: implementation.baseCommit, reused: false as const
+        },
+        preparePublication: vi.fn().mockResolvedValue({
+          result: implementation,
+          input: {
+            repoPath: fixture.project.repoPath,
+            authoritativeWorktreePath: implementation.worktreePath,
+            attemptPath: "/tmp/isolated-attempt",
+            attemptDev: 1,
+            attemptIno: 2,
+            attemptUid: 3,
+            attemptNonce: randomUUID(),
+            patch: Buffer.from("patch")
+          }
+        }),
+        cleanup
+      })
+    };
+    const service = new DeliveryExecutionService(
+      persistence, vi.fn().mockResolvedValue(implementation), "test-model", fixture.store.deliveryQuality,
+      {}, implementationDependencies as any
+    );
+
+    await expect(service.implement(fixture.unit.id, 1, job.claimToken)).resolves.toBe(completedUnit);
+    expect(prepareImplementationPublication).toHaveBeenCalledOnce();
+    expect(publishPreparedImplementation).toHaveBeenCalledOnce();
+    expect(failImplementation).not.toHaveBeenCalled();
+    expect(settleImplementationPublicationCleanup).toHaveBeenCalledWith(
+      expect.any(Object), "failed", "cleanup rejected"
+    );
   });
 
   it("runs review and testing against the same immutable implementation evidence", async () => {
@@ -1348,5 +1409,94 @@ describe("DeliveryExecutionService", () => {
     expect(existsSync(join(authoritative, "old-partial.txt"))).toBe(false);
     expect(existsSync(join(authoritative, "new-final.txt"))).toBe(true);
     expect(retryStore.deliveryExecutions.getCodingEvidence(fixture.unit.id, 1)).toEqual(expect.any(Object));
+  });
+
+  it("atomically publishes implementation evidence, quality jobs, its job settlement, and journal", async () => {
+    const fixture = createFixture(fileBackedDatabase());
+    const root = mkdtempSync(join(tmpdir(), "implementation-publication-store-"));
+    directories.push(root);
+    const repo = join(root, "repo");
+    const attempt = join(root, "attempt");
+    execFileSync("git", ["init", "--quiet", "--initial-branch=main", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "Test"]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+    writeFileSync(join(repo, "tracked.txt"), "base\n");
+    execFileSync("git", ["-C", repo, "add", "--all"]);
+    execFileSync("git", ["-C", repo, "commit", "--quiet", "-m", "base"]);
+    const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    execFileSync("git", ["-C", repo, "worktree", "add", "--quiet", "--detach", attempt, head]);
+    writeFileSync(join(attempt, "tracked.txt"), "published\n");
+    writeFileSync(join(attempt, "new.txt"), "new\n");
+    const attemptSnapshot = await getWorktreeSnapshot(attempt);
+    const patch = captureImplementationPatchSync(attempt);
+    const db = (fixture.store as any).db;
+    db.prepare("UPDATE projects SET repo_path = ? WHERE id = ?").run(repo, fixture.project.id);
+    db.prepare("UPDATE project_versions SET worktree_path = ?, head_commit = ? WHERE id = ?")
+      .run(repo, head, fixture.version.id);
+    db.prepare(`UPDATE delivery_unit_snapshots SET repo_path = ?, worktree_path = ?, head_commit = ?, branch = 'main'
+      WHERE delivery_unit_id = ?`).run(repo, repo, head, fixture.unit.id);
+    fixture.store.automationJobs.enqueue({
+      ownerType: "delivery_unit", ownerId: fixture.unit.id, evidenceVersion: 1,
+      action: "implement", payload: {}, maxAttempts: 3
+    });
+    const job = fixture.store.automationJobs.leaseNext("publication-worker", new Date(), 30_000)!;
+    const claim = fixture.store.deliveryExecutions.claimImplementation(
+      fixture.unit.id, "test-model", { evidenceVersion: 1, claimToken: job.claimToken }
+    );
+    const status = lstatSync(attempt);
+    const journal = (fixture.store.deliveryExecutions as any).prepareImplementationPublication(claim, {
+      repoPath: repo,
+      authoritativeWorktreePath: repo,
+      attemptPath: attempt,
+      attemptDev: status.dev,
+      attemptIno: status.ino,
+      attemptUid: status.uid,
+      attemptNonce: randomUUID(),
+      patch
+    });
+    const identity = {
+      ...attemptSnapshot.identity,
+      repositoryPath: repo,
+      gitCommonDir: join(repo, ".git"),
+      worktreePath: repo,
+      branch: "main"
+    };
+    const result = {
+      branch: "main", worktreePath: repo, baseCommit: head, commands: [] as const,
+      diff: attemptSnapshot.diff,
+      diffHash: createHash("sha256").update(attemptSnapshot.diff).digest("hex"),
+      changedFiles: attemptSnapshot.changedFiles,
+      identity,
+      manifest: attemptSnapshot.manifest,
+      manifestHash: attemptSnapshot.manifestHash,
+      originalChars: attemptSnapshot.diff.length,
+      truncated: false,
+      files: attemptSnapshot.files,
+      additions: attemptSnapshot.additions,
+      deletions: attemptSnapshot.deletions,
+      diagnostics: "",
+      output: { runId: "agent-run", summary: "published" }
+    };
+
+    const completed = (fixture.store.deliveryExecutions as any).publishPreparedImplementation(claim, result);
+    const replayed = (fixture.store.deliveryExecutions as any).publishPreparedImplementation(claim, result);
+
+    expect(completed.id).toBe(fixture.unit.id);
+    expect(replayed.id).toBe(fixture.unit.id);
+    expect(captureImplementationPatchSync(repo).equals(patch)).toBe(true);
+    expect(fixture.store.automationJobs.get(job.id)).toMatchObject({
+      status: "completed", claimToken: job.claimToken
+    });
+    expect(db.prepare("SELECT status, cleanup_status FROM implementation_publication_journals WHERE id = ?")
+      .get(journal.id)).toEqual({ status: "committed", cleanup_status: "pending" });
+    expect(db.prepare("SELECT count(*) AS count FROM coding_evidence WHERE delivery_unit_id = ?")
+      .get(fixture.unit.id)).toEqual({ count: 1 });
+    expect(db.prepare(`SELECT action, count(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND evidence_version = 1 GROUP BY action ORDER BY action`).all(fixture.unit.id))
+      .toEqual([
+        { action: "implement", count: 1 },
+        { action: "review", count: 1 },
+        { action: "test", count: 1 }
+      ]);
   });
 });

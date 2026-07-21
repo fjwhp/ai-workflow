@@ -83,6 +83,23 @@ export interface DeliveryExecutionSuccess {
   output: unknown;
 }
 
+export interface DeliveryImplementationPublicationInput {
+  repoPath: string;
+  authoritativeWorktreePath: string;
+  attemptPath: string;
+  attemptDev: number;
+  attemptIno: number;
+  attemptUid: number;
+  attemptNonce: string;
+  patch: Buffer;
+}
+
+export interface DeliveryImplementationPublicationJournal {
+  id: string;
+  status: "prepared" | "committed" | "canceled" | "manual";
+  cleanupStatus: "pending" | "completed" | "failed";
+}
+
 export interface DeliveryExecutionPersistence {
   claimImplementation(
     unitId: string,
@@ -90,6 +107,21 @@ export interface DeliveryExecutionPersistence {
     automation?: DeliveryImplementationAutomationInput
   ): DeliveryExecutionClaim;
   completeImplementation(claim: DeliveryExecutionClaim, result: DeliveryExecutionSuccess): DeliveryUnit;
+  prepareImplementationPublication(
+    claim: DeliveryExecutionClaim,
+    input: DeliveryImplementationPublicationInput
+  ): DeliveryImplementationPublicationJournal;
+  publishPreparedImplementation(claim: DeliveryExecutionClaim, result: DeliveryExecutionSuccess): DeliveryUnit;
+  getCompletedImplementation(
+    unitId: string,
+    evidenceVersion: number,
+    claimToken: string
+  ): DeliveryUnit | null;
+  settleImplementationPublicationCleanup(
+    claim: DeliveryExecutionClaim,
+    status: "completed" | "failed",
+    error?: string
+  ): void;
   failImplementation(claim: DeliveryExecutionClaim, error: string): DeliveryUnit;
   assertImplementationLease(claim: DeliveryExecutionClaim): void;
   listExecutions(deliveryUnitId: string, evidenceVersion?: number): unknown[];

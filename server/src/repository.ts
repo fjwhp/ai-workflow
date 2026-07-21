@@ -12,7 +12,7 @@ const protectedBranches=new Set(["prod","production","main","master"]);
 const CODING_ATTEMPT_OWNER_SUFFIX = ".owner.json";
 type GitConfigEntry = readonly [key: string, value: string];
 
-interface CodingAttemptOwnership {
+export interface CodingAttemptOwnership {
   version: 1;
   uid: number;
   nonce: string;
@@ -476,6 +476,7 @@ export async function createCodingAttemptWorktree(
   const id = randomUUID();
   const root = resolve(repoPath, "..", ".ai-workflow-worktrees", basename(repoPath), "implementation-attempts");
   const worktreePath = resolve(root, id);
+  let attemptIdentity: CodingAttemptOwnership | undefined;
   await ensureRequirementDirectory(resolve(repoPath, ".."), [
     ".ai-workflow-worktrees", basename(repoPath), "implementation-attempts"
   ], 0o700);
@@ -496,6 +497,7 @@ export async function createCodingAttemptWorktree(
       const ownership: CodingAttemptOwnership = {
         version: 1, uid, nonce: randomUUID(), dev: status.dev, ino: status.ino
       };
+      attemptIdentity = ownership;
       await writeFile(codingAttemptMarkerPath(root, id), JSON.stringify(ownership), {
         encoding: "utf8", flag: "wx", mode: 0o600
       });
@@ -507,7 +509,8 @@ export async function createCodingAttemptWorktree(
       await rm(hooksPath, { recursive: true, force: true });
     }
   });
-  return { branch: "HEAD", worktreePath, baseCommit, reused: false as const };
+  if (!attemptIdentity) throw new Error("IMPLEMENTATION_ATTEMPT_IDENTITY_MISSING");
+  return { branch: "HEAD", worktreePath, baseCommit, reused: false as const, attemptIdentity };
 }
 
 export async function cleanupCodingAttemptWorktree(repoPath: string, worktreePath: string) {

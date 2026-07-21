@@ -92,6 +92,8 @@ describe("project versions fresh schema", () => {
       "idx_delivery_unit_active_run",
       "idx_delivery_unit_project",
       "idx_executions_delivery_unit_version",
+      "idx_implementation_publication_claim",
+      "idx_implementation_publication_unit_version",
       "idx_project_knowledge_active",
       "idx_requirement_project_snapshots_active",
       "idx_requirement_projects_active_primary",

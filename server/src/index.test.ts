@@ -73,7 +73,7 @@ describe("server entry point", () => {
 
     expect(recoveredStatus).toBe("pending");
     expect(events).toEqual([
-      "recover:stage", "recover:knowledge", "recover:requirements", "recover:jobs",
+      "recover:publication", "recover:stage", "recover:knowledge", "recover:requirements", "recover:jobs",
       "cleanup:verification", "worker:create", "app:build", "app:onClose", "worker:start", "app:listen"
     ]);
     expect(cleanupVerification).toHaveBeenCalledOnce();
@@ -492,6 +492,11 @@ function seedLeasedImplementation(directory: string, now: Date, leaseMs: number)
 
 function observedStore(databasePath: string, events: string[]) {
   const store = new WorkflowStore(databasePath);
+  const reconcilePublications = store.reconcileImplementationPublications.bind(store);
+  vi.spyOn(store, "reconcileImplementationPublications").mockImplementation(async () => {
+    events.push("recover:publication");
+    return reconcilePublications();
+  });
   for (const [method, event] of [
     ["interruptActiveStageRuns", "recover:stage"],
     ["interruptActiveProjectKnowledge", "recover:knowledge"],

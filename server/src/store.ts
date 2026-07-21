@@ -14,6 +14,7 @@ import {
 } from "./delivery-unit-repository.js";
 import {
   DeliveryExecutionRepository,
+  type DeliveryImplementationPublicationInput,
   type DeliveryExecutionPersistence
 } from "./delivery-execution-repository.js";
 import {
@@ -38,6 +39,15 @@ import {
   type ExecutionInput
 } from "./execution-repository.js";
 import { deliveryEventGeneration } from "./delivery-live-events.js";
+import {
+  applyImplementationPatchSync,
+  captureImplementationPatchSync,
+  implementationPatchHash,
+  readImplementationHeadSync,
+  reverseImplementationPatchSync,
+  validateImplementationPatch
+} from "./implementation-publication.js";
+import { cleanupCodingAttemptWorktree } from "./repository.js";
 
 export type { ExecutionInput } from "./execution-repository.js";
 
@@ -92,7 +102,7 @@ export class WorkflowStore {
   public readonly deliveryUnitDetails: DeliveryUnitDetailPersistence;
   public readonly automationJobs: AutomationJobPersistence;
 
-  constructor(path: string, clock: () => Date = () => new Date()) {
+  constructor(path: string, private readonly clock: () => Date = () => new Date()) {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     createPhase2Schema(this.db);
@@ -134,6 +144,97 @@ export class WorkflowStore {
           return unit;
         }
       ),
+      prepareImplementationPublication: (claim, input) => this.withImmediateTransaction(
+        () => this.prepareImplementationPublicationInTransaction(claim, input)
+      ),
+      publishPreparedImplementation: (claim, result) => this.withImmediateTransaction(() => {
+        const lease = claim.automationLease;
+        if (!lease) throw new Error("IMPLEMENTATION_PUBLICATION_AUTOMATION_REQUIRED");
+        const row = this.db.prepare(`SELECT * FROM implementation_publication_journals
+          WHERE delivery_unit_id = ? AND evidence_version = ?
+            AND status IN ('prepared', 'committed', 'manual')
+          ORDER BY created_at DESC, id DESC LIMIT 1`).get(
+          claim.deliveryUnit.id, claim.deliveryUnit.evidenceVersion
+        ) as any;
+        if (!row || row.job_id !== lease.jobId || row.claim_token !== lease.claimToken
+          || row.worker_id !== lease.workerId || row.execution_id !== claim.executionId
+          || row.run_id !== claim.runId) {
+          throw new Error("IMPLEMENTATION_PUBLICATION_JOURNAL_STALE");
+        }
+        if (row.status === "committed") {
+          const job = automationJobRepository.get(lease.jobId);
+          if (job?.status !== "completed" || job.claimToken !== lease.claimToken) {
+            throw new Error("IMPLEMENTATION_PUBLICATION_SETTLEMENT_INVALID");
+          }
+          const completed = this.deliveryUnitRepository.get(claim.deliveryUnit.id);
+          if (!completed || !this.deliveryExecutionRepository.getCodingEvidence(
+            claim.deliveryUnit.id, claim.deliveryUnit.evidenceVersion
+          )) throw new Error("IMPLEMENTATION_PUBLICATION_SETTLEMENT_INVALID");
+          return completed;
+        }
+        if (row.status !== "prepared") throw new Error("IMPLEMENTATION_PUBLICATION_JOURNAL_STALE");
+        this.deliveryExecutionRepository.assertImplementationLeaseInTransaction(claim);
+        if (readImplementationHeadSync(row.authoritative_worktree_path) !== row.base_commit
+          || implementationPatchHash(captureImplementationPatchSync(row.authoritative_worktree_path))
+            !== row.baseline_diff_hash) {
+          throw new Error("IMPLEMENTATION_AUTHORITATIVE_WORKTREE_DIRTY");
+        }
+        const patch = Buffer.from(row.patch_blob);
+        validateImplementationPatch(patch);
+        if (patch.length !== row.patch_bytes || implementationPatchHash(patch) !== row.patch_sha256) {
+          throw new Error("IMPLEMENTATION_PUBLICATION_JOURNAL_INVALID");
+        }
+        applyImplementationPatchSync(row.authoritative_worktree_path, patch);
+        const published = captureImplementationPatchSync(row.authoritative_worktree_path);
+        if (!published.equals(patch) || implementationPatchHash(published) !== row.published_diff_hash) {
+          throw new Error("IMPLEMENTATION_PUBLICATION_DIFF_MISMATCH");
+        }
+        const unit = this.deliveryExecutionRepository.completeImplementationInTransaction(claim, result);
+        deliveryCoordinator.recordImplementationEvidenceInTransaction(unit.id, unit.evidenceVersion);
+        if (!deliveryCoordinator.isRequirementPaused(unit.requirementId)) {
+          for (const action of ["review", "test"] as const) {
+            automationJobRepository.enqueue({
+              ownerType: "delivery_unit", ownerId: unit.id, evidenceVersion: unit.evidenceVersion,
+              action, payload: {}, maxAttempts: 3
+            });
+          }
+        }
+        if (!automationJobRepository.complete(lease.jobId, lease.workerId, lease.claimToken)) {
+          throw new Error("IMPLEMENTATION_PUBLICATION_JOB_SETTLEMENT_STALE");
+        }
+        const now = this.nowIso();
+        const committed = this.db.prepare(`UPDATE implementation_publication_journals
+          SET status = 'committed', updated_at = ?, committed_at = ?
+          WHERE id = ? AND status = 'prepared' AND claim_token = ?`).run(
+          now, now, row.id, lease.claimToken
+        );
+        if (committed.changes !== 1) throw new Error("IMPLEMENTATION_PUBLICATION_JOURNAL_STALE");
+        return unit;
+      }),
+      getCompletedImplementation: (unitId, evidenceVersion, claimToken) => {
+        const row = this.db.prepare(`SELECT job_id FROM implementation_publication_journals
+          WHERE delivery_unit_id = ? AND evidence_version = ? AND claim_token = ? AND status = 'committed'`)
+          .get(unitId, evidenceVersion, claimToken) as { job_id: string } | undefined;
+        if (!row) return null;
+        const job = automationJobRepository.get(row.job_id);
+        if (job?.status !== "completed" || job.claimToken !== claimToken
+          || !this.deliveryExecutionRepository.getCodingEvidence(unitId, evidenceVersion)) return null;
+        return this.deliveryUnitRepository.get(unitId);
+      },
+      settleImplementationPublicationCleanup: (claim, status, error) => this.withImmediateTransaction(() => {
+        const lease = claim.automationLease;
+        if (!lease) throw new Error("IMPLEMENTATION_PUBLICATION_AUTOMATION_REQUIRED");
+        const now = this.nowIso();
+        const lastError = status === "failed" ? boundedPublicationError(error) : null;
+        const settled = this.db.prepare(`UPDATE implementation_publication_journals
+          SET cleanup_status = ?, last_error = ?, cleanup_completed_at = ?, updated_at = ?
+          WHERE delivery_unit_id = ? AND evidence_version = ? AND job_id = ? AND claim_token = ?
+            AND status = 'committed'`).run(
+          status, lastError, status === "completed" ? now : null, now,
+          claim.deliveryUnit.id, claim.deliveryUnit.evidenceVersion, lease.jobId, lease.claimToken
+        );
+        if (settled.changes !== 1) throw new Error("IMPLEMENTATION_PUBLICATION_JOURNAL_STALE");
+      }),
       failImplementation: (claim, error) => this.withImmediateTransaction(
         () => this.deliveryExecutionRepository.failImplementationInTransaction(claim, error)
       ),
@@ -149,7 +250,7 @@ export class WorkflowStore {
       enqueue: (input) => automationJobRepository.enqueue(input),
       leaseNext: (workerId, now, leaseMs) => automationJobRepository.leaseNext(workerId, now, leaseMs),
       renew: (jobId, workerId, now, leaseMs) => automationJobRepository.renew(jobId, workerId, now, leaseMs),
-      complete: (jobId, workerId) => automationJobRepository.complete(jobId, workerId),
+      complete: (jobId, workerId, claimToken) => automationJobRepository.complete(jobId, workerId, claimToken),
       fail: (jobId, workerId, error, retryable) => this.withImmediateTransaction(() => {
         const settled = automationJobRepository.fail(jobId, workerId, error, retryable);
         if (settled) this.deliveryQualityRepository.abortTerminalAutomationClaimsInTransaction();
@@ -240,6 +341,64 @@ export class WorkflowStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  private prepareImplementationPublicationInTransaction(
+    claim: import("./delivery-execution-repository.js").DeliveryExecutionClaim,
+    input: DeliveryImplementationPublicationInput
+  ) {
+    const lease = claim.automationLease;
+    if (!lease) throw new Error("IMPLEMENTATION_PUBLICATION_AUTOMATION_REQUIRED");
+    this.deliveryExecutionRepository.assertImplementationLeaseInTransaction(claim);
+    validateImplementationPatch(input.patch);
+    if (input.repoPath !== claim.project.repoPath
+      || !Number.isSafeInteger(input.attemptDev) || input.attemptDev < 0
+      || !Number.isSafeInteger(input.attemptIno) || input.attemptIno < 0
+      || !Number.isSafeInteger(input.attemptUid) || input.attemptUid < 0
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.attemptNonce)) {
+      throw new Error("IMPLEMENTATION_PUBLICATION_INPUT_INVALID");
+    }
+    const baseCommit = readImplementationHeadSync(input.authoritativeWorktreePath);
+    const baseline = captureImplementationPatchSync(input.authoritativeWorktreePath);
+    if (baseCommit !== claim.version.headCommit || baseline.length !== 0) {
+      throw new Error("IMPLEMENTATION_AUTHORITATIVE_WORKTREE_DIRTY");
+    }
+    const now = this.nowIso();
+    const id = randomUUID();
+    const patchHash = implementationPatchHash(input.patch);
+    const existing = this.db.prepare(`SELECT * FROM implementation_publication_journals
+      WHERE delivery_unit_id = ? AND evidence_version = ?
+        AND status IN ('prepared', 'committed', 'manual')
+      ORDER BY created_at DESC, id DESC LIMIT 1`).get(
+      claim.deliveryUnit.id, claim.deliveryUnit.evidenceVersion
+    ) as any;
+    if (existing) {
+      if (existing.status === "prepared" && existing.job_id === lease.jobId
+        && existing.claim_token === lease.claimToken && existing.patch_sha256 === patchHash
+        && existing.attempt_dev === input.attemptDev && existing.attempt_ino === input.attemptIno
+        && existing.attempt_nonce === input.attemptNonce) {
+        return mapImplementationPublicationJournal(existing);
+      }
+      throw new Error("IMPLEMENTATION_PUBLICATION_JOURNAL_CONFLICT");
+    }
+    this.db.prepare(`INSERT INTO implementation_publication_journals
+      (id, job_id, claim_token, worker_id, delivery_unit_id, evidence_version, execution_id, run_id,
+       attempt_path, attempt_dev, attempt_ino, attempt_uid, attempt_nonce, repo_path,
+       authoritative_worktree_path, base_commit, baseline_diff_hash, patch_blob, patch_sha256,
+       patch_bytes, published_diff_hash, status, cleanup_status, last_error, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 'pending', NULL, ?, ?)`)
+      .run(id, lease.jobId, lease.claimToken, lease.workerId, claim.deliveryUnit.id,
+        claim.deliveryUnit.evidenceVersion, claim.executionId, claim.runId, input.attemptPath,
+        input.attemptDev, input.attemptIno, input.attemptUid, input.attemptNonce, input.repoPath,
+        input.authoritativeWorktreePath, baseCommit, implementationPatchHash(baseline), input.patch,
+        patchHash, input.patch.length, patchHash, now, now);
+    return { id, status: "prepared" as const, cleanupStatus: "pending" as const };
+  }
+
+  private nowIso() {
+    const now = this.clock();
+    if (!Number.isFinite(now.getTime())) throw new Error("IMPLEMENTATION_PUBLICATION_DATE_INVALID");
+    return now.toISOString();
   }
 
   private withReadTransaction<T>(operation: () => T): T {
@@ -805,6 +964,83 @@ export class WorkflowStore {
     return rows.length;
   }
 
+  async reconcileImplementationPublications() {
+    const candidates = this.db.prepare(`SELECT * FROM implementation_publication_journals
+      WHERE status IN ('prepared', 'committed') AND cleanup_status <> 'completed'
+      ORDER BY created_at, id`).all() as any[];
+    let reconciled = 0;
+    for (const candidate of candidates) {
+      let manual = false;
+      if (candidate.status === "prepared") {
+        manual = this.withImmediateTransaction(() => {
+          const row = this.db.prepare(`SELECT * FROM implementation_publication_journals
+            WHERE id = ?`).get(candidate.id) as any;
+          if (!row || row.status !== "prepared") return false;
+          const patch = validateImplementationPatch(Buffer.from(row.patch_blob));
+          const currentHead = readImplementationHeadSync(row.authoritative_worktree_path);
+          const current = captureImplementationPatchSync(row.authoritative_worktree_path);
+          const clean = current.length === 0
+            && implementationPatchHash(current) === row.baseline_diff_hash;
+          const exact = current.equals(patch)
+            && implementationPatchHash(current) === row.published_diff_hash;
+          if (currentHead !== row.base_commit || (!clean && !exact)) {
+            const now = this.nowIso();
+            this.db.prepare(`UPDATE implementation_publication_journals
+              SET status = 'manual', last_error = ?, updated_at = ? WHERE id = ? AND status = 'prepared'`)
+              .run("IMPLEMENTATION_PUBLICATION_MANUAL_RECOVERY_REQUIRED", now, row.id);
+            return true;
+          }
+          if (exact) {
+            reverseImplementationPatchSync(row.authoritative_worktree_path, patch);
+            const restored = captureImplementationPatchSync(row.authoritative_worktree_path);
+            if (restored.length !== 0
+              || implementationPatchHash(restored) !== row.baseline_diff_hash) {
+              throw new Error("IMPLEMENTATION_PUBLICATION_RECOVERY_ROLLBACK_FAILED");
+            }
+          }
+          const now = this.nowIso();
+          this.db.prepare(`UPDATE implementation_publication_journals
+            SET status = 'canceled', last_error = NULL, updated_at = ?
+            WHERE id = ? AND status = 'prepared'`).run(now, row.id);
+          this.db.prepare(`UPDATE automation_jobs SET
+              status = CASE WHEN attempt < max_attempts THEN 'pending' ELSE 'failed' END,
+              lease_owner = NULL, lease_expires_at = NULL,
+              last_error = CASE WHEN attempt < max_attempts THEN NULL ELSE ? END,
+              updated_at = ?
+            WHERE id = ? AND claim_token = ? AND status = 'leased'`)
+            .run("IMPLEMENTATION_PUBLICATION_INTERRUPTED", now, row.job_id, row.claim_token);
+          return false;
+        });
+      }
+      if (manual) throw new Error("IMPLEMENTATION_PUBLICATION_MANUAL_RECOVERY_REQUIRED");
+      try {
+        await cleanupCodingAttemptWorktree(candidate.repo_path, candidate.attempt_path);
+        this.updatePublicationCleanup(candidate.id, "completed");
+      } catch (error) {
+        this.updatePublicationCleanup(
+          candidate.id,
+          "failed",
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+      reconciled += 1;
+    }
+    return reconciled;
+  }
+
+  private updatePublicationCleanup(id: string, status: "completed" | "failed", error?: string) {
+    this.withImmediateTransaction(() => {
+      const now = this.nowIso();
+      const updated = this.db.prepare(`UPDATE implementation_publication_journals SET
+          cleanup_status = ?, cleanup_completed_at = ?, last_error = ?, updated_at = ?
+        WHERE id = ? AND status IN ('committed', 'canceled')`).run(
+        status, status === "completed" ? now : null,
+        status === "failed" ? boundedPublicationError(error) : null, now, id
+      );
+      if (updated.changes !== 1) throw new Error("IMPLEMENTATION_PUBLICATION_JOURNAL_STALE");
+    });
+  }
+
   recoverAbandonedDeliveryExecutions(now: Date) {
     if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error("AUTOMATION_JOB_DATE_INVALID");
     const nowIso = now.toISOString();
@@ -1313,6 +1549,19 @@ function mapStageRun(row: any, events: any[]) {
 function mapStageRunEvent(row: any) {
   return { id: row.id, runId: row.run_id, sequence: row.sequence, type: row.type,
     payload: JSON.parse(row.payload_json), createdAt: row.created_at };
+}
+
+function mapImplementationPublicationJournal(row: any) {
+  return {
+    id: row.id,
+    status: row.status as "prepared" | "committed" | "canceled" | "manual",
+    cleanupStatus: row.cleanup_status as "pending" | "completed" | "failed"
+  };
+}
+
+function boundedPublicationError(error: string | undefined) {
+  const value = String(error ?? "IMPLEMENTATION_ATTEMPT_CLEANUP_FAILED").replaceAll("\0", "").trim();
+  return Array.from(value || "IMPLEMENTATION_ATTEMPT_CLEANUP_FAILED").slice(0, 4096).join("");
 }
 
 function mapProjectKnowledge(row:any){return {id:row.id,projectId:row.project_id,version:row.version,status:row.status,sourceHead:row.source_head,refreshReason:row.refresh_reason,summary:row.summary??"",entries:JSON.parse(row.entries_json||"[]"),entryCount:row.entry_count,moduleCount:row.module_count,error:row.error,createdAt:row.created_at,completedAt:row.completed_at};}

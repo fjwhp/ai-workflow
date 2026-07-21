@@ -41,7 +41,7 @@ export interface AutomationJobPersistence {
   enqueue(input: AutomationJobInput): AutomationJob;
   leaseNext(workerId: string, now: Date, leaseMs: number): AutomationJob | null;
   renew(jobId: string, workerId: string, now: Date, leaseMs: number): boolean;
-  complete(jobId: string, workerId: string): boolean;
+  complete(jobId: string, workerId: string, claimToken?: string): boolean;
   fail(jobId: string, workerId: string, error: unknown, retryable: boolean): boolean;
   cancelByOwnerVersion(ownerId: string, evidenceVersion: number, ownerType?: AutomationJobOwnerType): number;
   recoverExpired(now: Date): number;
@@ -162,16 +162,22 @@ export class AutomationJobRepository {
     return Number(result.changes) === 1;
   }
 
-  complete(jobId: string, workerId: string): boolean {
+  complete(jobId: string, workerId: string, claimToken?: string): boolean {
     validateBoundedId(jobId, "AUTOMATION_JOB_ID_INVALID");
     validateWorkerId(workerId);
+    if (claimToken !== undefined) validateBoundedId(claimToken, "AUTOMATION_JOB_CLAIM_TOKEN_INVALID");
     const settleNow = validateDate(this.clock());
     const result = this.db.prepare(`UPDATE automation_jobs
       SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
       WHERE id = ? AND status = 'leased' AND lease_owner = ?
         AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`)
       .run(settleNow, jobId, workerId, settleNow);
-    return Number(result.changes) === 1;
+    if (Number(result.changes) === 1) return true;
+    if (claimToken === undefined) return false;
+    if (!claimToken.startsWith(`lease:${jobId}:${workerId}:`)) return false;
+    const completed = this.db.prepare(`SELECT 1 FROM automation_jobs
+      WHERE id = ? AND status = 'completed' AND claim_token = ?`).get(jobId, claimToken);
+    return completed !== undefined;
   }
 
   fail(jobId: string, workerId: string, error: unknown, retryable: boolean): boolean {

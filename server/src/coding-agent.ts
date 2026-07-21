@@ -9,8 +9,9 @@ import {
   getWorktreeSnapshot,
   publishCodingAttemptDiff
 } from "./repository.js";
+import { captureImplementationPatchSync } from "./implementation-publication.js";
 import { resolveWorktreePath, safeReadWorktreeFile, safeWriteWorktreeFile } from "./worktree-file-safety.js";
-import { matchesSensitivePath } from "./evidence-tree.js";
+import { evidenceFingerprint, matchesSensitivePath } from "./evidence-tree.js";
 
 export { resolveWorktreePath } from "./worktree-file-safety.js";
 
@@ -76,13 +77,49 @@ export async function prepareDeliveryImplementationAttempt(input: CodingAgentInp
   let publication: Awaited<ReturnType<typeof publishCodingAttemptDiff>> | undefined;
   return {
     workspace,
+    async preparePublication(result: CodingAgentResult, publishSignal?: AbortSignal) {
+      throwIfCodingAborted(publishSignal);
+      validateAttemptResult(result, workspace);
+      const patch = captureImplementationPatchSync(workspace.worktreePath);
+      const identity = {
+        ...result.evidenceSnapshot.identity,
+        worktreePath: authoritative.worktreePath,
+        branch: authoritative.branch,
+        headCommit: authoritative.baseCommit
+      };
+      const evidenceSnapshot = {
+        ...result.evidenceSnapshot,
+        identity,
+        evidenceHash: evidenceFingerprint({
+          identity,
+          manifestHash: result.evidenceSnapshot.manifestHash,
+          diff: result.evidenceSnapshot.diff,
+          changedFiles: result.evidenceSnapshot.changedFiles
+        })
+      };
+      return {
+        result: {
+          ...result,
+          branch: authoritative.branch,
+          worktreePath: authoritative.worktreePath,
+          baseCommit: authoritative.baseCommit,
+          evidenceSnapshot
+        },
+        input: {
+          repoPath: input.project.repoPath,
+          authoritativeWorktreePath: authoritative.worktreePath,
+          attemptPath: workspace.worktreePath,
+          attemptDev: workspace.attemptIdentity.dev,
+          attemptIno: workspace.attemptIdentity.ino,
+          attemptUid: workspace.attemptIdentity.uid,
+          attemptNonce: workspace.attemptIdentity.nonce,
+          patch
+        }
+      };
+    },
     async publish(result: CodingAgentResult, publishSignal?: AbortSignal) {
       throwIfCodingAborted(publishSignal);
-      if (result.worktreePath !== workspace.worktreePath || result.baseCommit !== workspace.baseCommit
-        || result.evidenceSnapshot.identity.worktreePath !== workspace.worktreePath
-        || result.evidenceSnapshot.identity.headCommit !== workspace.baseCommit) {
-        throw new Error("IMPLEMENTATION_ATTEMPT_IDENTITY_MISMATCH");
-      }
+      validateAttemptResult(result, workspace);
       publication = await publishCodingAttemptDiff({
         repoPath: input.project.repoPath,
         authoritativeWorktreePath: authoritative.worktreePath,
@@ -116,6 +153,17 @@ export async function prepareDeliveryImplementationAttempt(input: CodingAgentInp
       await cleanupCodingAttemptWorktree(input.project.repoPath, workspace.worktreePath);
     }
   };
+}
+
+function validateAttemptResult(
+  result: CodingAgentResult,
+  workspace: Awaited<ReturnType<typeof createCodingAttemptWorktree>>
+) {
+  if (result.worktreePath !== workspace.worktreePath || result.baseCommit !== workspace.baseCommit
+    || result.evidenceSnapshot.identity.worktreePath !== workspace.worktreePath
+    || result.evidenceSnapshot.identity.headCommit !== workspace.baseCommit) {
+    throw new Error("IMPLEMENTATION_ATTEMPT_IDENTITY_MISMATCH");
+  }
 }
 
 export async function runCodingAgent(input: CodingAgentInput, signal?: AbortSignal): Promise<CodingAgentResult> {

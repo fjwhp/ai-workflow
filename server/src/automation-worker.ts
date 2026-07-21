@@ -161,7 +161,7 @@ export function createAutomationWorker(options: AutomationWorkerOptions): Automa
         job.id, workerId, handlerError, classifyAutomationError(handlerError) === "retryable"
       ));
     } else {
-      settle(job.id, "complete", () => options.jobs.complete(job.id, workerId));
+      settle(job.id, "complete", () => options.jobs.complete(job.id, workerId, job.claimToken));
     }
     return true;
   };

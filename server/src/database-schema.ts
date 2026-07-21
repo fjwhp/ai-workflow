@@ -298,6 +298,73 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
       UNIQUE(delivery_unit_id, evidence_version)
     );
+    CREATE TABLE IF NOT EXISTS implementation_publication_journals (
+      id TEXT PRIMARY KEY CHECK(instr(id, char(0)) = 0 AND length(id) BETWEEN 1 AND 256),
+      job_id TEXT NOT NULL CHECK(instr(job_id, char(0)) = 0 AND length(job_id) BETWEEN 1 AND 256),
+      claim_token TEXT NOT NULL CHECK(instr(claim_token, char(0)) = 0 AND length(claim_token) BETWEEN 1 AND 256),
+      worker_id TEXT NOT NULL CHECK(
+        instr(worker_id, char(0)) = 0 AND length(worker_id) BETWEEN 1 AND 128
+        AND worker_id NOT GLOB '*[^A-Za-z0-9_-]*'
+      ),
+      delivery_unit_id TEXT NOT NULL CHECK(
+        instr(delivery_unit_id, char(0)) = 0 AND length(delivery_unit_id) BETWEEN 1 AND 256
+      ),
+      evidence_version INTEGER NOT NULL CHECK(
+        typeof(evidence_version) = 'integer' AND evidence_version BETWEEN 1 AND ${MAX_AUTOMATION_EVIDENCE_VERSION}
+      ),
+      execution_id TEXT NOT NULL CHECK(instr(execution_id, char(0)) = 0 AND length(execution_id) BETWEEN 1 AND 256),
+      run_id TEXT NOT NULL CHECK(instr(run_id, char(0)) = 0 AND length(run_id) BETWEEN 1 AND 256),
+      attempt_path TEXT NOT NULL CHECK(instr(attempt_path, char(0)) = 0 AND length(attempt_path) BETWEEN 1 AND 4096),
+      attempt_dev INTEGER NOT NULL CHECK(typeof(attempt_dev) = 'integer' AND attempt_dev >= 0),
+      attempt_ino INTEGER NOT NULL CHECK(typeof(attempt_ino) = 'integer' AND attempt_ino >= 0),
+      attempt_uid INTEGER NOT NULL CHECK(typeof(attempt_uid) = 'integer' AND attempt_uid >= 0),
+      attempt_nonce TEXT NOT NULL CHECK(
+        length(attempt_nonce) = 36 AND attempt_nonce GLOB
+          '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*'
+      ),
+      repo_path TEXT NOT NULL CHECK(instr(repo_path, char(0)) = 0 AND length(repo_path) BETWEEN 1 AND 4096),
+      authoritative_worktree_path TEXT NOT NULL CHECK(
+        instr(authoritative_worktree_path, char(0)) = 0 AND length(authoritative_worktree_path) BETWEEN 1 AND 4096
+      ),
+      base_commit TEXT NOT NULL CHECK(
+        length(base_commit) = 40 AND base_commit NOT GLOB '*[^0-9a-f]*'
+      ),
+      baseline_diff_hash TEXT NOT NULL CHECK(
+        length(baseline_diff_hash) = 64 AND baseline_diff_hash NOT GLOB '*[^0-9a-f]*'
+      ),
+      patch_blob BLOB NOT NULL,
+      patch_sha256 TEXT NOT NULL CHECK(
+        length(patch_sha256) = 64 AND patch_sha256 NOT GLOB '*[^0-9a-f]*'
+      ),
+      patch_bytes INTEGER NOT NULL CHECK(
+        typeof(patch_bytes) = 'integer' AND patch_bytes BETWEEN 0 AND 8388608
+        AND typeof(patch_blob) = 'blob' AND length(patch_blob) = patch_bytes
+      ),
+      published_diff_hash TEXT NOT NULL CHECK(
+        length(published_diff_hash) = 64 AND published_diff_hash NOT GLOB '*[^0-9a-f]*'
+      ),
+      status TEXT NOT NULL CHECK(status IN ('prepared', 'committed', 'canceled', 'manual')),
+      cleanup_status TEXT NOT NULL CHECK(cleanup_status IN ('pending', 'completed', 'failed')),
+      last_error TEXT CHECK(
+        last_error IS NULL OR (instr(last_error, char(0)) = 0 AND length(last_error) <= 4096)
+      ),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL CHECK(updated_at >= created_at),
+      committed_at TEXT,
+      cleanup_completed_at TEXT,
+      CHECK(
+        (status = 'committed' AND committed_at IS NOT NULL)
+        OR (status <> 'committed' AND committed_at IS NULL)
+      ),
+      CHECK(
+        (cleanup_status = 'completed' AND cleanup_completed_at IS NOT NULL)
+        OR (cleanup_status <> 'completed' AND cleanup_completed_at IS NULL)
+      ),
+      FOREIGN KEY(job_id) REFERENCES automation_jobs(id),
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
+      FOREIGN KEY(execution_id) REFERENCES executions(id),
+      FOREIGN KEY(run_id) REFERENCES stage_runs(id)
+    );
     CREATE TABLE IF NOT EXISTS delivery_quality_runs (
       id TEXT PRIMARY KEY,
       requirement_id TEXT NOT NULL,
@@ -551,6 +618,11 @@ export function createPhase2Schema(db: DatabaseSync) {
       WHERE owner_type IS NULL AND owner_id IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_automation_job_dedupe
       ON automation_jobs(dedupe_key);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_implementation_publication_claim
+      ON implementation_publication_journals(job_id, claim_token);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_implementation_publication_unit_version
+      ON implementation_publication_journals(delivery_unit_id, evidence_version)
+      WHERE status IN ('prepared', 'committed', 'manual');
     CREATE INDEX IF NOT EXISTS idx_automation_jobs_pending_lease
       ON automation_jobs(status, created_at, id)
       WHERE status = 'pending' AND attempt < max_attempts;
