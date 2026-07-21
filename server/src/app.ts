@@ -47,8 +47,9 @@ export async function buildApp(store: WorkflowStore) {
   app.get("/api/requirements/:id", async (req: any, reply) => {
     const item = store.getRequirement(req.params.id);
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
-    const codingEvidence: any = store.getLatestCodingEvidence(item.id);
-    if (codingEvidence) {
+    const deliveryStage = ["implementation", "quality_verification", "acceptance_delivery"].includes(item.stage);
+    const codingEvidence: any = deliveryStage ? null : store.getLatestCodingEvidence(item.id);
+    if (!deliveryStage && codingEvidence) {
       try { codingEvidence.status = (await getWorktreeSnapshot(codingEvidence.worktreePath, {
         sensitivePatterns: codingEvidence.sensitivePatterns
       })).evidenceHash === codingEvidence.diffHash ? (codingEvidence.truncated ? "truncated" : "valid") : "stale"; }
@@ -57,7 +58,10 @@ export async function buildApp(store: WorkflowStore) {
     const artifacts=store.listArtifacts(item.id),approvals=store.listApprovals(item.id);
     const reworkContext=store.getLatestReworkContext(item.id);
     const delivery = store.deliveryUnitDetails.getForRequirement(item.id);
-    return { ...item, artifacts, approvals, executions: store.listExecutions(item.id), revisions: store.listRequirementRevisions(item.id), runs: store.listStageRuns(item.id), codingEvidence, reworkContext, knowledgeChanges:store.getKnowledgeChangeSet(item.id),deliveryUnits:delivery.units,deliveryDependencies:delivery.dependencies,automation:delivery.automation };
+    const detail = { ...item, artifacts, approvals, revisions: store.listRequirementRevisions(item.id),
+      runs: store.listStageRuns(item.id), reworkContext, knowledgeChanges:store.getKnowledgeChangeSet(item.id),
+      deliveryUnits:delivery.units,deliveryDependencies:delivery.dependencies,automation:delivery.automation };
+    return deliveryStage ? detail : { ...detail, executions: store.listExecutions(item.id), codingEvidence };
   });
   app.patch("/api/requirements/:id", async (req: any, reply) => {
     const input = requirementRevisionSchema.safeParse(req.body);
@@ -91,13 +95,7 @@ export async function buildApp(store: WorkflowStore) {
     const item = store.getRequirement(req.params.id);
     if (!item) return reply.code(404).send({ error: "NOT_FOUND" });
     if (["implementation", "quality_verification", "acceptance_delivery"].includes(item.stage)) {
-      return {
-        requirement: item,
-        stage: item.stage,
-        deliveryUnits: store.deliveryUnits.listForRequirement(item.id),
-        deliveryDependencies: store.deliveryUnits.listDependencies(item.id),
-        automationPending: true
-      };
+      return reply.code(409).send({ error: "DELIVERY_UNIT_AUTOMATION_OWNS_STAGE", stage: item.stage });
     }
     if (item.stage !== "definition" && item.stage !== "solution_design") {
       return reply.code(409).send({ error: "REQUIREMENT_AI_STAGE_UNSUPPORTED", stage: item.stage });

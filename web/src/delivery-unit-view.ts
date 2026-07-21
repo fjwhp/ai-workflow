@@ -111,6 +111,21 @@ export function deliveryActionSubmission(action: DeliveryUnitAllowedAction, reas
   return { ok: true as const, value: { type: action.type, reason: normalized } };
 }
 
+export async function submitDeliveryMutation(
+  mutate: () => Promise<void>,
+  onMutationSuccess: () => void,
+  refresh: () => Promise<void>,
+  onRefreshError: (error: unknown) => void
+) {
+  await mutate();
+  onMutationSuccess();
+  try {
+    await refresh();
+  } catch (error) {
+    onRefreshError(error);
+  }
+}
+
 export function deliveryActionRequest(requirementId: string, request: {
   type: DeliveryUnitActionType | "pause_automation" | "resume_automation";
   reason: string;

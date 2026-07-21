@@ -317,7 +317,7 @@ describe("project and requirement association APIs",()=>{
     await app.close();
   });
 
-  it("returns implementation delivery details without starting requirement-level execution",async()=>{
+  it("rejects implementation runs without starting requirement-level execution",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const primaryRepo=await projectRepo(),deliveryRepo=await projectRepo();
     const primary=store.createProject(projectPayload(primaryRepo,{name:"Architecture"})),delivery=store.createProject(projectPayload(deliveryRepo,{name:"Orders"}));
     const req=createRequirement(store,{title:"订单编码",businessProblem:"按设计编码",expectedOutcome:"交付订单",priority:"medium",primaryProjectId:primary.id});
@@ -327,7 +327,7 @@ describe("project and requirement association APIs",()=>{
 
     const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});
 
-    expect(response.statusCode).toBe(200);expect(response.json()).toMatchObject({stage:"implementation",deliveryUnits:[],deliveryDependencies:[],automationPending:true});
+    expect(response.statusCode).toBe(409);expect(response.json()).toMatchObject({error:"DELIVERY_UNIT_AUTOMATION_OWNS_STAGE",stage:"implementation"});
     expect(runAgent).not.toHaveBeenCalled();expect(runCodexCoding).not.toHaveBeenCalled();expect(store.listStageRuns(req.id)).toEqual([]);expect(store.listExecutions(req.id)).toEqual([]);
     await app.close();
   });
@@ -521,15 +521,15 @@ describe("project and requirement association APIs",()=>{
     expect(response.statusCode).toBe(201);expect((await execFileAsync("git",["-C",repo,"branch","--format=%(refname:short)"])).stdout).toBe(beforeBranches);expect((await execFileAsync("git",["-C",repo,"worktree","list","--porcelain"])).stdout).toBe(beforeWorktrees);await app.close();
   });
 
-  it("returns read-only details when multiple delivery projects are associated",async()=>{
+  it("rejects requirement runs when multiple delivery projects are associated",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const a=store.createProject(projectPayload(await projectRepo()));const b=store.createProject(projectPayload(await projectRepo(),{name:"B"}));
     const req=createRequirement(store,{title:"多项目交付",businessProblem:"需要多个项目共同交付",expectedOutcome:"明确阻止执行",priority:"medium",primaryProjectId:a.id});
     store.replaceRequirementProjects(req.id,[{projectId:a.id,projectVersionId:ensureProjectVersion(store,a.id).id,role:"primary",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:0},{projectId:b.id,projectVersionId:ensureProjectVersion(store,b.id).id,role:"collaborator",usage:"delivery",deliveryRequired:true,moduleMode:"auto",moduleIds:[],position:1}]);
     store.updateRequirementState(req.id,"implementation","ai_ready");
-    const app=await buildApp(store);const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});expect(response.statusCode).toBe(200);expect(response.json()).toMatchObject({stage:"implementation",automationPending:true});expect(response.json().deliveryUnits).toEqual([]);expect(store.listStageRuns(req.id)).toHaveLength(0);expect(runAgent).not.toHaveBeenCalled();expect(runCodexCoding).not.toHaveBeenCalled();await app.close();
+    const app=await buildApp(store);const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});expect(response.statusCode).toBe(409);expect(response.json()).toMatchObject({error:"DELIVERY_UNIT_AUTOMATION_OWNS_STAGE",stage:"implementation"});expect(store.listStageRuns(req.id)).toHaveLength(0);expect(runAgent).not.toHaveBeenCalled();expect(runCodexCoding).not.toHaveBeenCalled();await app.close();
   });
 
-  it("uses all projects for solution design and returns implementation details without a sole-project guard",async()=>{
+  it("uses all projects for solution design and rejects requirement-owned implementation",async()=>{
     const store=new WorkflowStore(":memory:");stores.push(store);const a=store.createProject(projectPayload(await projectRepo(),{name:"A"}));const b=store.createProject(projectPayload(await projectRepo(),{name:"B"}));
     const design=createRequirement(store,{title:"多项目设计",businessProblem:"设计需要两个交付项目",expectedOutcome:"完整上下文",priority:"medium",primaryProjectId:a.id});
     const associations=[{projectId:a.id,projectVersionId:ensureProjectVersion(store,a.id).id,role:"primary" as const,usage:"delivery" as const,deliveryRequired:true,moduleMode:"all" as const,moduleIds:[],position:0},{projectId:b.id,projectVersionId:ensureProjectVersion(store,b.id).id,role:"collaborator" as const,usage:"delivery" as const,deliveryRequired:true,moduleMode:"all" as const,moduleIds:[],position:1}];
@@ -540,7 +540,7 @@ describe("project and requirement association APIs",()=>{
     const designResponse=await app.inject({method:"POST",url:`/api/requirements/${design.id}/run`,payload:{}});const codingResponse=await app.inject({method:"POST",url:`/api/requirements/${coding.id}/run`,payload:{}});
 
     expect(designResponse.statusCode).toBe(202);expect((store.getStageRun(designResponse.json().id) as any).input.projectContext.projects.map((project:any)=>project.projectId)).toEqual([a.id,b.id]);
-    expect(codingResponse.statusCode).toBe(200);expect(codingResponse.json()).toMatchObject({stage:"implementation",automationPending:true});await app.close();
+    expect(codingResponse.statusCode).toBe(409);expect(codingResponse.json()).toMatchObject({error:"DELIVERY_UNIT_AUTOMATION_OWNS_STAGE",stage:"implementation"});await app.close();
   });
 
   it("redacts all associated project patterns from model-bound context and audit input",async()=>{
@@ -553,7 +553,7 @@ describe("project and requirement association APIs",()=>{
     expect(response.statusCode).toBe(202);const runInput=(store.getStageRun(response.json().id) as any).input,input=JSON.stringify(runInput),prompt=buildAgentPrompt("solution_design",runInput);expect(input).not.toContain("MODEL_TOKEN");expect(input).not.toContain("MODEL_BEARER");expect(input).not.toContain("USER_PASSWORD");expect(input).not.toContain("CUSTOM_SECRET");expect(prompt).not.toContain("MODEL_TOKEN");expect(prompt).not.toContain("CUSTOM_SECRET");expect(input).toContain("[REDACTED]");expect(prompt).toContain("UNTRUSTED");await app.close();
   });
 
-  it.each(["implementation", "quality_verification", "acceptance_delivery"] as const)("returns persisted delivery plan details without starting %s automation",async(stage)=>{
+  it.each(["implementation", "quality_verification", "acceptance_delivery"] as const)("rejects requirement-owned %s automation",async(stage)=>{
     const store=new WorkflowStore(":memory:");stores.push(store);
     const backend=store.createProject(projectPayload(`/tmp/app-plan-backend-${crypto.randomUUID()}`,{name:"Backend"}));
     const web=store.createProject(projectPayload(`/tmp/app-plan-web-${crypto.randomUUID()}`,{name:"Web"}));
@@ -567,7 +567,7 @@ describe("project and requirement association APIs",()=>{
 
     const response=await app.inject({method:"POST",url:`/api/requirements/${req.id}/run`,payload:{}});
 
-    expect(response.statusCode).toBe(200);expect(response.json()).toMatchObject({requirement:{id:req.id,stage},stage,automationPending:true,deliveryUnits:plan.units.map(unit=>expect.objectContaining({id:unit.id})),deliveryDependencies:plan.dependencies.map(dependency=>expect.objectContaining({id:dependency.id}))});
+    expect(response.statusCode).toBe(409);expect(response.json()).toMatchObject({error:"DELIVERY_UNIT_AUTOMATION_OWNS_STAGE",stage});
     expect(runAgent).not.toHaveBeenCalled();expect(runCodexCoding).not.toHaveBeenCalled();expect(store.listStageRuns(req.id)).toEqual([]);expect(store.listExecutions(req.id)).toEqual([]);await app.close();
   });
 });
@@ -629,6 +629,26 @@ describe("live delivery unit detail", () => {
     }
   }
 
+  it("rejects requirement-level runs for delivery stages without creating work", async () => {
+    const { store, requirement } = createDeliveryFixture();
+    store.updateRequirementState(requirement.id, "implementation", "ai_ready");
+    const app = await buildApp(store);
+    const pendingBefore = store.automationJobs.listPending().length;
+
+    const response = await app.inject({ method: "POST", url: `/api/requirements/${requirement.id}/run`,
+      payload: {} });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "DELIVERY_UNIT_AUTOMATION_OWNS_STAGE",
+      stage: "implementation" });
+    expect(store.listStageRuns(requirement.id)).toEqual([]);
+    expect(store.listExecutions(requirement.id)).toEqual([]);
+    expect(store.automationJobs.listPending()).toHaveLength(pendingBefore);
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(runCodexCoding).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it("returns current evidence, releases, pause state, blockers, and server-owned stale actions", async () => {
     const { store, requirement, primary, secondary } = createDeliveryFixture();
     completeImplementation(store, primary.id);
@@ -673,6 +693,96 @@ describe("live delivery unit detail", () => {
     expect(pausedDetail.deliveryUnits.every((unit: any) => unit.allowedActions.length === 0)).toBe(true);
     expect(pausedDetail.deliveryUnits[0].automation).toMatchObject({ status: "paused", actor: "local-human" });
     await app.close();
+  });
+
+  it("does not expose superseded requirement evidence after a delivery unit rerun", async () => {
+    const { store, requirement, primary, secondary } = createDeliveryFixture();
+    store.updateRequirementState(requirement.id, "implementation", "ai_ready");
+    completeImplementation(store, primary.id);
+    passQuality(store, primary.id, 1);
+    completeImplementation(store, secondary.id);
+    const supersededHash = `hash-${secondary.id}-v1`;
+    const db = (store as any).db;
+    db.prepare(`UPDATE delivery_units SET evidence_version = 2, phase = 'implementation', status = 'ready'
+      WHERE id = ?`).run(primary.id);
+    completeImplementation(store, primary.id);
+    passQuality(store, primary.id, 2);
+    const app = await buildApp(store);
+
+    const rerun = await app.inject({ method: "POST", url: `/api/delivery-units/${secondary.id}/stale-resolution`,
+      payload: { decision: "rerun", reason: "上游实现变化，重新执行" } });
+    expect(rerun.statusCode).toBe(200);
+    const response = await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` });
+    const body = response.json();
+
+    expect(body).not.toHaveProperty("codingEvidence");
+    expect(body).not.toHaveProperty("executions");
+    expect(JSON.stringify(body)).not.toContain(supersededHash);
+    expect(body.deliveryUnits.find((unit: any) => unit.id === secondary.id)).toMatchObject({
+      evidenceVersion: 2,
+      implementationEvidence: null,
+      codeReviewEvidence: null,
+      automatedTestingEvidence: null
+    });
+    await app.close();
+  });
+
+  it("uses current upstream evidence versions for stale reuse and retry authorization", async () => {
+    const stale = createDeliveryFixture();
+    completeImplementation(stale.store, stale.primary.id);
+    passQuality(stale.store, stale.primary.id, 1);
+    completeImplementation(stale.store, stale.secondary.id);
+    const staleDb = (stale.store as any).db;
+    staleDb.prepare(`UPDATE delivery_units SET evidence_version = 2, phase = 'implementation', status = 'ready'
+      WHERE id = ?`).run(stale.primary.id);
+    completeImplementation(stale.store, stale.primary.id);
+    passQuality(stale.store, stale.primary.id, 2);
+    staleDb.prepare(`UPDATE delivery_dependencies SET released_by_evidence_version = 1
+      WHERE downstream_unit_id = ?`).run(stale.secondary.id);
+    const staleApp = await buildApp(stale.store);
+
+    const staleDetail = (await staleApp.inject({ method: "GET",
+      url: `/api/requirements/${stale.requirement.id}` })).json();
+    expect(staleDetail.deliveryUnits.find((unit: any) => unit.id === stale.secondary.id).allowedActions).toEqual([
+      { type: "rerun", reasonRequired: true }
+    ]);
+    expect((await staleApp.inject({ method: "POST",
+      url: `/api/delivery-units/${stale.secondary.id}/stale-resolution`,
+      payload: { decision: "reuse", reason: "尝试复用旧依赖" } })).statusCode).toBe(409);
+    expect((await staleApp.inject({ method: "POST",
+      url: `/api/delivery-units/${stale.secondary.id}/stale-resolution`,
+      payload: { decision: "rerun", reason: "重新执行以匹配当前依赖" } })).statusCode).toBe(200);
+    await staleApp.close();
+
+    for (const target of ["implementation", "code_review"] as const) {
+      const fixture = createDeliveryFixture();
+      completeImplementation(fixture.store, fixture.primary.id);
+      passQuality(fixture.store, fixture.primary.id, 1);
+      const db = (fixture.store as any).db;
+      if (target === "implementation") {
+        db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id = ?").run(fixture.secondary.id);
+      } else {
+        completeImplementation(fixture.store, fixture.secondary.id);
+        fixture.store.automationJobs.cancelByOwnerVersion(fixture.secondary.id, 1);
+      }
+      const action = target === "implementation" ? "implement" : "review";
+      fixture.store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: fixture.secondary.id,
+        evidenceVersion: 1, action, payload: {}, maxAttempts: 1 });
+      const job = fixture.store.automationJobs.leaseNext(`worker-${target}`, new Date(), 30_000)!;
+      expect(fixture.store.automationJobs.fail(job.id, job.leaseOwner!, `${target} failed`, false)).toBe(true);
+      db.prepare("UPDATE delivery_units SET evidence_version = 2 WHERE id = ?").run(fixture.primary.id);
+      const app = await buildApp(fixture.store);
+
+      const detail = (await app.inject({ method: "GET",
+        url: `/api/requirements/${fixture.requirement.id}` })).json();
+      expect(detail.deliveryUnits.find((unit: any) => unit.id === fixture.secondary.id)).toMatchObject({
+        allowedActions: [],
+        blocker: { code: "DELIVERY_DEPENDENCY_PENDING", message: "等待上游依赖释放" }
+      });
+      expect((await app.inject({ method: "POST", url: `/api/delivery-units/${fixture.secondary.id}/retry`,
+        payload: { target, reason: "依赖版本过期时不能重试" } })).statusCode).toBe(409);
+      await app.close();
+    }
   });
 
   it("exposes only the failed job retry and optional skip, then enforces reason and fixed actor", async () => {

@@ -63,8 +63,7 @@ function App() {
       {selected ? <RequirementDetail item={selected} onRun={() => setModal("run")} onViewRun={setRunView} onEdit={() => setModal("edit")} onApprove={() => setModal("approve")} onRefresh={refresh} onManageProjects={() => setModal("associations")} onDeliveryAction={async (request) => {
         const action = deliveryActionRequest(selected.id, request);
         await post(action.path, action.body);
-        await refresh();
-      }}/> :
+      }} onDeliveryRefreshError={() => setError("操作已成功，但刷新失败，请重新打开需求")}/> :
        page === "projects" ? <ProjectManagement/> : page === "settings" ? <SettingsPage/> : <Dashboard items={visibleItems} queues={queues} queueFilter={queueFilter} onQueue={selectQueue} onClearFilter={()=>setQueueFilter(null)} onOpen={open}/>}
     </main>
     {modal === "new" && <NewRequirement

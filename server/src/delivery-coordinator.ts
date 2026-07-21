@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { MAX_AUTOMATION_EVIDENCE_VERSION } from "@ai-workflow/shared";
 import { AutomationJobRepository } from "./automation-job-repository.js";
+import { deliveryUnitDependenciesSatisfied } from "./delivery-unit-eligibility.js";
 import {
   DeliveryQualityRepository,
   type DeliveryQualityClaim,
@@ -596,7 +597,8 @@ export class DeliveryCoordinator {
       const hasEvidence = this.db.prepare(`SELECT 1 FROM delivery_quality_evidence
         WHERE delivery_unit_id = ? AND evidence_version = ? AND kind = ?`)
         .get(unit.id, unit.evidence_version, kind);
-      if (!hasCoding || hasEvidence || !["awaiting_gate", "returned", "failed"].includes(unit.status)) {
+      if (!hasCoding || hasEvidence || !this.dependenciesSatisfied(unit.id)
+        || !["awaiting_gate", "returned", "failed"].includes(unit.status)) {
         throw new Error("DELIVERY_UNIT_RETRY_NOT_ELIGIBLE");
       }
     }
@@ -842,11 +844,7 @@ export class DeliveryCoordinator {
   }
 
   private dependenciesSatisfied(unitId: string) {
-    return !this.db.prepare(`SELECT 1 FROM delivery_dependencies dependency
-      JOIN delivery_units upstream ON upstream.id = dependency.upstream_unit_id
-      WHERE dependency.downstream_unit_id = ?
-        AND dependency.released_by_evidence_version IS NOT upstream.evidence_version
-      LIMIT 1`).get(unitId);
+    return deliveryUnitDependenciesSatisfied(this.db, unitId);
   }
 
   private requirementPaused(requirementId: string) {

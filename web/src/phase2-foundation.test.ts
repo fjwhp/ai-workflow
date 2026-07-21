@@ -20,7 +20,7 @@ describe("Phase 2 foundation UI", () => {
         stage, status,
         primaryProjectId: "project-1", primaryProjectVersionId: "version-1",
         createdAt: "2026-07-20T00:00:00.000Z", updatedAt: "2026-07-20T00:00:00.000Z",
-        artifacts: [], approvals: [], executions: [], projects: [], deliveryUnits: [], deliveryDependencies: []
+        artifacts: [], approvals: [], projects: [], deliveryUnits: [], deliveryDependencies: []
       },
       onRun: () => undefined,
       onViewRun: () => undefined,
@@ -49,7 +49,7 @@ describe("Phase 2 foundation UI", () => {
         expectedOutcome: "Read-only delivery evidence", priority: "medium", stage, status: "ai_running",
         primaryProjectId: "project-1", primaryProjectVersionId: "version-1",
         createdAt: "2026-07-20T00:00:00.000Z", updatedAt: "2026-07-20T00:00:00.000Z",
-        artifacts: [], approvals: [], executions: [], projects: [], deliveryUnits: [], deliveryDependencies: [],
+        artifacts: [], approvals: [], projects: [], deliveryUnits: [], deliveryDependencies: [],
         runs: [{ id: "run-1", stage, status: "running", model: "legacy", input: {}, createdAt: "2026-07-20T00:00:00.000Z", events: [] }]
       },
       onRun: () => undefined, onViewRun: () => undefined, onEdit: () => undefined,

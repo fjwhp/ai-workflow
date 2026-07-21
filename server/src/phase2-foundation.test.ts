@@ -147,7 +147,7 @@ describe("Phase 2 foundation live surface", () => {
     await app.close();
   });
 
-  it.each(["implementation", "quality_verification", "acceptance_delivery"] as const)("keeps %s runs read-only without any mutation", async (stage) => {
+  it.each(["implementation", "quality_verification", "acceptance_delivery"] as const)("rejects requirement-owned %s runs without any mutation", async (stage) => {
     const store = createStore();
     const { requirement, repoPath, worktreePath } = createRequirement(store);
     store.updateRequirementState(requirement.id, stage, "ai_ready");
@@ -159,10 +159,8 @@ describe("Phase 2 foundation live surface", () => {
     const response = await app.inject({ method: "POST", url: `/api/requirements/${requirement.id}/run`, payload: {} });
     const detail = await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ requirement: { id: requirement.id, stage }, stage, automationPending: true });
-    expect(response.json()).toHaveProperty("deliveryUnits");
-    expect(response.json()).toHaveProperty("deliveryDependencies");
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: "DELIVERY_UNIT_AUTOMATION_OWNS_STAGE", stage });
     expect(runAgent).not.toHaveBeenCalled();
     expect(runCodexCoding).not.toHaveBeenCalled();
     expect(store.listExecutions(requirement.id)).toEqual([]);

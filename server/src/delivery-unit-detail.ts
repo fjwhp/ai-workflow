@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { DeliveryExecutionRepository } from "./delivery-execution-repository.js";
 import type { DeliveryQualityRepository } from "./delivery-quality-repository.js";
 import type { DeliveryDependency, DeliveryUnit, DeliveryUnitRepository } from "./delivery-unit-repository.js";
+import { deliveryUnitDependenciesSatisfied } from "./delivery-unit-eligibility.js";
 
 export type DeliveryUnitActionType =
   | "retry_implementation"
@@ -114,7 +115,7 @@ export class DeliveryUnitDetailRepository {
       .includes(unit.status)) return [];
     if (unit.status === "potentially_stale") {
       return this.hasActiveInvalidation(unit)
-        ? [action("reuse_evidence"), action("rerun")]
+        ? [...(this.dependenciesSatisfied(unit.id) ? [action("reuse_evidence")] : []), action("rerun")]
         : [];
     }
     const active = this.hasActiveWork(unit);
@@ -123,7 +124,8 @@ export class DeliveryUnitDetailRepository {
       && this.dependenciesSatisfied(unit.id) && this.failedJob(unit, "implement")) {
       actions.push(action("retry_implementation"));
     }
-    if (!active && evidence.implementation && ["awaiting_gate", "returned", "failed"].includes(unit.status)) {
+    if (!active && evidence.implementation && this.dependenciesSatisfied(unit.id)
+      && ["awaiting_gate", "returned", "failed"].includes(unit.status)) {
       if (!evidence.codeReview && this.failedJob(unit, "review")) actions.push(action("retry_code_review"));
       if (!evidence.automatedTesting && this.failedJob(unit, "test")) {
         actions.push(action("retry_automated_testing"));
@@ -148,8 +150,7 @@ export class DeliveryUnitDetailRepository {
       code: "DELIVERY_EVIDENCE_POTENTIALLY_STALE",
       message: "上游证据已变化，需要确认复用或重新执行"
     };
-    if (unit.status === "waiting_dependency" || dependencies.some((edge) =>
-      edge.direction === "incoming" && edge.releasedAt === null)) return {
+    if (unit.status === "waiting_dependency" || !this.dependenciesSatisfied(unit.id)) return {
       code: "DELIVERY_DEPENDENCY_PENDING", message: "等待上游依赖释放"
     };
     if (unit.status === "returned") return {
@@ -199,8 +200,7 @@ export class DeliveryUnitDetailRepository {
   }
 
   private dependenciesSatisfied(unitId: string) {
-    return !this.db.prepare(`SELECT 1 FROM delivery_dependencies
-      WHERE downstream_unit_id = ? AND released_by_evidence_version IS NULL LIMIT 1`).get(unitId);
+    return deliveryUnitDependenciesSatisfied(this.db, unitId);
   }
 }
 

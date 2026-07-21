@@ -1,12 +1,32 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import type { DeliveryQualityKind } from "./delivery-quality-repository.js";
 import type { WorkflowStore } from "./store.js";
+import { watchDeliveryEvents } from "./delivery-live-events.js";
 
 const LOCAL_HUMAN_ACTOR = "local-human";
 
 interface RouteOptions { store: WorkflowStore }
 
 export async function registerDeliveryUnitRoutes(app: FastifyInstance, { store }: RouteOptions) {
+  app.get("/api/requirements/:id/delivery-events", async (request, reply) => {
+    const requirementId = routeId((request.params as { id?: unknown }).id);
+    if (!requirementId || !store.getRequirement(requirementId)) {
+      return notFound(reply, "REQUIREMENT_NOT_FOUND");
+    }
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": request.headers.origin || "*"
+    });
+    const stop = watchDeliveryEvents({
+      generation: () => store.getDeliveryEventGeneration(requirementId),
+      emit: (generation) => reply.raw.write(`event: delivery-change\ndata: ${JSON.stringify({ generation })}\n\n`)
+    });
+    request.raw.once("close", stop);
+  });
+
   app.post("/api/delivery-units/:id/stale-resolution", async (request, reply) => {
     const unitId = routeId((request.params as { id?: unknown }).id);
     const body = objectBody(request.body);

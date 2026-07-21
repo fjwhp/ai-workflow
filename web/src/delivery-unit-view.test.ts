@@ -51,6 +51,25 @@ describe("deliveryUnitView", () => {
 });
 
 describe("deliveryActionSubmission", () => {
+  it("settles a successful mutation before refresh and reports refresh failure separately", async () => {
+    const module = await import("./delivery-unit-view.js");
+    const submitDeliveryMutation = (module as any).submitDeliveryMutation;
+    expect(submitDeliveryMutation).toBeTypeOf("function");
+    if (!submitDeliveryMutation) return;
+    const events: string[] = [];
+    let postCalls = 0;
+
+    await submitDeliveryMutation(
+      async () => { postCalls += 1; events.push("mutation"); },
+      () => events.push("mutation-success"),
+      async () => { events.push("refresh"); throw new Error("offline"); },
+      () => events.push("refresh-warning")
+    );
+
+    expect(postCalls).toBe(1);
+    expect(events).toEqual(["mutation", "mutation-success", "refresh", "refresh-warning"]);
+  });
+
   it("rejects a blank reason and trims a valid reason without losing the selected action", () => {
     const action = { type: "skip_optional", reasonRequired: true } as const;
     expect(deliveryActionSubmission(action, "  ")).toEqual({ ok: false, error: "请填写操作原因" });

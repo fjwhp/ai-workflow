@@ -8,6 +8,7 @@ import {
 import { AccessibleDialog } from "./accessible-dialog.js";
 import {
   deliveryUnitView,
+  submitDeliveryMutation,
   type DeliveryEvidenceSummary,
   type DeliveryUnitActionType,
   type DeliveryUnitAllowedAction,
@@ -60,6 +61,8 @@ export type DeliveryMatrixProps = {
     allowedActions: ReadonlyArray<{ type: "pause_automation" | "resume_automation"; reasonRequired: true }>;
   };
   onAction?: (request: DeliveryMatrixActionRequest) => Promise<void>;
+  onActionRefresh?: () => Promise<void>;
+  onActionRefreshError?: (error: unknown) => void;
 };
 
 export type DeliveryMatrixActionType = DeliveryUnitActionType | "pause_automation" | "resume_automation";
@@ -133,11 +136,18 @@ export function deliveryMatrixRowViews(
   dependencies: readonly DeliveryDependencyView[]
 ): ReadonlyMap<string, ReturnType<typeof deliveryRowView>> {
   const unitIds = new Set(units.map((unit) => unit.id));
+  const unitById = new Map(units.map((unit) => [unit.id, unit]));
+  const effectiveDependencies = dependencies.map((dependency) => {
+    const upstream = unitById.get(dependency.upstreamUnitId);
+    return upstream && dependency.releasedByEvidenceVersion !== upstream.evidenceVersion
+      ? { ...dependency, releasedAt: null }
+      : dependency;
+  });
   const invalidUnitIds = new Set<string>();
   const validDependencies: DeliveryDependencyView[] = [];
   let invalidGraph = false;
 
-  for (const dependency of dependencies) {
+  for (const dependency of effectiveDependencies) {
     const hasUpstream = unitIds.has(dependency.upstreamUnitId);
     const hasDownstream = unitIds.has(dependency.downstreamUnitId);
     if (!hasUpstream || !hasDownstream) {
@@ -152,7 +162,7 @@ export function deliveryMatrixRowViews(
   for (const unitId of cyclicUnitIds(unitIds, validDependencies)) invalidUnitIds.add(unitId);
 
   return new Map(units.map((unit) => {
-    const view = deliveryRowView(unit, dependencies);
+    const view = deliveryRowView(unit, effectiveDependencies);
     return [unit.id, invalidGraph || invalidUnitIds.has(unit.id) ? {
       ...view,
       dependencyLabel: "交付依赖数据异常",
@@ -189,7 +199,8 @@ function cyclicUnitIds(
   return cyclic;
 }
 
-export function DeliveryMatrix({ units, dependencies, projects, automation, onAction }: DeliveryMatrixProps) {
+export function DeliveryMatrix({ units, dependencies, projects, automation, onAction,
+  onActionRefresh, onActionRefreshError }: DeliveryMatrixProps) {
   const [pendingAction, setPendingAction] = useState<DeliveryMatrixAction | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState("");
@@ -210,13 +221,17 @@ export function DeliveryMatrix({ units, dependencies, projects, automation, onAc
     setPendingAction(action);
   };
   const submitAction = async (reason: string) => {
-    if (!pendingAction || !onAction) return;
+    if (!pendingAction || !onAction || actionBusy) return;
     setActionBusy(true);
     setActionError("");
     try {
-      await onAction({ type: pendingAction.type, reason, ...(pendingAction.unitId
-        ? { unitId: pendingAction.unitId } : {}) });
-      setPendingAction(null);
+      await submitDeliveryMutation(
+        () => onAction({ type: pendingAction.type, reason, ...(pendingAction.unitId
+          ? { unitId: pendingAction.unitId } : {}) }),
+        () => setPendingAction(null),
+        onActionRefresh ?? (async () => undefined),
+        onActionRefreshError ?? (() => undefined)
+      );
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "操作失败，请重试");
     } finally {

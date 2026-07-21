@@ -10,6 +10,7 @@ import {
   deliveryRowView,
   deliveryStatusViews
 } from "./delivery-matrix.js";
+import { RequirementDetail } from "./requirement-detail.js";
 
 type NativeRole = "table" | "row" | "columnheader" | "cell";
 
@@ -275,9 +276,51 @@ describe("deliveryMatrixRowViews", () => {
       expect(view.blocker).not.toBe("交付依赖数据异常");
     }
   });
+
+  it("treats a release from an older upstream evidence version as pending", () => {
+    const upstream = { ...unit, id: "unit-api", status: "ready_for_acceptance" as const,
+      phase: "quality_verification" as const, evidenceVersion: 2 };
+    const downstream = { ...unit, id: "unit-web", projectId: "web", projectVersionId: "web-v1",
+      status: "failed" as const };
+    const views = deliveryMatrixRowViews([upstream, downstream], [{
+      upstreamUnitId: upstream.id, downstreamUnitId: downstream.id,
+      releaseCondition: "automated_testing_passed", releasedByEvidenceVersion: 1,
+      releasedAt: "2026-07-22T00:00:00.000Z"
+    }]);
+
+    expect(views.get(downstream.id)?.dependencyLabel).toBe("等待 unit-api 自动化测试");
+  });
 });
 
 describe("DeliveryMatrix", () => {
+  it("does not render superseded requirement-level delivery evidence", () => {
+    const supersededHash = "superseded-v1-hash";
+    const markup = renderToStaticMarkup(React.createElement(RequirementDetail, {
+      item: {
+        id: "req-1", code: "REQ-001", title: "Delivery", businessProblem: "Deliver",
+        expectedOutcome: "Done", priority: "medium", stage: "implementation", status: "ai_ready",
+        createdAt: "2026-07-22T00:00:00.000Z", updatedAt: "2026-07-22T00:00:00.000Z",
+        artifacts: [], approvals: [], projects: [], deliveryDependencies: [],
+        deliveryUnits: [{
+          id: "unit-1", projectId: "project-1", projectVersionId: "version-1", required: true,
+          phase: "implementation", status: "ready", evidenceVersion: 2,
+          implementationEvidence: null, codeReviewEvidence: null, automatedTestingEvidence: null,
+          blocker: null, dependencyReleases: [], automation: { status: "active" }, allowedActions: []
+        }],
+        automation: { status: "active", allowedActions: [] },
+        codingEvidence: { status: "stale", diffHash: supersededHash, fileCount: 1,
+          additions: 1, deletions: 0, branch: "old", executionId: "old-execution", diff: supersededHash },
+        executions: [{ status: "completed", branch: "old", worktreePath: "/tmp/old", diff: supersededHash }]
+      } as any,
+      onRun: () => undefined, onViewRun: () => undefined, onEdit: () => undefined,
+      onApprove: () => undefined, onRefresh: async () => undefined,
+      onManageProjects: () => undefined, onDeliveryAction: async () => undefined
+    }));
+
+    expect(markup).not.toContain(supersededHash);
+    expect(markup).not.toContain("独立 Codex 编码会话");
+  });
+
   it("renders one read-only delivery row per unit with independent review and testing fields", () => {
     const units = [{
       id: "unit-backend", projectId: "backend", projectVersionId: "backend-v1", required: true,

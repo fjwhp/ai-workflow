@@ -37,6 +37,7 @@ import {
   type CodingEvidenceInput,
   type ExecutionInput
 } from "./execution-repository.js";
+import { deliveryEventGeneration } from "./delivery-live-events.js";
 
 export type { ExecutionInput } from "./execution-repository.js";
 
@@ -1213,6 +1214,10 @@ export class WorkflowStore {
   getLatestReworkContext(requirementId:string){
     const row=this.db.prepare("SELECT * FROM rework_contexts WHERE requirement_id=? ORDER BY decision_at DESC LIMIT 1").get(requirementId) as any;
     return row?{id:row.id,requirementId:row.requirement_id,approvalId:row.approval_id,artifactId:row.artifact_id,sourceStage:row.source_stage,targetStage:row.target_stage,actorType:row.actor_type,decisionAt:row.decision_at,unstructured:Boolean(row.unstructured),items:JSON.parse(row.items_json),risks:JSON.parse(row.risks_json),openQuestions:JSON.parse(row.questions_json),createdAt:row.created_at}:null;
+  }
+
+  getDeliveryEventGeneration(requirementId: string) {
+    return deliveryEventGeneration(this.db, requirementId);
   }
 
   close() { this.db.close(); }

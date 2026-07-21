@@ -45,6 +45,89 @@ function completeImplementation(store: WorkflowStore, unitId: string) {
 }
 
 describe("delivery unit control routes", () => {
+  it("tracks delivery generation changes and stops its watcher cleanly", async () => {
+    const liveModule = await import("./delivery-live-events.js").catch(() => ({}));
+    const deliveryEventGeneration = (liveModule as any).deliveryEventGeneration;
+    const watchDeliveryEvents = (liveModule as any).watchDeliveryEvents;
+    expect(deliveryEventGeneration).toBeTypeOf("function");
+    expect(watchDeliveryEvents).toBeTypeOf("function");
+    if (!deliveryEventGeneration || !watchDeliveryEvents) return;
+    const { store, requirement, unit } = fixture();
+    const db = (store as any).db;
+    const initial = deliveryEventGeneration(db, requirement.id);
+    db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id = ?").run(unit.id);
+    const unitChanged = deliveryEventGeneration(db, requirement.id);
+    expect(unitChanged).not.toBe(initial);
+    store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id, evidenceVersion: 1,
+      action: "implement", payload: {}, maxAttempts: 3 });
+    const jobChanged = deliveryEventGeneration(db, requirement.id);
+    expect(jobChanged).not.toBe(unitChanged);
+    store.deliveryCoordination.pauseAutomation({ requirementId: requirement.id, actor: "local-human",
+      reason: "watch pause" });
+    const pauseChanged = deliveryEventGeneration(db, requirement.id);
+    expect(pauseChanged).not.toBe(jobChanged);
+
+    let tick: (() => void) | undefined;
+    let cleared = false;
+    const events: string[] = [];
+    const stop = watchDeliveryEvents({
+      generation: () => deliveryEventGeneration(db, requirement.id),
+      emit: (generation: string) => events.push(generation),
+      setInterval: (callback: () => void) => { tick = callback; return 7; },
+      clearInterval: (id: number) => { expect(id).toBe(7); cleared = true; }
+    });
+    expect(events).toEqual([pauseChanged]);
+    db.prepare("UPDATE delivery_units SET status = 'ready' WHERE id = ?").run(unit.id);
+    tick?.();
+    expect(events).toHaveLength(2);
+    tick?.();
+    expect(events).toHaveLength(2);
+    stop();
+    expect(cleared).toBe(true);
+    db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id = ?").run(unit.id);
+    tick?.();
+    expect(events).toHaveLength(2);
+  });
+
+  it("returns a stable not-found response for a missing delivery event stream", async () => {
+    const { store } = fixture();
+    const app = await buildApp(store);
+
+    const response = await app.inject({ method: "GET", url: "/api/requirements/missing/delivery-events" });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({ error: "REQUIREMENT_NOT_FOUND" });
+    await app.close();
+  });
+
+  it("streams an initial delivery event and another event after state changes", async () => {
+    const { store, requirement, unit } = fixture();
+    const app = await buildApp(store);
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const controller = new AbortController();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await fetch(`${address}/api/requirements/${requirement.id}/delivery-events`, {
+        signal: controller.signal
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      reader = response.body!.getReader();
+      const first = await readDeliveryEvent(reader);
+      expect(first).toContain("event: delivery-change");
+      const firstGeneration = JSON.parse(first.match(/data: (.+)/)![1]!).generation;
+
+      (store as any).db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id = ?").run(unit.id);
+      const second = await readDeliveryEvent(reader);
+      const secondGeneration = JSON.parse(second.match(/data: (.+)/)![1]!).generation;
+      expect(secondGeneration).not.toBe(firstGeneration);
+    } finally {
+      controller.abort();
+      await reader?.cancel().catch(() => undefined);
+      await app.close();
+    }
+  });
+
   it("registers pause and resume with bounded reasons and a server-side actor", async () => {
     const { store, requirement } = fixture();
     const app = await buildApp(store);
@@ -158,3 +241,19 @@ describe("delivery unit control routes", () => {
     await app.close();
   });
 });
+
+async function readDeliveryEvent(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  return Promise.race([
+    (async () => {
+      while (!buffer.includes("\n\n")) {
+        const chunk = await reader.read();
+        if (chunk.done) throw new Error("DELIVERY_EVENT_STREAM_CLOSED");
+        buffer += decoder.decode(chunk.value, { stream: true });
+      }
+      return buffer.slice(0, buffer.indexOf("\n\n"));
+    })(),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("DELIVERY_EVENT_TIMEOUT")), 3_000))
+  ]);
+}
