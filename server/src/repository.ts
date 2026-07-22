@@ -10,7 +10,7 @@ import { captureCommitEvidence, captureWorktreeEvidence, type EvidenceOptions } 
 const execFileAsync = promisify(execFile);
 const protectedBranches=new Set(["prod","production","main","master"]);
 const CODING_ATTEMPT_OWNER_SUFFIX = ".owner.json";
-type GitConfigEntry = readonly [key: string, value: string];
+export type GitConfigEntry = readonly [key: string, value: string];
 
 export interface CodingAttemptOwnership {
   version: 1;
@@ -20,7 +20,7 @@ export interface CodingAttemptOwnership {
   ino: number;
 }
 
-function codingGitEnvironment(config: readonly GitConfigEntry[] = []) {
+export function codingGitEnvironment(config: readonly GitConfigEntry[] = []) {
   const env = { ...process.env };
   const exact = new Set([
     "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
@@ -46,27 +46,28 @@ function codingGitEnvironment(config: readonly GitConfigEntry[] = []) {
   return env;
 }
 
-async function codingFilterOverrides(repoPath: string): Promise<GitConfigEntry[]> {
+export async function codingFilterOverrides(repoPath: string): Promise<GitConfigEntry[]> {
   let stdout = "";
   try {
     stdout = (await execFileAsync("git", ["-C", repoPath, "config", "--name-only", "--get-regexp",
-      "^filter\\..*\\.(smudge|process|required)$"], { env: codingGitEnvironment() })).stdout;
+      "^filter\\..*\\.(clean|smudge|process|required)$"], { env: codingGitEnvironment() })).stdout;
   } catch (error) {
     if ((error as { code?: unknown }).code !== 1) throw error;
   }
   const names = new Set<string>();
   for (const key of stdout.split("\n").map((item) => item.trim()).filter(Boolean)) {
-    const match = /^filter\.(.+)\.(smudge|process|required)$/i.exec(key);
+    const match = /^filter\.(.+)\.(clean|smudge|process|required)$/i.exec(key);
     if (match?.[1]) names.add(match[1]);
   }
   return [...names].flatMap<GitConfigEntry>((name) => [
+    [`filter.${name}.clean`, ""],
     [`filter.${name}.smudge`, ""],
     [`filter.${name}.process`, ""],
     [`filter.${name}.required`, "false"]
   ]);
 }
 
-function codingGitEnvironmentWithFsmonitor(config: readonly GitConfigEntry[] = []) {
+export function codingGitEnvironmentWithFsmonitor(config: readonly GitConfigEntry[] = []) {
   return codingGitEnvironment([["core.fsmonitor", "false"], ...config]);
 }
 
@@ -107,7 +108,9 @@ export async function validateRepository(repoPath: string) {
 }
 
 async function canonicalGitCommonDir(repoOrWorktreePath: string) {
-  const { stdout } = await execFileAsync("git", ["-C", repoOrWorktreePath, "rev-parse", "--git-common-dir"]);
+  const { stdout } = await execFileAsync("git", ["-C", repoOrWorktreePath, "rev-parse", "--git-common-dir"], {
+    env: codingGitEnvironmentWithFsmonitor()
+  });
   return realpath(resolve(repoOrWorktreePath, stdout.trim()));
 }
 
@@ -138,7 +141,9 @@ export async function inspectActualWorktreeIdentity(
   catch { return { valid: false, status: "not_accessible" }; }
   try {
     const [{ stdout: topLevel }, repoCommonDir, candidateCommonDir] = await Promise.all([
-      execFileAsync("git", ["-C", canonicalCandidate, "rev-parse", "--show-toplevel"]),
+      execFileAsync("git", ["-C", canonicalCandidate, "rev-parse", "--show-toplevel"], {
+        env: codingGitEnvironmentWithFsmonitor()
+      }),
       canonicalGitCommonDir(repoPath),
       canonicalGitCommonDir(canonicalCandidate)
     ]);
@@ -147,8 +152,12 @@ export async function inspectActualWorktreeIdentity(
     }
     if (candidateCommonDir !== repoCommonDir) return { valid: false, status: "repository_mismatch" };
     const [{ stdout: branch }, { stdout: head }] = await Promise.all([
-      execFileAsync("git", ["-C", canonicalCandidate, "symbolic-ref", "--quiet", "HEAD"]),
-      execFileAsync("git", ["-C", canonicalCandidate, "rev-parse", "HEAD"])
+      execFileAsync("git", ["-C", canonicalCandidate, "symbolic-ref", "--quiet", "HEAD"], {
+        env: codingGitEnvironmentWithFsmonitor()
+      }),
+      execFileAsync("git", ["-C", canonicalCandidate, "rev-parse", "HEAD"], {
+        env: codingGitEnvironmentWithFsmonitor()
+      })
     ]);
     const actualBranch = branch.trim();
     if (actualBranch !== `refs/heads/${expectedBranch}`) return { valid: false, status: "branch_mismatch" };

@@ -138,6 +138,76 @@ describe("local integration", () => {
     expect((await exec("git", ["-C", item.repo, "for-each-ref", "--format=%(refname)", "refs/tags"])).stdout).toBe("");
   });
 
+  it("does not execute repository clean or process filters that can create refs", async () => {
+    const item = await fixture();
+    const cleanFilter = join(item.root, "clean-filter.sh");
+    const processFilter = join(item.root, "process-filter.sh");
+    await writeFile(cleanFilter, ["#!/bin/sh", "git tag forbidden-clean-filter", "cat"].join("\n"));
+    await writeFile(processFilter, ["#!/bin/sh", "git tag forbidden-process-filter", "exit 1"].join("\n"));
+    await chmod(cleanFilter, 0o755);
+    await chmod(processFilter, 0o755);
+    await writeFile(join(item.repo, ".git", "info", "attributes"), "feature.txt filter=hostile\n");
+    await exec("git", ["-C", item.repo, "config", "filter.hostile.clean", cleanFilter]);
+    await exec("git", ["-C", item.repo, "config", "filter.hostile.process", processFilter]);
+
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), commitMessage: "REQ-0001 ignores filters", commands: []
+    });
+
+    expect(result.status).toBe("completed");
+    expect((await exec("git", ["-C", item.repo, "for-each-ref", "--format=%(refname)", "refs/tags"])).stdout)
+      .toBe("");
+  });
+
+  it("ignores an inherited GIT_DIR that redirects Git outside the selected repository", async () => {
+    const item = await fixture();
+    const impostor = join(item.root, "redirected.git");
+    await exec("git", ["init", "--bare", impostor]);
+    const previous = process.env.GIT_DIR;
+    process.env.GIT_DIR = impostor;
+    try {
+      const result = await executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 ignores GIT_DIR", commands: []
+      });
+      expect(result.status).toBe("completed");
+      expect((await exec("git", ["-C", impostor, "for-each-ref", "--format=%(refname)"])).stdout).toBe("");
+    } finally {
+      if (previous === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = previous;
+    }
+  });
+
+  it("ignores inherited GIT_CONFIG_COUNT filter injection", async () => {
+    const item = await fixture();
+    const filter = join(item.root, "injected-filter.sh");
+    await writeFile(filter, ["#!/bin/sh", "git tag forbidden-injected-filter", "cat"].join("\n"));
+    await chmod(filter, 0o755);
+    await writeFile(join(item.repo, ".git", "info", "attributes"), "feature.txt filter=injected\n");
+    const inherited = {
+      count: process.env.GIT_CONFIG_COUNT,
+      key: process.env.GIT_CONFIG_KEY_0,
+      value: process.env.GIT_CONFIG_VALUE_0
+    };
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "filter.injected.clean";
+    process.env.GIT_CONFIG_VALUE_0 = filter;
+    try {
+      const result = await executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 ignores injected config", commands: []
+      });
+      expect(result.status).toBe("completed");
+      expect((await exec("git", ["-C", item.repo, "for-each-ref", "--format=%(refname)", "refs/tags"])).stdout)
+        .toBe("");
+    } finally {
+      if (inherited.count === undefined) delete process.env.GIT_CONFIG_COUNT;
+      else process.env.GIT_CONFIG_COUNT = inherited.count;
+      if (inherited.key === undefined) delete process.env.GIT_CONFIG_KEY_0;
+      else process.env.GIT_CONFIG_KEY_0 = inherited.key;
+      if (inherited.value === undefined) delete process.env.GIT_CONFIG_VALUE_0;
+      else process.env.GIT_CONFIG_VALUE_0 = inherited.value;
+    }
+  });
+
   it("excludes an untracked sensitive file from the prepared commit and target", async () => {
     const item = await fixture();
     await writeFile(join(item.sourceWorktree, ".env"), "TOKEN=do-not-commit\n");

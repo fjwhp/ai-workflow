@@ -3,7 +3,13 @@ import { promisify } from "node:util";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { getCommitSnapshot, getWorktreeSnapshot, inspectActualWorktreeIdentity } from "./repository.js";
+import {
+  codingFilterOverrides,
+  codingGitEnvironmentWithFsmonitor,
+  getCommitSnapshot,
+  getWorktreeSnapshot,
+  inspectActualWorktreeIdentity
+} from "./repository.js";
 import { buildVerificationPlan, type VerificationCommand } from "./verification-plan.js";
 
 const execFileAsync = promisify(execFile);
@@ -84,14 +90,17 @@ export type TargetState = {
   statusPorcelain: string;
 };
 
-async function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv) {
-  return execFileAsync("git", [
-    "-C", cwd,
-    "-c", "core.hooksPath=/dev/null",
-    "-c", "commit.gpgSign=false",
-    "-c", "core.fsmonitor=false",
-    ...args
-  ], { maxBuffer: 10 * 1024 * 1024, ...(env ? { env } : {}) });
+async function git(cwd: string, args: string[], indexPath?: string) {
+  const env = codingGitEnvironmentWithFsmonitor([
+    ["core.hooksPath", "/dev/null"],
+    ["commit.gpgSign", "false"],
+    ...await codingFilterOverrides(cwd)
+  ]);
+  if (indexPath) env.GIT_INDEX_FILE = indexPath;
+  return execFileAsync("git", ["-C", cwd, ...args], {
+    maxBuffer: 10 * 1024 * 1024,
+    env
+  });
 }
 
 async function prepareFrozenSourceCommit(
@@ -103,13 +112,12 @@ async function prepareFrozenSourceCommit(
   await input.onSourceFrozen?.();
   const root = await mkdtemp(join(tmpdir(), "ai-workflow-source-commit-"));
   const indexPath = join(root, "index");
-  const indexEnv = { ...process.env, GIT_INDEX_FILE: indexPath };
   const entries = new Map(snapshot.manifest.entries.map((entry) => [entry.path, entry]));
   const updateIndex = async (file: string, isolated: boolean) => {
     const entry = entries.get(file);
-    const env = isolated ? indexEnv : undefined;
+    const isolatedIndex = isolated ? indexPath : undefined;
     if (!entry) {
-      await git(input.sourceWorktreePath, ["update-index", "--force-remove", "--", file], env);
+      await git(input.sourceWorktreePath, ["update-index", "--force-remove", "--", file], isolatedIndex);
       return;
     }
     const content = entry.type === "symlink"
@@ -119,25 +127,25 @@ async function prepareFrozenSourceCommit(
     await writeFile(blobPath, content, { mode: 0o600 });
     const objectId = (await git(input.sourceWorktreePath, [
       "hash-object", "-w", "--no-filters", blobPath
-    ], env)).stdout.trim();
+    ], isolatedIndex)).stdout.trim();
     await git(input.sourceWorktreePath, [
       "update-index", "--add", "--cacheinfo", entry.mode, objectId, file
-    ], env);
+    ], isolatedIndex);
   };
   try {
-    await git(input.sourceWorktreePath, ["read-tree", baseCommit], indexEnv);
+    await git(input.sourceWorktreePath, ["read-tree", baseCommit], indexPath);
     for (const file of snapshot.files) await updateIndex(file, true);
-    const tree = (await git(input.sourceWorktreePath, ["write-tree"], indexEnv)).stdout.trim();
+    const tree = (await git(input.sourceWorktreePath, ["write-tree"], indexPath)).stdout.trim();
     const changed = (await git(input.sourceWorktreePath, [
       "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", baseCommit, tree
-    ], indexEnv)).stdout.split("\0").filter(Boolean).sort();
+    ], indexPath)).stdout.split("\0").filter(Boolean).sort();
     const frozen = [...snapshot.files].sort();
     if (JSON.stringify(changed) !== JSON.stringify(frozen)) {
       throw new Error("SOURCE_COMMIT_PATH_SET_MISMATCH");
     }
     const sourceCommit = (await git(input.sourceWorktreePath, [
       "commit-tree", tree, "-p", baseCommit, "-m", input.commitMessage
-    ], indexEnv)).stdout.trim();
+    ], indexPath)).stdout.trim();
     await git(input.sourceWorktreePath, [
       "update-ref", `refs/heads/${input.sourceBranch}`, sourceCommit, baseCommit
     ]);
