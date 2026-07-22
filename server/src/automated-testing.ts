@@ -96,13 +96,16 @@ export function sanitizedVerificationEnvironment(
   return env;
 }
 
-export interface AutomatedTestingInput {
+export interface IsolatedVerificationInput {
   sourceManifest: EvidenceManifest;
   sensitivePatterns: string[];
   targetWorktree: string;
   gitCommonDir: string;
   allowedCommands: FrozenCommand[];
   acceptanceCriteria: string[];
+}
+
+export interface AutomatedTestingInput extends IsolatedVerificationInput {
   untrustedEvidence: {
     requirement: unknown;
     approvedArtifacts: unknown[];
@@ -162,6 +165,14 @@ export interface AutomatedTestingDependencies {
 
 export async function runAutomatedTesting(
   input: AutomatedTestingInput,
+  dependencies: AutomatedTestingDependencies = {},
+  signal?: AbortSignal
+): Promise<AutomatedTestingResult> {
+  return runIsolatedVerification(input, dependencies, signal);
+}
+
+export async function runIsolatedVerification(
+  input: IsolatedVerificationInput,
   dependencies: AutomatedTestingDependencies = {},
   signal?: AbortSignal
 ): Promise<AutomatedTestingResult> {

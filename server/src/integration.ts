@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { runIsolatedVerification } from "./automated-testing.js";
 import {
   codingFilterOverrides,
   codingGitEnvironmentWithFsmonitor,
@@ -79,6 +80,7 @@ export type ApplicationResult = {
 export type LocalIntegrationExecutionInput = FrozenApplicationInput & {
   commitMessage: string;
   commands: VerificationCommand[];
+  signal?: AbortSignal;
   onSourceFrozen?: () => void | Promise<void>;
   onSourcePrepared?: (sourceCommit: string) => void | Promise<void>;
 };
@@ -422,26 +424,32 @@ export async function executeLocalIntegration(
   }
   const commandResults: ApplicationCommandResult[] = [];
   const commands=input.changedFiles?preflight.plannedCommands:input.commands;
-  for (const item of commands) {
-    try {
-      const result = await execFileAsync(item.command, item.argsPrefix, { cwd: input.targetWorktreePath, maxBuffer: 10 * 1024 * 1024 });
-      commandResults.push({
-        command: item.command,
-        args: item.argsPrefix,
-        code: 0,
-        stdout: boundedCommandOutput(result.stdout),
-        stderr: boundedCommandOutput(result.stderr)
-      });
-    } catch (error: any) {
-      commandResults.push({
-        command: item.command,
-        args: item.argsPrefix,
-        code: Number.isSafeInteger(error?.code) ? error.code : 1,
-        stdout: boundedCommandOutput(error?.stdout),
-        stderr: boundedCommandOutput(error?.stderr || error?.message)
-      });
+  if (commands.length > 0) {
+    const verificationSnapshot = await getWorktreeSnapshot(input.targetWorktreePath, {
+      sensitivePatterns: input.sensitivePatterns
+    });
+    const verification = await runIsolatedVerification({
+      sourceManifest: verificationSnapshot.manifest,
+      sensitivePatterns: input.sensitivePatterns,
+      targetWorktree: input.targetWorktreePath,
+      gitCommonDir: verificationSnapshot.identity.gitCommonDir,
+      allowedCommands: commands.map((item) => ({
+        command: item.command, argsPrefix: item.argsPrefix
+      })),
+      acceptanceCriteria: ["post-application verification passes"]
+    }, {}, input.signal);
+    commandResults.push(...verification.commandResults.map((result) => ({
+      command: result.command,
+      args: result.args,
+      code: result.exitCode,
+      stdout: boundedCommandOutput(result.stdout),
+      stderr: boundedCommandOutput(result.stderr || result.error)
+    })));
+    if (verification.result !== "passed") {
       const statusPorcelain = (await git(input.targetWorktreePath, ["status", "--porcelain"])).stdout;
-      return { status: "test_failed" as const, preflight, sourceCommit, preApplyHead, targetState: "applied_dirty" as const, statusPorcelain, commandResults, error: "本地应用后测试失败" };
+      return { status: "test_failed" as const, preflight, sourceCommit, preApplyHead,
+        targetState: "applied_dirty" as const, statusPorcelain, commandResults,
+        error: verification.error ?? "本地应用后测试失败" };
     }
   }
   const statusPorcelain = (await git(input.targetWorktreePath, ["status", "--porcelain"])).stdout;

@@ -309,6 +309,42 @@ describe("local integration", () => {
     expect((await exec("git", ["-C", item.targetWorktree, "diff", "--cached", "--name-only"])).stdout).toContain("feature.txt");
   });
 
+  it("does not expose inherited credentials to post-application verification", async () => {
+    const item = await fixture();
+    const previous = process.env.DELIVERY_TEST_SECRET;
+    process.env.DELIVERY_TEST_SECRET = "must-not-reach-verification";
+    try {
+      const result = await executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 sanitized verification",
+        commands: [{
+          command: process.execPath,
+          argsPrefix: ["-e", "process.exit(process.env.DELIVERY_TEST_SECRET ? 23 : 0)"]
+        }]
+      });
+
+      expect(result.status).toBe("completed");
+      expect(result.commandResults).toMatchObject([{ code: 0 }]);
+    } finally {
+      if (previous === undefined) delete process.env.DELIVERY_TEST_SECRET;
+      else process.env.DELIVERY_TEST_SECRET = previous;
+    }
+  });
+
+  it("contains post-application verification writes outside its frozen workspace", async () => {
+    const item = await fixture();
+    const marker = join(item.root, "verification-escaped");
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), commitMessage: "REQ-0001 contained verification",
+      commands: [{
+        command: process.execPath,
+        argsPrefix: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'escaped')`]
+      }]
+    });
+
+    expect(result.status).toBe("test_failed");
+    await expect(readFile(marker, "utf8")).rejects.toThrow();
+  });
+
   it("bounds verification output so application evidence remains persistable", async () => {
     const item = await fixture();
     const result = await executeLocalIntegration({
@@ -316,7 +352,7 @@ describe("local integration", () => {
       commands: [{ command: process.execPath, argsPrefix: ["-e", "process.stdout.write('x'.repeat(2_000_000))"] }]
     });
 
-    expect(result.status).toBe("completed");
+    expect(result.status).toBe("test_failed");
     expect(Buffer.byteLength(JSON.stringify(result.commandResults))).toBeLessThan(1_048_576);
     expect(result.commandResults[0]?.stdout.length).toBeLessThan(2_000_000);
   });
