@@ -163,6 +163,10 @@ export class DeliveryApplicationService {
       preflight: existing?.preflight ?? preflight
     });
     claim = this.dependencies.applications.assertClaim(claim);
+    const assertCurrentClaim = async () => {
+      throwIfAborted(signal);
+      claim = this.dependencies.applications.assertClaim(claim);
+    };
     const preparedSourceCommit = frozenInput.sourceCommit ?? preflight.sourceCommit;
     if (!claim.sourceCommit && preparedSourceCommit) {
       claim = this.dependencies.applications.bindSourceCommit(claim, preparedSourceCommit);
@@ -174,18 +178,13 @@ export class DeliveryApplicationService {
       commitMessage: `Apply delivery unit ${context.unitId}`,
       commands: context.allowedCommands,
       signal,
-      onSourceFrozen: async () => {
-        throwIfAborted(signal);
-        claim = this.dependencies.applications.assertClaim(claim);
-      },
+      onSourceFrozen: assertCurrentClaim,
       onSourcePrepared: async (sourceCommit) => {
         claim = this.dependencies.applications.bindSourceCommit(claim, sourceCommit);
         claim = this.dependencies.applications.assertClaim(claim);
       },
-      assertTargetOwnership: async () => {
-        throwIfAborted(signal);
-        claim = this.dependencies.applications.assertClaim(claim);
-      }
+      assertSourceOwnership: assertCurrentClaim,
+      assertTargetOwnership: assertCurrentClaim
     });
     throwIfAborted(signal);
     claim = this.dependencies.applications.assertClaim(claim);

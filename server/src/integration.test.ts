@@ -28,6 +28,120 @@ async function fixture() {
   return { root, repo, targetWorktree, sourceWorktree, evidenceHash: snapshot.evidenceHash };
 }
 
+async function fixtureWithTwoChangedFiles() {
+  const item = await fixture();
+  await writeFile(join(item.sourceWorktree, "second.txt"), "second\n");
+  const snapshot = await getWorktreeSnapshot(item.sourceWorktree);
+  return { ...item, evidenceHash: snapshot.evidenceHash };
+}
+
+type SourceBoundaryCommand = "update-ref" | "update-index";
+
+async function installSourceGitBoundaryWrapper(
+  item: Awaited<ReturnType<typeof fixture>>,
+  options: {
+    command: SourceBoundaryCommand;
+    loseOwnershipAfterFilterLookup?: boolean;
+    loseOwnershipAfterCommand?: boolean;
+  }
+) {
+  const wrapperDirectory = join(item.root, `git-source-${options.command}-wrapper`);
+  const wrapper = join(wrapperDirectory, "git");
+  const snapshotCompletions = join(item.root, `source-${options.command}-snapshot-completions`);
+  const sourcePreparationStarted = join(item.root, `source-${options.command}-preparation-started`);
+  const forcedLoss = join(item.root, `source-${options.command}-forced-loss`);
+  const filterLookupFinished = join(item.root, `source-${options.command}-filter-finished`);
+  const commandStarted = join(item.root, `source-${options.command}-started`);
+  const commandCompleted = join(item.root, `source-${options.command}-completed`);
+  const realIndexMutations = join(item.root, `source-${options.command}-real-index`);
+  const targetWork = join(item.root, `source-${options.command}-target-work`);
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  const exists = (path: string) => readFile(path).then(() => true, () => false);
+  const lineCount = async (path: string) => {
+    const contents = await readFile(path, "utf8").catch(() => "");
+    return contents.split("\n").filter(Boolean).length;
+  };
+
+  await mkdir(wrapperDirectory);
+  await writeFile(wrapper, [
+    "#!/bin/sh",
+    "is_source=",
+    "is_target=",
+    "is_config=",
+    "is_selected=",
+    "is_update_index=",
+    "is_diff=",
+    "is_cached=",
+    "is_no_ext_diff=",
+    "is_no_textconv=",
+    "for argument in \"$@\"; do",
+    `  if [ \"$argument\" = ${JSON.stringify(item.sourceWorktree)} ]; then is_source=1; fi`,
+    `  if [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
+    "  if [ \"$argument\" = \"config\" ]; then is_config=1; fi",
+    `  if [ \"$argument\" = ${JSON.stringify(options.command)} ]; then is_selected=1; fi`,
+    "  if [ \"$argument\" = \"update-index\" ]; then is_update_index=1; fi",
+    "  if [ \"$argument\" = \"diff\" ]; then is_diff=1; fi",
+    "  if [ \"$argument\" = \"--cached\" ]; then is_cached=1; fi",
+    "  if [ \"$argument\" = \"--no-ext-diff\" ]; then is_no_ext_diff=1; fi",
+    "  if [ \"$argument\" = \"--no-textconv\" ]; then is_no_textconv=1; fi",
+    "done",
+    "if [ \"$is_diff\" = \"1\" ] && [ \"$is_cached\" = \"1\" ] && [ \"$is_no_ext_diff\" = \"1\" ] && [ \"$is_no_textconv\" = \"1\" ]; then",
+    `  ${JSON.stringify(realGit)} \"$@\"`,
+    "  status=$?",
+    `  printf 'done\\n' >> ${JSON.stringify(snapshotCompletions)}`,
+    `  if [ \"$(wc -l < ${JSON.stringify(snapshotCompletions)})\" -ge 2 ]; then : > ${JSON.stringify(sourcePreparationStarted)}; fi`,
+    "  exit $status",
+    "fi",
+    `if [ \"$is_target\" = \"1\" ] && [ -f ${JSON.stringify(sourcePreparationStarted)} ]; then`,
+    `  printf '%s\\n' \"$*\" >> ${JSON.stringify(targetWork)}`,
+    "fi",
+    `if [ \"$is_source\" = \"1\" ] && [ \"$is_config\" = \"1\" ] && [ -f ${JSON.stringify(sourcePreparationStarted)} ]; then`,
+    `  ${JSON.stringify(realGit)} \"$@\"`,
+    "  status=$?",
+    `  : > ${JSON.stringify(filterLookupFinished)}`,
+    "  exit $status",
+    "fi",
+    "is_real_index=",
+    "if [ \"$is_source\" = \"1\" ] && [ \"$is_update_index\" = \"1\" ] && [ -z \"${GIT_INDEX_FILE+x}\" ]; then",
+    "  is_real_index=1",
+    `  printf '%s\\n' \"$*\" >> ${JSON.stringify(realIndexMutations)}`,
+    "fi",
+    "if [ \"$is_selected\" = \"1\" ] && { [ \"$is_update_index\" != \"1\" ] || [ \"$is_real_index\" = \"1\" ]; }; then",
+    `  printf '%s\\n' \"$*\" >> ${JSON.stringify(commandStarted)}`,
+    `  ${JSON.stringify(realGit)} \"$@\"`,
+    "  status=$?",
+    `  printf '%s\\n' \"$*\" >> ${JSON.stringify(commandCompleted)}`,
+    "  exit $status",
+    "fi",
+    `exec ${JSON.stringify(realGit)} \"$@\"`
+  ].join("\n"));
+  await chmod(wrapper, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+  const error = new Error(`DELIVERY_APPLICATION_SOURCE_${options.command.toUpperCase()}_CLAIM_LOST`);
+
+  return {
+    error,
+    loseOwnership: () => writeFile(forcedLoss, ""),
+    sourceFilterPrepared: () => exists(filterLookupFinished),
+    assertCurrent: async () => {
+      if (await exists(forcedLoss)
+        || (options.loseOwnershipAfterFilterLookup && await exists(filterLookupFinished))
+        || (options.loseOwnershipAfterCommand && await exists(commandCompleted))) {
+        throw error;
+      }
+    },
+    commandStarted: () => exists(commandStarted),
+    commandCompleted: () => exists(commandCompleted),
+    realIndexMutationCount: () => lineCount(realIndexMutations),
+    targetWorkStarted: () => exists(targetWork),
+    restore: () => {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  };
+}
+
 function integrationInput(item: Awaited<ReturnType<typeof fixture>>) {
   return {
     projectRepoPath: item.repo,
@@ -41,6 +155,74 @@ function integrationInput(item: Awaited<ReturnType<typeof fixture>>) {
 }
 
 describe("local integration", () => {
+  it("does not publish the source ref after ownership loss during source filter lookup", async () => {
+    const item = await fixture();
+    const sourceHead = (await exec("git", ["-C", item.sourceWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const marker = await installSourceGitBoundaryWrapper(item, {
+      command: "update-ref", loseOwnershipAfterFilterLookup: true
+    });
+
+    try {
+      await expect(executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 fenced source ref", commands: [],
+        onSourceFrozen: async () => {
+          expect(await marker.sourceFilterPrepared()).toBe(true);
+          await marker.assertCurrent();
+        },
+        assertSourceOwnership: marker.assertCurrent
+      })).rejects.toBe(marker.error);
+
+      expect((await exec("git", ["-C", item.sourceWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(sourceHead);
+      expect(await marker.commandStarted()).toBe(false);
+      expect(await marker.targetWorkStarted()).toBe(false);
+    } finally {
+      marker.restore();
+    }
+  });
+
+  it("stops source index synchronization when ownership is lost as update-ref completes", async () => {
+    const item = await fixtureWithTwoChangedFiles();
+    const marker = await installSourceGitBoundaryWrapper(item, {
+      command: "update-ref", loseOwnershipAfterCommand: true
+    });
+
+    try {
+      await expect(executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 fenced source index", commands: [],
+        assertSourceOwnership: marker.assertCurrent
+      })).rejects.toBe(marker.error);
+
+      expect(await marker.commandCompleted()).toBe(true);
+      expect(await marker.realIndexMutationCount()).toBe(0);
+      expect(await marker.targetWorkStarted()).toBe(false);
+    } finally {
+      marker.restore();
+    }
+  });
+
+  it.each(["before", "after"] as const)(
+    "stops remaining source index mutations and target work after ownership loss %s a real source index update",
+    async (boundary) => {
+      const item = await fixtureWithTwoChangedFiles();
+      const marker = await installSourceGitBoundaryWrapper(item, {
+        command: "update-index", loseOwnershipAfterCommand: boundary === "after"
+      });
+
+      try {
+        await expect(executeLocalIntegration({
+          ...integrationInput(item), commitMessage: `REQ-0001 source index ${boundary} fence`, commands: [],
+          onSourcePrepared: boundary === "before" ? marker.loseOwnership : undefined,
+          assertSourceOwnership: marker.assertCurrent
+        })).rejects.toBe(marker.error);
+
+        expect(await marker.realIndexMutationCount()).toBe(boundary === "before" ? 0 : 1);
+        expect(await marker.targetWorkStarted()).toBe(false);
+      } finally {
+        marker.restore();
+      }
+    }
+  );
+
   it("rejects the registered project root as an integration target", async () => {
     const item = await fixture();
     const check = await preflightLocalIntegration({

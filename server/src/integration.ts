@@ -32,6 +32,11 @@ interface GitExecutionFence {
   after?: () => void | Promise<void>;
 }
 
+interface PreparedGitEnvironment {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}
+
 export interface FrozenApplicationInput {
   projectRepoPath: string;
   targetWorktreePath: string;
@@ -97,6 +102,7 @@ export type LocalIntegrationExecutionInput = FrozenApplicationInput & {
   signal?: AbortSignal;
   onSourceFrozen?: () => void | Promise<void>;
   onSourcePrepared?: (sourceCommit: string) => void | Promise<void>;
+  assertSourceOwnership?: () => void | Promise<void>;
   onBeforeTargetMutation?: () => void | Promise<void>;
   onTargetMutated?: () => void | Promise<void>;
   assertTargetOwnership?: () => void | Promise<void>;
@@ -126,32 +132,77 @@ async function git(
   indexPath?: string,
   fence?: GitExecutionFence
 ) {
-  throwIfApplicationAborted(context.signal);
-  const filterTimeout = gitRemaining(context);
-  const env = codingGitEnvironmentWithFsmonitor([
-    ["core.hooksPath", "/dev/null"],
-    ["commit.gpgSign", "false"],
-    ...await codingFilterOverrides(cwd, { signal: context.signal, timeout: filterTimeout })
-  ]);
-  if (indexPath) env.GIT_INDEX_FILE = indexPath;
-  await fence?.before?.();
-  throwIfApplicationAborted(context.signal);
-  try {
-    return await execFileAsync("git", ["-C", cwd, ...args], {
-      maxBuffer: 10 * 1024 * 1024,
-      env,
-      signal: context.signal,
-      timeout: gitRemaining(context)
-    });
-  } finally {
-    await fence?.after?.();
-  }
+  const prepared = await prepareGitEnvironment(cwd, context);
+  return runPreparedGit(
+    indexPath ? preparedGitWithIndex(prepared, indexPath) : prepared,
+    args,
+    context,
+    fence
+  );
 }
 
-async function prepareFrozenSourceCommit(
+async function prepareGitEnvironment(cwd: string, context: GitExecutionContext) {
+  throwIfApplicationAborted(context.signal);
+  const filterTimeout = gitRemaining(context);
+  const overrides = await codingFilterOverrides(cwd, {
+    signal: context.signal,
+    timeout: filterTimeout
+  });
+  throwIfApplicationAborted(context.signal);
+  gitRemaining(context);
+  return {
+    cwd,
+    env: codingGitEnvironmentWithFsmonitor([
+      ["core.hooksPath", "/dev/null"],
+      ["commit.gpgSign", "false"],
+      ...overrides
+    ])
+  } satisfies PreparedGitEnvironment;
+}
+
+function preparedGitWithIndex(prepared: PreparedGitEnvironment, indexPath: string) {
+  return {
+    cwd: prepared.cwd,
+    env: { ...prepared.env, GIT_INDEX_FILE: indexPath }
+  } satisfies PreparedGitEnvironment;
+}
+
+async function runPreparedGit(
+  prepared: PreparedGitEnvironment,
+  args: string[],
+  context: GitExecutionContext,
+  fence?: GitExecutionFence
+) {
+  await fence?.before?.();
+  throwIfApplicationAborted(context.signal);
+  const timeout = gitRemaining(context);
+  let result: { stdout: string; stderr: string } | undefined;
+  let commandError: unknown;
+  try {
+    result = await execFileAsync("git", ["-C", prepared.cwd, ...args], {
+      maxBuffer: 10 * 1024 * 1024,
+      env: prepared.env,
+      signal: context.signal,
+      timeout,
+      encoding: "utf8"
+    });
+  } catch (error) {
+    commandError = error;
+  }
+  await fence?.after?.();
+  throwIfApplicationAborted(context.signal);
+  gitRemaining(context);
+  if (commandError) throw commandError;
+  return result!;
+}
+
+type FrozenSourceIndexEntry = { mode: string; objectId: string } | undefined;
+
+async function buildFrozenSourceObjects(
   input: LocalIntegrationExecutionInput,
   snapshot: Awaited<ReturnType<typeof getWorktreeSnapshot>>,
-  execution: GitExecutionContext
+  execution: GitExecutionContext,
+  preparedSourceGit: PreparedGitEnvironment
 ) {
   const baseCommit = snapshot.identity.headCommit;
   if (!baseCommit || snapshot.files.length === 0) throw new Error("SOURCE_EVIDENCE_EMPTY");
@@ -159,11 +210,13 @@ async function prepareFrozenSourceCommit(
   const root = await mkdtemp(join(tmpdir(), "ai-workflow-source-commit-"));
   const indexPath = join(root, "index");
   const entries = new Map(snapshot.manifest.entries.map((entry) => [entry.path, entry]));
-  const updateIndex = async (file: string, isolated: boolean) => {
+  const frozenEntries = new Map<string, FrozenSourceIndexEntry>();
+  const isolatedGit = preparedGitWithIndex(preparedSourceGit, indexPath);
+  const updateIsolatedIndex = async (file: string) => {
     const entry = entries.get(file);
-    const isolatedIndex = isolated ? indexPath : undefined;
     if (!entry) {
-      await git(input.sourceWorktreePath, ["update-index", "--force-remove", "--", file], execution, isolatedIndex);
+      frozenEntries.set(file, undefined);
+      await runPreparedGit(isolatedGit, ["update-index", "--force-remove", "--", file], execution);
       return;
     }
     const content = entry.type === "symlink"
@@ -171,34 +224,58 @@ async function prepareFrozenSourceCommit(
       : Buffer.from(entry.contentBase64, "base64");
     const blobPath = join(root, `blob-${snapshot.files.indexOf(file)}`);
     await writeFile(blobPath, content, { mode: 0o600 });
-    const objectId = (await git(input.sourceWorktreePath, [
+    const objectId = (await runPreparedGit(isolatedGit, [
       "hash-object", "-w", "--no-filters", blobPath
-    ], execution, isolatedIndex)).stdout.trim();
-    await git(input.sourceWorktreePath, [
+    ], execution)).stdout.trim();
+    frozenEntries.set(file, { mode: entry.mode, objectId });
+    await runPreparedGit(isolatedGit, [
       "update-index", "--add", "--cacheinfo", entry.mode, objectId, file
-    ], execution, isolatedIndex);
+    ], execution);
   };
   try {
-    await git(input.sourceWorktreePath, ["read-tree", baseCommit], execution, indexPath);
-    for (const file of snapshot.files) await updateIndex(file, true);
-    const tree = (await git(input.sourceWorktreePath, ["write-tree"], execution, indexPath)).stdout.trim();
-    const changed = (await git(input.sourceWorktreePath, [
+    await runPreparedGit(isolatedGit, ["read-tree", baseCommit], execution);
+    for (const file of snapshot.files) await updateIsolatedIndex(file);
+    const tree = (await runPreparedGit(isolatedGit, ["write-tree"], execution)).stdout.trim();
+    const changed = (await runPreparedGit(isolatedGit, [
       "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", baseCommit, tree
-    ], execution, indexPath)).stdout.split("\0").filter(Boolean).sort();
+    ], execution)).stdout.split("\0").filter(Boolean).sort();
     const frozen = [...snapshot.files].sort();
     if (JSON.stringify(changed) !== JSON.stringify(frozen)) {
       throw new Error("SOURCE_COMMIT_PATH_SET_MISMATCH");
     }
-    const sourceCommit = (await git(input.sourceWorktreePath, [
+    const sourceCommit = (await runPreparedGit(isolatedGit, [
       "commit-tree", tree, "-p", baseCommit, "-m", input.commitMessage
-    ], execution, indexPath)).stdout.trim();
-    await git(input.sourceWorktreePath, [
-      "update-ref", `refs/heads/${input.sourceBranch}`, sourceCommit, baseCommit
-    ], execution);
-    for (const file of snapshot.files) await updateIndex(file, false);
-    return sourceCommit;
+    ], execution)).stdout.trim();
+    return { baseCommit, sourceCommit, frozenEntries };
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function synchronizeFrozenSourceIndex(
+  snapshot: Awaited<ReturnType<typeof getWorktreeSnapshot>>,
+  preparedSourceGit: PreparedGitEnvironment,
+  frozenEntries: Map<string, FrozenSourceIndexEntry>,
+  execution: GitExecutionContext,
+  fence: GitExecutionFence
+) {
+  for (const file of snapshot.files) {
+    const entry = frozenEntries.get(file);
+    if (!entry) {
+      await runPreparedGit(
+        preparedSourceGit,
+        ["update-index", "--force-remove", "--", file],
+        execution,
+        fence
+      );
+      continue;
+    }
+    await runPreparedGit(
+      preparedSourceGit,
+      ["update-index", "--add", "--cacheinfo", entry.mode, entry.objectId, file],
+      execution,
+      fence
+    );
   }
 }
 
@@ -516,6 +593,7 @@ export async function executeLocalIntegration(
       statusPorcelain: target.statusPorcelain, error: "应用预检未通过", commandResults: [] };
   }
   let sourceCommit: string | undefined = preflight.sourceCommit;
+  let sourcePreparedCallbackCalled = false;
   const preApplyHead = input.expectedTargetHead ?? preflight.targetHead!;
   if (preflight.targetHead !== preApplyHead) {
     return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead,
@@ -523,6 +601,7 @@ export async function executeLocalIntegration(
   }
   if (!sourceCommit) {
     let snapshot: Awaited<ReturnType<typeof getWorktreeSnapshot>>;
+    let preparedSourceGit!: PreparedGitEnvironment;
     try {
       snapshot = await getWorktreeSnapshot(input.sourceWorktreePath, {
         sensitivePatterns: input.sensitivePatterns,
@@ -532,6 +611,7 @@ export async function executeLocalIntegration(
       if (!snapshot.diff || snapshot.evidenceHash !== input.evidenceHash) {
         throw new Error("SOURCE_EVIDENCE_CHANGED");
       }
+      preparedSourceGit = await prepareGitEnvironment(input.sourceWorktreePath, execution);
     } catch (error: any) {
       throwIfApplicationAborted(input.signal);
       const target = await inspectTargetState(input, execution);
@@ -541,10 +621,59 @@ export async function executeLocalIntegration(
         error: String(error?.stderr || error?.message || error), commandResults: [] };
     }
     await input.onSourceFrozen?.();
-    throwIfApplicationAborted(input.signal);
+    await assertSourceOwnership(input);
+    let preparedSource: Awaited<ReturnType<typeof buildFrozenSourceObjects>>;
     try {
-      sourceCommit = await prepareFrozenSourceCommit(input, snapshot, execution);
+      preparedSource = await buildFrozenSourceObjects(input, snapshot, execution, preparedSourceGit);
     } catch (error: any) {
+      throwIfApplicationAborted(input.signal);
+      const target = await inspectTargetState(input, execution);
+      const safe = target.identityValid && target.clean && target.head === preApplyHead;
+      return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+        targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
+        error: String(error?.stderr || error?.message || error), commandResults: [] };
+    }
+    let sourceOwnershipError: unknown;
+    let sourceOwnershipFailed = false;
+    const fenceSourceMutation = async () => {
+      try {
+        await assertSourceOwnership(input);
+      } catch (error) {
+        sourceOwnershipFailed = true;
+        sourceOwnershipError = error;
+        throw error;
+      }
+    };
+    try {
+      await runPreparedGit(preparedSourceGit, [
+        "update-ref", `refs/heads/${input.sourceBranch}`,
+        preparedSource.sourceCommit, preparedSource.baseCommit
+      ], execution, { before: fenceSourceMutation, after: fenceSourceMutation });
+    } catch (error: any) {
+      if (sourceOwnershipFailed) throw sourceOwnershipError;
+      throwIfApplicationAborted(input.signal);
+      const target = await inspectTargetState(input, execution);
+      const safe = target.identityValid && target.clean && target.head === preApplyHead;
+      return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+        targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
+        error: String(error?.stderr || error?.message || error), commandResults: [] };
+    }
+    sourceCommit = preparedSource.sourceCommit;
+    await input.onSourcePrepared?.(preparedSource.sourceCommit);
+    sourcePreparedCallbackCalled = true;
+    await assertSourceOwnership(input);
+    sourceOwnershipFailed = false;
+    sourceOwnershipError = undefined;
+    try {
+      await synchronizeFrozenSourceIndex(
+        snapshot,
+        preparedSourceGit,
+        preparedSource.frozenEntries,
+        execution,
+        { before: fenceSourceMutation, after: fenceSourceMutation }
+      );
+    } catch (error: any) {
+      if (sourceOwnershipFailed) throw sourceOwnershipError;
       throwIfApplicationAborted(input.signal);
       const target = await inspectTargetState(input, execution);
       const safe = target.identityValid && target.clean && target.head === preApplyHead;
@@ -570,7 +699,7 @@ export async function executeLocalIntegration(
       targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
       error: String(error?.stderr || error?.message || error), commandResults: [] };
   }
-  await input.onSourcePrepared?.(sourceCommit!);
+  if (!sourcePreparedCallbackCalled) await input.onSourcePrepared?.(sourceCommit!);
   throwIfApplicationAborted(input.signal);
   const target = await inspectTargetState(input, execution);
   if (!target.identityValid || !target.clean || target.head !== preApplyHead) {
@@ -780,6 +909,12 @@ export async function executeLocalIntegration(
 
 function throwIfApplicationAborted(signal: AbortSignal | undefined) {
   if (signal?.aborted) throw new Error("DELIVERY_APPLICATION_ABORTED", { cause: signal.reason });
+}
+
+async function assertSourceOwnership(input: LocalIntegrationExecutionInput) {
+  throwIfApplicationAborted(input.signal);
+  await input.assertSourceOwnership?.();
+  throwIfApplicationAborted(input.signal);
 }
 
 async function assertTargetOwnership(input: LocalIntegrationExecutionInput) {

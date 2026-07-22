@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
@@ -556,11 +557,12 @@ describe("DeliveryApplicationService", () => {
   it("recovers a prepared source commit when the worker crashes before binding it", async () => {
     const fixture = await createFixture();
     let crashBeforeBind = true;
+    const callbackError = new Error("SIMULATED_CRASH_BEFORE_BIND");
     const service = new DeliveryApplicationService({
       applications: {
         ...fixture.store.deliveryApplications,
         bindSourceCommit: (claim, sourceCommit) => {
-          if (crashBeforeBind) throw new Error("SIMULATED_CRASH_BEFORE_BIND");
+          if (crashBeforeBind) throw callbackError;
           return fixture.store.deliveryApplications.bindSourceCommit(claim, sourceCommit);
         }
       },
@@ -576,7 +578,7 @@ describe("DeliveryApplicationService", () => {
 
     await expect(service.apply(
       fixture.frontendUnit.id, applicationInput(firstLease)
-    )).rejects.toThrow("SIMULATED_CRASH_BEFORE_BIND");
+    )).rejects.toBe(callbackError);
     const preparedCommit = await head(context.codingEvidence.worktreePath);
     expect(preparedCommit).not.toBe(context.codingEvidence.sourceHead);
     const firstRun = fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)[0]!;
@@ -630,12 +632,32 @@ describe("DeliveryApplicationService", () => {
   it("does not settle after the lease is lost immediately after target mutation", async () => {
     const fixture = await createFixture();
     const persistence = fixture.store.deliveryApplications;
-    let fences = 0;
+    const wrapperDirectory = join(fixture.root, "git-target-mutation-wrapper");
+    const wrapper = join(wrapperDirectory, "git");
+    const targetMutationFinished = join(fixture.root, "target-mutation-finished");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    await mkdir(wrapperDirectory);
+    await writeFile(wrapper, [
+      "#!/bin/sh",
+      "is_target=",
+      "is_cherry_pick=",
+      "for argument in \"$@\"; do",
+      `  if [ \"$argument\" = ${JSON.stringify(fixture.frontendGit.versionWorktree)} ]; then is_target=1; fi`,
+      "  if [ \"$argument\" = \"cherry-pick\" ]; then is_cherry_pick=1; fi",
+      "done",
+      "if [ \"$is_target\" = \"1\" ] && [ \"$is_cherry_pick\" = \"1\" ]; then",
+      `  ${JSON.stringify(realGit)} \"$@\"`,
+      "  status=$?",
+      `  : > ${JSON.stringify(targetMutationFinished)}`,
+      "  exit $status",
+      "fi",
+      `exec ${JSON.stringify(realGit)} \"$@\"`
+    ].join("\n"));
+    await chmod(wrapper, 0o755);
     const applications = {
       ...persistence,
       assertClaim: (claim: Parameters<typeof persistence.complete>[0]) => {
-        fences += 1;
-        if (fences === 5) {
+        if (existsSync(targetMutationFinished)) {
           loseApplicationLeaseWithoutReconciliation(fixture, claim.automationJobId);
         }
         return (persistence as any).assertClaim(claim);
@@ -650,11 +672,18 @@ describe("DeliveryApplicationService", () => {
       }
     });
     const lease = leaseApplication(fixture.store, fixture.frontendUnit.id);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
 
-    await expect(service.apply(fixture.frontendUnit.id, applicationInput(lease)))
-      .rejects.toThrow("DELIVERY_APPLICATION_LEASE_STALE");
+    try {
+      await expect(service.apply(fixture.frontendUnit.id, applicationInput(lease)))
+        .rejects.toThrow("DELIVERY_APPLICATION_LEASE_STALE");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
 
-    expect(fences).toBe(5);
+    expect(existsSync(targetMutationFinished)).toBe(true);
     expect(await status(fixture.frontendGit.versionWorktree)).toContain("src/feature.ts");
     expect(fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)[0])
       .toMatchObject({ status: "applying" });
