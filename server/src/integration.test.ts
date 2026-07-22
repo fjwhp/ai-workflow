@@ -43,6 +43,7 @@ async function installSourceGitBoundaryWrapper(
     command: SourceBoundaryCommand;
     loseOwnershipAfterFilterLookup?: boolean;
     loseOwnershipAfterCommand?: boolean;
+    selectedCommandFailure?: string;
   }
 ) {
   const wrapperDirectory = join(item.root, `git-source-${options.command}-wrapper`);
@@ -108,8 +109,13 @@ async function installSourceGitBoundaryWrapper(
     "fi",
     "if [ \"$is_selected\" = \"1\" ] && { [ \"$is_update_index\" != \"1\" ] || [ \"$is_real_index\" = \"1\" ]; }; then",
     `  printf '%s\\n' \"$*\" >> ${JSON.stringify(commandStarted)}`,
-    `  ${JSON.stringify(realGit)} \"$@\"`,
-    "  status=$?",
+    ...(options.selectedCommandFailure ? [
+      `  printf '%s\\n' ${JSON.stringify(options.selectedCommandFailure)} >&2`,
+      "  status=23"
+    ] : [
+      `  ${JSON.stringify(realGit)} \"$@\"`,
+      "  status=$?"
+    ]),
     `  printf '%s\\n' \"$*\" >> ${JSON.stringify(commandCompleted)}`,
     "  exit $status",
     "fi",
@@ -217,6 +223,36 @@ describe("local integration", () => {
 
         expect(await marker.realIndexMutationCount()).toBe(boundary === "before" ? 0 : 1);
         expect(await marker.targetWorkStarted()).toBe(false);
+      } finally {
+        marker.restore();
+      }
+    }
+  );
+
+  it.each(["lost", "current"] as const)(
+    "preserves %s source ownership precedence when the fenced Git command fails",
+    async (ownership) => {
+      const item = await fixture();
+      const gitError = "SOURCE_UPDATE_REF_COMMAND_FAILED";
+      const marker = await installSourceGitBoundaryWrapper(item, {
+        command: "update-ref",
+        selectedCommandFailure: gitError,
+        loseOwnershipAfterCommand: ownership === "lost"
+      });
+
+      try {
+        const pending = executeLocalIntegration({
+          ...integrationInput(item), commitMessage: "REQ-0001 source error precedence", commands: [],
+          assertSourceOwnership: marker.assertCurrent
+        });
+        if (ownership === "lost") {
+          await expect(pending).rejects.toBe(marker.error);
+        } else {
+          const result = await pending;
+          expect(result.status).toBe("failed");
+          expect(result.error).toContain(gitError);
+        }
+        expect(await marker.commandCompleted()).toBe(true);
       } finally {
         marker.restore();
       }

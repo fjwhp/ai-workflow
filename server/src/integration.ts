@@ -253,13 +253,13 @@ async function buildFrozenSourceObjects(
 }
 
 async function synchronizeFrozenSourceIndex(
-  snapshot: Awaited<ReturnType<typeof getWorktreeSnapshot>>,
+  files: readonly string[],
   preparedSourceGit: PreparedGitEnvironment,
   frozenEntries: Map<string, FrozenSourceIndexEntry>,
   execution: GitExecutionContext,
   fence: GitExecutionFence
 ) {
-  for (const file of snapshot.files) {
+  for (const file of files) {
     const entry = frozenEntries.get(file);
     if (!entry) {
       await runPreparedGit(
@@ -277,6 +277,21 @@ async function synchronizeFrozenSourceIndex(
       fence
     );
   }
+}
+
+async function frozenSourceEntriesFromCommit(
+  files: readonly string[],
+  sourceCommit: string,
+  preparedSourceGit: PreparedGitEnvironment,
+  execution: GitExecutionContext
+) {
+  const entries = parseTreeEntries((await runPreparedGit(preparedSourceGit, [
+    "ls-tree", "-z", sourceCommit, "--", ...files.map(literalPathspec)
+  ], execution)).stdout);
+  if (!entries) throw new Error("SOURCE_COMMIT_TREE_INVALID");
+  return new Map<string, FrozenSourceIndexEntry>(
+    files.map((file) => [file, entries.get(file)])
+  );
 }
 
 function parseRegisteredWorktrees(output: string) {
@@ -593,12 +608,22 @@ export async function executeLocalIntegration(
       statusPorcelain: target.statusPorcelain, error: "应用预检未通过", commandResults: [] };
   }
   let sourceCommit: string | undefined = preflight.sourceCommit;
-  let sourcePreparedCallbackCalled = false;
   const preApplyHead = input.expectedTargetHead ?? preflight.targetHead!;
   if (preflight.targetHead !== preApplyHead) {
     return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead,
       targetState: "uncertain" as const, statusPorcelain: "", error: "目标工作树 HEAD 在租约获取后发生变化", commandResults: [] };
   }
+  let sourceOwnershipError: unknown;
+  let sourceOwnershipFailed = false;
+  const fenceSourceMutation = async () => {
+    try {
+      await assertSourceOwnership(input);
+    } catch (error) {
+      sourceOwnershipFailed = true;
+      sourceOwnershipError = error;
+      throw error;
+    }
+  };
   if (!sourceCommit) {
     let snapshot: Awaited<ReturnType<typeof getWorktreeSnapshot>>;
     let preparedSourceGit!: PreparedGitEnvironment;
@@ -633,17 +658,6 @@ export async function executeLocalIntegration(
         targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
         error: String(error?.stderr || error?.message || error), commandResults: [] };
     }
-    let sourceOwnershipError: unknown;
-    let sourceOwnershipFailed = false;
-    const fenceSourceMutation = async () => {
-      try {
-        await assertSourceOwnership(input);
-      } catch (error) {
-        sourceOwnershipFailed = true;
-        sourceOwnershipError = error;
-        throw error;
-      }
-    };
     try {
       await runPreparedGit(preparedSourceGit, [
         "update-ref", `refs/heads/${input.sourceBranch}`,
@@ -660,15 +674,44 @@ export async function executeLocalIntegration(
     }
     sourceCommit = preparedSource.sourceCommit;
     await input.onSourcePrepared?.(preparedSource.sourceCommit);
-    sourcePreparedCallbackCalled = true;
     await assertSourceOwnership(input);
     sourceOwnershipFailed = false;
     sourceOwnershipError = undefined;
     try {
       await synchronizeFrozenSourceIndex(
-        snapshot,
+        snapshot.files,
         preparedSourceGit,
         preparedSource.frozenEntries,
+        execution,
+        { before: fenceSourceMutation, after: fenceSourceMutation }
+      );
+    } catch (error: any) {
+      if (sourceOwnershipFailed) throw sourceOwnershipError;
+      throwIfApplicationAborted(input.signal);
+      const target = await inspectTargetState(input, execution);
+      const safe = target.identityValid && target.clean && target.head === preApplyHead;
+      return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+        targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
+        error: String(error?.stderr || error?.message || error), commandResults: [] };
+    }
+  } else {
+    try {
+      const evidence = await getCommitSnapshot(input.sourceWorktreePath, sourceCommit, {
+        sensitivePatterns: input.sensitivePatterns,
+        signal: execution.signal,
+        deadlineAt: execution.deadlineAt
+      });
+      if (!evidence.diff || evidence.evidenceHash !== input.evidenceHash) {
+        throw new Error("SOURCE_EVIDENCE_CHANGED");
+      }
+      const preparedSourceGit = await prepareGitEnvironment(input.sourceWorktreePath, execution);
+      const frozenEntries = await frozenSourceEntriesFromCommit(
+        evidence.files, sourceCommit, preparedSourceGit, execution
+      );
+      await synchronizeFrozenSourceIndex(
+        evidence.files,
+        preparedSourceGit,
+        frozenEntries,
         execution,
         { before: fenceSourceMutation, after: fenceSourceMutation }
       );
@@ -699,7 +742,6 @@ export async function executeLocalIntegration(
       targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
       error: String(error?.stderr || error?.message || error), commandResults: [] };
   }
-  if (!sourcePreparedCallbackCalled) await input.onSourcePrepared?.(sourceCommit!);
   throwIfApplicationAborted(input.signal);
   const target = await inspectTargetState(input, execution);
   if (!target.identityValid || !target.clean || target.head !== preApplyHead) {

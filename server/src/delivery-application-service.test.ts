@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
@@ -97,6 +97,7 @@ async function createFixture(options: {
   conflict?: boolean;
   verificationFails?: boolean;
   sensitiveValue?: string;
+  twoChangedFiles?: boolean;
 } = {}) {
   const root = await mkdtemp(join(tmpdir(), "delivery-application-service-"));
   roots.push(root);
@@ -183,6 +184,9 @@ async function createFixture(options: {
     const sourceBranch = `ai/${requirement.code}`;
     await exec("git", ["-C", projectGit.repo, "worktree", "add", "-b", sourceBranch, sourceWorktree, "main"]);
     await writeFile(join(sourceWorktree, "src", "feature.ts"), `export const feature = '${project.name}';\n`);
+    if (options.twoChangedFiles && project.id === frontend.id) {
+      await writeFile(join(sourceWorktree, "src", "second.ts"), "export const second = true;\n");
+    }
     const snapshot = await getWorktreeSnapshot(sourceWorktree);
     database.prepare(`UPDATE delivery_units
       SET phase = 'implementation', status = 'ready' WHERE id = ?`).run(unitId);
@@ -287,6 +291,63 @@ function loseApplicationLeaseWithoutReconciliation(
   fixture.database.prepare(`UPDATE automation_jobs
     SET status = 'canceled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
     WHERE id = ?`).run(new Date().toISOString(), jobId);
+}
+
+async function installServiceSourceIndexWrapper(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+  sourceWorktree: string
+) {
+  const wrapperDirectory = join(fixture.root, "git-source-index-retry-wrapper");
+  const wrapper = join(wrapperDirectory, "git");
+  const realIndexCompletions = join(fixture.root, "source-index-completions");
+  const targetMutationStarted = join(fixture.root, "source-index-target-started");
+  const indexCountAtTarget = join(fixture.root, "source-index-count-at-target");
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  const exists = (path: string) => readFile(path).then(() => true, () => false);
+  const completionCount = async () => {
+    const contents = await readFile(realIndexCompletions, "utf8").catch(() => "");
+    return contents.split("\n").filter(Boolean).length;
+  };
+
+  await mkdir(wrapperDirectory);
+  await writeFile(wrapper, [
+    "#!/bin/sh",
+    "is_source=",
+    "is_target=",
+    "is_update_index=",
+    "is_cherry_pick=",
+    "for argument in \"$@\"; do",
+    `  if [ \"$argument\" = ${JSON.stringify(sourceWorktree)} ]; then is_source=1; fi`,
+    `  if [ \"$argument\" = ${JSON.stringify(fixture.frontendGit.versionWorktree)} ]; then is_target=1; fi`,
+    "  if [ \"$argument\" = \"update-index\" ]; then is_update_index=1; fi",
+    "  if [ \"$argument\" = \"cherry-pick\" ]; then is_cherry_pick=1; fi",
+    "done",
+    "if [ \"$is_target\" = \"1\" ] && [ \"$is_cherry_pick\" = \"1\" ]; then",
+    `  : > ${JSON.stringify(targetMutationStarted)}`,
+    `  if [ -f ${JSON.stringify(realIndexCompletions)} ]; then wc -l < ${JSON.stringify(realIndexCompletions)} > ${JSON.stringify(indexCountAtTarget)}; else printf '0\\n' > ${JSON.stringify(indexCountAtTarget)}; fi`,
+    "fi",
+    "if [ \"$is_source\" = \"1\" ] && [ \"$is_update_index\" = \"1\" ] && [ -z \"${GIT_INDEX_FILE+x}\" ]; then",
+    `  ${JSON.stringify(realGit)} \"$@\"`,
+    "  status=$?",
+    `  printf 'done\\n' >> ${JSON.stringify(realIndexCompletions)}`,
+    "  exit $status",
+    "fi",
+    `exec ${JSON.stringify(realGit)} \"$@\"`
+  ].join("\n"));
+  await chmod(wrapper, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+
+  return {
+    firstRealIndexCompleted: () => exists(realIndexCompletions),
+    completionCount,
+    targetMutationStarted: () => exists(targetMutationStarted),
+    indexCountAtTarget: async () => Number((await readFile(indexCountAtTarget, "utf8")).trim()),
+    restore: () => {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  };
 }
 
 describe("DeliveryApplicationService", () => {
@@ -557,11 +618,13 @@ describe("DeliveryApplicationService", () => {
   it("recovers a prepared source commit when the worker crashes before binding it", async () => {
     const fixture = await createFixture();
     let crashBeforeBind = true;
+    let bindAttempts = 0;
     const callbackError = new Error("SIMULATED_CRASH_BEFORE_BIND");
     const service = new DeliveryApplicationService({
       applications: {
         ...fixture.store.deliveryApplications,
         bindSourceCommit: (claim, sourceCommit) => {
+          bindAttempts += 1;
           if (crashBeforeBind) throw callbackError;
           return fixture.store.deliveryApplications.bindSourceCommit(claim, sourceCommit);
         }
@@ -598,6 +661,69 @@ describe("DeliveryApplicationService", () => {
       id: firstRun.id, sourceCommit: preparedCommit, automationAttempt: 2, status: "applied"
     });
     expect(result.run.id).toBe(firstRun.id);
+    expect(bindAttempts).toBe(2);
+    expect(await status(context.codingEvidence.worktreePath)).toBe("");
+  });
+
+  it("resumes fenced source index synchronization before target mutation on attempt 2", async () => {
+    const fixture = await createFixture({ twoChangedFiles: true });
+    const context = fixture.contexts.get(fixture.frontendUnit.id)!;
+    const marker = await installServiceSourceIndexWrapper(fixture, context.codingEvidence.worktreePath);
+    const persistence = fixture.store.deliveryApplications;
+    const ownershipError = new Error("DELIVERY_APPLICATION_SOURCE_OWNERSHIP_LOST_AFTER_INDEX");
+    let loseOwnership = true;
+    let bindCalls = 0;
+    const service = new DeliveryApplicationService({
+      applications: {
+        ...persistence,
+        assertClaim: (claim) => {
+          if (loseOwnership && existsSync(join(fixture.root, "source-index-completions"))) {
+            throw ownershipError;
+          }
+          return persistence.assertClaim(claim);
+        },
+        bindSourceCommit: (claim, sourceCommit) => {
+          bindCalls += 1;
+          return persistence.bindSourceCommit(claim, sourceCommit);
+        }
+      },
+      loadContext: async (unitId) => {
+        const loaded = fixture.contexts.get(unitId);
+        const unit = fixture.store.deliveryUnits.get(unitId);
+        return loaded && unit ? { ...loaded, unit } : null;
+      }
+    });
+    const firstLease = leaseApplication(fixture.store, fixture.frontendUnit.id, "first-worker");
+
+    try {
+      await expect(service.apply(fixture.frontendUnit.id, applicationInput(firstLease)))
+        .rejects.toBe(ownershipError);
+      const firstRun = fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)[0]!;
+      const sourceCommit = await head(context.codingEvidence.worktreePath);
+      expect(firstRun).toMatchObject({ status: "applying", sourceCommit });
+      expect(await marker.completionCount()).toBe(1);
+      expect(await marker.targetMutationStarted()).toBe(false);
+      expect(await status(context.codingEvidence.worktreePath)).not.toBe("");
+      expect(fixture.store.automationJobs.fail(
+        firstLease.id, "first-worker", firstLease.claimToken, "ownership lost", true
+      )).toBe(true);
+      const nextLease = fixture.store.automationJobs.leaseNext("retry-worker", new Date(), 60_000)!;
+      loseOwnership = false;
+
+      const result = await service.apply(fixture.frontendUnit.id, applicationInput(nextLease));
+
+      expect(result.status).toBe("completed");
+      expect(result.sourceCommit).toBe(sourceCommit);
+      expect(result.run).toMatchObject({
+        id: firstRun.id, sourceCommit, automationAttempt: 2, status: "applied"
+      });
+      expect(await marker.completionCount()).toBe(3);
+      expect(await marker.indexCountAtTarget()).toBe(3);
+      expect(await status(context.codingEvidence.worktreePath)).toBe("");
+      expect(bindCalls).toBe(1);
+    } finally {
+      marker.restore();
+    }
   });
 
   it("does not mutate the target when the application lease is lost after source binding", async () => {
