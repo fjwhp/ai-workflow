@@ -1,5 +1,7 @@
 import {
   deliveryUnitStatuses,
+  MAX_DELIVERY_PLAN_DEPENDENCIES,
+  MAX_DELIVERY_PLAN_UNITS,
   validateDeliveryGraph,
   type DeliveryUnitStatus
 } from "@ai-workflow/shared";
@@ -72,10 +74,12 @@ function validateInput(input: unknown): {
   if (!isPlainRecord(input)) invalidPlan();
   const units = ownDataValue(input, "units");
   const dependencies = ownDataValue(input, "dependencies");
-  if (!Array.isArray(units)
-    || !Array.isArray(dependencies)
-    || !isDenseArray(units)
-    || !isDenseArray(dependencies)) {
+  if (!Array.isArray(units) || !Array.isArray(dependencies)) invalidPlan();
+  if (units.length > MAX_DELIVERY_PLAN_UNITS) throw new Error("DELIVERY_PLAN_UNIT_LIMIT");
+  if (dependencies.length > MAX_DELIVERY_PLAN_DEPENDENCIES) {
+    throw new Error("DELIVERY_PLAN_DEPENDENCY_LIMIT");
+  }
+  if (!isDenseArray(units) || !isDenseArray(dependencies)) {
     invalidPlan();
   }
   return { units, dependencies };

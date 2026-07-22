@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { DeliveryUnitStatus } from "@ai-workflow/shared";
+import {
+  MAX_DELIVERY_PLAN_DEPENDENCIES,
+  MAX_DELIVERY_PLAN_UNITS,
+  type DeliveryUnitStatus
+} from "@ai-workflow/shared";
 import {
   buildApplicationPlan,
   type DeliveryApplicationDependencyInput,
@@ -24,6 +28,14 @@ function dependency(
   downstreamUnitId: string
 ): DeliveryApplicationDependencyInput {
   return { upstreamUnitId, downstreamUnitId, releaseCondition: "automated_testing_passed" };
+}
+
+function oversizedUnits(): DeliveryApplicationUnitInput[] {
+  return Array.from({ length: MAX_DELIVERY_PLAN_UNITS + 1 }, (_, index) => unit(`unit-${index}`, index));
+}
+
+function oversizedDependencies(): DeliveryApplicationDependencyInput[] {
+  return Array.from({ length: MAX_DELIVERY_PLAN_DEPENDENCIES + 1 }, () => dependency("a", "b"));
 }
 
 describe("buildApplicationPlan", () => {
@@ -74,7 +86,7 @@ describe("buildApplicationPlan", () => {
 
   it("enforces the shared unit limit before filtering skipped units", () => {
     expect(() => buildApplicationPlan({
-      units: Array.from({ length: 65 }, (_, index) => unit(`unit-${index}`, index, {
+      units: Array.from({ length: MAX_DELIVERY_PLAN_UNITS + 1 }, (_, index) => unit(`unit-${index}`, index, {
         required: false,
         status: "skipped"
       })),
@@ -89,8 +101,75 @@ describe("buildApplicationPlan", () => {
     ];
     expect(() => buildApplicationPlan({
       units: skipped,
-      dependencies: Array.from({ length: 2_049 }, () => dependency("a", "b"))
+      dependencies: Array.from({ length: MAX_DELIVERY_PLAN_DEPENDENCIES + 1 }, () => dependency("a", "b"))
     })).toThrow("DELIVERY_PLAN_DEPENDENCY_LIMIT");
+  });
+
+  it.each([
+    ["dense-array scanning", () => new Array<DeliveryApplicationUnitInput>(MAX_DELIVERY_PLAN_UNITS + 1)],
+    ["element validation", () => {
+      const units = oversizedUnits();
+      units[MAX_DELIVERY_PLAN_UNITS] = null as never;
+      return units;
+    }],
+    ["accessor element inspection", () => {
+      const units = oversizedUnits();
+      Object.defineProperty(units, MAX_DELIVERY_PLAN_UNITS, {
+        configurable: true,
+        get(): never { throw new Error("UNIT_ELEMENT_ACCESSED"); }
+      });
+      return units;
+    }],
+    ["mapping", () => {
+      const units = oversizedUnits();
+      Object.defineProperty(units, "map", {
+        configurable: true,
+        get(): never { throw new Error("UNIT_MAPPING_STARTED"); }
+      });
+      return units;
+    }]
+  ])("rejects oversized units before %s", (_, makeUnits) => {
+    expect(() => buildApplicationPlan({ units: makeUnits(), dependencies: [] }))
+      .toThrow("DELIVERY_PLAN_UNIT_LIMIT");
+  });
+
+  it.each([
+    ["dense-array scanning", () => new Array<DeliveryApplicationDependencyInput>(
+      MAX_DELIVERY_PLAN_DEPENDENCIES + 1
+    )],
+    ["element validation", () => {
+      const dependencies = oversizedDependencies();
+      dependencies[MAX_DELIVERY_PLAN_DEPENDENCIES] = null as never;
+      return dependencies;
+    }],
+    ["accessor element inspection", () => {
+      const dependencies = oversizedDependencies();
+      Object.defineProperty(dependencies, MAX_DELIVERY_PLAN_DEPENDENCIES, {
+        configurable: true,
+        get(): never { throw new Error("DEPENDENCY_ELEMENT_ACCESSED"); }
+      });
+      return dependencies;
+    }],
+    ["mapping", () => {
+      const dependencies = oversizedDependencies();
+      Object.defineProperty(dependencies, "map", {
+        configurable: true,
+        get(): never { throw new Error("DEPENDENCY_MAPPING_STARTED"); }
+      });
+      return dependencies;
+    }]
+  ])("rejects oversized dependencies before %s", (_, makeDependencies) => {
+    expect(() => buildApplicationPlan({
+      units: [unit("a", 0), unit("b", 1)],
+      dependencies: makeDependencies()
+    })).toThrow("DELIVERY_PLAN_DEPENDENCY_LIMIT");
+  });
+
+  it("gives the unit limit precedence when both raw arrays are oversized", () => {
+    expect(() => buildApplicationPlan({
+      units: new Array<DeliveryApplicationUnitInput>(MAX_DELIVERY_PLAN_UNITS + 1),
+      dependencies: new Array<DeliveryApplicationDependencyInput>(MAX_DELIVERY_PLAN_DEPENDENCIES + 1)
+    })).toThrow("DELIVERY_PLAN_UNIT_LIMIT");
   });
 
   it("does not omit a required skipped unit", () => {
