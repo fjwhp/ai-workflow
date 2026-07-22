@@ -8,6 +8,7 @@ import { simulateDeliveryMerge, type DeliveryMergeSimulationInput } from "./deli
 
 const exec = promisify(execFile);
 const roots: string[] = [];
+const INVALID_UTF8_LINK_TARGET = Buffer.from([0x72, 0x61, 0x77, 0x2d, 0xff]);
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -20,7 +21,7 @@ interface WorktreeEntry {
   type: "directory" | "file" | "symlink";
   mode: number;
   bytes?: Buffer;
-  target?: string;
+  target?: Buffer;
 }
 
 interface TargetSnapshot {
@@ -41,6 +42,8 @@ interface MergeFixture {
   baseCommit: string;
   targetCommit: string;
   sourceCommit: string;
+  targetTagObject: string;
+  sourceTagObject: string;
   simulationInput: DeliveryMergeSimulationInput;
   before: TargetSnapshot;
 }
@@ -57,6 +60,7 @@ async function commit(cwd: string, message: string) {
 
 async function createBase(repoPath: string, kind: MergeKind) {
   await writeFile(join(repoPath, "value.txt"), Buffer.from("base value\n"));
+  await symlink(INVALID_UTF8_LINK_TARGET, join(repoPath, "raw-link"));
   if (kind === "binary") await writeFile(join(repoPath, "asset.bin"), Buffer.from([0, 1, 2, 0, 255]));
   if (kind === "mode") await writeFile(join(repoPath, "script.sh"), Buffer.from("#!/bin/sh\nprintf 'base\\n'\n"), { mode: 0o644 });
   if (kind === "symlink") await symlink("base-destination", join(repoPath, "link"));
@@ -96,7 +100,12 @@ async function captureEntries(root: string): Promise<WorktreeEntry[]> {
       const entryPath = relative(root, path).split(sep).join("/");
       const mode = stat.mode & 0o7777;
       if (stat.isSymbolicLink()) {
-        entries.push({ path: entryPath, type: "symlink", mode, target: await readlink(path) });
+        entries.push({
+          path: entryPath,
+          type: "symlink",
+          mode,
+          target: await readlink(path, { encoding: "buffer" })
+        });
       } else if (stat.isDirectory()) {
         entries.push({ path: entryPath, type: "directory", mode });
         await visit(path);
@@ -150,6 +159,12 @@ async function createMergeFixture(kind: MergeKind): Promise<MergeFixture> {
   await git(repoPath, "switch", "source");
   await changeSource(repoPath, kind);
   const sourceCommit = await commit(repoPath, "source");
+  await git(repoPath, "tag", "-a", "target-object", "-m", "target object", targetCommit);
+  await git(repoPath, "tag", "-a", "source-object", "-m", "source object", sourceCommit);
+  const targetTagObject = (await git(repoPath, "rev-parse", "target-object^{tag}"))
+    .stdout.toString("utf8").trim();
+  const sourceTagObject = (await git(repoPath, "rev-parse", "source-object^{tag}"))
+    .stdout.toString("utf8").trim();
 
   await exec("git", ["init", "--bare", remotePath]);
   await git(repoPath, "remote", "add", "origin", remotePath);
@@ -165,6 +180,8 @@ async function createMergeFixture(kind: MergeKind): Promise<MergeFixture> {
     baseCommit,
     targetCommit,
     sourceCommit,
+    targetTagObject,
+    sourceTagObject,
     simulationInput: {
       repoPath,
       sourceCommit,
@@ -235,8 +252,22 @@ describe("simulateDeliveryMerge", () => {
     if (result.status !== "clean") throw new Error("expected a clean simulation");
     const names = (await git(fixture.repoPath, "ls-tree", "-r", "--name-only", "-z", result.mergedTree))
       .stdout.toString("utf8").split("\0").filter(Boolean).sort();
-    expect(names).toEqual(["source.txt", "target.txt", "value.txt"]);
+    expect(names).toEqual(["raw-link", "source.txt", "target.txt", "value.txt"]);
     await expectTargetState(fixture);
+  });
+
+  it("captures invalid UTF-8 symlink targets as raw bytes before and after simulation", async () => {
+    const fixture = await createMergeFixture("clean");
+    const beforeLink = fixture.before.entries.find((entry) => entry.path === "raw-link");
+    expect(Buffer.isBuffer(beforeLink?.target)).toBe(true);
+    expect(beforeLink?.target).toEqual(INVALID_UTF8_LINK_TARGET);
+
+    await simulateDeliveryMerge(fixture.simulationInput);
+
+    await expectTargetState(fixture);
+    const after = await targetSnapshot(fixture);
+    expect(after.entries.find((entry) => entry.path === "raw-link")?.target)
+      .toEqual(INVALID_UTF8_LINK_TARGET);
   });
 
   it.each([
@@ -340,6 +371,19 @@ describe("simulateDeliveryMerge", () => {
     await expectTargetState(fixture);
   });
 
+  it.each([
+    ["sourceCommit", "sourceTagObject"],
+    ["preApplyHead", "targetTagObject"]
+  ] as const)("rejects an annotated tag object passed as %s", async (inputField, fixtureField) => {
+    const fixture = await createMergeFixture("clean");
+
+    await expect(simulateDeliveryMerge({
+      ...fixture.simulationInput,
+      [inputField]: fixture[fixtureField]
+    })).rejects.toThrow("DELIVERY_APPLICATION_MERGE_COMMIT_INVALID");
+    await expectTargetState(fixture);
+  });
+
   it("rejects duplicate conflict stages as malformed evidence", async () => {
     const fixture = await createMergeFixture("text");
     const wrapperDirectory = join(fixture.root, "malformed-conflict-git");
@@ -408,6 +452,57 @@ describe("simulateDeliveryMerge", () => {
         mergedTree: null,
         conflictFiles: []
       });
+      expect(await exists(writeTreeStarted)).toBe(false);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+    await expectTargetState(fixture);
+  });
+
+  it("bounds conflict evidence larger than the Git capture limit without write-tree", async () => {
+    const fixture = await createMergeFixture("text");
+    const wrapperDirectory = join(fixture.root, "capture-limit-conflict-git");
+    const wrapperPath = join(wrapperDirectory, "git");
+    const evidencePath = join(fixture.root, "oversized-conflicts");
+    const writeTreeStarted = join(fixture.root, "capture-limit-write-tree-started");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    const records = Array.from({ length: 85_000 }, (_, index) => {
+      const path = `file-${String(index).padStart(6, "0")}`;
+      return [1, 2].map((stage) =>
+        `100644 ${String(stage).repeat(40)} ${stage}\t${path}\0`
+      ).join("");
+    }).join("");
+    expect(Buffer.byteLength(records)).toBeGreaterThan(10 * 1024 * 1024);
+    await writeFile(evidencePath, records);
+    await mkdir(wrapperDirectory);
+    await writeFile(wrapperPath, [
+      "#!/bin/sh",
+      "is_unmerged=",
+      "is_write_tree=",
+      "for argument in \"$@\"; do",
+      "  if [ \"$argument\" = \"-u\" ]; then is_unmerged=1; fi",
+      "  if [ \"$argument\" = \"write-tree\" ]; then is_write_tree=1; fi",
+      "done",
+      "if [ \"$is_unmerged\" = \"1\" ]; then",
+      `  exec /bin/cat ${JSON.stringify(evidencePath)}`,
+      "fi",
+      "if [ \"$is_write_tree\" = \"1\" ]; then",
+      `  : > ${JSON.stringify(writeTreeStarted)}`,
+      "fi",
+      `exec ${JSON.stringify(realGit)} \"$@\"`
+    ].join("\n"));
+    await chmod(wrapperPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+    try {
+      const result = await simulateDeliveryMerge({
+        ...fixture.simulationInput,
+        deadlineAt: Date.now() + 10_000
+      });
+      expect(result.status).toBe("conflict");
+      expect(result.conflictFiles).toHaveLength(1_024);
+      expect(Buffer.byteLength(JSON.stringify(result.conflictFiles))).toBeLessThanOrEqual(262_144);
       expect(await exists(writeTreeStarted)).toBe(false);
     } finally {
       if (previousPath === undefined) delete process.env.PATH;

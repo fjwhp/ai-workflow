@@ -49,8 +49,9 @@ export async function simulateDeliveryMerge(
 
   const repoPath = await canonicalRepository(input);
   const execution = { repoPath, signal: input.signal, deadlineAt: input.deadlineAt };
+  await requireDirectCommit(execution, input.sourceCommit);
+  await requireDirectCommit(execution, input.preApplyHead);
   const sourceParent = await resolveSourceParent(execution, input.sourceCommit);
-  await requireCommit(execution, input.preApplyHead);
   throwIfAborted(input.signal);
   requireRemainingTime(input.deadlineAt);
 
@@ -61,9 +62,10 @@ export async function simulateDeliveryMerge(
     await runGit(isolatedExecution, [
       "read-tree", "-m", sourceParent, input.preApplyHead, input.sourceCommit
     ]);
-    const conflictEvidence = parseConflictFiles((await runGit(isolatedExecution, [
+    const conflictScan = await runGit(isolatedExecution, [
       "ls-files", "-u", "-z"
-    ])).stdout);
+    ], { allowOutputOverflow: true });
+    const conflictEvidence = parseConflictFiles(conflictScan.stdout, conflictScan.outputOverflow);
     if (conflictEvidence.hasConflicts) {
       return { status: "conflict", mergedTree: null, conflictFiles: conflictEvidence.files };
     }
@@ -163,11 +165,13 @@ async function resolveSourceParent(execution: GitExecution, sourceCommit: string
   }
 }
 
-async function requireCommit(execution: GitExecution, commit: string) {
+async function requireDirectCommit(execution: GitExecution, commit: string) {
   try {
-    await runGit(execution, ["cat-file", "-e", `${commit}^{commit}`]);
+    const objectType = decodeLine((await runGit(execution, ["cat-file", "-t", commit])).stdout);
+    if (objectType !== "commit") throw new Error("DELIVERY_APPLICATION_MERGE_COMMIT_INVALID");
   } catch (error) {
     preserveExecutionError(error);
+    if (error instanceof Error && error.message === "DELIVERY_APPLICATION_MERGE_COMMIT_INVALID") throw error;
     throw new Error("DELIVERY_APPLICATION_MERGE_COMMIT_INVALID", { cause: error });
   }
 }
@@ -180,7 +184,11 @@ function preserveExecutionError(error: unknown): void {
   }
 }
 
-async function runGit(execution: GitExecution, args: readonly string[]) {
+async function runGit(
+  execution: GitExecution,
+  args: readonly string[],
+  options: { allowOutputOverflow?: boolean } = {}
+) {
   throwIfAborted(execution.signal);
   const timeout = Math.min(requireRemainingTime(execution.deadlineAt), GIT_COMMAND_TIMEOUT_MS);
   const env = codingGitEnvironmentWithFsmonitor(SAFE_GIT_CONFIG);
@@ -190,20 +198,25 @@ async function runGit(execution: GitExecution, args: readonly string[]) {
   env.SSH_ASKPASS = "/usr/bin/false";
   env.GIT_OPTIONAL_LOCKS = "0";
   if (execution.indexPath) env.GIT_INDEX_FILE = execution.indexPath;
-  const result = await spawnGit(execution, args, env, timeout);
+  const result = await spawnGit(execution, args, env, timeout, !options.allowOutputOverflow);
   throwIfAborted(execution.signal);
   requireRemainingTime(execution.deadlineAt);
-  if (result.outputOverflow || result.error || result.exitCode !== 0) {
+  if ((!options.allowOutputOverflow && result.outputOverflow) || result.error || result.exitCode !== 0) {
     throw new Error("DELIVERY_APPLICATION_MERGE_GIT_FAILED", { cause: result.error });
   }
-  return { stdout: Buffer.concat(result.stdout), stderr: Buffer.concat(result.stderr) };
+  return {
+    stdout: Buffer.concat(result.stdout),
+    stderr: Buffer.concat(result.stderr),
+    outputOverflow: result.outputOverflow
+  };
 }
 
 function spawnGit(
   execution: GitExecution,
   args: readonly string[],
   env: NodeJS.ProcessEnv,
-  timeout: number
+  timeout: number,
+  terminateOnOverflow: boolean
 ): Promise<{
   exitCode: number;
   stdout: Buffer[];
@@ -243,7 +256,7 @@ function spawnGit(
         if (remaining > 0) target.push(chunk.subarray(0, remaining));
         capturedBytes = MAX_GIT_OUTPUT_BYTES;
         outputOverflow = true;
-        terminate();
+        if (terminateOnOverflow) terminate();
         return;
       }
       target.push(chunk);
@@ -311,12 +324,20 @@ function decodeObjectId(output: Buffer) {
   return objectId;
 }
 
-function parseConflictFiles(output: Buffer) {
-  if (output.length === 0) return { hasConflicts: false as const, files: [] as string[] };
-  if (output[output.length - 1] !== 0) conflictEvidenceInvalid();
+function parseConflictFiles(output: Buffer, outputOverflow = false) {
+  if (output.length === 0) {
+    return { hasConflicts: outputOverflow, files: [] as string[] };
+  }
+  let completeOutput = output;
+  if (output[output.length - 1] !== 0) {
+    if (!outputOverflow) conflictEvidenceInvalid();
+    const finalTerminator = output.lastIndexOf(0);
+    if (finalTerminator < 0) return { hasConflicts: true as const, files: [] as string[] };
+    completeOutput = output.subarray(0, finalTerminator + 1);
+  }
   const files = new Set<string>();
   const seenStages = new Set<string>();
-  for (const record of splitNulRecords(output, "DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID")) {
+  for (const record of splitNulRecords(completeOutput, "DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID")) {
     const tab = record.indexOf(0x09);
     if (tab <= 0 || tab === record.length - 1) conflictEvidenceInvalid();
     const prefix = record.subarray(0, tab).toString("ascii");
