@@ -92,14 +92,22 @@ async function createProjectGitFixture(
   return { repo, remote, versionWorktree, targetBranch, baseHead, targetHead: await head(versionWorktree) };
 }
 
-async function createFixture(options: { conflict?: boolean; verificationFails?: boolean } = {}) {
+async function createFixture(options: {
+  conflict?: boolean;
+  verificationFails?: boolean;
+  sensitiveValue?: string;
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), "delivery-application-service-"));
   roots.push(root);
   const backendGit = await createProjectGitFixture(root, "backend");
-  const frontendGit = await createProjectGitFixture(root, "frontend", {
+  const frontendGit = await createProjectGitFixture(
+    root,
+    options.sensitiveValue ? `frontend-${options.sensitiveValue}` : "frontend",
+    {
     targetConflict: options.conflict,
     verificationFails: options.verificationFails
-  });
+    }
+  );
   const databasePath = join(root, "workflow.db");
   const store = new WorkflowStore(databasePath);
   stores.push(store);
@@ -117,7 +125,7 @@ async function createFixture(options: { conflict?: boolean; verificationFails?: 
     allowedCommands: options.verificationFails
       ? [{ command: "npm", argsPrefix: ["test", "--silent"] }]
       : [{ command: "git", argsPrefix: ["diff", "--cached", "--check"] }],
-    sensitivePatterns: []
+    sensitivePatterns: options.sensitiveValue ? [options.sensitiveValue] : []
   });
   const backendVersion = store.createProjectVersion({
     projectId: backend.id, name: "2.2.1-backend", branch: backendGit.targetBranch, baseBranch: "main",
@@ -305,6 +313,22 @@ describe("DeliveryApplicationService", () => {
     });
     expect(fixture.store.automationJobs.get(lease.id)?.status).toBe("completed");
     await expectRepositoryState(fixture.backendGit, otherBefore);
+  });
+
+  it("returns only the sanitized persisted preflight", async () => {
+    const sensitiveValue = "CUSTOM_SECRET_PATH";
+    const fixture = await createFixture({ sensitiveValue });
+    const lease = leaseApplication(fixture.store, fixture.frontendUnit.id);
+
+    const result = await fixture.service.apply(fixture.frontendUnit.id, applicationInput(lease));
+
+    expect(result.status).toBe("completed");
+    expect(JSON.stringify(result)).not.toContain(sensitiveValue);
+    expect(JSON.stringify(result)).toContain("[REDACTED]");
+    expect(result.preflight).toEqual(result.run.preflight);
+    expect(result.run.preflight).toEqual(
+      fixture.store.deliveryApplications.get(result.run.id)?.preflight
+    );
   });
 
   it("rejects a dirty target without changing either repository", async () => {

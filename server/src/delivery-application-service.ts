@@ -208,7 +208,7 @@ function serviceResult(
   return {
     status,
     run,
-    preflight: result.preflight,
+    preflight: run.preflight as ApplicationPreflight,
     ...(result.sourceCommit ? { sourceCommit: result.sourceCommit } : {}),
     ...(result.preApplyHead ? { preApplyHead: result.preApplyHead } : {}),
     error
