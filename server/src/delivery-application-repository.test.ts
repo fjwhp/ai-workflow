@@ -308,6 +308,77 @@ describe("DeliveryApplicationRepository", () => {
     expect(fixture.store.deliveryApplications.complete(resumed, completedResult()).status).toBe("applied");
   });
 
+  it("continues to attempt three after a preclaim retryable failure", () => {
+    const fixture = createFixture();
+    const firstLease = leaseApplication(
+      fixture.store, fixture.backendUnit.id, 1, "worker-one", CLOCK, 10
+    );
+    const firstClaim = bindSource(fixture.store, fixture.store.deliveryApplications.claim(
+      fixture.backendUnit.id, claimInput(firstLease, "backend")
+    ), "backend");
+    const retryTime = new Date(CLOCK.getTime() + 10);
+    expect(fixture.store.automationJobs.recoverExpired(retryTime)).toBe(1);
+    const secondLease = fixture.store.automationJobs.leaseNext("worker-two", retryTime, 60_000)!;
+    expect(secondLease).toMatchObject({ id: firstLease.id, attempt: 2 });
+
+    expect(fixture.store.automationJobs.fail(
+      secondLease.id, "worker-two", secondLease.claimToken, "temporary", true
+    )).toBe(true);
+    expect(fixture.store.automationJobs.get(firstLease.id)?.status).toBe("pending");
+    const thirdLease = fixture.store.automationJobs.leaseNext(
+      "worker-three", new Date(CLOCK.getTime() + 11), 60_000
+    );
+    expect(thirdLease).toMatchObject({ id: firstLease.id, attempt: 3 });
+    if (!thirdLease) throw new Error("expected third application lease");
+    const resumed = fixture.store.deliveryApplications.claim(
+      fixture.backendUnit.id, claimInput(thirdLease, "backend")
+    );
+    const secondClaim = {
+      ...firstClaim, automationAttempt: 2, leaseOwner: "worker-two", claimToken: secondLease.claimToken
+    };
+
+    expect(resumed).toMatchObject({ id: firstClaim.id, automationAttempt: 3, sourceCommit: commit("backend-source") });
+    expect(() => fixture.store.deliveryApplications.complete(firstClaim, completedResult()))
+      .toThrow("DELIVERY_APPLICATION_LEASE_STALE");
+    expect(() => fixture.store.deliveryApplications.complete(secondClaim, completedResult()))
+      .toThrow("DELIVERY_APPLICATION_LEASE_STALE");
+    expect(fixture.store.deliveryApplications.complete(resumed, completedResult()).status).toBe("applied");
+  });
+
+  it("continues to attempt three after a preclaim nonfinal expiry", () => {
+    const fixture = createFixture();
+    const firstLease = leaseApplication(
+      fixture.store, fixture.backendUnit.id, 1, "worker-one", CLOCK, 10
+    );
+    const firstClaim = bindSource(fixture.store, fixture.store.deliveryApplications.claim(
+      fixture.backendUnit.id, claimInput(firstLease, "backend")
+    ), "backend");
+    const secondTime = new Date(CLOCK.getTime() + 10);
+    expect(fixture.store.automationJobs.recoverExpired(secondTime)).toBe(1);
+    const secondLease = fixture.store.automationJobs.leaseNext("worker-two", secondTime, 10)!;
+    expect(secondLease).toMatchObject({ id: firstLease.id, attempt: 2 });
+
+    const thirdTime = new Date(CLOCK.getTime() + 20);
+    expect(fixture.store.automationJobs.recoverExpired(thirdTime)).toBe(1);
+    expect(fixture.store.automationJobs.get(firstLease.id)?.status).toBe("pending");
+    const thirdLease = fixture.store.automationJobs.leaseNext("worker-three", thirdTime, 60_000);
+    expect(thirdLease).toMatchObject({ id: firstLease.id, attempt: 3 });
+    if (!thirdLease) throw new Error("expected third application lease");
+    const resumed = fixture.store.deliveryApplications.claim(
+      fixture.backendUnit.id, claimInput(thirdLease, "backend")
+    );
+    const secondClaim = {
+      ...firstClaim, automationAttempt: 2, leaseOwner: "worker-two", claimToken: secondLease.claimToken
+    };
+
+    expect(resumed).toMatchObject({ id: firstClaim.id, automationAttempt: 3, sourceCommit: commit("backend-source") });
+    expect(() => fixture.store.deliveryApplications.complete(firstClaim, completedResult()))
+      .toThrow("DELIVERY_APPLICATION_LEASE_STALE");
+    expect(() => fixture.store.deliveryApplications.complete(secondClaim, completedResult()))
+      .toThrow("DELIVERY_APPLICATION_LEASE_STALE");
+    expect(fixture.store.deliveryApplications.complete(resumed, completedResult()).status).toBe("applied");
+  });
+
   it("atomically reconciles a nonretryable apply failure from another connection", () => {
     const fixture = createFixture();
     const claim = bindSource(fixture.store,
