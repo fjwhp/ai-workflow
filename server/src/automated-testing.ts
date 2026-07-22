@@ -163,6 +163,11 @@ export interface AutomatedTestingDependencies {
   now?: () => number;
 }
 
+export interface VerificationExecutionLease {
+  assertCurrent(): void | Promise<void>;
+  deadlineAt?: number;
+}
+
 export async function runAutomatedTesting(
   input: AutomatedTestingInput,
   dependencies: AutomatedTestingDependencies = {},
@@ -174,10 +179,11 @@ export async function runAutomatedTesting(
 export async function runIsolatedVerification(
   input: IsolatedVerificationInput,
   dependencies: AutomatedTestingDependencies = {},
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  lease?: VerificationExecutionLease
 ): Promise<AutomatedTestingResult> {
   const now = dependencies.now ?? Date.now;
-  const deadline = now() + COMMAND_TIMEOUT_MS;
+  const deadline = Math.min(now() + COMMAND_TIMEOUT_MS, lease?.deadlineAt ?? Number.POSITIVE_INFINITY);
   let plan: ReturnType<typeof buildVerificationPlan>;
   try {
     plan = buildVerificationPlan(input.allowedCommands, input.acceptanceCriteria);
@@ -288,6 +294,8 @@ export async function runIsolatedVerification(
         commandResults.push(...plan.commands.slice(index).map(deadlineCommandResult));
         break;
       }
+      await lease?.assertCurrent();
+      throwIfAutomatedTestAborted(signal);
       if (!dependencies.execFile) {
         const frozenCommand = toolchain?.commands[index];
         if (!frozenCommand || frozenCommand.id !== command.id) throw new Error("AUTOMATED_TEST_TOOLCHAIN_INVALID");
@@ -300,8 +308,12 @@ export async function runIsolatedVerification(
             }
           );
           throwIfAutomatedTestAborted(signal);
+          await lease?.assertCurrent();
+          throwIfAutomatedTestAborted(signal);
         } catch (error) {
           if (automatedTestAborted(signal, error)) throw automatedTestAbort(error);
+          await lease?.assertCurrent();
+          throwIfAutomatedTestAborted(signal);
           if (error instanceof Error && error.message === "MANAGED_PROCESS_DEADLINE_EXCEEDED") {
             deadlineExceeded = true;
             commandResults.push(...plan.commands.slice(index).map(deadlineCommandResult));
@@ -326,8 +338,10 @@ export async function runIsolatedVerification(
         commandResults.push(result);
         continue;
       }
+      let output: { stdout?: unknown; stderr?: unknown } | undefined;
+      let commandError: unknown;
       try {
-        const output = await dependencies.execFile(SANDBOX_EXEC, ["-p", profile, command.command, ...command.args], {
+        output = await dependencies.execFile(SANDBOX_EXEC, ["-p", profile, command.command, ...command.args], {
           cwd: join(canonicalParent, "worktree"),
           env,
           shell: false,
@@ -337,10 +351,17 @@ export async function runIsolatedVerification(
           signal
         });
         throwIfAutomatedTestAborted(signal);
+      } catch (error) {
+        if (automatedTestAborted(signal, error)) throw automatedTestAbort(error);
+        commandError = error;
+      }
+      await lease?.assertCurrent();
+      throwIfAutomatedTestAborted(signal);
+      if (!commandError) {
         const result: CommandResult = {
           ...command, exitCode: 0,
-          stdout: redactSensitive(String(output.stdout ?? ""), input.sensitivePatterns),
-          stderr: redactSensitive(String(output.stderr ?? ""), input.sensitivePatterns),
+          stdout: redactSensitive(String(output?.stdout ?? ""), input.sensitivePatterns),
+          stderr: redactSensitive(String(output?.stderr ?? ""), input.sensitivePatterns),
           timedOut: false, outputOverflow: false
         };
         if (now() > deadline) {
@@ -352,9 +373,8 @@ export async function runIsolatedVerification(
           break;
         }
         commandResults.push(result);
-      } catch (error) {
-        if (automatedTestAborted(signal, error)) throw automatedTestAbort(error);
-        const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown; killed?: unknown; signal?: unknown };
+      } else {
+        const failure = commandError as { code?: unknown; stdout?: unknown; stderr?: unknown; killed?: unknown; signal?: unknown };
         const timedOut = failure.killed === true || failure.signal === "SIGTERM";
         commandResults.push({
           ...command,

@@ -10,6 +10,7 @@ import {
   buildVerificationPlan,
   sanitizedVerificationEnvironment,
   runAutomatedTesting,
+  runIsolatedVerification,
   type AutomatedTestingInput
 } from "./automated-testing.js";
 import { getWorktreeSnapshot } from "./repository.js";
@@ -347,6 +348,49 @@ describe("automated testing safety", () => {
       ],
       acceptanceTrace: [{ criterion: "all frozen commands finish before the deadline", passed: false }]
     });
+  });
+
+  it("stops between isolated commands when the application lease is lost", async () => {
+    const target = initializeTarget();
+    const execFile = vi.fn(async () => ({ stdout: "ok", stderr: "" }));
+    let assertions = 0;
+    const assertCurrent = vi.fn(async () => {
+      assertions += 1;
+      if (assertions === 3) throw new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+    });
+
+    const pending = runIsolatedVerification(automatedInput(target, [
+      { command: "first" }, { command: "second" }
+    ]), {
+      platform: "darwin", sandboxExecutableAvailable: async () => true,
+      materializeManifest: async (root: string) => { mkdirSync(root); }, execFile
+    }, undefined, { assertCurrent });
+
+    await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_CLAIM_LOST");
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(assertCurrent).toHaveBeenCalledTimes(3);
+  });
+
+  it("propagates lease loss after a managed command reaches its deadline", async () => {
+    const target = initializeTarget();
+    const runManagedProcess = vi.fn(async () => {
+      throw new Error("MANAGED_PROCESS_DEADLINE_EXCEEDED");
+    });
+    let assertions = 0;
+    const assertCurrent = vi.fn(async () => {
+      assertions += 1;
+      if (assertions === 2) throw new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+    });
+
+    const pending = runIsolatedVerification(automatedInput(target, [{ command: "first" }]), {
+      platform: "darwin", sandboxExecutableAvailable: async () => true,
+      materializeManifest: async (root: string) => { mkdirSync(root); },
+      snapshotToolchain: fakeToolchain, runManagedProcess
+    }, undefined, { assertCurrent });
+
+    await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_CLAIM_LOST");
+    expect(runManagedProcess).toHaveBeenCalledOnce();
+    expect(assertCurrent).toHaveBeenCalledTimes(2);
   });
 
   it("does not start the first command when entry work consumes the deadline", async () => {

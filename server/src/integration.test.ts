@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { executeLocalIntegration, preflightLocalIntegration } from "./integration.js";
@@ -208,6 +208,23 @@ describe("local integration", () => {
     }
   });
 
+  it("does not inherit Git trace destinations outside the selected repository", async () => {
+    const item = await fixture();
+    const trace = join(item.root, "outside-git-trace.log");
+    const previous = process.env.GIT_TRACE;
+    process.env.GIT_TRACE = trace;
+    try {
+      const result = await executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 ignores Git trace", commands: []
+      });
+      expect(result.status).toBe("completed");
+      await expect(readFile(trace, "utf8")).rejects.toThrow();
+    } finally {
+      if (previous === undefined) delete process.env.GIT_TRACE;
+      else process.env.GIT_TRACE = previous;
+    }
+  });
+
   it("excludes an untracked sensitive file from the prepared commit and target", async () => {
     const item = await fixture();
     await writeFile(join(item.sourceWorktree, ".env"), "TOKEN=do-not-commit\n");
@@ -287,6 +304,259 @@ describe("local integration", () => {
     expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "--verify", "CHERRY_PICK_HEAD"]).catch(() => ({ stdout: "" }))).stdout).toBe("");
   });
 
+  it("preserves a foreign conflict created immediately before target mutation", async () => {
+    const item = await fixture();
+    await rm(join(item.sourceWorktree, "feature.txt"));
+    await writeFile(join(item.sourceWorktree, "value.txt"), "delivery source\n");
+    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
+
+    await writeFile(join(item.targetWorktree, "value.txt"), "target version\n");
+    await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
+    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target version"]);
+    await writeFile(join(item.repo, "value.txt"), "foreign source\n");
+    await exec("git", ["-C", item.repo, "add", "--all"]);
+    await exec("git", ["-C", item.repo, "commit", "-m", "foreign source"]);
+    const foreignCommit = (await exec("git", ["-C", item.repo, "rev-parse", "HEAD"])).stdout.trim();
+
+    const captureConflictState = async () => {
+      const cherryPickHeadPath = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "--git-path", "CHERRY_PICK_HEAD"])).stdout.trim();
+      const indexPath = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "--git-path", "index"])).stdout.trim();
+      return {
+        cherryPickHead: await readFile(cherryPickHeadPath).catch(() => Buffer.alloc(0)),
+        index: await readFile(indexPath),
+        value: await readFile(join(item.targetWorktree, "value.txt")),
+        status: (await exec("git", ["-C", item.targetWorktree, "status", "--porcelain=v1"])).stdout
+      };
+    };
+    let foreignState: Awaited<ReturnType<typeof captureConflictState>> | undefined;
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
+      commitMessage: "REQ-0001 preserves foreign conflict", commands: [],
+      onBeforeTargetMutation: async () => {
+        await exec("git", ["-C", item.targetWorktree, "cherry-pick", foreignCommit]).catch(() => undefined);
+        foreignState = await captureConflictState();
+      }
+    });
+
+    expect(result.status).toBe("ambiguous");
+    expect(foreignState).toBeDefined();
+    expect(await captureConflictState()).toEqual(foreignState);
+  });
+
+  it("rolls back a wildcard filename without touching a matching sibling path", async () => {
+    const item = await fixture();
+    await writeFile(join(item.sourceWorktree, "new?.txt"), "source wildcard\n");
+    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
+
+    await writeFile(join(item.targetWorktree, "new?.txt"), "target wildcard\n");
+    await writeFile(join(item.targetWorktree, "new1.txt"), "committed sibling\n");
+    await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
+    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target wildcard"]);
+    await exec("git", ["-C", item.targetWorktree, "update-index", "--assume-unchanged", "new1.txt"]);
+    await writeFile(join(item.targetWorktree, "new1.txt"), "hidden sibling edit\n");
+
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
+      commitMessage: "REQ-0001 wildcard conflict", commands: []
+    });
+
+    expect(result.status, JSON.stringify(result)).toBe("conflict");
+    expect(result.conflictFiles).toEqual(["new?.txt"]);
+    expect(await readFile(join(item.targetWorktree, "new1.txt"), "utf8")).toBe("hidden sibling edit\n");
+  });
+
+  it("aborts a running Git cherry-pick without waiting for the subprocess timeout", async () => {
+    const item = await fixture();
+    const wrapperDirectory = join(item.root, "git-wrapper");
+    const wrapper = join(wrapperDirectory, "git");
+    const marker = join(item.root, "cherry-pick-started");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    await mkdir(wrapperDirectory);
+    await writeFile(wrapper, [
+      "#!/bin/sh",
+      "for argument in \"$@\"; do",
+      "  if [ \"$argument\" = \"cherry-pick\" ]; then",
+      `    : > ${JSON.stringify(marker)}`,
+      "    exec /bin/sleep 2",
+      "  fi",
+      "done",
+      `exec ${JSON.stringify(realGit)} \"$@\"`
+    ].join("\n"));
+    await chmod(wrapper, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+    const controller = new AbortController();
+    try {
+      const pending = executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 abort cherry-pick", commands: [],
+        signal: controller.signal
+      });
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (await readFile(marker, "utf8").then(() => true, () => false)) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await expect(readFile(marker, "utf8")).resolves.toBe("");
+      const abortedAt = Date.now();
+      controller.abort();
+      await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_ABORTED");
+      expect(Date.now() - abortedAt).toBeLessThan(1_000);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
+  it("does not swallow cancellation while inspecting an owned cherry-pick conflict", async () => {
+    const item = await fixture();
+    await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
+    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
+    await writeFile(join(item.targetWorktree, "value.txt"), "target\n");
+    await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
+    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target conflict"]);
+
+    const wrapperDirectory = join(item.root, "git-cleanup-wrapper");
+    const wrapper = join(wrapperDirectory, "git");
+    const marker = join(item.root, "cleanup-inspection-started");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    await mkdir(wrapperDirectory);
+    await writeFile(wrapper, [
+      "#!/bin/sh",
+      "for argument in \"$@\"; do",
+      "  if [ \"$argument\" = \"CHERRY_PICK_HEAD\" ]; then",
+      `    : > ${JSON.stringify(marker)}`,
+      "    exec /bin/sleep 2",
+      "  fi",
+      "done",
+      `exec ${JSON.stringify(realGit)} \"$@\"`
+    ].join("\n"));
+    await chmod(wrapper, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+    const controller = new AbortController();
+    try {
+      const pending = executeLocalIntegration({
+        ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
+        commitMessage: "REQ-0001 abort cleanup", commands: [], signal: controller.signal
+      });
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (await readFile(marker, "utf8").then(() => true, () => false)) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await expect(readFile(marker, "utf8")).resolves.toBe("");
+      controller.abort();
+      await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_ABORTED");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
+  it("does not start destructive cleanup after the target lease is lost during diagnostics", async () => {
+    const item = await fixture();
+    await rm(join(item.sourceWorktree, "feature.txt"));
+    await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
+    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
+    await writeFile(join(item.targetWorktree, "value.txt"), "target\n");
+    await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
+    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target conflict"]);
+
+    const wrapperDirectory = join(item.root, "git-cleanup-lease-wrapper");
+    const wrapper = join(wrapperDirectory, "git");
+    const diagnosticsFinished = join(item.root, "cleanup-diagnostics-finished");
+    const destructiveCommandStarted = join(item.root, "destructive-cleanup-started");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    await mkdir(wrapperDirectory);
+    await writeFile(wrapper, [
+      "#!/bin/sh",
+      "is_target=",
+      "is_ls_tree=",
+      "is_destructive=",
+      "for argument in \"$@\"; do",
+      `  if [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
+      "  if [ \"$argument\" = \"ls-tree\" ]; then is_ls_tree=1; fi",
+      "  if [ \"$argument\" = \"restore\" ] || [ \"$argument\" = \"rm\" ] || [ \"$argument\" = \"--quit\" ]; then is_destructive=1; fi",
+      "done",
+      "if [ \"$is_target\" = \"1\" ] && [ \"$is_ls_tree\" = \"1\" ]; then",
+      `  ${JSON.stringify(realGit)} \"$@\"`,
+      "  status=$?",
+      `  : > ${JSON.stringify(diagnosticsFinished)}`,
+      "  exit $status",
+      "fi",
+      "if [ \"$is_target\" = \"1\" ] && [ \"$is_destructive\" = \"1\" ]; then",
+      `  : > ${JSON.stringify(destructiveCommandStarted)}`,
+      "fi",
+      `exec ${JSON.stringify(realGit)} \"$@\"`
+    ].join("\n"));
+    await chmod(wrapper, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+    try {
+      const pending = executeLocalIntegration({
+        ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
+        commitMessage: "REQ-0001 fenced cleanup", commands: [],
+        assertTargetOwnership: async () => {
+          if (await readFile(diagnosticsFinished).then(() => true, () => false)) {
+            throw new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+          }
+        }
+      });
+
+      await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_CLAIM_LOST");
+      await expect(readFile(destructiveCommandStarted, "utf8")).rejects.toThrow();
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
+  it.each([
+    ["worktree identity", "rev-parse", "--show-toplevel"],
+    ["source evidence", "ls-files", "--ignored"]
+  ])("aborts Git promptly while reading %s", async (_label, firstArgument, secondArgument) => {
+    const item = await fixture();
+    const wrapperDirectory = join(item.root, "git-read-wrapper");
+    const wrapper = join(wrapperDirectory, "git");
+    const marker = join(item.root, "git-read-started");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    await mkdir(wrapperDirectory);
+    await writeFile(wrapper, [
+      "#!/bin/sh",
+      "has_first=",
+      "has_second=",
+      "for argument in \"$@\"; do",
+      `  if [ \"$argument\" = ${JSON.stringify(firstArgument)} ]; then has_first=1; fi`,
+      `  if [ \"$argument\" = ${JSON.stringify(secondArgument)} ]; then has_second=1; fi`,
+      "done",
+      "if [ \"$has_first\" = \"1\" ] && [ \"$has_second\" = \"1\" ]; then",
+      `  : > ${JSON.stringify(marker)}`,
+      "  exec /bin/sleep 2",
+      "fi",
+      `exec ${JSON.stringify(realGit)} \"$@\"`
+    ].join("\n"));
+    await chmod(wrapper, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+    const controller = new AbortController();
+    try {
+      const pending = executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 abort Git read", commands: [],
+        signal: controller.signal
+      });
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (await readFile(marker, "utf8").then(() => true, () => false)) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await expect(readFile(marker, "utf8")).resolves.toBe("");
+      const abortedAt = Date.now();
+      controller.abort();
+      await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_ABORTED");
+      expect(Date.now() - abortedAt).toBeLessThan(1_000);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
   it("reuses the source commit on retry instead of creating another commit", async () => {
     const item = await fixture();
     await exec("git", ["-C", item.sourceWorktree, "add", "--all"]);
@@ -307,6 +577,86 @@ describe("local integration", () => {
     expect(result.statusPorcelain).toContain("A  feature.txt");
     expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
     expect((await exec("git", ["-C", item.targetWorktree, "diff", "--cached", "--name-only"])).stdout).toContain("feature.txt");
+  });
+
+  it("checks the live target lease before and after a trusted index verification command", async () => {
+    const item = await fixture();
+    let assertions = 0;
+    const pending = executeLocalIntegration({
+      ...integrationInput(item), commitMessage: "REQ-0001 fenced trusted check",
+      commands: [{ command: "git", argsPrefix: ["diff", "--cached", "--check"] }],
+      assertTargetOwnership: async () => {
+        assertions += 1;
+        if (assertions === 4) throw new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+      }
+    } as Parameters<typeof executeLocalIntegration>[0]);
+
+    await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_CLAIM_LOST");
+    expect(assertions).toBe(4);
+  });
+
+  it("does not start trusted verification after the target lease is lost during filter lookup", async () => {
+    const item = await fixture();
+    const wrapperDirectory = join(item.root, "git-trusted-lease-wrapper");
+    const wrapper = join(wrapperDirectory, "git");
+    const cherryPickFinished = join(item.root, "cherry-pick-finished");
+    const filterLookupFinished = join(item.root, "filter-lookup-finished");
+    const verificationStarted = join(item.root, "trusted-verification-started");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    await mkdir(wrapperDirectory);
+    await writeFile(wrapper, [
+      "#!/bin/sh",
+      "is_target=",
+      "is_cherry_pick=",
+      "is_config=",
+      "is_diff=",
+      "is_cached=",
+      "is_check=",
+      "for argument in \"$@\"; do",
+      `  if [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
+      "  if [ \"$argument\" = \"cherry-pick\" ]; then is_cherry_pick=1; fi",
+      "  if [ \"$argument\" = \"config\" ]; then is_config=1; fi",
+      "  if [ \"$argument\" = \"diff\" ]; then is_diff=1; fi",
+      "  if [ \"$argument\" = \"--cached\" ]; then is_cached=1; fi",
+      "  if [ \"$argument\" = \"--check\" ]; then is_check=1; fi",
+      "done",
+      "if [ \"$is_target\" = \"1\" ] && [ \"$is_cherry_pick\" = \"1\" ]; then",
+      `  ${JSON.stringify(realGit)} \"$@\"`,
+      "  status=$?",
+      `  : > ${JSON.stringify(cherryPickFinished)}`,
+      "  exit $status",
+      "fi",
+      `if [ \"$is_target\" = \"1\" ] && [ \"$is_config\" = \"1\" ] && [ -f ${JSON.stringify(cherryPickFinished)} ]; then`,
+      `  ${JSON.stringify(realGit)} \"$@\"`,
+      "  status=$?",
+      `  : > ${JSON.stringify(filterLookupFinished)}`,
+      "  exit $status",
+      "fi",
+      "if [ \"$is_target\" = \"1\" ] && [ \"$is_diff\" = \"1\" ] && [ \"$is_cached\" = \"1\" ] && [ \"$is_check\" = \"1\" ]; then",
+      `  : > ${JSON.stringify(verificationStarted)}`,
+      "fi",
+      `exec ${JSON.stringify(realGit)} \"$@\"`
+    ].join("\n"));
+    await chmod(wrapper, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+    try {
+      const pending = executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 fenced trusted lookup",
+        commands: [{ command: "git", argsPrefix: ["diff", "--cached", "--check"] }],
+        assertTargetOwnership: async () => {
+          if (await readFile(filterLookupFinished).then(() => true, () => false)) {
+            throw new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+          }
+        }
+      });
+
+      await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_CLAIM_LOST");
+      await expect(readFile(verificationStarted, "utf8")).rejects.toThrow();
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
   });
 
   it("does not expose inherited credentials to post-application verification", async () => {
@@ -393,5 +743,52 @@ describe("local integration", () => {
     expect(result.status).toBe("ambiguous");
     expect(await readFile(join(item.targetWorktree, "human.txt"), "utf8")).toBe("human after preflight\n");
     expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).not.toContain("feature.txt");
+  });
+
+  it("does not clean another actor's conflict when source binding fails before target mutation", async () => {
+    const item = await fixture();
+    await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
+    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
+
+    await exec("git", ["-C", item.repo, "switch", "-c", "other-application", "main"]);
+    await writeFile(join(item.repo, "value.txt"), "other\n");
+    await exec("git", ["-C", item.repo, "add", "value.txt"]);
+    await exec("git", ["-C", item.repo, "commit", "-m", "other application"]);
+    const otherCommit = (await exec("git", ["-C", item.repo, "rev-parse", "HEAD"])).stdout.trim();
+    await exec("git", ["-C", item.repo, "switch", "main"]);
+
+    await writeFile(join(item.targetWorktree, "value.txt"), "target\n");
+    await exec("git", ["-C", item.targetWorktree, "add", "value.txt"]);
+    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target change"]);
+
+    let conflictState: Record<string, string> | undefined;
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
+      commitMessage: "REQ-0001 stale source binding", commands: [],
+      onSourcePrepared: async () => {
+        await expect(exec("git", ["-C", item.targetWorktree, "cherry-pick", otherCommit])).rejects.toThrow();
+        conflictState = {
+          head: (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout,
+          cherryPickHead: (await exec("git", ["-C", item.targetWorktree, "rev-parse", "CHERRY_PICK_HEAD"])).stdout,
+          index: (await exec("git", ["-C", item.targetWorktree, "ls-files", "-u", "-z"])).stdout,
+          status: (await exec("git", ["-C", item.targetWorktree, "status", "--porcelain=v2", "-z"])).stdout,
+          value: await readFile(join(item.targetWorktree, "value.txt"), "utf8")
+        };
+        throw new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+      }
+    });
+
+    expect(result.error).toContain("DELIVERY_APPLICATION_CLAIM_LOST");
+    expect(conflictState).toBeDefined();
+    await expect(Promise.all([
+      exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"]).then(({ stdout }) => stdout),
+      exec("git", ["-C", item.targetWorktree, "rev-parse", "CHERRY_PICK_HEAD"]).then(({ stdout }) => stdout),
+      exec("git", ["-C", item.targetWorktree, "ls-files", "-u", "-z"]).then(({ stdout }) => stdout),
+      exec("git", ["-C", item.targetWorktree, "status", "--porcelain=v2", "-z"]).then(({ stdout }) => stdout),
+      readFile(join(item.targetWorktree, "value.txt"), "utf8")
+    ])).resolves.toEqual([
+      conflictState!.head, conflictState!.cherryPickHead, conflictState!.index,
+      conflictState!.status, conflictState!.value
+    ]);
   });
 });

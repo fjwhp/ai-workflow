@@ -447,9 +447,9 @@ for argument in "$@"; do
   if [ "$argument" = "add" ]; then has_add=1; fi
 done
 if [ "$has_worktree" = "1" ] && [ "$has_add" = "1" ]; then
-  env > "$FILTER_ENVIRONMENT_MARKER"
+  env > ${JSON.stringify(environmentMarker)}
 fi
-exec "$FILTER_REAL_GIT" "$@"
+exec ${JSON.stringify(realGit)} "$@"
 `, "utf8");
     await chmod(wrapper, 0o755);
     const previousPath = process.env.PATH;
@@ -457,8 +457,6 @@ exec "$FILTER_REAL_GIT" "$@"
     const previousConfigKey = process.env.GIT_CONFIG_KEY_0;
     const previousConfigValue = process.env.GIT_CONFIG_VALUE_0;
     process.env.PATH = `${wrapperDir}${delimiter}${previousPath ?? ""}`;
-    process.env.FILTER_REAL_GIT = realGit;
-    process.env.FILTER_ENVIRONMENT_MARKER = environmentMarker;
     process.env.GIT_CONFIG_COUNT = "1";
     process.env.GIT_CONFIG_KEY_0 = "filter.injected.smudge";
     process.env.GIT_CONFIG_VALUE_0 = "unsafe-driver";
@@ -473,8 +471,6 @@ exec "$FILTER_REAL_GIT" "$@"
       else process.env.GIT_CONFIG_KEY_0 = previousConfigKey;
       if (previousConfigValue === undefined) delete process.env.GIT_CONFIG_VALUE_0;
       else process.env.GIT_CONFIG_VALUE_0 = previousConfigValue;
-      delete process.env.FILTER_REAL_GIT;
-      delete process.env.FILTER_ENVIRONMENT_MARKER;
     }
 
     const environment = await readFile(environmentMarker, "utf8");

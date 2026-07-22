@@ -152,7 +152,7 @@ export class DeliveryApplicationService {
       changedFiles: context.changedFiles,
       fallbackCommands: context.allowedCommands
     };
-    const preflight = await preflightLocalIntegration(frozenInput);
+    const preflight = await preflightLocalIntegration(frozenInput, { signal });
     throwIfAborted(signal);
     let claim = this.dependencies.applications.claim(unitId, {
       expectedEvidenceVersion: lease.expectedEvidenceVersion,
@@ -182,11 +182,7 @@ export class DeliveryApplicationService {
         claim = this.dependencies.applications.bindSourceCommit(claim, sourceCommit);
         claim = this.dependencies.applications.assertClaim(claim);
       },
-      onBeforeTargetMutation: async () => {
-        throwIfAborted(signal);
-        claim = this.dependencies.applications.assertClaim(claim);
-      },
-      onTargetMutated: async () => {
+      assertTargetOwnership: async () => {
         throwIfAborted(signal);
         claim = this.dependencies.applications.assertClaim(claim);
       }

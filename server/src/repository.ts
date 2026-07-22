@@ -21,15 +21,11 @@ export interface CodingAttemptOwnership {
 }
 
 export function codingGitEnvironment(config: readonly GitConfigEntry[] = []) {
-  const env = { ...process.env };
-  const exact = new Set([
-    "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
-    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_SYSTEM", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS"
-  ]);
-  for (const key of Object.keys(env)) {
-    if (exact.has(key) || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) delete env[key];
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+  };
+  for (const key of ["LANG", "LC_ALL"] as const) {
+    if (process.env[key]) env[key] = process.env[key];
   }
   env.GIT_ATTR_NOSYSTEM = "1";
   env.GIT_CONFIG_NOSYSTEM = "1";
@@ -46,11 +42,16 @@ export function codingGitEnvironment(config: readonly GitConfigEntry[] = []) {
   return env;
 }
 
-export async function codingFilterOverrides(repoPath: string): Promise<GitConfigEntry[]> {
+export async function codingFilterOverrides(
+  repoPath: string,
+  options: { signal?: AbortSignal; timeout?: number } = {}
+): Promise<GitConfigEntry[]> {
   let stdout = "";
   try {
     stdout = (await execFileAsync("git", ["-C", repoPath, "config", "--name-only", "--get-regexp",
-      "^filter\\..*\\.(clean|smudge|process|required)$"], { env: codingGitEnvironment() })).stdout;
+      "^filter\\..*\\.(clean|smudge|process|required)$"], {
+      env: codingGitEnvironment(), signal: options.signal, timeout: options.timeout
+    })).stdout;
   } catch (error) {
     if ((error as { code?: unknown }).code !== 1) throw error;
   }
@@ -107,9 +108,28 @@ export async function validateRepository(repoPath: string) {
   }
 }
 
-async function canonicalGitCommonDir(repoOrWorktreePath: string) {
+export interface BoundedGitExecutionOptions {
+  signal?: AbortSignal;
+  deadlineAt?: number;
+}
+
+function boundedGitExecutionOptions(options: BoundedGitExecutionOptions) {
+  const execution: { signal?: AbortSignal; timeout?: number } = {};
+  if (options.signal) execution.signal = options.signal;
+  if (options.deadlineAt !== undefined) {
+    const remaining = options.deadlineAt - Date.now();
+    if (remaining <= 0) throw new Error("DELIVERY_APPLICATION_DEADLINE_EXCEEDED");
+    execution.timeout = remaining;
+  }
+  return execution;
+}
+
+async function canonicalGitCommonDir(
+  repoOrWorktreePath: string,
+  options: BoundedGitExecutionOptions = {}
+) {
   const { stdout } = await execFileAsync("git", ["-C", repoOrWorktreePath, "rev-parse", "--git-common-dir"], {
-    env: codingGitEnvironmentWithFsmonitor()
+    env: codingGitEnvironmentWithFsmonitor(), ...boundedGitExecutionOptions(options)
   });
   return realpath(resolve(repoOrWorktreePath, stdout.trim()));
 }
@@ -134,7 +154,8 @@ export async function withRepoWorktreeMutationLock<T>(repoPath: string, operatio
 export async function inspectActualWorktreeIdentity(
   repoPath: string,
   candidatePath: string,
-  expectedBranch: string
+  expectedBranch: string,
+  options: BoundedGitExecutionOptions = {}
 ): Promise<ActualWorktreeIdentity> {
   let canonicalCandidate: string;
   try { canonicalCandidate = await realpath(resolve(candidatePath)); }
@@ -142,10 +163,10 @@ export async function inspectActualWorktreeIdentity(
   try {
     const [{ stdout: topLevel }, repoCommonDir, candidateCommonDir] = await Promise.all([
       execFileAsync("git", ["-C", canonicalCandidate, "rev-parse", "--show-toplevel"], {
-        env: codingGitEnvironmentWithFsmonitor()
+        env: codingGitEnvironmentWithFsmonitor(), ...boundedGitExecutionOptions(options)
       }),
-      canonicalGitCommonDir(repoPath),
-      canonicalGitCommonDir(canonicalCandidate)
+      canonicalGitCommonDir(repoPath, options),
+      canonicalGitCommonDir(canonicalCandidate, options)
     ]);
     if (await realpath(resolve(canonicalCandidate, topLevel.trim())) !== canonicalCandidate) {
       return { valid: false, status: "repository_mismatch" };
@@ -153,16 +174,17 @@ export async function inspectActualWorktreeIdentity(
     if (candidateCommonDir !== repoCommonDir) return { valid: false, status: "repository_mismatch" };
     const [{ stdout: branch }, { stdout: head }] = await Promise.all([
       execFileAsync("git", ["-C", canonicalCandidate, "symbolic-ref", "--quiet", "HEAD"], {
-        env: codingGitEnvironmentWithFsmonitor()
+        env: codingGitEnvironmentWithFsmonitor(), ...boundedGitExecutionOptions(options)
       }),
       execFileAsync("git", ["-C", canonicalCandidate, "rev-parse", "HEAD"], {
-        env: codingGitEnvironmentWithFsmonitor()
+        env: codingGitEnvironmentWithFsmonitor(), ...boundedGitExecutionOptions(options)
       })
     ]);
     const actualBranch = branch.trim();
     if (actualBranch !== `refs/heads/${expectedBranch}`) return { valid: false, status: "branch_mismatch" };
     return { valid: true, path: canonicalCandidate, branch: actualBranch, headCommit: head.trim() };
-  } catch {
+  } catch (error) {
+    if (options.signal?.aborted) throw error;
     return { valid: false, status: "not_accessible" };
   }
 }

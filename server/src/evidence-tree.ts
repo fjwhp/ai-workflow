@@ -12,6 +12,23 @@ export const MAX_EVIDENCE_TOTAL_BYTES = 32 * 1024 * 1024;
 export interface EvidenceOptions {
   sensitivePatterns?: string[];
   maxTotalBytes?: number;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+}
+
+function evidenceGitOptions(
+  env: NodeJS.ProcessEnv,
+  options: EvidenceOptions,
+  extra: Record<string, unknown> = {}
+) {
+  const execution: Record<string, unknown> = { env, ...extra };
+  if (options.signal) execution.signal = options.signal;
+  if (options.deadlineAt !== undefined) {
+    const remaining = options.deadlineAt - Date.now();
+    if (remaining <= 0) throw new Error("CODING_EVIDENCE_DEADLINE_EXCEEDED");
+    execution.timeout = remaining;
+  }
+  return execution;
 }
 
 export type EvidenceManifestEntry =
@@ -43,15 +60,15 @@ export async function captureWorktreeEvidence(
 ) {
   const sensitivePatterns = options.sensitivePatterns ?? [];
   const maxTotalBytes = evidenceByteLimit(options.maxTotalBytes);
-  const identity = await readEvidenceIdentity(worktreePath, env);
-  const ignored = await readIgnoredPaths(identity.worktreePath, env);
+  const identity = await readEvidenceIdentity(worktreePath, env, options);
+  const ignored = await readIgnoredPaths(identity.worktreePath, env, options);
   const [rawBaseEntries, rawFinalEntries] = await Promise.all([
-    readHeadManifest(identity, env, sensitivePatterns, maxTotalBytes),
+    readHeadManifest(identity, env, sensitivePatterns, maxTotalBytes, options),
     readFilesystemManifest(identity.worktreePath, ignored, sensitivePatterns, maxTotalBytes)
   ]);
-  const identityAfter = await readEvidenceIdentity(worktreePath, env);
+  const identityAfter = await readEvidenceIdentity(worktreePath, env, options);
   if (JSON.stringify(identityAfter) !== JSON.stringify(identity)) throw new Error("CODING_EVIDENCE_IDENTITY_CHANGED");
-  return buildEvidenceSnapshot(identity, rawBaseEntries, rawFinalEntries, env, sensitivePatterns, maxTotalBytes);
+  return buildEvidenceSnapshot(identity, rawBaseEntries, rawFinalEntries, env, sensitivePatterns, maxTotalBytes, options);
 }
 
 export async function captureCommitEvidence(
@@ -62,25 +79,25 @@ export async function captureCommitEvidence(
 ) {
   const sensitivePatterns = options.sensitivePatterns ?? [];
   const maxTotalBytes = evidenceByteLimit(options.maxTotalBytes);
-  const currentIdentity = await readEvidenceIdentity(worktreePath, env);
+  const currentIdentity = await readEvidenceIdentity(worktreePath, env, options);
   const { stdout } = await execFileAsync("git", [
     "-C", currentIdentity.worktreePath, "rev-list", "--parents", "-n", "1", `${commit}^{commit}`
-  ], { env });
+  ], evidenceGitOptions(env, options));
   const commits = stdout.trim().split(/\s+/).filter(Boolean);
   if (commits.length !== 2 || currentIdentity.headCommit !== commits[0]) {
     throw new Error("CODING_EVIDENCE_COMMIT_UNSUPPORTED");
   }
   const [rawBaseEntries, rawFinalEntries] = await Promise.all([
-    readTreeManifest(currentIdentity, commits[1]!, env, sensitivePatterns, maxTotalBytes),
-    readTreeManifest(currentIdentity, commits[0]!, env, sensitivePatterns, maxTotalBytes)
+    readTreeManifest(currentIdentity, commits[1]!, env, sensitivePatterns, maxTotalBytes, options),
+    readTreeManifest(currentIdentity, commits[0]!, env, sensitivePatterns, maxTotalBytes, options)
   ]);
-  const identityAfter = await readEvidenceIdentity(worktreePath, env);
+  const identityAfter = await readEvidenceIdentity(worktreePath, env, options);
   if (JSON.stringify(identityAfter) !== JSON.stringify(currentIdentity)) {
     throw new Error("CODING_EVIDENCE_IDENTITY_CHANGED");
   }
   return buildEvidenceSnapshot(
     { ...currentIdentity, headCommit: commits[1]! }, rawBaseEntries, rawFinalEntries, env,
-    sensitivePatterns, maxTotalBytes
+    sensitivePatterns, maxTotalBytes, options
   );
 }
 
@@ -90,13 +107,14 @@ async function buildEvidenceSnapshot(
   rawFinalEntries: EvidenceManifestEntry[],
   env: NodeJS.ProcessEnv,
   sensitivePatterns: string[],
-  maxTotalBytes: number
+  maxTotalBytes: number,
+  options: EvidenceOptions
 ) {
   const baseEntries = excludeSensitiveClosure(rawBaseEntries, sensitivePatterns);
   const finalEntries = excludeSensitiveClosure(rawFinalEntries, sensitivePatterns);
   const manifest: EvidenceManifest = { version: 1, entries: finalEntries };
   const manifestHash = hashCanonical(manifest);
-  const diff = await buildSafeEvidenceDiff(baseEntries, finalEntries, env);
+  const diff = await buildSafeEvidenceDiff(baseEntries, finalEntries, env, options);
   const baseByPath = new Map(baseEntries.map((entry) => [entry.path, entry]));
   const finalByPath = new Map(finalEntries.map((entry) => [entry.path, entry]));
   const files = [...new Set([...baseByPath.keys(), ...finalByPath.keys()])]
@@ -119,19 +137,24 @@ async function buildEvidenceSnapshot(
   return { diff, files, changedFiles, additions, deletions, identity, manifest, manifestHash, evidenceHash };
 }
 
-async function readEvidenceIdentity(worktreePath: string, env: NodeJS.ProcessEnv): Promise<WorktreeEvidenceIdentity> {
+async function readEvidenceIdentity(
+  worktreePath: string,
+  env: NodeJS.ProcessEnv,
+  options: EvidenceOptions
+): Promise<WorktreeEvidenceIdentity> {
   const canonicalWorktree = await realpath(resolve(worktreePath));
   const [{ stdout: topLevel }, { stdout: common }, branch] = await Promise.all([
-    execFileAsync("git", ["-C", canonicalWorktree, "rev-parse", "--show-toplevel"], { env }),
-    execFileAsync("git", ["-C", canonicalWorktree, "rev-parse", "--git-common-dir"], { env }),
-    readEvidenceBranch(canonicalWorktree, env)
+    execFileAsync("git", ["-C", canonicalWorktree, "rev-parse", "--show-toplevel"], evidenceGitOptions(env, options)),
+    execFileAsync("git", ["-C", canonicalWorktree, "rev-parse", "--git-common-dir"], evidenceGitOptions(env, options)),
+    readEvidenceBranch(canonicalWorktree, env, options)
   ]);
   if (await realpath(resolve(canonicalWorktree, topLevel.trim())) !== canonicalWorktree) {
     throw new Error("CODING_EVIDENCE_REPOSITORY_MISMATCH");
   }
   let headCommit = "";
   try {
-    headCommit = (await execFileAsync("git", ["-C", canonicalWorktree, "rev-parse", "--verify", "--quiet", "HEAD"], { env })).stdout.trim();
+    headCommit = (await execFileAsync("git", ["-C", canonicalWorktree, "rev-parse", "--verify", "--quiet", "HEAD"],
+      evidenceGitOptions(env, options))).stdout.trim();
   } catch (error) {
     const failure = error as { code?: unknown; signal?: unknown };
     if (failure.code !== 1 || failure.signal) throw error;
@@ -143,10 +166,10 @@ async function readEvidenceIdentity(worktreePath: string, env: NodeJS.ProcessEnv
   };
 }
 
-async function readEvidenceBranch(worktreePath: string, env: NodeJS.ProcessEnv) {
+async function readEvidenceBranch(worktreePath: string, env: NodeJS.ProcessEnv, options: EvidenceOptions) {
   try {
     return (await execFileAsync("git", ["-C", worktreePath, "symbolic-ref", "--quiet", "--short", "HEAD"], {
-      env
+      ...evidenceGitOptions(env, options)
     })).stdout.trim();
   } catch (error) {
     if ((error as { code?: unknown; signal?: unknown }).code === 1 && !(error as { signal?: unknown }).signal) {
@@ -156,10 +179,10 @@ async function readEvidenceBranch(worktreePath: string, env: NodeJS.ProcessEnv) 
   }
 }
 
-async function readIgnoredPaths(worktreePath: string, env: NodeJS.ProcessEnv) {
+async function readIgnoredPaths(worktreePath: string, env: NodeJS.ProcessEnv, options: EvidenceOptions) {
   const { stdout } = await execFileAsync("git", [
     "-C", worktreePath, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"
-  ], { env, encoding: "buffer" as any, maxBuffer: 10 * 1024 * 1024 });
+  ], evidenceGitOptions(env, options, { encoding: "buffer" as any, maxBuffer: 10 * 1024 * 1024 }) as any);
   return new Set(Buffer.from(stdout as any).toString("utf8").split("\0").filter(Boolean)
     .map((path) => path.endsWith("/") ? path.slice(0, -1) : path));
 }
@@ -215,10 +238,11 @@ async function readHeadManifest(
   identity: WorktreeEvidenceIdentity,
   env: NodeJS.ProcessEnv,
   sensitivePatterns: string[],
-  maxTotalBytes: number
+  maxTotalBytes: number,
+  options: EvidenceOptions
 ): Promise<EvidenceManifestEntry[]> {
   if (!identity.headCommit) return [];
-  return readTreeManifest(identity, identity.headCommit, env, sensitivePatterns, maxTotalBytes);
+  return readTreeManifest(identity, identity.headCommit, env, sensitivePatterns, maxTotalBytes, options);
 }
 
 async function readTreeManifest(
@@ -226,11 +250,12 @@ async function readTreeManifest(
   commit: string,
   env: NodeJS.ProcessEnv,
   sensitivePatterns: string[],
-  maxTotalBytes: number
+  maxTotalBytes: number,
+  options: EvidenceOptions
 ): Promise<EvidenceManifestEntry[]> {
   const { stdout } = await execFileAsync("git", [
     "-C", identity.worktreePath, "ls-tree", "-r", "-z", "--full-tree", commit
-  ], { env, encoding: "buffer" as any, maxBuffer: 10 * 1024 * 1024 });
+  ], evidenceGitOptions(env, options, { encoding: "buffer" as any, maxBuffer: 10 * 1024 * 1024 }) as any);
   const entries: EvidenceManifestEntry[] = [];
   let totalBytes = 0;
   for (const record of Buffer.from(stdout as any).toString("utf8").split("\0").filter(Boolean)) {
@@ -239,8 +264,8 @@ async function readTreeManifest(
     const [, mode, , objectId, path] = match;
     if (matchesSensitivePath(path!, sensitivePatterns)) continue;
     const output = await execFileAsync("git", ["-C", identity.worktreePath, "cat-file", "blob", objectId!], {
-      env, encoding: "buffer" as any, maxBuffer: 10 * 1024 * 1024
-    });
+      ...evidenceGitOptions(env, options, { encoding: "buffer" as any, maxBuffer: 10 * 1024 * 1024 })
+    } as any);
     const content = Buffer.from(output.stdout as any);
     totalBytes += content.length;
     if (totalBytes > maxTotalBytes) throw new Error("CODING_EVIDENCE_SIZE_LIMIT");
@@ -260,11 +285,13 @@ async function readTreeManifest(
 }
 
 async function buildSafeEvidenceDiff(
-  before: EvidenceManifestEntry[], after: EvidenceManifestEntry[], env: NodeJS.ProcessEnv
+  before: EvidenceManifestEntry[], after: EvidenceManifestEntry[], env: NodeJS.ProcessEnv,
+  options: EvidenceOptions
 ) {
   const root = await mkdtemp(join(tmpdir(), "ai-workflow-evidence-diff-"));
   try {
-    await execFileAsync("git", ["init", "--quiet", "--initial-branch=evidence", "--template=", root], { env });
+    await execFileAsync("git", ["init", "--quiet", "--initial-branch=evidence", "--template=", root],
+      evidenceGitOptions(env, options));
     await mkdir(join(root, ".git", "info"), { recursive: true });
     const binaryPaths = [...before, ...after].filter((entry) => entry.type === "file"
       && decodeText(Buffer.from(entry.contentBase64, "base64")) === undefined).map((entry) => entry.path);
@@ -272,14 +299,16 @@ async function buildSafeEvidenceDiff(
       .map((line) => line.includes(" -filter ") ? line : `${JSON.stringify(line)} -diff -text`).join("\n");
     await writeFile(join(root, ".git", "info", "attributes"), `${attributes}\n`);
     await materializeEvidenceManifest(root, { version: 1, entries: before });
-    await execFileAsync("git", ["-C", root, "add", "--all", "--force"], { env });
+    await execFileAsync("git", ["-C", root, "add", "--all", "--force"], evidenceGitOptions(env, options));
     await execFileAsync("git", ["-C", root, "-c", "user.name=Evidence", "-c", "user.email=evidence@invalid",
-      "-c", "commit.gpgSign=false", "commit", "--quiet", "--allow-empty", "-m", "base"], { env });
+      "-c", "commit.gpgSign=false", "commit", "--quiet", "--allow-empty", "-m", "base"],
+      evidenceGitOptions(env, options));
     for (const child of await readdir(root)) if (child !== ".git") await rm(join(root, child), { recursive: true, force: true });
     await materializeEvidenceManifest(root, { version: 1, entries: after });
-    await execFileAsync("git", ["-C", root, "add", "--all", "--force"], { env });
+    await execFileAsync("git", ["-C", root, "add", "--all", "--force"], evidenceGitOptions(env, options));
     const { stdout } = await execFileAsync("git", ["-C", root, "diff", "--cached", "--binary", "--full-index",
-      "--no-ext-diff", "--no-textconv", "HEAD", "--", "."], { env, maxBuffer: 10 * 1024 * 1024 });
+      "--no-ext-diff", "--no-textconv", "HEAD", "--", "."],
+      evidenceGitOptions(env, options, { maxBuffer: 10 * 1024 * 1024 }));
     const beforeByPath = new Map(before.map((entry) => [entry.path, entry]));
     const binaryDetails = after.flatMap((entry) => {
       if (entry.type !== "file" || decodeText(Buffer.from(entry.contentBase64, "base64")) !== undefined
