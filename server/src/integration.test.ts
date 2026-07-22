@@ -122,7 +122,10 @@ async function integrationRefs(item: Awaited<ReturnType<typeof fixture>>) {
 
 async function rejectIfTargetMutationStarts(
   item: Awaited<ReturnType<typeof fixture>>,
-  options: { mutation?: "reject" | "pass" | "pause_after" } = {}
+  options: {
+    mutation?: "reject" | "pass" | "pause_after";
+    indexFlagsOutput?: string;
+  } = {}
 ) {
   const wrapperDirectory = join(item.root, "git-reject-target-mutation-wrapper");
   const wrapper = join(wrapperDirectory, "git");
@@ -130,6 +133,7 @@ async function rejectIfTargetMutationStarts(
   const targetMutationFinished = join(item.root, "target-mutation-finished");
   const pausedMutationPid = join(item.root, "paused-target-mutation-pid");
   const destructiveCommands = join(item.root, "target-destructive-commands");
+  const realTargetWriteTrees = join(item.root, "real-target-write-trees");
   const realGit = (await exec("which", ["git"])).stdout.trim();
   const lines = async (path: string) => (await readFile(path, "utf8").catch(() => ""))
     .split("\n").filter(Boolean);
@@ -141,14 +145,27 @@ async function rejectIfTargetMutationStarts(
     "previous=",
     "is_no_commit=",
     "is_abort_or_quit=",
+    "is_verbose=",
+    "is_nul=",
     "for argument in \"$@\"; do",
     `  if [ \"$previous\" = \"-C\" ] && [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
     "  if [ -z \"$command\" ] && [ \"$previous\" != \"-C\" ] && [ \"$argument\" != \"-C\" ]; then command=$argument; fi",
     "  if [ \"$argument\" = \"--no-commit\" ]; then is_no_commit=1; fi",
     "  if [ \"$argument\" = \"--abort\" ] || [ \"$argument\" = \"--quit\" ]; then is_abort_or_quit=1; fi",
+    "  if [ \"$argument\" = \"-v\" ]; then is_verbose=1; fi",
+    "  if [ \"$argument\" = \"-z\" ]; then is_nul=1; fi",
     "  previous=$argument",
     "done",
     "if [ \"$is_target\" = \"1\" ]; then",
+    ...(options.indexFlagsOutput !== undefined ? [
+      "  if [ \"$command\" = \"ls-files\" ] && [ \"$is_verbose\" = \"1\" ] && [ \"$is_nul\" = \"1\" ]; then",
+      `    printf '%s' ${JSON.stringify(options.indexFlagsOutput)}`,
+      "    exit 0",
+      "  fi"
+    ] : []),
+    "  if [ \"$command\" = \"write-tree\" ] && [ -z \"${GIT_INDEX_FILE+x}\" ]; then",
+    `    printf '%s\\n' \"$*\" >> ${JSON.stringify(realTargetWriteTrees)}`,
+    "  fi",
     "  if [ \"$command\" = \"cherry-pick\" ] && [ \"$is_no_commit\" = \"1\" ]; then",
     `    printf '%s\\n' \"$*\" >> ${JSON.stringify(targetMutations)}`,
     ...(options.mutation === "pass" || options.mutation === "pause_after" ? [
@@ -180,6 +197,7 @@ async function rejectIfTargetMutationStarts(
     waitForTargetMutation: () => waitForFile(targetMutationFinished),
     pausedMutationPid: async () => Number((await readFile(pausedMutationPid, "utf8")).trim()),
     destructiveCommands: () => lines(destructiveCommands),
+    realTargetWriteTrees: () => lines(realTargetWriteTrees),
     restore: () => {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
@@ -1094,6 +1112,111 @@ describe("local integration", () => {
     expect(await integrationRefs(item)).toBe(refsBefore);
   });
 
+  it.each([
+    ["assume-unchanged", "--assume-unchanged"],
+    ["skip-worktree", "--skip-worktree"]
+  ] as const)("does not start target mutation for a pre-mutation %s tracked edit", async (_label, flag) => {
+    const item = await fixture();
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    const hiddenBytes = Buffer.from(`${flag} external bytes\n`);
+    await exec(realGit, ["-C", item.targetWorktree, "update-index", flag, "--", "value.txt"]);
+    const indexFlags = (await exec(realGit, [
+      "-C", item.targetWorktree, "ls-files", "-v", "-z", "--", "value.txt"
+    ])).stdout;
+    expect(indexFlags[0]).toBe(flag === "--assume-unchanged" ? "h" : "S");
+    await writeFile(join(item.targetWorktree, "value.txt"), hiddenBytes);
+    const targetBefore = await captureIntegrationTargetState(item);
+    const guard = await rejectIfTargetMutationStarts(item);
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), commitMessage: `REQ-0001 pre-mutation ${flag}`, commands: []
+      });
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!, JSON.stringify(result)).toMatchObject({
+      status: "ambiguous",
+      targetState: "uncertain",
+      error: "TARGET_CHANGED_BEFORE_APPLICATION",
+      commandResults: []
+    });
+    expect(await guard.targetMutations()).toEqual([]);
+    expect(await guard.destructiveCommands()).toEqual([]);
+    expect(await captureIntegrationTargetState(item)).toEqual(targetBefore);
+    expect(await readFile(join(item.targetWorktree, "value.txt"))).toEqual(hiddenBytes);
+  });
+
+  it("fails closed before target mutation on malformed target index flags", async () => {
+    const item = await fixture();
+    const targetBefore = await captureIntegrationTargetState(item);
+    const guard = await rejectIfTargetMutationStarts(item, {
+      indexFlagsOutput: "malformed-without-nul"
+    });
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 malformed index flags", commands: []
+      });
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!, JSON.stringify(result)).toMatchObject({
+      status: "ambiguous",
+      targetState: "uncertain",
+      error: "TARGET_CHANGED_BEFORE_APPLICATION",
+      commandResults: []
+    });
+    expect(await guard.targetMutations()).toEqual([]);
+    expect(await guard.destructiveCommands()).toEqual([]);
+    expect(await captureIntegrationTargetState(item)).toEqual(targetBefore);
+  });
+
+  it.each([
+    ["assume-unchanged", "--assume-unchanged"],
+    ["skip-worktree", "--skip-worktree"]
+  ] as const)("returns uncertain for a post-mutation %s external byte edit", async (_label, flag) => {
+    const item = await fixture();
+    const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    const indexPath = (await exec(realGit, [
+      "-C", item.targetWorktree, "rev-parse", "--git-path", "index"
+    ])).stdout.trim();
+    const hiddenBytes = Buffer.from(`${flag} post-mutation bytes\n`);
+    const guard = await rejectIfTargetMutationStarts(item, { mutation: "pass" });
+    let hiddenIndex = Buffer.alloc(0);
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), expectedTargetHead: preApplyHead,
+        commitMessage: `REQ-0001 post-mutation ${flag}`, commands: [],
+        onTargetMutated: async () => {
+          await exec(realGit, ["-C", item.targetWorktree, "update-index", flag, "--", "feature.txt"]);
+          const indexFlags = (await exec(realGit, [
+            "-C", item.targetWorktree, "ls-files", "-v", "-z", "--", "feature.txt"
+          ])).stdout;
+          expect(indexFlags[0]).toBe(flag === "--assume-unchanged" ? "h" : "S");
+          await writeFile(join(item.targetWorktree, "feature.txt"), hiddenBytes);
+          hiddenIndex = await readFile(indexPath);
+        }
+      });
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!, JSON.stringify(result)).toMatchObject({
+      status: "ambiguous",
+      preApplyHead,
+      targetState: "uncertain",
+      error: "TARGET_CHANGED_AFTER_APPLICATION"
+    });
+    expect(await readFile(indexPath)).toEqual(hiddenIndex);
+    expect(await readFile(join(item.targetWorktree, "feature.txt"))).toEqual(hiddenBytes);
+    expect(await guard.destructiveCommands()).toEqual([]);
+  });
+
   it("returns uncertain without cleanup when an external actor commits the applied target", async () => {
     const item = await fixture();
     const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
@@ -1138,8 +1261,12 @@ describe("local integration", () => {
     const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
     const refsBefore = await integrationRefs(item);
     const realGit = (await exec("which", ["git"])).stdout.trim();
+    const indexPath = (await exec(realGit, [
+      "-C", item.targetWorktree, "rev-parse", "--git-path", "index"
+    ])).stdout.trim();
     const externalBytes = "external staged bytes with trailing whitespace \n";
     const guard = await rejectIfTargetMutationStarts(item, { mutation: "pass" });
+    let externalIndex = Buffer.alloc(0);
     let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
     try {
       result = await executeLocalIntegration({
@@ -1150,6 +1277,7 @@ describe("local integration", () => {
         onTargetMutated: async () => {
           await writeFile(join(item.targetWorktree, "feature.txt"), externalBytes);
           await exec(realGit, ["-C", item.targetWorktree, "add", "--", "feature.txt"]);
+          externalIndex = await readFile(indexPath);
         }
       });
     } finally {
@@ -1164,6 +1292,8 @@ describe("local integration", () => {
     });
     expect(result!.commandResults).toHaveLength(1);
     expect(result!.commandResults[0]?.code).not.toBe(0);
+    expect(await guard.realTargetWriteTrees()).toEqual([]);
+    expect(await readFile(indexPath)).toEqual(externalIndex);
     expect((await exec(realGit, ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
       .toBe(preApplyHead);
     expect(await readFile(join(item.targetWorktree, "feature.txt"), "utf8")).toBe(externalBytes);

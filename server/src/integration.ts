@@ -110,6 +110,7 @@ export type TargetState = {
   clean: boolean;
   head: string;
   statusPorcelain: string;
+  indexFlagsSafe: boolean;
 };
 
 function gitExecutionContext(signal?: AbortSignal, timeoutMs = APPLICATION_TIMEOUT_MS): GitExecutionContext {
@@ -405,17 +406,37 @@ async function inspectTargetState(
   execution: GitExecutionContext
 ): Promise<TargetState> {
   const identity = await inspectRegisteredWorktree(input, "target", execution);
-  if (!identity.valid) return { identityValid: false, clean: false, head: "", statusPorcelain: "" };
+  if (!identity.valid) {
+    return {
+      identityValid: false, clean: false, head: "", statusPorcelain: "", indexFlagsSafe: false
+    };
+  }
   try {
-    const [{ stdout: head }, { stdout: statusPorcelain }] = await Promise.all([
+    const [{ stdout: head }, { stdout: statusPorcelain }, { stdout: indexFlags }] = await Promise.all([
       git(identity.path, ["rev-parse", "HEAD"], execution),
-      git(identity.path, ["status", "--porcelain=v1", "--untracked-files=all"], execution)
+      git(identity.path, ["status", "--porcelain=v1", "--untracked-files=all"], execution),
+      git(identity.path, ["ls-files", "-v", "-z"], execution)
     ]);
-    return { identityValid: true, clean: statusPorcelain.length === 0, head: head.trim(), statusPorcelain };
+    const indexFlagsSafe = targetIndexFlagsSafe(indexFlags);
+    return {
+      identityValid: true,
+      clean: statusPorcelain.length === 0 && indexFlagsSafe,
+      head: head.trim(),
+      statusPorcelain,
+      indexFlagsSafe
+    };
   } catch (error) {
     throwIfApplicationStopped(error, execution.signal);
-    return { identityValid: false, clean: false, head: "", statusPorcelain: "" };
+    return {
+      identityValid: false, clean: false, head: "", statusPorcelain: "", indexFlagsSafe: false
+    };
   }
+}
+
+function targetIndexFlagsSafe(output: string) {
+  if (output.length === 0) return true;
+  if (!output.endsWith("\0")) return false;
+  return output.slice(0, -1).split("\0").every((record) => /^[HMRCK] [\s\S]+$/.test(record));
 }
 
 async function inspectFinalTargetPostcondition(
@@ -427,21 +448,28 @@ async function inspectFinalTargetPostcondition(
 ) {
   await assertTargetOwnership(input);
   let target: TargetState = {
-    identityValid: false, clean: false, head: "", statusPorcelain: ""
+    identityValid: false, clean: false, head: "", statusPorcelain: "", indexFlagsSafe: false
   };
-  let indexTree = "";
+  let indexDifference = "";
   let unstagedPaths = "";
   let untrackedPaths = "";
+  let finalIndexFlagsSafe = false;
   let readError: unknown;
   try {
     target = await inspectTargetState(input, execution);
-    indexTree = (await runPreparedGit(preparedTargetGit, ["write-tree"], execution)).stdout.trim();
+    indexDifference = (await runPreparedGit(preparedTargetGit, [
+      "diff-index", "--cached", "--name-only", "-z", "--no-renames",
+      "--no-ext-diff", "--no-textconv", expectedIndexTree
+    ], execution)).stdout;
     unstagedPaths = (await runPreparedGit(preparedTargetGit, [
       "diff-files", "--name-only", "-z", "--no-ext-diff", "--no-textconv"
     ], execution)).stdout;
     untrackedPaths = (await runPreparedGit(preparedTargetGit, [
       "ls-files", "--others", "--exclude-standard", "-z"
     ], execution)).stdout;
+    finalIndexFlagsSafe = targetIndexFlagsSafe((await runPreparedGit(
+      preparedTargetGit, ["ls-files", "-v", "-z"], execution
+    )).stdout);
   } catch (error) {
     readError = error;
   }
@@ -451,7 +479,9 @@ async function inspectFinalTargetPostcondition(
     valid: !readError
       && target.identityValid
       && target.head === preApplyHead
-      && indexTree === expectedIndexTree
+      && target.indexFlagsSafe
+      && finalIndexFlagsSafe
+      && indexDifference.length === 0
       && unstagedPaths.length === 0
       && untrackedPaths.length === 0,
     statusPorcelain: target.statusPorcelain
