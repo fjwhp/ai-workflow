@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFile } from "node:child_process";
 import {
   chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, writeFile
@@ -20,6 +20,16 @@ async function waitForFile(path: string) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`TIMED_OUT_WAITING_FOR_FILE:${path}`);
+}
+
+function expectProcessExited(pid: number) {
+  let error: unknown;
+  try {
+    process.kill(pid, 0);
+  } catch (caught) {
+    error = caught;
+  }
+  expect(error).toEqual(expect.objectContaining({ code: "ESRCH" }));
 }
 
 async function fixture() {
@@ -103,10 +113,22 @@ async function captureIntegrationTargetState(
   };
 }
 
-async function rejectIfTargetMutationStarts(item: Awaited<ReturnType<typeof fixture>>) {
+async function integrationRefs(item: Awaited<ReturnType<typeof fixture>>) {
+  return (await exec("git", [
+    "-C", item.repo, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)",
+    "refs/remotes", "refs/tags"
+  ])).stdout;
+}
+
+async function rejectIfTargetMutationStarts(
+  item: Awaited<ReturnType<typeof fixture>>,
+  options: { mutation?: "reject" | "pass" | "pause_after" } = {}
+) {
   const wrapperDirectory = join(item.root, "git-reject-target-mutation-wrapper");
   const wrapper = join(wrapperDirectory, "git");
   const targetMutations = join(item.root, "target-mutations");
+  const targetMutationFinished = join(item.root, "target-mutation-finished");
+  const pausedMutationPid = join(item.root, "paused-target-mutation-pid");
   const destructiveCommands = join(item.root, "target-destructive-commands");
   const realGit = (await exec("which", ["git"])).stdout.trim();
   const lines = async (path: string) => (await readFile(path, "utf8").catch(() => ""))
@@ -129,8 +151,18 @@ async function rejectIfTargetMutationStarts(item: Awaited<ReturnType<typeof fixt
     "if [ \"$is_target\" = \"1\" ]; then",
     "  if [ \"$command\" = \"cherry-pick\" ] && [ \"$is_no_commit\" = \"1\" ]; then",
     `    printf '%s\\n' \"$*\" >> ${JSON.stringify(targetMutations)}`,
-    "    printf 'injected ordinary target Git failure\\n' >&2",
-    "    exit 97",
+    ...(options.mutation === "pass" || options.mutation === "pause_after" ? [
+      `    ${JSON.stringify(realGit)} \"$@\"`,
+      "    status=$?",
+      `    : > ${JSON.stringify(targetMutationFinished)}`,
+      ...(options.mutation === "pause_after" ? [
+        `    if [ \"$status\" = \"0\" ]; then printf '%s\\n' \"$$\" > ${JSON.stringify(pausedMutationPid)}; exec /bin/sleep 10; fi`
+      ] : []),
+      "    exit $status"
+    ] : [
+      "    printf 'injected ordinary target Git failure\\n' >&2",
+      "    exit 97"
+    ]),
     "  fi",
     "  if [ \"$command\" = \"restore\" ] || [ \"$command\" = \"reset\" ] || [ \"$command\" = \"rm\" ] || [ \"$command\" = \"checkout\" ] || [ \"$command\" = \"clean\" ] || { [ \"$command\" = \"cherry-pick\" ] && [ \"$is_abort_or_quit\" = \"1\" ]; }; then",
     `    printf '%s\\n' \"$*\" >> ${JSON.stringify(destructiveCommands)}`,
@@ -144,6 +176,9 @@ async function rejectIfTargetMutationStarts(item: Awaited<ReturnType<typeof fixt
   process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
   return {
     targetMutations: () => lines(targetMutations),
+    targetMutationFinished: () => readFile(targetMutationFinished).then(() => true, () => false),
+    waitForTargetMutation: () => waitForFile(targetMutationFinished),
+    pausedMutationPid: async () => Number((await readFile(pausedMutationPid, "utf8")).trim()),
     destructiveCommands: () => lines(destructiveCommands),
     restore: () => {
       if (previousPath === undefined) delete process.env.PATH;
@@ -805,9 +840,11 @@ describe("local integration", () => {
     expect(check.checks.find((entry) => entry.id === "target_clean")?.ok).toBe(false);
   });
 
-  it("reports a deterministic conflict without starting target mutation or cleanup", async () => {
+  it("proves deterministic conflict never starts destructive target cleanup", async () => {
     const item = await fixtureWithDeterministicConflict();
     const targetBefore = await captureIntegrationTargetState(item);
+    const preApplyHead = targetBefore.head.trim();
+    const refsBefore = await integrationRefs(item);
     const guard = await rejectIfTargetMutationStarts(item);
     let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
     try {
@@ -821,6 +858,7 @@ describe("local integration", () => {
 
     expect(result!, JSON.stringify(result)).toMatchObject({
       status: "conflict",
+      preApplyHead,
       targetState: "untouched_clean",
       conflictFiles: ["value.txt"],
       commandResults: []
@@ -828,10 +866,15 @@ describe("local integration", () => {
     expect(await guard.targetMutations()).toEqual([]);
     expect(await guard.destructiveCommands()).toEqual([]);
     expect(await captureIntegrationTargetState(item)).toEqual(targetBefore);
+    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
+      .toBe(preApplyHead);
+    expect(await integrationRefs(item)).toBe(refsBefore);
   });
 
-  it("returns uncertain without cleanup when the target changes at the concurrent target boundary", async () => {
+  it("proves a concurrent target edit remains uncertain without destructive cleanup", async () => {
     const item = await fixture();
+    const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const refsBefore = await integrationRefs(item);
     const guard = await rejectIfTargetMutationStarts(item);
     const externalBytes = Buffer.from("external target edit\n\0raw");
     let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
@@ -848,12 +891,16 @@ describe("local integration", () => {
 
     expect(result!, JSON.stringify(result)).toMatchObject({
       status: "ambiguous",
+      preApplyHead,
       targetState: "uncertain",
       commandResults: []
     });
     expect(await readFile(join(item.targetWorktree, "external.txt"))).toEqual(externalBytes);
     expect(await guard.targetMutations()).toEqual([]);
     expect(await guard.destructiveCommands()).toEqual([]);
+    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
+      .toBe(preApplyHead);
+    expect(await integrationRefs(item)).toBe(refsBefore);
   });
 
   it("preserves an ordinary target Git failure and returns uncertain without cleanup", async () => {
@@ -939,43 +986,113 @@ describe("local integration", () => {
     expect(await readFile(join(item.targetWorktree, "new1.txt"), "utf8")).toBe("hidden sibling edit\n");
   });
 
-  it("aborts a running Git cherry-pick without waiting for the subprocess timeout", async () => {
+  it("proves a target Git timeout preserves uncertain staged state without destructive cleanup", async () => {
     const item = await fixture();
-    const wrapperDirectory = join(item.root, "git-wrapper");
-    const wrapper = join(wrapperDirectory, "git");
-    const marker = join(item.root, "cherry-pick-started");
-    const realGit = (await exec("which", ["git"])).stdout.trim();
-    await mkdir(wrapperDirectory);
-    await writeFile(wrapper, [
-      "#!/bin/sh",
-      "for argument in \"$@\"; do",
-      "  if [ \"$argument\" = \"cherry-pick\" ]; then",
-      `    : > ${JSON.stringify(marker)}`,
-      "    exec /bin/sleep 2",
-      "  fi",
-      "done",
-      `exec ${JSON.stringify(realGit)} \"$@\"`
-    ].join("\n"));
-    await chmod(wrapper, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+    const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const refsBefore = await integrationRefs(item);
+    const guard = await rejectIfTargetMutationStarts(item, { mutation: "pause_after" });
+    const realNow = Date.now.bind(Date);
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    let thrown: unknown;
+    try {
+      await executeLocalIntegration({
+        ...integrationInput(item), expectedTargetHead: preApplyHead,
+        commitMessage: "REQ-0001 target Git timeout", commands: [],
+        onBeforeTargetMutation: () => {
+          clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 294_000);
+        }
+      });
+    } catch (error) {
+      thrown = error;
+    } finally {
+      clock?.mockRestore();
+      guard.restore();
+    }
+
+    expect(thrown).toEqual(expect.objectContaining({ message: "DELIVERY_APPLICATION_DEADLINE_EXCEEDED" }));
+    expect(await guard.targetMutationFinished()).toBe(true);
+    expectProcessExited(await guard.pausedMutationPid());
+    expect(await guard.targetMutations()).toHaveLength(1);
+    expect(await guard.destructiveCommands()).toEqual([]);
+    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
+      .toBe(preApplyHead);
+    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout)
+      .toContain("A  feature.txt");
+    expect(await readFile(join(item.targetWorktree, "feature.txt"), "utf8")).toBe("implemented\n");
+    expect(await integrationRefs(item)).toBe(refsBefore);
+  }, 15_000);
+
+  it("proves worker abort preserves uncertain staged state without destructive cleanup", async () => {
+    const item = await fixture();
+    const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const refsBefore = await integrationRefs(item);
+    const guard = await rejectIfTargetMutationStarts(item, { mutation: "pause_after" });
     const controller = new AbortController();
+    let abortedAt = 0;
+    let thrown: unknown;
     try {
       const pending = executeLocalIntegration({
-        ...integrationInput(item), commitMessage: "REQ-0001 abort cherry-pick", commands: [],
-        signal: controller.signal
+        ...integrationInput(item), expectedTargetHead: preApplyHead,
+        commitMessage: "REQ-0001 worker abort", commands: [], signal: controller.signal
       });
-      await waitForFile(marker);
-      await expect(readFile(marker, "utf8")).resolves.toBe("");
-      const abortedAt = Date.now();
+      await guard.waitForTargetMutation();
+      abortedAt = Date.now();
       controller.abort();
-      await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_ABORTED");
-      expect(Date.now() - abortedAt).toBeLessThan(1_000);
+      try {
+        await pending;
+      } catch (error) {
+        thrown = error;
+      }
     } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
+      guard.restore();
     }
+
+    expect(thrown).toEqual(expect.objectContaining({ message: "DELIVERY_APPLICATION_ABORTED" }));
+    expect(Date.now() - abortedAt).toBeLessThan(1_000);
+    expect(await guard.targetMutationFinished()).toBe(true);
+    expectProcessExited(await guard.pausedMutationPid());
+    expect(await guard.targetMutations()).toHaveLength(1);
+    expect(await guard.destructiveCommands()).toEqual([]);
+    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
+      .toBe(preApplyHead);
+    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout)
+      .toContain("A  feature.txt");
+    expect(await readFile(join(item.targetWorktree, "feature.txt"), "utf8")).toBe("implemented\n");
+    expect(await integrationRefs(item)).toBe(refsBefore);
   }, 15_000);
+
+  it("proves lease loss after target mutation never settles or starts destructive cleanup", async () => {
+    const item = await fixture();
+    const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const refsBefore = await integrationRefs(item);
+    const guard = await rejectIfTargetMutationStarts(item, { mutation: "pass" });
+    const ownershipError = new Error("DELIVERY_APPLICATION_LEASE_STALE_AFTER_TARGET_MUTATION");
+    let thrown: unknown;
+    try {
+      await executeLocalIntegration({
+        ...integrationInput(item), expectedTargetHead: preApplyHead,
+        commitMessage: "REQ-0001 post-mutation lease loss", commands: [],
+        assertTargetOwnership: async () => {
+          if (await guard.targetMutationFinished()) throw ownershipError;
+        }
+      });
+    } catch (error) {
+      thrown = error;
+    } finally {
+      guard.restore();
+    }
+
+    expect(thrown).toBe(ownershipError);
+    expect(await guard.targetMutationFinished()).toBe(true);
+    expect(await guard.targetMutations()).toHaveLength(1);
+    expect(await guard.destructiveCommands()).toEqual([]);
+    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
+      .toBe(preApplyHead);
+    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout)
+      .toContain("A  feature.txt");
+    expect(await readFile(join(item.targetWorktree, "feature.txt"), "utf8")).toBe("implemented\n");
+    expect(await integrationRefs(item)).toBe(refsBefore);
+  });
 
   it("does not start target mutation after ownership loss during the final target read", async () => {
     const item = await fixture();
@@ -1160,15 +1277,32 @@ describe("local integration", () => {
     }
   }, 15_000);
 
-  it("keeps staged local changes when verification fails", async () => {
+  it("proves verification failure preserves intended staged changes without destructive cleanup", async () => {
     const item = await fixture();
-    const targetHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
-    const result = await executeLocalIntegration({ ...integrationInput(item), commitMessage: "REQ-0001 feature", commands: [{ command: process.execPath, argsPrefix: ["-e", "process.exit(7)"] }] });
-    expect(result.status).toBe("test_failed");
-    expect(result.preApplyHead).toBe(targetHead);
-    expect(result.statusPorcelain).toContain("A  feature.txt");
-    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
+    const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const refsBefore = await integrationRefs(item);
+    const guard = await rejectIfTargetMutationStarts(item, { mutation: "pass" });
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), expectedTargetHead: preApplyHead,
+        commitMessage: "REQ-0001 verification failure",
+        commands: [{ command: process.execPath, argsPrefix: ["-e", "process.exit(7)"] }]
+      });
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!.status).toBe("test_failed");
+    expect(result!.preApplyHead).toBe(preApplyHead);
+    expect(result!.statusPorcelain).toContain("A  feature.txt");
+    expect(await guard.targetMutations()).toHaveLength(1);
+    expect(await guard.destructiveCommands()).toEqual([]);
+    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
+      .toBe(preApplyHead);
     expect((await exec("git", ["-C", item.targetWorktree, "diff", "--cached", "--name-only"])).stdout).toContain("feature.txt");
+    expect(await readFile(join(item.targetWorktree, "feature.txt"), "utf8")).toBe("implemented\n");
+    expect(await integrationRefs(item)).toBe(refsBefore);
   });
 
   it("checks the live target lease before and after a trusted index verification command", async () => {
