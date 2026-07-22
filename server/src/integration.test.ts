@@ -138,6 +138,62 @@ describe("local integration", () => {
     expect((await exec("git", ["-C", item.repo, "for-each-ref", "--format=%(refname)", "refs/tags"])).stdout).toBe("");
   });
 
+  it("excludes an untracked sensitive file from the prepared commit and target", async () => {
+    const item = await fixture();
+    await writeFile(join(item.sourceWorktree, ".env"), "TOKEN=do-not-commit\n");
+
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), sensitivePatterns: [".env"],
+      commitMessage: "REQ-0001 excludes sensitive files", commands: []
+    });
+
+    expect(result.status).toBe("completed");
+    await expect(exec("git", ["-C", item.sourceWorktree, "cat-file", "-e", `${result.sourceCommit}:.env`]))
+      .rejects.toThrow();
+    await expect(readFile(join(item.targetWorktree, ".env"), "utf8")).rejects.toThrow();
+    expect(await readFile(join(item.sourceWorktree, ".env"), "utf8")).toContain("do-not-commit");
+  });
+
+  it("preserves a pre-staged excluded file without adding it to the prepared commit", async () => {
+    const item = await fixture();
+    await writeFile(join(item.sourceWorktree, "credentials.json"), "{\"token\":\"private\"}\n");
+    await exec("git", ["-C", item.sourceWorktree, "add", "credentials.json"]);
+
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), sensitivePatterns: ["credentials.json"],
+      commitMessage: "REQ-0001 preserves staged exclusions", commands: []
+    });
+
+    expect(result.status).toBe("completed");
+    await expect(exec("git", ["-C", item.sourceWorktree, "cat-file", "-e",
+      `${result.sourceCommit}:credentials.json`])).rejects.toThrow();
+    expect((await exec("git", ["-C", item.sourceWorktree, "diff", "--cached", "--name-only"])).stdout)
+      .toContain("credentials.json");
+    await expect(readFile(join(item.targetWorktree, "credentials.json"), "utf8")).rejects.toThrow();
+  });
+
+  it("does not add a file created after source evidence is frozen", async () => {
+    const item = await fixture();
+    let frozen = false;
+
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), commitMessage: "REQ-0001 freezes exact paths", commands: [],
+      onSourceFrozen: async () => {
+        frozen = true;
+        await writeFile(join(item.sourceWorktree, "race-added.txt"), "late content\n");
+        await exec("git", ["-C", item.sourceWorktree, "add", "race-added.txt"]);
+      }
+    } as Parameters<typeof executeLocalIntegration>[0]);
+
+    expect(frozen).toBe(true);
+    expect(result.status).toBe("completed");
+    await expect(exec("git", ["-C", item.sourceWorktree, "cat-file", "-e",
+      `${result.sourceCommit}:race-added.txt`])).rejects.toThrow();
+    expect((await exec("git", ["-C", item.sourceWorktree, "diff", "--cached", "--name-only"])).stdout)
+      .toContain("race-added.txt");
+    await expect(readFile(join(item.targetWorktree, "race-added.txt"), "utf8")).rejects.toThrow();
+  });
+
   it("rejects a dirty target worktree", async () => {
     const item = await fixture(); await writeFile(join(item.targetWorktree, "dirty.txt"), "dirty\n");
     const check = await preflightLocalIntegration(integrationInput(item));

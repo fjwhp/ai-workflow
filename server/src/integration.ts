@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { realpath } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
 import { getCommitSnapshot, getWorktreeSnapshot, inspectActualWorktreeIdentity } from "./repository.js";
 import { buildVerificationPlan, type VerificationCommand } from "./verification-plan.js";
 
@@ -72,6 +73,7 @@ export type ApplicationResult = {
 export type LocalIntegrationExecutionInput = FrozenApplicationInput & {
   commitMessage: string;
   commands: VerificationCommand[];
+  onSourceFrozen?: () => void | Promise<void>;
   onSourcePrepared?: (sourceCommit: string) => void | Promise<void>;
 };
 
@@ -82,14 +84,68 @@ export type TargetState = {
   statusPorcelain: string;
 };
 
-async function git(cwd: string, args: string[]) {
+async function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv) {
   return execFileAsync("git", [
     "-C", cwd,
     "-c", "core.hooksPath=/dev/null",
     "-c", "commit.gpgSign=false",
     "-c", "core.fsmonitor=false",
     ...args
-  ], { maxBuffer: 10 * 1024 * 1024 });
+  ], { maxBuffer: 10 * 1024 * 1024, ...(env ? { env } : {}) });
+}
+
+async function prepareFrozenSourceCommit(
+  input: LocalIntegrationExecutionInput,
+  snapshot: Awaited<ReturnType<typeof getWorktreeSnapshot>>
+) {
+  const baseCommit = snapshot.identity.headCommit;
+  if (!baseCommit || snapshot.files.length === 0) throw new Error("SOURCE_EVIDENCE_EMPTY");
+  await input.onSourceFrozen?.();
+  const root = await mkdtemp(join(tmpdir(), "ai-workflow-source-commit-"));
+  const indexPath = join(root, "index");
+  const indexEnv = { ...process.env, GIT_INDEX_FILE: indexPath };
+  const entries = new Map(snapshot.manifest.entries.map((entry) => [entry.path, entry]));
+  const updateIndex = async (file: string, isolated: boolean) => {
+    const entry = entries.get(file);
+    const env = isolated ? indexEnv : undefined;
+    if (!entry) {
+      await git(input.sourceWorktreePath, ["update-index", "--force-remove", "--", file], env);
+      return;
+    }
+    const content = entry.type === "symlink"
+      ? Buffer.from(entry.target)
+      : Buffer.from(entry.contentBase64, "base64");
+    const blobPath = join(root, `blob-${snapshot.files.indexOf(file)}`);
+    await writeFile(blobPath, content, { mode: 0o600 });
+    const objectId = (await git(input.sourceWorktreePath, [
+      "hash-object", "-w", "--no-filters", blobPath
+    ], env)).stdout.trim();
+    await git(input.sourceWorktreePath, [
+      "update-index", "--add", "--cacheinfo", entry.mode, objectId, file
+    ], env);
+  };
+  try {
+    await git(input.sourceWorktreePath, ["read-tree", baseCommit], indexEnv);
+    for (const file of snapshot.files) await updateIndex(file, true);
+    const tree = (await git(input.sourceWorktreePath, ["write-tree"], indexEnv)).stdout.trim();
+    const changed = (await git(input.sourceWorktreePath, [
+      "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", baseCommit, tree
+    ], indexEnv)).stdout.split("\0").filter(Boolean).sort();
+    const frozen = [...snapshot.files].sort();
+    if (JSON.stringify(changed) !== JSON.stringify(frozen)) {
+      throw new Error("SOURCE_COMMIT_PATH_SET_MISMATCH");
+    }
+    const sourceCommit = (await git(input.sourceWorktreePath, [
+      "commit-tree", tree, "-p", baseCommit, "-m", input.commitMessage
+    ], indexEnv)).stdout.trim();
+    await git(input.sourceWorktreePath, [
+      "update-ref", `refs/heads/${input.sourceBranch}`, sourceCommit, baseCommit
+    ]);
+    for (const file of snapshot.files) await updateIndex(file, false);
+    return sourceCommit;
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 function parseRegisteredWorktrees(output: string) {
@@ -274,9 +330,13 @@ export async function executeLocalIntegration(
   }
   try {
     if (!sourceCommit) {
-      await git(input.sourceWorktreePath, ["add", "--all"]);
-      await git(input.sourceWorktreePath, ["commit", "-m", input.commitMessage]);
-      sourceCommit = (await git(input.sourceWorktreePath, ["rev-parse", "HEAD"])).stdout.trim();
+      const snapshot = await getWorktreeSnapshot(input.sourceWorktreePath, {
+        sensitivePatterns: input.sensitivePatterns
+      });
+      if (!snapshot.diff || snapshot.evidenceHash !== input.evidenceHash) {
+        throw new Error("SOURCE_EVIDENCE_CHANGED");
+      }
+      sourceCommit = await prepareFrozenSourceCommit(input, snapshot);
     }
   } catch (error: any) {
     const target = await inspectTargetState(input);
