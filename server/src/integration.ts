@@ -6,7 +6,12 @@ import { getCommitSnapshot, getWorktreeSnapshot, inspectActualWorktreeIdentity }
 import { buildVerificationPlan, type VerificationCommand } from "./verification-plan.js";
 
 const execFileAsync = promisify(execFile);
-type Input = {
+const MAX_COMMAND_OUTPUT_BYTES = 16_384;
+const MAX_CONFLICT_FILES = 1_024;
+const MAX_CONFLICT_FILES_BYTES = 262_144;
+const TRUNCATED_OUTPUT_MARKER = "\n[truncated]";
+
+export interface FrozenApplicationInput {
   projectRepoPath: string;
   targetWorktreePath: string;
   targetBranch: string;
@@ -18,9 +23,59 @@ type Input = {
   sourceCommit?: string;
   changedFiles?: string[];
   fallbackCommands?: VerificationCommand[];
+}
+
+export interface ApplicationCheck {
+  id: string;
+  label: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface ApplicationPreflight {
+  allowed: boolean;
+  checks: ApplicationCheck[];
+  changedModules: string[];
+  plannedCommands: VerificationCommand[];
+  commandSource: "module_inference" | "project_fallback" | "unavailable";
+  evidenceMode?: "worktree" | "commit";
+  sourceCommit?: string;
+  sourceBranch: string;
+  targetBranch: string;
+  sourceWorktreePath: string;
+  targetWorktreePath: string;
+  targetHead?: string;
+}
+
+export interface ApplicationCommandResult {
+  command: string;
+  args: string[];
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+export type ApplicationResult = {
+  status: "completed" | "failed" | "ambiguous" | "conflict" | "test_failed";
+  preflight: ApplicationPreflight;
+  sourceCommit?: string;
+  preApplyHead?: string;
+  targetState: "untouched_clean" | "rolled_back_clean" | "applied_dirty" | "uncertain";
+  statusPorcelain: string;
+  commandResults: ApplicationCommandResult[];
+  error: string | null;
+  conflictFiles?: string[];
+  rollbackError?: string;
+  rollbackPostcondition?: TargetState;
 };
-type Check = { id: string; label: string; ok: boolean; detail: string };
-type TargetState = {
+
+export type LocalIntegrationExecutionInput = FrozenApplicationInput & {
+  commitMessage: string;
+  commands: VerificationCommand[];
+  onSourcePrepared?: (sourceCommit: string) => void | Promise<void>;
+};
+
+export type TargetState = {
   identityValid: boolean;
   clean: boolean;
   head: string;
@@ -28,7 +83,13 @@ type TargetState = {
 };
 
 async function git(cwd: string, args: string[]) {
-  return execFileAsync("git", ["-C", cwd, ...args], { maxBuffer: 10 * 1024 * 1024 });
+  return execFileAsync("git", [
+    "-C", cwd,
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "commit.gpgSign=false",
+    "-c", "core.fsmonitor=false",
+    ...args
+  ], { maxBuffer: 10 * 1024 * 1024 });
 }
 
 function parseRegisteredWorktrees(output: string) {
@@ -50,7 +111,7 @@ function parseRegisteredWorktrees(output: string) {
   return result;
 }
 
-async function inspectRegisteredWorktree(input: Input, kind: "target" | "source") {
+async function inspectRegisteredWorktree(input: FrozenApplicationInput, kind: "target" | "source") {
   const candidatePath = kind === "target" ? input.targetWorktreePath : input.sourceWorktreePath;
   const branch = kind === "target" ? input.targetBranch : input.sourceBranch;
   try {
@@ -86,7 +147,7 @@ async function inspectRegisteredWorktree(input: Input, kind: "target" | "source"
   }
 }
 
-async function inspectTargetState(input: Input): Promise<TargetState> {
+async function inspectTargetState(input: FrozenApplicationInput): Promise<TargetState> {
   const identity = await inspectRegisteredWorktree(input, "target");
   if (!identity.valid) return { identityValid: false, clean: false, head: "", statusPorcelain: "" };
   try {
@@ -108,8 +169,32 @@ async function changedTargetFiles(worktreePath: string) {
   return [...new Set(outputs.flatMap(({ stdout }) => stdout.split("\0").filter(Boolean)))];
 }
 
-export async function preflightLocalIntegration(input: Input) {
-  const checks: Check[] = [];
+function boundedCommandOutput(value: unknown) {
+  const output = String(value ?? "");
+  if (Buffer.byteLength(output) <= MAX_COMMAND_OUTPUT_BYTES) return output;
+  const prefix = Buffer.from(output).subarray(
+    0,
+    MAX_COMMAND_OUTPUT_BYTES - Buffer.byteLength(TRUNCATED_OUTPUT_MARKER) - 4
+  ).toString("utf8");
+  return `${prefix}${TRUNCATED_OUTPUT_MARKER}`;
+}
+
+function boundedConflictFiles(files: string[]) {
+  const result: string[] = [];
+  let bytes = 2;
+  for (const file of files.slice(0, MAX_CONFLICT_FILES)) {
+    const nextBytes = Buffer.byteLength(JSON.stringify(file)) + (result.length ? 1 : 0);
+    if (bytes + nextBytes > MAX_CONFLICT_FILES_BYTES) break;
+    result.push(file);
+    bytes += nextBytes;
+  }
+  return result;
+}
+
+export async function preflightLocalIntegration(
+  input: FrozenApplicationInput
+): Promise<ApplicationPreflight> {
+  const checks: ApplicationCheck[] = [];
   let evidenceMode: "worktree" | "commit" | undefined;
   let resolvedSourceCommit: string | undefined;
   const targetIdentity = await inspectRegisteredWorktree(input, "target");
@@ -118,7 +203,12 @@ export async function preflightLocalIntegration(input: Input) {
     const branch = (await git(input.targetWorktreePath, ["branch", "--show-current"])).stdout.trim();
     checks.push({ id: "target_branch", label: "目标分支正确", ok: branch === input.targetBranch, detail: branch || "游离 HEAD" });
     const status = (await git(input.targetWorktreePath, ["status", "--porcelain"])).stdout;
-    checks.push({ id: "target_clean", label: "目标工作树干净", ok: status.length === 0, detail: status || "没有本地修改" });
+    checks.push({
+      id: "target_clean",
+      label: "目标工作树干净",
+      ok: status.length === 0,
+      detail: status ? boundedCommandOutput(status) : "没有本地修改"
+    });
   } catch { checks.push({ id: "target_branch", label: "目标分支正确", ok: false, detail: "无法读取目标分支" }); }
   const sourceIdentity = await inspectRegisteredWorktree(input, "source");
   checks.push({ id: "source_identity", label: "来源工作树身份有效", ok: sourceIdentity.valid, detail: sourceIdentity.valid ? sourceIdentity.path : sourceIdentity.status });
@@ -150,10 +240,23 @@ export async function preflightLocalIntegration(input: Input) {
   if (targetIdentity.valid) {
     try { targetHead = (await git(targetIdentity.path, ["rev-parse", "HEAD"])).stdout.trim(); } catch { /* failed checks block application */ }
   }
-  return { allowed: checks.length >= 7 && checks.every((entry) => entry.ok) && Boolean(targetHead), checks, ...plan, evidenceMode, sourceCommit: resolvedSourceCommit, sourceBranch: input.sourceBranch, targetBranch: input.targetBranch, sourceWorktreePath: input.sourceWorktreePath, targetWorktreePath: input.targetWorktreePath, targetHead };
+  return {
+    allowed: checks.length >= 7 && checks.every((entry) => entry.ok) && Boolean(targetHead),
+    checks,
+    ...plan,
+    ...(evidenceMode ? { evidenceMode } : {}),
+    ...(resolvedSourceCommit ? { sourceCommit: resolvedSourceCommit } : {}),
+    sourceBranch: input.sourceBranch,
+    targetBranch: input.targetBranch,
+    sourceWorktreePath: input.sourceWorktreePath,
+    targetWorktreePath: input.targetWorktreePath,
+    ...(targetHead ? { targetHead } : {})
+  };
 }
 
-export async function executeLocalIntegration(input: Input & { commitMessage: string; commands: VerificationCommand[] }) {
+export async function executeLocalIntegration(
+  input: LocalIntegrationExecutionInput
+): Promise<ApplicationResult> {
   const preflight = await preflightLocalIntegration({...input,fallbackCommands:input.fallbackCommands||input.commands});
   if (!preflight.allowed) {
     const target = await inspectTargetState(input);
@@ -183,14 +286,14 @@ export async function executeLocalIntegration(input: Input & { commitMessage: st
       error: String(error?.stderr || error?.message || error), commandResults: [] };
   }
   try {
-    const [sourceIdentityAfterCommit, target] = await Promise.all([
-      inspectRegisteredWorktree(input, "source"), inspectTargetState(input)
-    ]);
+    const sourceIdentityAfterCommit = await inspectRegisteredWorktree(input, "source");
     if (!sourceIdentityAfterCommit.valid) throw new Error("来源工作树身份在提交后失效");
     const evidence = await getCommitSnapshot(input.sourceWorktreePath, sourceCommit!, {
       sensitivePatterns: input.sensitivePatterns
     });
     if (!evidence.diff || evidence.evidenceHash !== input.evidenceHash) throw new Error("提交后的编码证据与原始证据不一致");
+    await input.onSourcePrepared?.(sourceCommit!);
+    const target = await inspectTargetState(input);
     if (!target.identityValid || !target.clean || target.head !== preApplyHead) {
       return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead, targetState: "uncertain" as const,
         statusPorcelain: target.statusPorcelain, error: "目标工作树在应用前发生变化", commandResults: [] };
@@ -209,7 +312,11 @@ export async function executeLocalIntegration(input: Input & { commitMessage: st
         error: String(error?.stderr || error?.message || error), commandResults: [] };
     }
     let conflictFiles: string[] = [];
-    try { conflictFiles = (await git(input.targetWorktreePath, ["diff", "--name-only", "--diff-filter=U"])).stdout.trim().split("\n").filter(Boolean); }
+    try {
+      conflictFiles = boundedConflictFiles((await git(input.targetWorktreePath, [
+        "diff", "--name-only", "--diff-filter=U", "-z"
+      ])).stdout.split("\0").filter(Boolean));
+    }
     catch { /* Preserve the original error. */ }
     const evidence = await getCommitSnapshot(input.sourceWorktreePath, sourceCommit!, {
       sensitivePatterns: input.sensitivePatterns
@@ -245,14 +352,26 @@ export async function executeLocalIntegration(input: Input & { commitMessage: st
       rollbackPostcondition,
       error: String(error?.stderr || error?.message || error), commandResults: [] };
   }
-  const commandResults: any[] = [];
+  const commandResults: ApplicationCommandResult[] = [];
   const commands=input.changedFiles?preflight.plannedCommands:input.commands;
   for (const item of commands) {
     try {
       const result = await execFileAsync(item.command, item.argsPrefix, { cwd: input.targetWorktreePath, maxBuffer: 10 * 1024 * 1024 });
-      commandResults.push({ command: item.command, args: item.argsPrefix, code: 0, stdout: result.stdout, stderr: result.stderr });
+      commandResults.push({
+        command: item.command,
+        args: item.argsPrefix,
+        code: 0,
+        stdout: boundedCommandOutput(result.stdout),
+        stderr: boundedCommandOutput(result.stderr)
+      });
     } catch (error: any) {
-      commandResults.push({ command: item.command, args: item.argsPrefix, code: error?.code ?? 1, stdout: error?.stdout || "", stderr: error?.stderr || error?.message || "" });
+      commandResults.push({
+        command: item.command,
+        args: item.argsPrefix,
+        code: Number.isSafeInteger(error?.code) ? error.code : 1,
+        stdout: boundedCommandOutput(error?.stdout),
+        stderr: boundedCommandOutput(error?.stderr || error?.message)
+      });
       const statusPorcelain = (await git(input.targetWorktreePath, ["status", "--porcelain"])).stdout;
       return { status: "test_failed" as const, preflight, sourceCommit, preApplyHead, targetState: "applied_dirty" as const, statusPorcelain, commandResults, error: "本地应用后测试失败" };
     }

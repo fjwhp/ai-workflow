@@ -102,6 +102,10 @@ describe("local integration", () => {
 
   it("applies one local source commit without committing the target branch", async () => {
     const item = await fixture();
+    const remote = join(item.root, "remote.git");
+    await exec("git", ["init", "--bare", remote]);
+    await exec("git", ["-C", item.repo, "remote", "add", "origin", remote]);
+    const remoteRefsBefore = (await exec("git", ["-C", remote, "for-each-ref", "--format=%(refname)"])).stdout;
     const check = await preflightLocalIntegration(integrationInput(item));
     expect(check.allowed, JSON.stringify(check.checks)).toBe(true);
 
@@ -116,6 +120,22 @@ describe("local integration", () => {
     expect((await exec("git", ["-C", item.targetWorktree, "diff", "--cached", "--name-only"])).stdout).toContain("feature.txt");
     expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toContain("A  feature.txt");
     expect((await exec("git", ["-C", item.repo, "status", "--porcelain"])).stdout).toBe(mainBefore);
+    expect((await exec("git", ["-C", item.repo, "for-each-ref", "--format=%(refname)", "refs/remotes", "refs/tags"])).stdout).toBe("");
+    expect((await exec("git", ["-C", remote, "for-each-ref", "--format=%(refname)"])).stdout).toBe(remoteRefsBefore);
+  });
+
+  it("does not execute repository hooks that can create refs", async () => {
+    const item = await fixture();
+    const hook = join(item.repo, ".git", "hooks", "pre-commit");
+    await writeFile(hook, ["#!/bin/sh", "git tag forbidden-hook-ref"].join("\n"));
+    await chmod(hook, 0o755);
+
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), commitMessage: "REQ-0001 safe hook boundary", commands: []
+    });
+
+    expect(result.status).toBe("completed");
+    expect((await exec("git", ["-C", item.repo, "for-each-ref", "--format=%(refname)", "refs/tags"])).stdout).toBe("");
   });
 
   it("rejects a dirty target worktree", async () => {
@@ -163,7 +183,19 @@ describe("local integration", () => {
     expect((await exec("git", ["-C", item.targetWorktree, "diff", "--cached", "--name-only"])).stdout).toContain("feature.txt");
   });
 
-  it("rejects source evidence changed by a pre-commit hook before touching the target", async () => {
+  it("bounds verification output so application evidence remains persistable", async () => {
+    const item = await fixture();
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), commitMessage: "REQ-0001 bounded output",
+      commands: [{ command: process.execPath, argsPrefix: ["-e", "process.stdout.write('x'.repeat(2_000_000))"] }]
+    });
+
+    expect(result.status).toBe("completed");
+    expect(Buffer.byteLength(JSON.stringify(result.commandResults))).toBeLessThan(1_048_576);
+    expect(result.commandResults[0]?.stdout.length).toBeLessThan(2_000_000);
+  });
+
+  it("ignores a pre-commit hook that attempts to change source evidence", async () => {
     const item = await fixture();
     const hook = join(item.repo, ".git", "hooks", "pre-commit");
     await writeFile(hook, [
@@ -178,30 +210,26 @@ describe("local integration", () => {
       ...integrationInput(item), commitMessage: "REQ-0001 hook", commands: []
     });
 
-    expect(result.status).toBe("failed");
-    expect(result.error).toContain("编码证据");
+    expect(result.status).toBe("completed");
+    expect((await exec("git", ["-C", item.sourceWorktree, "status", "--porcelain"])).stdout).toBe("");
+    await expect(readFile(join(item.sourceWorktree, "hook-added.txt"), "utf8")).rejects.toThrow();
     expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
-    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toBe("");
+    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toContain("feature.txt");
   });
 
   it("preserves a tracked target edit injected after preflight without applying evidence", async () => {
     const item = await fixture();
-    await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
     const snapshot = await getWorktreeSnapshot(item.sourceWorktree);
-    const hook = join(item.repo, ".git", "hooks", "pre-commit");
-    await writeFile(hook, [
-      "#!/bin/sh",
-      `printf 'human after preflight\\n' > ${JSON.stringify(join(item.targetWorktree, "value.txt"))}`
-    ].join("\n"));
-    await chmod(hook, 0o755);
-
     const result = await executeLocalIntegration({
       ...integrationInput(item), evidenceHash: snapshot.evidenceHash,
-      commitMessage: "REQ-0001 target race", commands: []
+      commitMessage: "REQ-0001 target race", commands: [],
+      onSourcePrepared: async () => {
+        await writeFile(join(item.targetWorktree, "human.txt"), "human after preflight\n");
+      }
     });
 
     expect(result.status).toBe("ambiguous");
-    expect(await readFile(join(item.targetWorktree, "value.txt"), "utf8")).toBe("human after preflight\n");
+    expect(await readFile(join(item.targetWorktree, "human.txt"), "utf8")).toBe("human after preflight\n");
     expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).not.toContain("feature.txt");
   });
 });
