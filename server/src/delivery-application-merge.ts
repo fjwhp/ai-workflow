@@ -240,15 +240,11 @@ function spawnGit(
     let timedOut = false;
     let terminating = false;
     let spawnError: Error | undefined;
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
-
+    const termination = createGitProcessTermination(child, (error) => { spawnError ??= error; });
     const terminate = () => {
       if (terminating) return;
       terminating = true;
-      spawnError ??= signalGitProcess(child, "SIGTERM");
-      killTimer = setTimeout(() => {
-        spawnError ??= signalGitProcess(child, "SIGKILL");
-      }, TERMINATION_GRACE_MS);
+      termination.terminate();
     };
     const capture = (target: Buffer[], chunk: Buffer) => {
       const remaining = MAX_GIT_OUTPUT_BYTES - capturedBytes;
@@ -276,23 +272,25 @@ function spawnGit(
     execution.signal?.addEventListener("abort", abort, { once: true });
     if (execution.signal?.aborted) abort();
     child.once("close", (code) => {
-      clearTimeout(deadlineTimer);
-      if (killTimer) clearTimeout(killTimer);
-      execution.signal?.removeEventListener("abort", abort);
-      if (aborted) {
-        rejectPromise(new Error("DELIVERY_APPLICATION_ABORTED", { cause: execution.signal?.reason }));
-        return;
-      }
-      if (timedOut) {
-        rejectPromise(new Error("DELIVERY_APPLICATION_DEADLINE_EXCEEDED"));
-        return;
-      }
-      resolvePromise({
-        exitCode: code ?? -1,
-        stdout,
-        stderr,
-        outputOverflow,
-        ...(spawnError ? { error: spawnError } : {})
+      void termination.afterChildClose().then(() => {
+        clearTimeout(deadlineTimer);
+        termination.dispose();
+        execution.signal?.removeEventListener("abort", abort);
+        if (aborted) {
+          rejectPromise(new Error("DELIVERY_APPLICATION_ABORTED", { cause: execution.signal?.reason }));
+          return;
+        }
+        if (timedOut) {
+          rejectPromise(new Error("DELIVERY_APPLICATION_DEADLINE_EXCEEDED"));
+          return;
+        }
+        resolvePromise({
+          exitCode: code ?? -1,
+          stdout,
+          stderr,
+          outputOverflow,
+          ...(spawnError ? { error: spawnError } : {})
+        });
       });
     });
   });
@@ -350,15 +348,11 @@ function spawnConflictScan(
     let timedOut = false;
     let terminating = false;
     let spawnError: Error | undefined;
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
-
+    const termination = createGitProcessTermination(child, (error) => { spawnError ??= error; });
     const terminate = () => {
       if (terminating) return;
       terminating = true;
-      spawnError ??= signalGitProcess(child, "SIGTERM");
-      killTimer = setTimeout(() => {
-        spawnError ??= signalGitProcess(child, "SIGKILL");
-      }, TERMINATION_GRACE_MS);
+      termination.terminate();
     };
     const abort = () => {
       aborted = true;
@@ -400,26 +394,101 @@ function spawnConflictScan(
     execution.signal?.addEventListener("abort", abort, { once: true });
     if (execution.signal?.aborted) abort();
     child.once("close", (code) => {
-      clearTimeout(deadlineTimer);
-      if (killTimer) clearTimeout(killTimer);
-      execution.signal?.removeEventListener("abort", abort);
-      if (aborted) {
-        rejectPromise(new Error("DELIVERY_APPLICATION_ABORTED", { cause: execution.signal?.reason }));
-        return;
-      }
-      if (timedOut) {
-        rejectPromise(new Error("DELIVERY_APPLICATION_DEADLINE_EXCEEDED"));
-        return;
-      }
-      resolvePromise({
-        exitCode: code ?? -1,
-        stdoutOverflow,
-        stderrOverflow,
-        ...(validationError ? { validationError } : {}),
-        ...(spawnError ? { error: spawnError } : {})
+      void termination.afterChildClose().then(() => {
+        clearTimeout(deadlineTimer);
+        termination.dispose();
+        execution.signal?.removeEventListener("abort", abort);
+        if (aborted) {
+          rejectPromise(new Error("DELIVERY_APPLICATION_ABORTED", { cause: execution.signal?.reason }));
+          return;
+        }
+        if (timedOut) {
+          rejectPromise(new Error("DELIVERY_APPLICATION_DEADLINE_EXCEEDED"));
+          return;
+        }
+        resolvePromise({
+          exitCode: code ?? -1,
+          stdoutOverflow,
+          stderrOverflow,
+          ...(validationError ? { validationError } : {}),
+          ...(spawnError ? { error: spawnError } : {})
+        });
       });
     });
   });
+}
+
+function createGitProcessTermination(child: ChildProcess, onError: (error: Error) => void) {
+  let started = false;
+  let resolveBarrier: (() => void) | undefined;
+  let barrier = Promise.resolve();
+  let escalationTimer: ReturnType<typeof setTimeout> | undefined;
+  let groupPollTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const clearTimers = () => {
+    if (escalationTimer) clearTimeout(escalationTimer);
+    if (groupPollTimer) clearTimeout(groupPollTimer);
+    escalationTimer = undefined;
+    groupPollTimer = undefined;
+  };
+  const finishBarrier = () => {
+    clearTimers();
+    resolveBarrier?.();
+    resolveBarrier = undefined;
+  };
+  const groupExists = () => {
+    if (!USE_PROCESS_GROUPS || child.pid === undefined) return false;
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+      onError(error instanceof Error ? error : new Error("Git process group probe failed"));
+      return true;
+    }
+  };
+  const waitForGroupExit = () => {
+    if (!groupExists()) {
+      finishBarrier();
+      return;
+    }
+    groupPollTimer = setTimeout(waitForGroupExit, 10);
+  };
+  const escalate = () => {
+    escalationTimer = undefined;
+    if (USE_PROCESS_GROUPS && !groupExists()) {
+      finishBarrier();
+      return;
+    }
+    const error = signalGitProcess(child, "SIGKILL");
+    if (error) onError(error);
+    if (USE_PROCESS_GROUPS) waitForGroupExit();
+    else finishBarrier();
+  };
+
+  return {
+    terminate() {
+      if (started) return;
+      started = true;
+      barrier = new Promise<void>((resolve) => { resolveBarrier = resolve; });
+      const error = signalGitProcess(child, "SIGTERM");
+      if (error) onError(error);
+      if (USE_PROCESS_GROUPS && !groupExists()) {
+        finishBarrier();
+        return;
+      }
+      escalationTimer = setTimeout(escalate, TERMINATION_GRACE_MS);
+    },
+    async afterChildClose() {
+      if (!started) return;
+      if (!USE_PROCESS_GROUPS) finishBarrier();
+      else if (!groupExists()) finishBarrier();
+      await barrier;
+    },
+    dispose() {
+      clearTimers();
+    }
+  };
 }
 
 function signalGitProcess(child: ChildProcess, signal: NodeJS.Signals) {

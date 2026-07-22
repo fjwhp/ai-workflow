@@ -316,6 +316,39 @@ async function installDescendantPipeWrapper(fixture: MergeFixture, name: string)
   };
 }
 
+async function installTermIgnoringDescendantWrapper(fixture: MergeFixture, name: string) {
+  const wrapperDirectory = join(fixture.root, `${name}-git`);
+  const wrapperPath = join(wrapperDirectory, "git");
+  const descendantPidPath = join(fixture.root, `${name}-descendant-pid`);
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  await mkdir(wrapperDirectory);
+  await writeFile(wrapperPath, [
+    "#!/bin/sh",
+    "is_read_tree=",
+    "for argument in \"$@\"; do",
+    "  if [ \"$argument\" = \"read-tree\" ]; then is_read_tree=1; fi",
+    "done",
+    "if [ \"$is_read_tree\" = \"1\" ]; then",
+    `  /bin/sh -c ${JSON.stringify("trap '' TERM INT; exec /bin/sleep 60")} </dev/null >/dev/null 2>&1 &`,
+    "  descendant=$!",
+    `  printf '%s\\n' "$descendant" > ${JSON.stringify(descendantPidPath)}`,
+    "  /bin/sleep 60",
+    "  exit 0",
+    "fi",
+    `exec ${JSON.stringify(realGit)} "$@"`
+  ].join("\n"));
+  await chmod(wrapperPath, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+  return {
+    descendantPidPath,
+    restore: () => {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  };
+}
+
 function oversizedValidConflictRecords() {
   const paths = [
     ...Array.from({ length: 1_024 }, (_, index) => `file-${String(index).padStart(6, "0")}`),
@@ -567,6 +600,48 @@ describe("simulateDeliveryMerge", () => {
             : "DELIVERY_APPLICATION_DEADLINE_EXCEEDED"
         );
         await waitForProcessExit(descendantPid);
+      } finally {
+        if (descendantPid !== undefined && processExists(descendantPid)) {
+          try { process.kill(descendantPid, "SIGKILL"); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          }
+        }
+        await pending.catch(() => undefined);
+        wrapper.restore();
+      }
+      await expectTargetState(fixture);
+    }
+  );
+
+  it.each(["abort", "deadline"] as const)(
+    "waits for TERM-ignoring descendants to exit on %s",
+    async (termination) => {
+      if (process.platform === "win32") return;
+      const fixture = await createMergeFixture("clean");
+      const wrapper = await installTermIgnoringDescendantWrapper(
+        fixture,
+        `term-ignoring-${termination}`
+      );
+      const controller = new AbortController();
+      const pending = simulateDeliveryMerge({
+        ...fixture.simulationInput,
+        signal: controller.signal,
+        deadlineAt: Date.now() + (termination === "deadline" ? 750 : 5_000)
+      });
+      let descendantPid: number | undefined;
+      try {
+        await waitFor(wrapper.descendantPidPath);
+        descendantPid = Number((await readFile(wrapper.descendantPidPath, "utf8")).trim());
+        expect(Number.isSafeInteger(descendantPid)).toBe(true);
+        if (termination === "abort") controller.abort(new Error("LEASE_LOST"));
+
+        await expect(settleWithin(pending, 2_000)).rejects.toThrow(
+          termination === "abort"
+            ? "DELIVERY_APPLICATION_ABORTED"
+            : "DELIVERY_APPLICATION_DEADLINE_EXCEEDED"
+        );
+        expect(processExists(descendantPid)).toBe(false);
       } finally {
         if (descendantPid !== undefined && processExists(descendantPid)) {
           try { process.kill(descendantPid, "SIGKILL"); }
