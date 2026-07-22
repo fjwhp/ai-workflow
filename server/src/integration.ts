@@ -313,15 +313,25 @@ async function frozenSourceEntriesFromCommit(
   if (batch.length > 0) batches.push(batch);
 
   const entries = new Map<string, GitIndexEntry>();
+  const returnedPaths = new Set<string>();
   for (const paths of batches) {
     const parsed = parseTreeEntries((await runPreparedGit(preparedSourceGit, [
       "--literal-pathspecs", "ls-tree", "-z", sourceCommit, "--", ...paths
     ], execution)).stdout);
     const requested = new Set(paths);
-    if (!parsed || [...parsed.keys()].some((path) => !requested.has(path) || entries.has(path))) {
-      throw new Error("SOURCE_COMMIT_TREE_INVALID");
+    if (!parsed) throw new Error("SOURCE_COMMIT_TREE_INVALID");
+    for (const [path, entry] of parsed) {
+      if (!requested.has(path) || returnedPaths.has(path)) {
+        throw new Error("SOURCE_COMMIT_TREE_INVALID");
+      }
+      returnedPaths.add(path);
+      if (entry.objectType === "tree" && entry.mode === "040000") continue;
+      if (entry.objectType !== "blob"
+        || (entry.mode !== "100644" && entry.mode !== "100755" && entry.mode !== "120000")) {
+        throw new Error("SOURCE_COMMIT_TREE_ENTRY_UNSUPPORTED");
+      }
+      entries.set(path, entry);
     }
-    for (const [path, entry] of parsed) entries.set(path, entry);
   }
   return new Map<string, FrozenSourceIndexEntry>(
     files.map((file) => [file, entries.get(file)])
@@ -448,6 +458,7 @@ function literalPathspec(path: string) {
 }
 
 type GitIndexEntry = { mode: string; objectId: string };
+type GitTreeEntry = GitIndexEntry & { objectType: string };
 
 function sameGitEntry(left: GitIndexEntry | undefined, right: GitIndexEntry | undefined) {
   return left?.mode === right?.mode && left?.objectId === right?.objectId;
@@ -470,15 +481,16 @@ function parseUnmergedIndex(output: string) {
 }
 
 function parseTreeEntries(output: string) {
-  const entries = new Map<string, GitIndexEntry>();
+  const entries = new Map<string, GitTreeEntry>();
   for (const record of output.split("\0").filter(Boolean)) {
-    const match = /^([0-7]{6}) [^ ]+ ([0-9a-f]+)\t([\s\S]+)$/.exec(record);
+    const match = /^([0-7]{6}) ([^ ]+) ([0-9a-f]+)\t([\s\S]+)$/.exec(record);
     if (!match) return undefined;
     const mode = match[1]!;
-    const objectId = match[2]!;
-    const path = match[3]!;
+    const objectType = match[2]!;
+    const objectId = match[3]!;
+    const path = match[4]!;
     if (entries.has(path)) return undefined;
-    entries.set(path, { mode, objectId });
+    entries.set(path, { mode, objectType, objectId });
   }
   return entries;
 }

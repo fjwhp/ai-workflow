@@ -51,14 +51,54 @@ async function fixtureWithLongChangedPaths() {
   return { ...item, evidenceHash: snapshot.evidenceHash, files };
 }
 
+async function fixtureWithDirectoryBoundary(withPadding: boolean) {
+  const root = await mkdtemp(join(tmpdir(), "flowgate-integration-")); roots.push(root);
+  const repo = join(root, "repo"), targetWorktree = join(root, "version");
+  const sourceWorktree = join(root, ".ai-workflow-worktrees", "repo", "requirements", "REQ-0001");
+  const parent = "a";
+  const child = `a/child-${"e".repeat(180)}/nested-${"f".repeat(180)}/value-${"g".repeat(180)}.txt`;
+  await exec("git", ["init", "-b", "main", repo]);
+  await exec("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  await exec("git", ["-C", repo, "config", "user.name", "Flowgate Test"]);
+  await writeFile(join(repo, "value.txt"), "base\n");
+  await writeFile(join(repo, parent), "old file\n");
+  await exec("git", ["-C", repo, "add", "--all"]);
+  await exec("git", ["-C", repo, "commit", "-m", "base"]);
+  await exec("git", ["-C", repo, "worktree", "add", "-b", "release/1.0", targetWorktree, "main"]);
+  await mkdir(dirname(sourceWorktree), { recursive: true });
+  await exec("git", ["-C", repo, "worktree", "add", "-b", "ai/REQ-0001", sourceWorktree, "main"]);
+  await rm(join(sourceWorktree, parent));
+  await mkdir(dirname(join(sourceWorktree, child)), { recursive: true });
+  await writeFile(join(sourceWorktree, child), "new child\n");
+  if (withPadding) {
+    const paddingDirectory = [
+      `0-batch-${"h".repeat(190)}`,
+      `nested-${"i".repeat(190)}`,
+      `literal-[*]-${"j".repeat(190)}`
+    ].join("/");
+    const paddingFiles = Array.from({ length: 20 }, (_, index) =>
+      `${paddingDirectory}/entry-${String(index).padStart(2, "0")}-${"k".repeat(180)}.txt`
+    );
+    await mkdir(join(sourceWorktree, paddingDirectory), { recursive: true });
+    await Promise.all(paddingFiles.map((file) => writeFile(join(sourceWorktree, file), `${file}\n`)));
+  }
+  const snapshot = await getWorktreeSnapshot(sourceWorktree);
+  return { root, repo, targetWorktree, sourceWorktree, evidenceHash: snapshot.evidenceHash, parent, child };
+}
+
 async function installSourceTreeArgvBudgetWrapper(
   item: Awaited<ReturnType<typeof fixture>>,
-  budgetBytes: number
+  budgetBytes: number,
+  boundaryPaths?: readonly [string, string]
 ) {
   const wrapperDirectory = join(item.root, "git-source-tree-argv-wrapper");
   const wrapper = join(wrapperDirectory, "git");
   const queries = join(item.root, "source-tree-query-bytes");
   const rejected = join(item.root, "source-tree-query-rejected");
+  const boundaryParent = join(item.root, "source-tree-boundary-parent");
+  const boundaryChild = join(item.root, "source-tree-boundary-child");
+  const boundarySameQuery = join(item.root, "source-tree-boundary-same-query");
+  const targetMutation = join(item.root, "source-tree-target-mutation");
   const realGit = (await exec("which", ["git"])).stdout.trim();
   const exists = (path: string) => readFile(path).then(() => true, () => false);
 
@@ -66,15 +106,28 @@ async function installSourceTreeArgvBudgetWrapper(
   await writeFile(wrapper, [
     "#!/bin/sh",
     "is_source=",
+    "is_target=",
     "is_ls_tree=",
+    "is_cherry_pick=",
     "has_separator=",
     "has_literal_pathspecs=",
+    "has_boundary_parent=",
+    "has_boundary_child=",
     "for argument in \"$@\"; do",
     `  if [ "$argument" = ${JSON.stringify(item.sourceWorktree)} ]; then is_source=1; fi`,
+    `  if [ "$argument" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
     "  if [ \"$argument\" = \"ls-tree\" ]; then is_ls_tree=1; fi",
+    "  if [ \"$argument\" = \"cherry-pick\" ]; then is_cherry_pick=1; fi",
     "  if [ \"$argument\" = \"--\" ]; then has_separator=1; fi",
     "  if [ \"$argument\" = \"--literal-pathspecs\" ]; then has_literal_pathspecs=1; fi",
+    ...(boundaryPaths ? [
+      `  if [ "$argument" = ${JSON.stringify(boundaryPaths[0])} ]; then has_boundary_parent=1; fi`,
+      `  if [ "$argument" = ${JSON.stringify(boundaryPaths[1])} ]; then has_boundary_child=1; fi`
+    ] : []),
     "done",
+    "if [ \"$is_target\" = \"1\" ] && [ \"$is_cherry_pick\" = \"1\" ]; then",
+    `  : > ${JSON.stringify(targetMutation)}`,
+    "fi",
     "if [ \"$is_source\" = \"1\" ] && [ \"$is_ls_tree\" = \"1\" ] && [ \"$has_separator\" = \"1\" ]; then",
     "  bytes=4",
     "  for argument in \"$@\"; do bytes=$((bytes + ${#argument} + 1)); done",
@@ -88,6 +141,11 @@ async function installSourceTreeArgvBudgetWrapper(
     "    printf 'SOURCE_RECOVERED_PATH_QUERY_NOT_LITERAL\n' >&2",
     "    exit 92",
     "  fi",
+    `  if [ "$has_boundary_parent" = "1" ]; then : > ${JSON.stringify(boundaryParent)}; fi`,
+    `  if [ "$has_boundary_child" = "1" ]; then : > ${JSON.stringify(boundaryChild)}; fi`,
+    "  if [ \"$has_boundary_parent\" = \"1\" ] && [ \"$has_boundary_child\" = \"1\" ]; then",
+    `    : > ${JSON.stringify(boundarySameQuery)}`,
+    "  fi",
     `  printf '%s\n' "$bytes" >> ${JSON.stringify(queries)}`,
     "fi",
     `exec ${JSON.stringify(realGit)} "$@"`
@@ -99,6 +157,10 @@ async function installSourceTreeArgvBudgetWrapper(
   return {
     queryBytes: async () => (await readFile(queries, "utf8")).trim().split("\n").map(Number),
     rejected: () => exists(rejected),
+    boundaryPathsQueried: async () => await exists(boundaryParent) && await exists(boundaryChild),
+    boundaryQueriesSplit: async () => await exists(boundaryParent) && await exists(boundaryChild)
+      && !await exists(boundarySameQuery),
+    targetMutationStarted: () => exists(targetMutation),
     restore: () => {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
@@ -1087,6 +1149,43 @@ describe("local integration", () => {
       expect(queryBytes.length).toBeGreaterThan(1);
       expect(queryBytes.every((bytes) => bytes <= budgetBytes)).toBe(true);
       expect(await marker.rejected()).toBe(false);
+      expect((await exec("git", ["-C", item.sourceWorktree, "status", "--porcelain=v1"])).stdout).toBe("");
+    } finally {
+      marker.restore();
+    }
+  }, 15_000);
+
+  it.each([
+    { batchBoundary: "same query batch", withPadding: false, expectedSplit: false },
+    { batchBoundary: "different query batches", withPadding: true, expectedSplit: true }
+  ])("treats a recovered file replaced by a directory as a deletion across $batchBoundary", async ({
+    withPadding, expectedSplit
+  }) => {
+    const budgetBytes = 16 * 1024;
+    const item = await fixtureWithDirectoryBoundary(withPadding);
+    await exec("git", ["-C", item.sourceWorktree, "add", "--all"]);
+    await exec("git", ["-C", item.sourceWorktree, "commit", "-m", "replace file with directory"]);
+    const sourceCommit = (await exec("git", ["-C", item.sourceWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const marker = await installSourceTreeArgvBudgetWrapper(item, budgetBytes, [item.parent, item.child]);
+
+    try {
+      const result = await executeLocalIntegration({
+        ...integrationInput(item), sourceCommit, commitMessage: "must not be created", commands: []
+      });
+
+      expect({
+        boundaryPathsQueried: await marker.boundaryPathsQueried(),
+        boundaryQueriesSplit: await marker.boundaryQueriesSplit(),
+        targetMutationStarted: await marker.targetMutationStarted(),
+        status: result.status,
+        error: result.error
+      }).toEqual({
+        boundaryPathsQueried: true,
+        boundaryQueriesSplit: expectedSplit,
+        targetMutationStarted: true,
+        status: "completed",
+        error: null
+      });
       expect((await exec("git", ["-C", item.sourceWorktree, "status", "--porcelain=v1"])).stdout).toBe("");
     } finally {
       marker.restore();
