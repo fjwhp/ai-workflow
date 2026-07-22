@@ -35,6 +35,10 @@ export function buildApplicationPlan(input: DeliveryApplicationPlanInput): strin
     return { unit, sourceIndex };
   });
   const validatedDependencies = dependencies.map(validateDependency);
+  const orderedUnitIds = orderUnitIds(validatedUnits);
+  const allGraphDependencies = mapGraphDependencies(validatedDependencies);
+
+  validateDeliveryGraph(orderedUnitIds, allGraphDependencies);
 
   const skippedUnitIds = new Set(validatedUnits
     .filter(({ unit }) => !unit.required && unit.status === "skipped")
@@ -45,77 +49,119 @@ export function buildApplicationPlan(input: DeliveryApplicationPlanInput): strin
     throw new Error("DELIVERY_UNIT_NOT_VERIFIED");
   }
 
-  const orderedUnitIds = participatingUnits
-    .slice()
-    .sort((left, right) => left.unit.position - right.unit.position || left.sourceIndex - right.sourceIndex)
-    .map(({ unit }) => unit.id);
-  const graphDependencies = validatedDependencies
+  const participatingUnitIds = orderUnitIds(participatingUnits);
+  const participatingDependencies = validatedDependencies
     .filter((dependency) => {
       const bothEndpointsExist = unitIds.has(dependency.upstreamUnitId)
         && unitIds.has(dependency.downstreamUnitId);
       return !bothEndpointsExist
         || (!skippedUnitIds.has(dependency.upstreamUnitId)
           && !skippedUnitIds.has(dependency.downstreamUnitId));
-    })
-    .map(({ upstreamUnitId, downstreamUnitId, releaseCondition }) => ({
-      upstreamProjectId: upstreamUnitId,
-      downstreamProjectId: downstreamUnitId,
-      releaseCondition
-    }));
+    });
 
-  return validateDeliveryGraph(orderedUnitIds, graphDependencies).order;
+  return validateDeliveryGraph(
+    participatingUnitIds,
+    mapGraphDependencies(participatingDependencies)
+  ).order;
 }
 
 function validateInput(input: unknown): {
   units: unknown[];
   dependencies: unknown[];
 } {
-  if (!isObject(input)
-    || !Array.isArray(input.units)
-    || !Array.isArray(input.dependencies)
-    || !isDenseArray(input.units)
-    || !isDenseArray(input.dependencies)) {
+  if (!isPlainRecord(input)) invalidPlan();
+  const units = ownDataValue(input, "units");
+  const dependencies = ownDataValue(input, "dependencies");
+  if (!Array.isArray(units)
+    || !Array.isArray(dependencies)
+    || !isDenseArray(units)
+    || !isDenseArray(dependencies)) {
     invalidPlan();
   }
-  return { units: input.units, dependencies: input.dependencies };
+  return { units, dependencies };
 }
 
 function validateUnit(value: unknown): DeliveryApplicationUnitInput {
-  if (!isObject(value)
-    || !validId(value.id)
-    || !Number.isSafeInteger(value.position)
-    || typeof value.required !== "boolean"
-    || typeof value.status !== "string"
-    || !deliveryUnitStatusSet.has(value.status as DeliveryUnitStatus)) {
+  if (!isPlainRecord(value)) invalidPlan();
+  const id = ownDataValue(value, "id");
+  const position = ownDataValue(value, "position");
+  const required = ownDataValue(value, "required");
+  const status = ownDataValue(value, "status");
+  if (!validId(id)
+    || typeof position !== "number"
+    || !Number.isSafeInteger(position)
+    || typeof required !== "boolean"
+    || typeof status !== "string"
+    || !deliveryUnitStatusSet.has(status as DeliveryUnitStatus)) {
     invalidPlan();
   }
-  return value as unknown as DeliveryApplicationUnitInput;
+  return { id, position, required, status: status as DeliveryUnitStatus };
 }
 
 function validateDependency(value: unknown): DeliveryApplicationDependencyInput {
-  if (!isObject(value)
-    || !validId(value.upstreamUnitId)
-    || !validId(value.downstreamUnitId)
-    || value.releaseCondition !== "automated_testing_passed") {
+  if (!isPlainRecord(value)) invalidPlan();
+  const upstreamUnitId = ownDataValue(value, "upstreamUnitId");
+  const downstreamUnitId = ownDataValue(value, "downstreamUnitId");
+  const releaseCondition = ownDataValue(value, "releaseCondition");
+  if (!validId(upstreamUnitId)
+    || !validId(downstreamUnitId)
+    || releaseCondition !== "automated_testing_passed") {
     invalidPlan();
   }
-  return value as unknown as DeliveryApplicationDependencyInput;
+  return { upstreamUnitId, downstreamUnitId, releaseCondition };
 }
 
 function validId(value: unknown): value is string {
   return typeof value === "string"
-    && value.trim().length > 0
+    && value.length > 0
+    && value.trim() === value
     && value.length <= MAX_DELIVERY_UNIT_ID_LENGTH
     && !value.includes("\0");
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+function orderUnitIds(units: Array<{
+  unit: DeliveryApplicationUnitInput;
+  sourceIndex: number;
+}>): string[] {
+  return units
+    .slice()
+    .sort((left, right) => left.unit.position - right.unit.position || left.sourceIndex - right.sourceIndex)
+    .map(({ unit }) => unit.id);
+}
+
+function mapGraphDependencies(dependencies: DeliveryApplicationDependencyInput[]) {
+  return dependencies.map(({ upstreamUnitId, downstreamUnitId, releaseCondition }) => ({
+    upstreamProjectId: upstreamUnitId,
+    downstreamProjectId: downstreamUnitId,
+    releaseCondition
+  }));
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    return false;
+  }
+}
+
+function ownDataValue(record: Record<string, unknown>, key: string): unknown {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(record, key);
+  } catch {
+    invalidPlan();
+  }
+  if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value")) invalidPlan();
+  return descriptor.value;
 }
 
 function isDenseArray(value: unknown[]): boolean {
   for (let index = 0; index < value.length; index += 1) {
-    if (!Object.prototype.hasOwnProperty.call(value, index)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value")) return false;
   }
   return true;
 }

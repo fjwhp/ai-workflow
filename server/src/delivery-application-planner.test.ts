@@ -58,6 +58,41 @@ describe("buildApplicationPlan", () => {
     })).toEqual(["backend", "frontend"]);
   });
 
+  it.each([
+    ["self edge", [dependency("a", "a")], "DELIVERY_DEPENDENCY_SELF_EDGE"],
+    ["duplicate edge", [dependency("a", "b"), dependency("a", "b")], "DELIVERY_DEPENDENCY_DUPLICATE_EDGE"],
+    ["cycle", [dependency("a", "b"), dependency("b", "a")], "DELIVERY_DEPENDENCY_CYCLE"]
+  ])("validates a skipped-only %s before filtering incident edges", (_, dependencies, error) => {
+    expect(() => buildApplicationPlan({
+      units: [
+        unit("a", 0, { required: false, status: "skipped" }),
+        unit("b", 1, { required: false, status: "skipped" })
+      ],
+      dependencies
+    })).toThrow(error);
+  });
+
+  it("enforces the shared unit limit before filtering skipped units", () => {
+    expect(() => buildApplicationPlan({
+      units: Array.from({ length: 65 }, (_, index) => unit(`unit-${index}`, index, {
+        required: false,
+        status: "skipped"
+      })),
+      dependencies: []
+    })).toThrow("DELIVERY_PLAN_UNIT_LIMIT");
+  });
+
+  it("enforces the shared dependency limit before filtering skipped incident edges", () => {
+    const skipped = [
+      unit("a", 0, { required: false, status: "skipped" }),
+      unit("b", 1, { required: false, status: "skipped" })
+    ];
+    expect(() => buildApplicationPlan({
+      units: skipped,
+      dependencies: Array.from({ length: 2_049 }, () => dependency("a", "b"))
+    })).toThrow("DELIVERY_PLAN_DEPENDENCY_LIMIT");
+  });
+
   it("does not omit a required skipped unit", () => {
     expect(() => buildApplicationPlan({
       units: [unit("backend", 0, { status: "skipped" })],
@@ -102,6 +137,9 @@ describe("buildApplicationPlan", () => {
   it.each([
     ["empty", ""],
     ["blank", "   "],
+    ["leading whitespace", " backend"],
+    ["trailing whitespace", "backend "],
+    ["NUL-containing", "back\0end"],
     ["overlong", "x".repeat(257)]
   ])("rejects a %s unit ID", (_, id) => {
     expect(() => buildApplicationPlan({ units: [unit(id, 0)], dependencies: [] }))
@@ -111,6 +149,9 @@ describe("buildApplicationPlan", () => {
   it.each([
     ["empty upstream", dependency("", "b")],
     ["blank downstream", dependency("a", "   ")],
+    ["leading-whitespace upstream", dependency(" a", "b")],
+    ["trailing-whitespace downstream", dependency("a", "b ")],
+    ["NUL-containing endpoint", dependency("a\0", "b")],
     ["overlong endpoint", dependency("x".repeat(257), "b")]
   ])("rejects a dependency with an %s", (_, invalidDependency) => {
     expect(() => buildApplicationPlan({
@@ -172,6 +213,58 @@ describe("buildApplicationPlan", () => {
     }]
   ])("rejects a %s shape", (_, input) => {
     expect(() => buildApplicationPlan(input as never)).toThrow("DELIVERY_APPLICATION_PLAN_INVALID");
+  });
+
+  it.each([
+    ["input", Object.create({ units: [], dependencies: [] })],
+    ["unit", {
+      units: [Object.create(unit("backend", 0))],
+      dependencies: []
+    }],
+    ["dependency", {
+      units: [unit("a", 0), unit("b", 1)],
+      dependencies: [Object.create(dependency("a", "b"))]
+    }]
+  ])("rejects a %s with prototype-inherited fields", (_, input) => {
+    expect(() => buildApplicationPlan(input as never)).toThrow("DELIVERY_APPLICATION_PLAN_INVALID");
+  });
+
+  it.each([
+    ["input", {
+      get units(): never { throw new Error("INPUT_ACCESSOR_EXECUTED"); },
+      dependencies: []
+    }],
+    ["unit", {
+      units: [{
+        id: "backend",
+        position: 0,
+        required: true,
+        get status(): never { throw new Error("UNIT_ACCESSOR_EXECUTED"); }
+      }],
+      dependencies: []
+    }],
+    ["dependency", {
+      units: [unit("a", 0), unit("b", 1)],
+      dependencies: [{
+        upstreamUnitId: "a",
+        downstreamUnitId: "b",
+        get releaseCondition(): never { throw new Error("DEPENDENCY_ACCESSOR_EXECUTED"); }
+      }]
+    }]
+  ])("rejects a %s accessor without executing it", (_, input) => {
+    expect(() => buildApplicationPlan(input as never)).toThrow("DELIVERY_APPLICATION_PLAN_INVALID");
+  });
+
+  it("accepts plain null-prototype input records", () => {
+    const backend = Object.assign(Object.create(null), unit("backend", 0));
+    const frontend = Object.assign(Object.create(null), unit("frontend", 1));
+    const edge = Object.assign(Object.create(null), dependency("backend", "frontend"));
+    const input = Object.assign(Object.create(null), {
+      units: [backend, frontend],
+      dependencies: [edge]
+    });
+
+    expect(buildApplicationPlan(input)).toEqual(["backend", "frontend"]);
   });
 
   it("does not mutate frozen input arrays or objects", () => {
