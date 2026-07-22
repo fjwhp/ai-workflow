@@ -991,8 +991,7 @@ describe("local integration", () => {
     await writeFile(join(item.targetWorktree, "new1.txt"), "committed sibling\n");
     await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
     await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target wildcard"]);
-    await exec("git", ["-C", item.targetWorktree, "update-index", "--assume-unchanged", "new1.txt"]);
-    await writeFile(join(item.targetWorktree, "new1.txt"), "hidden sibling edit\n");
+    const targetBefore = await captureIntegrationTargetState(item);
 
     const result = await executeLocalIntegration({
       ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
@@ -1001,7 +1000,8 @@ describe("local integration", () => {
 
     expect(result.status, JSON.stringify(result)).toBe("conflict");
     expect(result.conflictFiles).toEqual(["new?.txt"]);
-    expect(await readFile(join(item.targetWorktree, "new1.txt"), "utf8")).toBe("hidden sibling edit\n");
+    expect(await captureIntegrationTargetState(item)).toEqual(targetBefore);
+    expect(await readFile(join(item.targetWorktree, "new1.txt"), "utf8")).toBe("committed sibling\n");
   });
 
   it("proves a target Git timeout preserves uncertain staged state without destructive cleanup", async () => {
