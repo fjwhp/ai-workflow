@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFile } from "node:child_process";
 import {
-  chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, writeFile
+  chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, utimes, writeFile
 } from "node:fs/promises";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { executeLocalIntegration, preflightLocalIntegration } from "./integration.js";
@@ -857,6 +857,32 @@ describe("local integration", () => {
     expect(check.allowed).toBe(false);
     expect(check.checks.find((entry) => entry.id === "target_clean")?.ok).toBe(false);
   });
+
+  it("keeps the target index byte-identical across read-only preflight and conflict simulation", async () => {
+    const item = await fixtureWithDeterministicConflict();
+    const indexOutput = (await exec("git", [
+      "-C", item.targetWorktree, "rev-parse", "--git-path", "index"
+    ])).stdout.trim();
+    const indexPath = resolve(item.targetWorktree, indexOutput);
+    const indexBefore = await readFile(indexPath);
+    const targetPath = join(item.targetWorktree, "value.txt");
+    const targetStat = await lstat(targetPath);
+    await utimes(targetPath, targetStat.atime, new Date(targetStat.mtimeMs + 60_000));
+
+    const preflight = await preflightLocalIntegration(integrationInput(item));
+
+    expect(preflight.allowed, JSON.stringify(preflight.checks)).toBe(true);
+    expect(await readFile(indexPath)).toEqual(indexBefore);
+
+    const result = await executeLocalIntegration({
+      ...integrationInput(item), evidenceHash: item.evidenceHash,
+      commitMessage: "REQ-0001 read-only target index", commands: []
+    });
+
+    expect(result.status, JSON.stringify(result)).toBe("conflict");
+    expect(result.conflictFiles).toEqual(["value.txt"]);
+    expect(await readFile(indexPath)).toEqual(indexBefore);
+  }, 15_000);
 
   it("proves deterministic conflict never starts destructive target cleanup", async () => {
     const item = await fixtureWithDeterministicConflict();

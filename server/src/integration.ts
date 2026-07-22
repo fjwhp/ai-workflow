@@ -150,11 +150,14 @@ async function prepareGitEnvironment(cwd: string, context: GitExecutionContext) 
   gitRemaining(context);
   return {
     cwd,
-    env: codingGitEnvironmentWithFsmonitor([
-      ["core.hooksPath", "/dev/null"],
-      ["commit.gpgSign", "false"],
-      ...overrides
-    ])
+    env: {
+      ...codingGitEnvironmentWithFsmonitor([
+        ["core.hooksPath", "/dev/null"],
+        ["commit.gpgSign", "false"],
+        ...overrides
+      ]),
+      GIT_OPTIONAL_LOCKS: "0"
+    }
   } satisfies PreparedGitEnvironment;
 }
 
