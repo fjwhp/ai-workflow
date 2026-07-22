@@ -9,7 +9,6 @@ const COMMIT_ID = /^[0-9a-f]{40}$/;
 const MAX_GIT_OUTPUT_BYTES = 10 * 1024 * 1024;
 const MAX_CONFLICT_FILES = 1_024;
 const MAX_CONFLICT_FILES_BYTES = 262_144;
-const MAX_CONFLICT_RECORDS = 262_144;
 const GIT_COMMAND_TIMEOUT_MS = 30_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
 const TERMINATION_GRACE_MS = 250;
@@ -444,7 +443,7 @@ class ConflictRecordParser {
   private segmentBytes = 0;
   private segmentAllDots = true;
   private retainedPath: string[] | undefined;
-  private recordCount = 0;
+  private hasRecords = false;
   private readonly seenStages = new Set<string>();
   private readonly seenPaths = new Set<string>();
   private files: string[] = [];
@@ -478,7 +477,7 @@ class ConflictRecordParser {
   finish() {
     if (this.state !== "prefix" || this.prefixBytes.length !== 0) conflictEvidenceInvalid();
     return {
-      hasConflicts: this.recordCount > 0,
+      hasConflicts: this.hasRecords,
       files: [...this.files]
     };
   }
@@ -529,11 +528,8 @@ class ConflictRecordParser {
     catch (error) {
       throw new Error("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID", { cause: error });
     }
-    this.recordCount += 1;
-    if (this.recordCount > MAX_CONFLICT_RECORDS) {
-      throw new Error("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_LIMIT_EXCEEDED");
-    }
-    const digest = this.pathHash!.digest("hex");
+    this.hasRecords = true;
+    const digest = this.pathHash!.digest().subarray(0, 16).toString("base64url");
     const stageKey = `${this.stage}:${digest}`;
     if (this.seenStages.has(stageKey)) conflictEvidenceInvalid();
     this.seenStages.add(stageKey);

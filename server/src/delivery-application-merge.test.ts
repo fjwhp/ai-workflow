@@ -266,6 +266,15 @@ function oversizedValidConflictRecords() {
   }).join("");
 }
 
+function excessiveCountConflictRecords() {
+  return Array.from({ length: 131_073 }, (_, index) => {
+    const path = `file-${String(index).padStart(6, "0")}`;
+    return [1, 2].map((stage) =>
+      `100644 ${String(stage).repeat(40)} ${stage}\t${path}\0`
+    ).join("");
+  }).join("");
+}
+
 async function installConflictScanOutputWrapper(
   fixture: MergeFixture,
   name: string,
@@ -582,6 +591,33 @@ describe("simulateDeliveryMerge", () => {
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
+    }
+    await expectTargetState(fixture);
+  });
+
+  it("preserves a bounded conflict result when valid records exceed the former record limit", async () => {
+    const fixture = await createMergeFixture("text");
+    const evidencePath = join(fixture.root, "excessive-count-conflicts");
+    await writeFile(evidencePath, excessiveCountConflictRecords());
+    const wrapper = await installConflictScanOutputWrapper(fixture, "excessive-count-conflicts", {
+      stdoutPath: evidencePath
+    });
+    try {
+      const result = await simulateDeliveryMerge({
+        ...fixture.simulationInput,
+        deadlineAt: Date.now() + 10_000
+      });
+      expect(result).toEqual({
+        status: "conflict",
+        mergedTree: null,
+        conflictFiles: Array.from({ length: 1_024 }, (_, index) =>
+          `file-${String(index).padStart(6, "0")}`
+        )
+      });
+      expect(Buffer.byteLength(JSON.stringify(result.conflictFiles))).toBeLessThanOrEqual(262_144);
+      expect(await wrapper.writeTreeStarted()).toBe(false);
+    } finally {
+      wrapper.restore();
     }
     await expectTargetState(fixture);
   });
