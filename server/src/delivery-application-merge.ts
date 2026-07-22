@@ -444,8 +444,9 @@ class ConflictRecordParser {
   private segmentAllDots = true;
   private retainedPath: string[] | undefined;
   private hasRecords = false;
-  private readonly seenStages = new Set<string>();
-  private readonly seenPaths = new Set<string>();
+  private previousPathDigest: Buffer | undefined;
+  private previousStage = "";
+  private previousRetainedPath: string | undefined;
   private files: string[] = [];
   private evidenceBytes = 2;
 
@@ -529,17 +530,27 @@ class ConflictRecordParser {
       throw new Error("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID", { cause: error });
     }
     this.hasRecords = true;
-    const digest = this.pathHash!.digest().subarray(0, 16).toString("base64url");
-    const stageKey = `${this.stage}:${digest}`;
-    if (this.seenStages.has(stageKey)) conflictEvidenceInvalid();
-    this.seenStages.add(stageKey);
-    if (!this.seenPaths.has(digest)) {
-      this.seenPaths.add(digest);
-      if (this.retainedPath) {
-        this.retainedPath.push(finalText);
-        this.addEvidence(this.retainedPath.join(""));
-      }
+    const digest = this.pathHash!.digest();
+    let path: string | undefined;
+    if (this.retainedPath) {
+      this.retainedPath.push(finalText);
+      path = this.retainedPath.join("");
     }
+    // `git ls-files -u` emits index order: path first, then ascending stage.
+    if (this.previousPathDigest?.equals(digest)) {
+      if (path !== undefined && this.previousRetainedPath !== undefined
+        && path !== this.previousRetainedPath) conflictEvidenceInvalid();
+      if (this.stage <= this.previousStage) conflictEvidenceInvalid();
+    } else {
+      if (path !== undefined && this.previousRetainedPath !== undefined
+        && Buffer.compare(Buffer.from(path), Buffer.from(this.previousRetainedPath)) <= 0) {
+        conflictEvidenceInvalid();
+      }
+      if (path !== undefined) this.addEvidence(path);
+    }
+    this.previousPathDigest = digest;
+    this.previousStage = this.stage;
+    this.previousRetainedPath = path;
     this.state = "prefix";
     this.prefixBytes.length = 0;
     this.stage = "";

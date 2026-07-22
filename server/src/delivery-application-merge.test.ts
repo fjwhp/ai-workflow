@@ -503,6 +503,27 @@ describe("simulateDeliveryMerge", () => {
     await expectTargetState(fixture);
   });
 
+  it("rejects conflict paths outside Git index ordering", async () => {
+    const fixture = await createMergeFixture("text");
+    const evidencePath = join(fixture.root, "unordered-conflicts");
+    await writeFile(evidencePath, ["z-value.txt", "a-value.txt"].map((path) => {
+      return [1, 2].map((stage) =>
+        `100644 ${String(stage).repeat(40)} ${stage}\t${path}\0`
+      ).join("");
+    }).join(""));
+    const wrapper = await installConflictScanOutputWrapper(fixture, "unordered-conflicts", {
+      stdoutPath: evidencePath
+    });
+    try {
+      await expect(simulateDeliveryMerge(fixture.simulationInput))
+        .rejects.toThrow("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID");
+      expect(await wrapper.writeTreeStarted()).toBe(false);
+    } finally {
+      wrapper.restore();
+    }
+    await expectTargetState(fixture);
+  });
+
   it("returns conflict without write-tree when bounded evidence omits an oversized path", async () => {
     const fixture = await createMergeFixture("text");
     const wrapperDirectory = join(fixture.root, "oversized-conflict-git");
