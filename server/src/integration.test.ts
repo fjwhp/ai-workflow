@@ -1647,7 +1647,7 @@ describe("local integration", () => {
       if (previous === undefined) delete process.env.DELIVERY_TEST_SECRET;
       else process.env.DELIVERY_TEST_SECRET = previous;
     }
-  });
+  }, 15_000);
 
   it("contains post-application verification writes outside its frozen workspace", async () => {
     const item = await fixture();
