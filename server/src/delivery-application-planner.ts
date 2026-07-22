@@ -76,8 +76,8 @@ function validateInput(input: unknown): {
   const dependencies = ownDataValue(input, "dependencies");
   if (!Array.isArray(units) || !Array.isArray(dependencies)) invalidPlan();
   const unitCount = units.length;
-  const dependencyCount = dependencies.length;
   if (unitCount > MAX_DELIVERY_PLAN_UNITS) throw new Error("DELIVERY_PLAN_UNIT_LIMIT");
+  const dependencyCount = dependencies.length;
   if (dependencyCount > MAX_DELIVERY_PLAN_DEPENDENCIES) {
     throw new Error("DELIVERY_PLAN_DEPENDENCY_LIMIT");
   }

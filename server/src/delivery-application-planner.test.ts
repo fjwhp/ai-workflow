@@ -172,6 +172,29 @@ describe("buildApplicationPlan", () => {
     })).toThrow("DELIVERY_PLAN_UNIT_LIMIT");
   });
 
+  it("does not read dependency length after detecting oversized units", () => {
+    const dependencies = new Proxy([] as DeliveryApplicationDependencyInput[], {
+      get(target, property, receiver) {
+        if (property === "length") throw new Error("DEPENDENCY_LENGTH_ACCESSED");
+        return Reflect.get(target, property, receiver);
+      }
+    });
+
+    expect(() => buildApplicationPlan({ units: oversizedUnits(), dependencies }))
+      .toThrow("DELIVERY_PLAN_UNIT_LIMIT");
+  });
+
+  it("does not inspect unit elements after detecting oversized dependencies", () => {
+    const units = [unit("a", 0)];
+    Object.defineProperty(units, 0, {
+      configurable: true,
+      get(): never { throw new Error("UNIT_ELEMENT_ACCESSED"); }
+    });
+
+    expect(() => buildApplicationPlan({ units, dependencies: oversizedDependencies() }))
+      .toThrow("DELIVERY_PLAN_DEPENDENCY_LIMIT");
+  });
+
   it.each([
     ["own map override", () => {
       const units = [unit("backend", 0)];
