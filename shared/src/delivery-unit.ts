@@ -6,6 +6,8 @@ export const deliveryUnitStatuses = [
   "conflicted", "failed", "skipped"
 ] as const;
 
+export type DeliveryUnitStatus = typeof deliveryUnitStatuses[number];
+
 export const deliveryReleaseConditions = ["automated_testing_passed"] as const;
 export const automationActions = ["implement", "review", "test", "apply"] as const;
 export const MAX_AUTOMATION_EVIDENCE_VERSION = 2_147_483_647;

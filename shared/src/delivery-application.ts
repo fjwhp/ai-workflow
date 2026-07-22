@@ -1,4 +1,4 @@
-import { deliveryUnitStatuses } from "./delivery-unit.js";
+import type { DeliveryUnitStatus } from "./delivery-unit.js";
 
 export const aggregateDeliveryStatuses = [
   "in_progress",
@@ -10,7 +10,6 @@ export const aggregateDeliveryStatuses = [
 ] as const;
 
 export type AggregateDeliveryStatus = typeof aggregateDeliveryStatuses[number];
-type DeliveryUnitStatus = typeof deliveryUnitStatuses[number];
 
 export type AggregateDeliveryUnitInput = {
   status: DeliveryUnitStatus;

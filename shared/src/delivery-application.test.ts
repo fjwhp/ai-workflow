@@ -2,9 +2,11 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   aggregateDeliveryStatuses,
   aggregateDeliveryStatus,
+  deliveryUnitStatuses,
   type AggregateDeliveryStatus,
-  type AggregateDeliveryUnitInput
-} from "./delivery-application.js";
+  type AggregateDeliveryUnitInput,
+  type DeliveryUnitStatus
+} from "./index.js";
 
 const required = (status: AggregateDeliveryUnitInput["status"]): AggregateDeliveryUnitInput => ({
   status,
@@ -17,7 +19,7 @@ const optional = (status: AggregateDeliveryUnitInput["status"]): AggregateDelive
 });
 
 describe("aggregate delivery application contract", () => {
-  it("exposes only the planned aggregate statuses", () => {
+  it("exports the aggregate and delivery unit contracts from the public barrel", () => {
     const statuses: readonly AggregateDeliveryStatus[] = aggregateDeliveryStatuses;
 
     expect(statuses).toEqual([
@@ -29,6 +31,45 @@ describe("aggregate delivery application contract", () => {
       "blocked"
     ]);
     expectTypeOf(aggregateDeliveryStatus([])).toEqualTypeOf<AggregateDeliveryStatus>();
+    expectTypeOf<AggregateDeliveryUnitInput["status"]>().toEqualTypeOf<DeliveryUnitStatus>();
+  });
+
+  const requiredStatusExpectations = {
+    waiting_dependency: "in_progress",
+    ready: "in_progress",
+    running: "in_progress",
+    awaiting_gate: "in_progress",
+    returned: "in_progress",
+    potentially_stale: "blocked",
+    ready_for_acceptance: "awaiting_acceptance",
+    applying: "applying",
+    applied: "completed",
+    conflicted: "blocked",
+    failed: "blocked",
+    skipped: "in_progress"
+  } satisfies Record<DeliveryUnitStatus, AggregateDeliveryStatus>;
+
+  const optionalStatusExpectations = {
+    waiting_dependency: "in_progress",
+    ready: "in_progress",
+    running: "in_progress",
+    awaiting_gate: "in_progress",
+    returned: "in_progress",
+    potentially_stale: "blocked",
+    ready_for_acceptance: "awaiting_acceptance",
+    applying: "applying",
+    applied: "completed",
+    conflicted: "blocked",
+    failed: "blocked",
+    skipped: "completed"
+  } satisfies Record<DeliveryUnitStatus, AggregateDeliveryStatus>;
+
+  it.each(deliveryUnitStatuses)("aggregates a required %s unit", (status) => {
+    expect(aggregateDeliveryStatus([required(status)])).toBe(requiredStatusExpectations[status]);
+  });
+
+  it.each(deliveryUnitStatuses)("aggregates an optional %s unit", (status) => {
+    expect(aggregateDeliveryStatus([optional(status)])).toBe(optionalStatusExpectations[status]);
   });
 
   it.each([
