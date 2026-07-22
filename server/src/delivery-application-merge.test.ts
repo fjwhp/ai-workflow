@@ -668,7 +668,7 @@ describe("simulateDeliveryMerge", () => {
   it.each([
     ["traversal path", `100644 ${"3".repeat(40)} 1\t../escape\0`],
     ["duplicate stage", `100644 ${"9".repeat(40)} 1\tfile-000000\0`]
-  ])("rejects a %s after the conflict capture cutoff", async (name, invalidRecord) => {
+  ])("returns safe conflict without validating a %s after the stdout cap", async (name, invalidRecord) => {
     const fixture = await createMergeFixture("text");
     const evidencePath = join(fixture.root, `post-cutoff-${name.replace(" ", "-")}`);
     await writeFile(evidencePath, `${oversizedValidConflictRecords()}${invalidRecord}`);
@@ -676,10 +676,13 @@ describe("simulateDeliveryMerge", () => {
       stdoutPath: evidencePath
     });
     try {
-      await expect(simulateDeliveryMerge({
+      const result = await simulateDeliveryMerge({
         ...fixture.simulationInput,
         deadlineAt: Date.now() + 10_000
-      })).rejects.toThrow("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID");
+      });
+      expect(result.status).toBe("conflict");
+      expect(result.conflictFiles).toHaveLength(1_024);
+      expect(Buffer.byteLength(JSON.stringify(result.conflictFiles))).toBeLessThanOrEqual(262_144);
       expect(await wrapper.writeTreeStarted()).toBe(false);
     } finally {
       wrapper.restore();
