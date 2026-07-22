@@ -1094,6 +1094,119 @@ describe("local integration", () => {
     expect(await integrationRefs(item)).toBe(refsBefore);
   });
 
+  it("returns uncertain without cleanup when an external actor commits the applied target", async () => {
+    const item = await fixture();
+    const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const refsBefore = await integrationRefs(item);
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    const guard = await rejectIfTargetMutationStarts(item, { mutation: "pass" });
+    let externalCommit = "";
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), expectedTargetHead: preApplyHead,
+        commitMessage: "REQ-0001 external target commit", commands: [],
+        onTargetMutated: async () => {
+          await exec(realGit, ["-C", item.targetWorktree, "commit", "-m", "external actor commit"]);
+          externalCommit = (await exec(realGit, ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+        }
+      });
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!, JSON.stringify(result)).toMatchObject({
+      status: "ambiguous",
+      preApplyHead,
+      targetState: "uncertain",
+      error: "TARGET_CHANGED_AFTER_APPLICATION",
+      commandResults: []
+    });
+    expect(externalCommit).toMatch(/^[0-9a-f]{40}$/);
+    expect(externalCommit).not.toBe(preApplyHead);
+    expect((await exec(realGit, ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
+      .toBe(externalCommit);
+    expect((await exec(realGit, ["-C", item.targetWorktree, "show", "HEAD:feature.txt"])).stdout)
+      .toBe("implemented\n");
+    expect((await exec(realGit, ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toBe("");
+    expect(await guard.destructiveCommands()).toEqual([]);
+    expect(await integrationRefs(item)).toBe(refsBefore);
+  });
+
+  it("returns uncertain without cleanup when verification fails after an external staged index replacement", async () => {
+    const item = await fixture();
+    const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const refsBefore = await integrationRefs(item);
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    const externalBytes = "external staged bytes with trailing whitespace \n";
+    const guard = await rejectIfTargetMutationStarts(item, { mutation: "pass" });
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), expectedTargetHead: preApplyHead,
+        commitMessage: "REQ-0001 external staged index", commands: [
+          { command: "git", argsPrefix: ["diff", "--cached", "--check"] }
+        ],
+        onTargetMutated: async () => {
+          await writeFile(join(item.targetWorktree, "feature.txt"), externalBytes);
+          await exec(realGit, ["-C", item.targetWorktree, "add", "--", "feature.txt"]);
+        }
+      });
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!, JSON.stringify(result)).toMatchObject({
+      status: "ambiguous",
+      preApplyHead,
+      targetState: "uncertain",
+      error: "TARGET_CHANGED_AFTER_APPLICATION"
+    });
+    expect(result!.commandResults).toHaveLength(1);
+    expect(result!.commandResults[0]?.code).not.toBe(0);
+    expect((await exec(realGit, ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
+      .toBe(preApplyHead);
+    expect(await readFile(join(item.targetWorktree, "feature.txt"), "utf8")).toBe(externalBytes);
+    expect((await exec(realGit, ["-C", item.targetWorktree, "show", ":feature.txt"])).stdout)
+      .toBe(externalBytes);
+    expect(await guard.destructiveCommands()).toEqual([]);
+    expect(await integrationRefs(item)).toBe(refsBefore);
+  });
+
+  it("returns uncertain when external unstaged and untracked files appear after target mutation", async () => {
+    const item = await fixture();
+    const preApplyHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    const guard = await rejectIfTargetMutationStarts(item, { mutation: "pass" });
+    const unstagedBytes = "external unstaged bytes\n";
+    const untrackedBytes = "external untracked bytes\n";
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), expectedTargetHead: preApplyHead,
+        commitMessage: "REQ-0001 external worktree edits", commands: [],
+        onTargetMutated: async () => {
+          await writeFile(join(item.targetWorktree, "feature.txt"), unstagedBytes);
+          await writeFile(join(item.targetWorktree, "external.txt"), untrackedBytes);
+        }
+      });
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!, JSON.stringify(result)).toMatchObject({
+      status: "ambiguous",
+      preApplyHead,
+      targetState: "uncertain",
+      error: "TARGET_CHANGED_AFTER_APPLICATION"
+    });
+    expect((await exec(realGit, ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
+      .toBe(preApplyHead);
+    expect(await readFile(join(item.targetWorktree, "feature.txt"), "utf8")).toBe(unstagedBytes);
+    expect(await readFile(join(item.targetWorktree, "external.txt"), "utf8")).toBe(untrackedBytes);
+    expect(await guard.destructiveCommands()).toEqual([]);
+  });
+
   it("does not start target mutation after ownership loss during the final target read", async () => {
     const item = await fixture();
     const wrapperDirectory = join(item.root, "git-primary-lease-wrapper");

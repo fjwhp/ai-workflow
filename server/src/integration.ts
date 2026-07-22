@@ -418,6 +418,46 @@ async function inspectTargetState(
   }
 }
 
+async function inspectFinalTargetPostcondition(
+  input: LocalIntegrationExecutionInput,
+  execution: GitExecutionContext,
+  preparedTargetGit: PreparedGitEnvironment,
+  preApplyHead: string,
+  expectedIndexTree: string
+) {
+  await assertTargetOwnership(input);
+  let target: TargetState = {
+    identityValid: false, clean: false, head: "", statusPorcelain: ""
+  };
+  let indexTree = "";
+  let unstagedPaths = "";
+  let untrackedPaths = "";
+  let readError: unknown;
+  try {
+    target = await inspectTargetState(input, execution);
+    indexTree = (await runPreparedGit(preparedTargetGit, ["write-tree"], execution)).stdout.trim();
+    unstagedPaths = (await runPreparedGit(preparedTargetGit, [
+      "diff-files", "--name-only", "-z", "--no-ext-diff", "--no-textconv"
+    ], execution)).stdout;
+    untrackedPaths = (await runPreparedGit(preparedTargetGit, [
+      "ls-files", "--others", "--exclude-standard", "-z"
+    ], execution)).stdout;
+  } catch (error) {
+    readError = error;
+  }
+  await assertTargetOwnership(input);
+  if (readError) throwIfApplicationStopped(readError, input.signal);
+  return {
+    valid: !readError
+      && target.identityValid
+      && target.head === preApplyHead
+      && indexTree === expectedIndexTree
+      && unstagedPaths.length === 0
+      && untrackedPaths.length === 0,
+    statusPorcelain: target.statusPorcelain
+  };
+}
+
 function boundedCommandOutput(value: unknown) {
   const output = String(value ?? "");
   if (Buffer.byteLength(output) <= MAX_COMMAND_OUTPUT_BYTES) return output;
@@ -851,15 +891,23 @@ export async function executeLocalIntegration(
     })));
     trustedCheckFailed = verification.result !== "passed";
   }
+  const settlementTarget = await inspectFinalTargetPostcondition(
+    input, execution, preparedTargetGit, preApplyHead, simulation.mergedTree
+  );
+  if (!settlementTarget.valid) {
+    return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+      targetState: "uncertain" as const, statusPorcelain: settlementTarget.statusPorcelain,
+      commandResults, error: "TARGET_CHANGED_AFTER_APPLICATION" };
+  }
   if (trustedCheckFailed) {
-    const statusPorcelain = (await git(input.targetWorktreePath, ["status", "--porcelain"], execution)).stdout;
     return { status: "test_failed" as const, preflight, sourceCommit, preApplyHead,
-      targetState: "applied_dirty" as const, statusPorcelain, commandResults,
+      targetState: "applied_dirty" as const, statusPorcelain: settlementTarget.statusPorcelain, commandResults,
       error: "本地应用后测试失败" };
   }
-  const statusPorcelain = (await git(input.targetWorktreePath, ["status", "--porcelain"], execution)).stdout;
   throwIfApplicationAborted(input.signal);
-  return { status: "completed" as const, preflight, sourceCommit, preApplyHead, targetState: "applied_dirty" as const, statusPorcelain, commandResults, error: null };
+  return { status: "completed" as const, preflight, sourceCommit, preApplyHead,
+    targetState: "applied_dirty" as const, statusPorcelain: settlementTarget.statusPorcelain,
+    commandResults, error: null };
 }
 
 function throwIfApplicationAborted(signal: AbortSignal | undefined) {
