@@ -143,7 +143,10 @@ export async function startServer(options: StartupOptions = {}) {
       jobs: store.automationJobs,
       handlers: {
         ...createDeliveryAutomationHandlers(deliveryService),
-        ...createDeliveryApplicationAutomationHandlers(applicationService),
+        ...createDeliveryApplicationAutomationHandlers(
+          applicationService,
+          (job) => store.assertDeliveryApplicationSequence(job)
+        ),
         ...options.automationHandlers
       },
       clock,

@@ -7,7 +7,10 @@ import { WorkflowStore } from "./store.js";
 import type { DeliveryQualityKind, DeliveryQualityResult } from "./delivery-quality-repository.js";
 import type { DeliveryExecutionSuccess } from "./delivery-execution-repository.js";
 import { DeliveryExecutionService, createDeliveryQualityAutomationHandlers } from "./delivery-execution-service.js";
-import { createAutomationWorker } from "./automation-worker.js";
+import {
+  createAutomationWorker,
+  createDeliveryApplicationAutomationHandlers
+} from "./automation-worker.js";
 import { evidenceFingerprint, evidenceManifestHash } from "./evidence-tree.js";
 
 const stores: WorkflowStore[] = [];
@@ -479,6 +482,133 @@ describe("DeliveryCoordinator", () => {
     expect(fixture.store.automationJobs.byDedupe(
       `apply:${fixture.backend.id}:v${fixture.backend.evidenceVersion}`
     )).toMatchObject({ status: "completed" });
+  });
+
+  it("reverts an applied predecessor atomically, retries it, and revives only its canceled successor", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    const applied = settleApplication(fixture, fixture.backend.id, "applied");
+    expect(fixture.store.automationJobs.complete(
+      applied.automationJobId, applied.leaseOwner, applied.claimToken
+    )).toBe(true);
+    const successorDedupe = `apply:${fixture.frontend.id}:v${fixture.frontend.evidenceVersion}`;
+    const successor = fixture.store.automationJobs.byDedupe(successorDedupe)!;
+
+    fixture.store.deliveryApplications.resolve(applied, "reverted");
+
+    expect(fixture.store.deliveryUnits.get(fixture.backend.id)).toMatchObject({
+      status: "ready_for_acceptance"
+    });
+    expect(fixture.store.deliveryUnits.get(fixture.frontend.id)).toMatchObject({
+      status: "ready_for_acceptance"
+    });
+    expect(fixture.store.automationJobs.byDedupe(successorDedupe)).toMatchObject({
+      id: successor.id,
+      status: "canceled"
+    });
+    expect(fixture.store.automationJobs.leaseNext("unexpected-worker", new Date(), 60_000)).toBeNull();
+
+    const retry = fixture.store.deliveryCoordination.retryApplication({
+      unitId: fixture.backend.id,
+      actor: "local-human",
+      reason: "target application was reverted"
+    });
+    expect(retry).toMatchObject({
+      retryAttempt: 1,
+      evidenceVersion: fixture.backend.evidenceVersion
+    });
+    expect(fixture.store.automationJobs.byDedupe(
+      `apply:${fixture.backend.id}:v${fixture.backend.evidenceVersion}:retry1`
+    )).toMatchObject({
+      id: retry.jobId,
+      status: "pending",
+      payload: {
+        type: "delivery_application_plan",
+        version: 1,
+        requirementId: fixture.requirement.id,
+        cursor: 0,
+        retryAttempt: 1,
+        units: [
+          { unitId: fixture.backend.id, evidenceVersion: fixture.backend.evidenceVersion },
+          { unitId: fixture.frontend.id, evidenceVersion: fixture.frontend.evidenceVersion }
+        ]
+      }
+    });
+
+    const reapplied = settleApplication(fixture, fixture.backend.id, "applied");
+    expect(fixture.store.automationJobs.complete(
+      reapplied.automationJobId, reapplied.leaseOwner, reapplied.claimToken
+    )).toBe(true);
+    expect(fixture.store.deliveryUnits.get(fixture.backend.id)).toMatchObject({ status: "applied" });
+    expect(fixture.store.automationJobs.byDedupe(successorDedupe)).toMatchObject({
+      id: successor.id,
+      status: "pending",
+      payload: expect.objectContaining({ cursor: 1, retryAttempt: 0 })
+    });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND action = 'apply'`).get(fixture.frontend.id)).toEqual({ count: 1 });
+  });
+
+  it("rejects predecessor reversion once its frozen successor has a live lease", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    const applied = settleApplication(fixture, fixture.backend.id, "applied");
+    expect(fixture.store.automationJobs.complete(
+      applied.automationJobId, applied.leaseOwner, applied.claimToken
+    )).toBe(true);
+    const successor = fixture.store.automationJobs.leaseNext("successor-worker", new Date(), 60_000)!;
+    expect(successor.ownerId).toBe(fixture.frontend.id);
+
+    expect(() => fixture.store.deliveryApplications.resolve(applied, "reverted"))
+      .toThrow("DELIVERY_APPLICATION_SEQUENCE_ACTIVE");
+
+    expect(fixture.store.deliveryApplications.get(applied.id)).toMatchObject({
+      status: "applied",
+      resolutionStatus: "pending"
+    });
+    expect(fixture.store.deliveryUnits.get(fixture.backend.id)).toMatchObject({ status: "applied" });
+    expect(fixture.store.automationJobs.get(successor.id)).toMatchObject({ status: "leased" });
+  });
+
+  it("preserves an applied prefix sibling when a later application is reverted", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    const first = settleApplication(fixture, fixture.backend.id, "applied");
+    expect(fixture.store.automationJobs.complete(
+      first.automationJobId, first.leaseOwner, first.claimToken
+    )).toBe(true);
+    const second = settleApplication(fixture, fixture.frontend.id, "applied");
+    expect(fixture.store.automationJobs.complete(
+      second.automationJobId, second.leaseOwner, second.claimToken
+    )).toBe(true);
+
+    fixture.store.deliveryApplications.resolve(second, "reverted");
+
+    expect(fixture.store.deliveryUnits.get(fixture.backend.id)).toMatchObject({ status: "applied" });
+    expect(fixture.store.deliveryUnits.get(fixture.frontend.id)).toMatchObject({
+      status: "ready_for_acceptance"
+    });
+  });
+
+  it("rejects a stale frozen prefix before invoking the Git application service", async () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    const applied = settleApplication(fixture, fixture.backend.id, "applied");
+    expect(fixture.store.automationJobs.complete(
+      applied.automationJobId, applied.leaseOwner, applied.claimToken
+    )).toBe(true);
+    const successor = fixture.store.automationJobs.leaseNext("successor-worker", new Date(), 60_000)!;
+    fixture.database.prepare(`UPDATE delivery_units SET status = 'ready_for_acceptance'
+      WHERE id = ?`).run(fixture.backend.id);
+    let invoked = false;
+    const handlers = createDeliveryApplicationAutomationHandlers(
+      { apply: async () => { invoked = true; return {} as never; } },
+      (job) => fixture.store.assertDeliveryApplicationSequence(job)
+    );
+
+    await expect(handlers.apply(successor, { signal: new AbortController().signal }))
+      .rejects.toThrow("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    expect(invoked).toBe(false);
   });
 
   it("retries a clean failed application but rejects retry while the initial job is still active", () => {

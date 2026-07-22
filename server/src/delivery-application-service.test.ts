@@ -477,6 +477,54 @@ describe("DeliveryApplicationService", () => {
     await expectRepositoryState(fixture.backendGit, otherBefore);
   });
 
+  it("reuses the trusted source commit after an applied run is explicitly reverted", async () => {
+    const fixture = await createFixture();
+    const context = fixture.contexts.get(fixture.backendUnit.id)!;
+    const firstLease = leaseApplication(fixture.store, fixture.backendUnit.id);
+    const first = await fixture.service.apply(
+      fixture.backendUnit.id, applicationInput(firstLease)
+    );
+    const sourceCommit = first.run.sourceCommit!;
+    await git(fixture.backendGit.versionWorktree, "reset", "--hard", context.version.headCommit);
+    expect(await status(context.codingEvidence.worktreePath)).toBe("");
+    expect(await head(context.codingEvidence.worktreePath)).toBe(sourceCommit);
+    fixture.store.deliveryApplications.resolve(first.run, "reverted");
+    const retryJob = fixture.store.automationJobs.enqueue({
+      ownerType: "delivery_unit",
+      ownerId: fixture.backendUnit.id,
+      evidenceVersion: fixture.backendUnit.evidenceVersion,
+      action: "apply",
+      payload: {
+        type: "delivery_application_plan",
+        version: 1,
+        requirementId: fixture.requirement.id,
+        cursor: 0,
+        retryAttempt: 1,
+        units: [
+          { unitId: fixture.backendUnit.id, evidenceVersion: fixture.backendUnit.evidenceVersion },
+          { unitId: fixture.frontendUnit.id, evidenceVersion: fixture.frontendUnit.evidenceVersion }
+        ]
+      },
+      maxAttempts: 3
+    });
+    const retryLease = fixture.store.automationJobs.leaseNext(
+      "retry-worker", new Date(), 60_000
+    )!;
+    expect(retryLease.id).toBe(retryJob.id);
+
+    const retried = await fixture.service.apply(
+      fixture.backendUnit.id, applicationInput(retryLease)
+    );
+
+    expect(retried.preflight.checks.filter((check) => !check.ok)).toEqual([]);
+    expect(retried).toMatchObject({
+      status: "completed",
+      run: { status: "applied", sourceCommit }
+    });
+    expect(fixture.store.deliveryApplications.listForUnit(fixture.backendUnit.id)).toHaveLength(2);
+    expect(await head(context.codingEvidence.worktreePath)).toBe(sourceCommit);
+  });
+
   it("returns only the sanitized persisted preflight", async () => {
     const sensitiveValue = "CUSTOM_SECRET_PATH";
     const fixture = await createFixture({ sensitiveValue });

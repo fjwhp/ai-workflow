@@ -36,6 +36,7 @@ import {
 } from "./delivery-coordinator.js";
 import {
   AutomationJobRepository,
+  type AutomationJob,
   type AutomationJobPersistence
 } from "./automation-job-repository.js";
 import {
@@ -110,6 +111,7 @@ export class WorkflowStore {
   public readonly deliveryCoordination: DeliveryCoordinationPersistence;
   public readonly deliveryUnitDetails: DeliveryUnitDetailPersistence;
   public readonly automationJobs: AutomationJobPersistence;
+  public readonly assertDeliveryApplicationSequence: (job: AutomationJob) => void;
 
   constructor(
     path: string,
@@ -156,9 +158,10 @@ export class WorkflowStore {
           return run;
         }
       ),
-      resolve: (run, resolution) => this.withImmediateTransaction(
-        () => this.deliveryApplicationRepository.resolveInTransaction(run, resolution)
-      ),
+      resolve: (run, resolution) => this.withImmediateTransaction(() => {
+        deliveryCoordinator.prepareApplicationResolutionInTransaction(run, resolution);
+        return this.deliveryApplicationRepository.resolveInTransaction(run, resolution);
+      }),
       get: (runId) => this.deliveryApplicationRepository.get(runId),
       listForUnit: (unitId) => this.deliveryApplicationRepository.listForUnit(unitId),
       aggregate: (requirementId) => this.withReadTransaction(
@@ -334,6 +337,9 @@ export class WorkflowStore {
       byDedupe: (dedupeKey) => automationJobRepository.byDedupe(dedupeKey),
       listPending: () => automationJobRepository.listPending()
     };
+    this.assertDeliveryApplicationSequence = (job) => this.withReadTransaction(
+      () => deliveryCoordinator.assertApplicationSequenceInTransaction(job)
+    );
     this.deliveryQuality = {
       claim: (unitId, evidenceVersion, kind, claimToken) => this.withImmediateTransaction(
         () => this.deliveryQualityRepository.claimInTransaction(unitId, evidenceVersion, kind, claimToken)

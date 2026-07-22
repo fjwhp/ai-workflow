@@ -131,7 +131,8 @@ export class DeliveryApplicationService {
       throw new Error("DELIVERY_APPLICATION_UNIT_NOT_READY");
     }
     const trustedSource = existing ?? [...history].reverse().find((run) =>
-      (run.status === "conflicted" || run.status === "failed")
+      (run.status === "conflicted" || run.status === "failed"
+        || (run.status === "applied" && run.resolutionStatus === "reverted"))
       && run.sourceCommit !== null
       && run.projectVersionId === context.projectVersionId
       && run.evidenceVersion === context.evidenceVersion

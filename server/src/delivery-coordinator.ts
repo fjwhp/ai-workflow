@@ -13,7 +13,10 @@ import {
 } from "./automation-job-repository.js";
 import { deliveryUnitDependenciesSatisfied } from "./delivery-unit-eligibility.js";
 import { buildApplicationPlan } from "./delivery-application-planner.js";
-import type { DeliveryApplicationRun } from "./delivery-application-repository.js";
+import type {
+  DeliveryApplicationResolution,
+  DeliveryApplicationRun
+} from "./delivery-application-repository.js";
 import {
   DeliveryQualityRepository,
   type DeliveryQualityClaim,
@@ -436,6 +439,96 @@ export class DeliveryCoordinator {
     });
   }
 
+  prepareApplicationResolutionInTransaction(
+    run: DeliveryApplicationRun,
+    resolution: DeliveryApplicationResolution
+  ): void {
+    if (resolution !== "reverted" || run.status !== "applied") return;
+    const jobs = new AutomationJobRepository(this.db);
+    const sourceJob = jobs.get(run.automationJobId);
+    if (!sourceJob) throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    if (!isDeliveryApplicationPlanPayload(sourceJob.payload)) return;
+    const payload = parseDeliveryApplicationJob(sourceJob);
+    const current = payload.units[payload.cursor]!;
+    if (payload.requirementId !== run.requirementId
+      || current.unitId !== run.deliveryUnitId
+      || current.evidenceVersion !== run.evidenceVersion) {
+      throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    }
+    const pendingJobIds: string[] = [];
+    for (let index = 0; index < payload.units.length; index += 1) {
+      const entry = payload.units[index]!;
+      const unit = this.db.prepare(`SELECT requirement_id, evidence_version, status
+        FROM delivery_units WHERE id = ?`).get(entry.unitId) as {
+          requirement_id: string; evidence_version: number; status: string;
+        } | undefined;
+      if (!unit || unit.requirement_id !== payload.requirementId
+        || unit.evidence_version !== entry.evidenceVersion) {
+        throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+      }
+      if (index < payload.cursor) {
+        if (unit.status !== "applied") throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+        continue;
+      }
+      if (index === payload.cursor) continue;
+      const application = this.db.prepare(`SELECT status FROM delivery_application_runs
+        WHERE delivery_unit_id = ? AND evidence_version = ? ORDER BY rowid DESC LIMIT 1`)
+        .get(entry.unitId, entry.evidenceVersion) as { status: string } | undefined;
+      if (application?.status === "applying") throw new Error("DELIVERY_APPLICATION_SEQUENCE_ACTIVE");
+      if (application || unit.status !== "ready_for_acceptance") {
+        throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+      }
+      const laterJobs = this.db.prepare(`SELECT id, status FROM automation_jobs
+        WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ? AND action = 'apply'
+        ORDER BY rowid`).all(entry.unitId, entry.evidenceVersion) as Array<{
+          id: string; status: string;
+        }>;
+      for (const job of laterJobs) {
+        if (job.status === "leased") throw new Error("DELIVERY_APPLICATION_SEQUENCE_ACTIVE");
+        if (job.status === "pending") pendingJobIds.push(job.id);
+        else if (job.status !== "canceled") throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+      }
+    }
+    const now = new Date().toISOString();
+    for (const jobId of pendingJobIds) {
+      const canceled = this.db.prepare(`UPDATE automation_jobs
+        SET status = 'canceled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+        WHERE id = ? AND status = 'pending'`).run(now, jobId);
+      if (canceled.changes !== 1) throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    }
+  }
+
+  assertApplicationSequenceInTransaction(job: AutomationJob): void {
+    const persisted = new AutomationJobRepository(this.db).get(job.id);
+    if (!persisted || persisted.status !== "leased"
+      || persisted.claimToken !== job.claimToken
+      || persisted.attempt !== job.attempt
+      || persisted.ownerType !== job.ownerType
+      || persisted.ownerId !== job.ownerId
+      || persisted.evidenceVersion !== job.evidenceVersion
+      || persisted.action !== job.action) {
+      throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    }
+    const supplied = parseDeliveryApplicationJob(job);
+    const payload = parseDeliveryApplicationJob(persisted);
+    if (JSON.stringify(supplied) !== JSON.stringify(payload)) {
+      throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    }
+    for (const [index, entry] of payload.units.entries()) {
+      const unit = this.db.prepare(`SELECT requirement_id, evidence_version, status
+        FROM delivery_units WHERE id = ?`).get(entry.unitId) as {
+          requirement_id: string; evidence_version: number; status: string;
+        } | undefined;
+      if (!unit || unit.requirement_id !== payload.requirementId
+        || unit.evidence_version !== entry.evidenceVersion
+        || (index < payload.cursor && unit.status !== "applied")
+        || (index === payload.cursor
+          && unit.status !== "ready_for_acceptance" && unit.status !== "applying")) {
+        throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+      }
+    }
+  }
+
   retryApplicationInTransaction(input: DeliveryApplicationRetryInput): DeliveryApplicationRetry {
     validateApplicationRetryInput(input);
     const unit = this.db.prepare(`SELECT id, requirement_id, evidence_version, phase, status
@@ -488,7 +581,9 @@ export class DeliveryCoordinator {
       && run?.status === "failed" && run.resolution_status === "not_required";
     const revertedFailure = unit.status === "ready_for_acceptance"
       && run?.status === "failed" && run.resolution_status === "reverted";
-    if (!conflicted && !cleanFailure && !revertedFailure) {
+    const revertedApplication = unit.status === "ready_for_acceptance"
+      && run?.status === "applied" && run.resolution_status === "reverted";
+    if (!conflicted && !cleanFailure && !revertedFailure && !revertedApplication) {
       throw new Error("DELIVERY_APPLICATION_RETRY_NOT_ELIGIBLE");
     }
     if (payload.retryAttempt >= 100) throw new Error("DELIVERY_APPLICATION_RETRY_LIMIT");

@@ -44,14 +44,17 @@ export interface AutomationWorker {
 }
 
 export function createDeliveryApplicationAutomationHandlers(
-  service: Pick<DeliveryApplicationService, "apply">
+  service: Pick<DeliveryApplicationService, "apply">,
+  assertSequence: (job: AutomationJob) => void
 ): Pick<AutomationHandlers, "apply"> {
   if (!service || typeof service.apply !== "function") {
     throw new Error("DELIVERY_APPLICATION_HANDLER_INVALID");
   }
+  if (typeof assertSequence !== "function") throw new Error("DELIVERY_APPLICATION_HANDLER_INVALID");
   return {
     apply: async (job, context) => {
       parseDeliveryApplicationJob(job);
+      assertSequence(job);
       await service.apply(job.ownerId, {
         expectedEvidenceVersion: job.evidenceVersion,
         claimToken: job.claimToken

@@ -70,7 +70,6 @@ describe("server entry point", () => {
       buildApplication: async () => fakeApp(events),
       writeListening: () => {}
     });
-
     expect(recoveredStatus).toBe("pending");
     expect(events).toEqual([
       "recover:publication", "recover:stage", "recover:knowledge", "recover:requirements", "recover:jobs",
@@ -404,6 +403,9 @@ describe("server entry point", () => {
       buildApplication: async () => fakeApp([]),
       writeListening: () => {}
     });
+    const assertApplicationSequence = vi.spyOn(
+      runtime.store, "assertDeliveryApplicationSequence"
+    ).mockImplementation(() => {});
     const reviewJob = {
       id: "review-job", claimToken: "review-job", ownerType: "delivery_unit", ownerId: "unit-1",
       evidenceVersion: 3, action: "review"
@@ -430,6 +432,7 @@ describe("server entry point", () => {
       }
     };
     await workerOptions.handlers.apply(applyJob, { signal: new AbortController().signal });
+    expect(assertApplicationSequence).toHaveBeenCalledWith(applyJob);
     expect(review).toHaveBeenCalledWith("unit-1", 3, "review-job", undefined);
     expect(test).not.toHaveBeenCalled();
     expect(overrideTest).toHaveBeenCalledOnce();

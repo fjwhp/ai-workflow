@@ -52,7 +52,8 @@ describe("automation worker handler lifecycle", () => {
       .createDeliveryApplicationAutomationHandlers;
     expect(typeof createApplicationHandlers).toBe("function");
     const apply = vi.fn(async () => ({ status: "completed" }));
-    const handlers = createApplicationHandlers({ apply });
+    const assertSequence = vi.fn();
+    const handlers = createApplicationHandlers({ apply }, assertSequence);
     const job = {
       id: "apply-job",
       claimToken: "lease-token",
@@ -73,6 +74,7 @@ describe("automation worker handler lifecycle", () => {
 
     await handlers.apply(job, { signal });
 
+    expect(assertSequence).toHaveBeenCalledWith(job);
     expect(apply).toHaveBeenCalledWith(
       "backend-unit",
       { expectedEvidenceVersion: 3, claimToken: "lease-token" },
@@ -83,7 +85,7 @@ describe("automation worker handler lifecycle", () => {
   it("rejects a forged application cursor before invoking the application service", async () => {
     const apply = vi.fn(async () => ({ status: "completed" }));
     const handlers = (automationWorkerModule as any)
-      .createDeliveryApplicationAutomationHandlers({ apply });
+      .createDeliveryApplicationAutomationHandlers({ apply }, vi.fn());
     const job = {
       id: "apply-job",
       claimToken: "lease-token",
