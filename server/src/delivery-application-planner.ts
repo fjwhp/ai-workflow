@@ -17,7 +17,7 @@ export interface DeliveryApplicationUnitInput {
 export interface DeliveryApplicationDependencyInput {
   readonly upstreamUnitId: string;
   readonly downstreamUnitId: string;
-  readonly releaseCondition?: "automated_testing_passed";
+  readonly releaseCondition: "automated_testing_passed";
 }
 
 export interface DeliveryApplicationPlanInput {
@@ -57,10 +57,10 @@ export function buildApplicationPlan(input: DeliveryApplicationPlanInput): strin
         || (!skippedUnitIds.has(dependency.upstreamUnitId)
           && !skippedUnitIds.has(dependency.downstreamUnitId));
     })
-    .map(({ upstreamUnitId, downstreamUnitId }) => ({
+    .map(({ upstreamUnitId, downstreamUnitId, releaseCondition }) => ({
       upstreamProjectId: upstreamUnitId,
       downstreamProjectId: downstreamUnitId,
-      releaseCondition: "automated_testing_passed" as const
+      releaseCondition
     }));
 
   return validateDeliveryGraph(orderedUnitIds, graphDependencies).order;
@@ -93,7 +93,12 @@ function validateUnit(value: unknown): DeliveryApplicationUnitInput {
 }
 
 function validateDependency(value: unknown): DeliveryApplicationDependencyInput {
-  if (!isObject(value) || !validId(value.upstreamUnitId) || !validId(value.downstreamUnitId)) invalidPlan();
+  if (!isObject(value)
+    || !validId(value.upstreamUnitId)
+    || !validId(value.downstreamUnitId)
+    || value.releaseCondition !== "automated_testing_passed") {
+    invalidPlan();
+  }
   return value as unknown as DeliveryApplicationDependencyInput;
 }
 

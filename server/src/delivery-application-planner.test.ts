@@ -125,6 +125,46 @@ describe("buildApplicationPlan", () => {
     ["null dependencies", { units: [], dependencies: null }],
     ["null unit", { units: [null], dependencies: [] }],
     ["null dependency", { units: [unit("backend", 0)], dependencies: [null] }],
+    ["missing required", {
+      units: [{ id: "backend", position: 0, status: "ready_for_acceptance" }],
+      dependencies: []
+    }],
+    ["non-boolean required", {
+      units: [{ id: "backend", position: 0, required: "yes", status: "ready_for_acceptance" }],
+      dependencies: []
+    }],
+    ["missing status", {
+      units: [{ id: "backend", position: 0, required: true }],
+      dependencies: []
+    }],
+    ["null status", {
+      units: [{ id: "backend", position: 0, required: true, status: null }],
+      dependencies: []
+    }],
+    ["non-string status", {
+      units: [{ id: "backend", position: 0, required: true, status: 1 }],
+      dependencies: []
+    }],
+    ["out-of-enum status", {
+      units: [{ id: "backend", position: 0, required: true, status: "verified" }],
+      dependencies: []
+    }],
+    ["missing release condition", {
+      units: [unit("a", 0), unit("b", 1)],
+      dependencies: [{ upstreamUnitId: "a", downstreamUnitId: "b" }]
+    }],
+    ["null release condition", {
+      units: [unit("a", 0), unit("b", 1)],
+      dependencies: [{ upstreamUnitId: "a", downstreamUnitId: "b", releaseCondition: null }]
+    }],
+    ["numeric release condition", {
+      units: [unit("a", 0), unit("b", 1)],
+      dependencies: [{ upstreamUnitId: "a", downstreamUnitId: "b", releaseCondition: 1 }]
+    }],
+    ["wrong release condition", {
+      units: [unit("a", 0), unit("b", 1)],
+      dependencies: [{ upstreamUnitId: "a", downstreamUnitId: "b", releaseCondition: "manual" }]
+    }],
     ["sparse units", { units: new Array<DeliveryApplicationUnitInput>(1), dependencies: [] }],
     ["sparse dependencies", {
       units: [unit("backend", 0)],
