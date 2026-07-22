@@ -82,6 +82,7 @@ export interface DeliveryApplicationClaim extends DeliveryApplicationRun {
 
 export interface DeliveryApplicationPersistence {
   claim(unitId: string, input: DeliveryApplicationClaimInput): DeliveryApplicationClaim;
+  assertClaim(claim: DeliveryApplicationClaim): DeliveryApplicationClaim;
   bindSourceCommit(claim: DeliveryApplicationClaim, sourceCommit: string): DeliveryApplicationClaim;
   complete(claim: DeliveryApplicationClaim, completion: DeliveryApplicationCompletion): DeliveryApplicationRun;
   resolve(run: DeliveryApplicationRun, resolution: DeliveryApplicationResolution): DeliveryApplicationRun;
@@ -215,6 +216,10 @@ export class DeliveryApplicationRepository {
         AND status = 'ready_for_acceptance'`).run(now, unit.id, unit.evidence_version);
     if (updated.changes !== 1) throw new Error("DELIVERY_APPLICATION_UNIT_STALE");
     return this.getRequiredClaim(id);
+  }
+
+  assertClaimInTransaction(claim: DeliveryApplicationClaim): DeliveryApplicationClaim {
+    return mapClaim(this.assertFencedClaim(claim).row);
   }
 
   bindSourceCommitInTransaction(

@@ -115,11 +115,14 @@ export class DeliveryApplicationService {
 
   async apply(
     deliveryUnitId: string,
-    automation: DeliveryApplicationAutomationInput
+    automation: DeliveryApplicationAutomationInput,
+    signal?: AbortSignal
   ): Promise<DeliveryApplicationServiceResult> {
+    throwIfAborted(signal);
     const unitId = text(deliveryUnitId, "DELIVERY_APPLICATION_ID_INVALID", MAX_ID_LENGTH);
     const lease = validateAutomationInput(automation);
     const loaded = await this.dependencies.loadContext(unitId);
+    throwIfAborted(signal);
     const context = validateContext(loaded, unitId, lease.expectedEvidenceVersion);
     const history = this.dependencies.applications.listForUnit(unitId);
     const existing = history
@@ -150,6 +153,7 @@ export class DeliveryApplicationService {
       fallbackCommands: context.allowedCommands
     };
     const preflight = await preflightLocalIntegration(frozenInput);
+    throwIfAborted(signal);
     let claim = this.dependencies.applications.claim(unitId, {
       expectedEvidenceVersion: lease.expectedEvidenceVersion,
       claimToken: lease.claimToken,
@@ -158,19 +162,37 @@ export class DeliveryApplicationService {
       evidenceHash: context.evidenceHash,
       preflight: existing?.preflight ?? preflight
     });
+    claim = this.dependencies.applications.assertClaim(claim);
     const preparedSourceCommit = frozenInput.sourceCommit ?? preflight.sourceCommit;
     if (!claim.sourceCommit && preparedSourceCommit) {
       claim = this.dependencies.applications.bindSourceCommit(claim, preparedSourceCommit);
+      claim = this.dependencies.applications.assertClaim(claim);
     }
     const result = await executeLocalIntegration({
       ...frozenInput,
       ...(claim.sourceCommit ? { sourceCommit: claim.sourceCommit } : {}),
       commitMessage: `Apply delivery unit ${context.unitId}`,
       commands: context.allowedCommands,
+      signal,
+      onSourceFrozen: async () => {
+        throwIfAborted(signal);
+        claim = this.dependencies.applications.assertClaim(claim);
+      },
       onSourcePrepared: async (sourceCommit) => {
         claim = this.dependencies.applications.bindSourceCommit(claim, sourceCommit);
+        claim = this.dependencies.applications.assertClaim(claim);
+      },
+      onBeforeTargetMutation: async () => {
+        throwIfAborted(signal);
+        claim = this.dependencies.applications.assertClaim(claim);
+      },
+      onTargetMutated: async () => {
+        throwIfAborted(signal);
+        claim = this.dependencies.applications.assertClaim(claim);
       }
     });
+    throwIfAborted(signal);
+    claim = this.dependencies.applications.assertClaim(claim);
     return this.settle(claim, result);
   }
 
@@ -211,6 +233,10 @@ export class DeliveryApplicationService {
     });
     return serviceResult("failed", run, result, error);
   }
+}
+
+function throwIfAborted(signal: AbortSignal | undefined) {
+  if (signal?.aborted) throw new Error("DELIVERY_APPLICATION_ABORTED", { cause: signal.reason });
 }
 
 function serviceResult(

@@ -229,6 +229,29 @@ describe("DeliveryApplicationRepository", () => {
       .toThrow("DELIVERY_APPLICATION_SOURCE_COMMIT_BOUND");
   });
 
+  it("rechecks an exact live claim without mutation and rejects lease expiry", () => {
+    const fixture = createFixture();
+    const lease = leaseApplication(fixture.store, fixture.backendUnit.id);
+    const claim = fixture.store.deliveryApplications.claim(
+      fixture.backendUnit.id, claimInput(lease, "backend")
+    );
+    const statement = fixture.database.prepare(
+      "SELECT * FROM delivery_application_runs WHERE id = ?"
+    );
+    const before = statement.get(claim.id);
+
+    expect(fixture.store.deliveryApplications.assertClaim(claim)).toEqual(claim);
+    expect(statement.get(claim.id)).toEqual(before);
+
+    const expiredStore = new WorkflowStore(
+      fixture.path, () => new Date(CLOCK.getTime() + 120_000)
+    );
+    stores.push(expiredStore);
+    expect(() => expiredStore.deliveryApplications.assertClaim(claim))
+      .toThrow("DELIVERY_APPLICATION_LEASE_STALE");
+    expect(statement.get(claim.id)).toEqual(before);
+  });
+
   it("requires expected evidence and a live apply lease before claiming", () => {
     const fixture = createFixture();
     const lease = leaseApplication(fixture.store, fixture.backendUnit.id);

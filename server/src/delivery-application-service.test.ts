@@ -279,6 +279,15 @@ function reviveApplicationJob(
     .run(now, jobId);
 }
 
+function loseApplicationLeaseWithoutReconciliation(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+  jobId: string
+) {
+  fixture.database.prepare(`UPDATE automation_jobs
+    SET status = 'canceled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+    WHERE id = ?`).run(new Date().toISOString(), jobId);
+}
+
 describe("DeliveryApplicationService", () => {
   it("rejects inherited automation fields before loading application context", async () => {
     let loaded = false;
@@ -586,6 +595,99 @@ describe("DeliveryApplicationService", () => {
       sourceCommit: preparedCommit, automationAttempt: 1, status: "applied"
     });
     expect(result.run.id).not.toBe(firstRun.id);
+  });
+
+  it("does not mutate the target when the application lease is lost after source binding", async () => {
+    const fixture = await createFixture();
+    const targetBefore = await repositoryState(fixture.frontendGit);
+    const persistence = fixture.store.deliveryApplications;
+    const service = new DeliveryApplicationService({
+      applications: {
+        ...persistence,
+        bindSourceCommit: (claim, sourceCommit) => {
+          const bound = persistence.bindSourceCommit(claim, sourceCommit);
+          loseApplicationLeaseWithoutReconciliation(fixture, claim.automationJobId);
+          return bound;
+        }
+      },
+      loadContext: async (unitId) => {
+        const context = fixture.contexts.get(unitId);
+        const unit = fixture.store.deliveryUnits.get(unitId);
+        return context && unit ? { ...context, unit } : null;
+      }
+    });
+    const lease = leaseApplication(fixture.store, fixture.frontendUnit.id);
+
+    await expect(service.apply(fixture.frontendUnit.id, applicationInput(lease)))
+      .rejects.toThrow("DELIVERY_APPLICATION_LEASE_STALE");
+
+    await expectRepositoryState(fixture.frontendGit, targetBefore);
+    expect(fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)[0])
+      .toMatchObject({ status: "applying", sourceCommit: expect.stringMatching(/^[0-9a-f]{40}$/) });
+  });
+
+  it("does not settle after the lease is lost immediately after target mutation", async () => {
+    const fixture = await createFixture();
+    const persistence = fixture.store.deliveryApplications;
+    let fences = 0;
+    const applications = {
+      ...persistence,
+      assertClaim: (claim: Parameters<typeof persistence.complete>[0]) => {
+        fences += 1;
+        if (fences === 5) {
+          loseApplicationLeaseWithoutReconciliation(fixture, claim.automationJobId);
+        }
+        return (persistence as any).assertClaim(claim);
+      }
+    };
+    const service = new DeliveryApplicationService({
+      applications: applications as typeof persistence,
+      loadContext: async (unitId) => {
+        const context = fixture.contexts.get(unitId);
+        const unit = fixture.store.deliveryUnits.get(unitId);
+        return context && unit ? { ...context, unit } : null;
+      }
+    });
+    const lease = leaseApplication(fixture.store, fixture.frontendUnit.id);
+
+    await expect(service.apply(fixture.frontendUnit.id, applicationInput(lease)))
+      .rejects.toThrow("DELIVERY_APPLICATION_LEASE_STALE");
+
+    expect(fences).toBe(6);
+    expect(await status(fixture.frontendGit.versionWorktree)).toContain("src/feature.ts");
+    expect(fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)[0])
+      .toMatchObject({ status: "applying" });
+  });
+
+  it("honors cancellation after source binding before target mutation", async () => {
+    const fixture = await createFixture();
+    const targetBefore = await repositoryState(fixture.frontendGit);
+    const controller = new AbortController();
+    const persistence = fixture.store.deliveryApplications;
+    const service = new DeliveryApplicationService({
+      applications: {
+        ...persistence,
+        bindSourceCommit: (claim, sourceCommit) => {
+          const bound = persistence.bindSourceCommit(claim, sourceCommit);
+          controller.abort();
+          return bound;
+        }
+      },
+      loadContext: async (unitId) => {
+        const context = fixture.contexts.get(unitId);
+        const unit = fixture.store.deliveryUnits.get(unitId);
+        return context && unit ? { ...context, unit } : null;
+      }
+    });
+    const lease = leaseApplication(fixture.store, fixture.frontendUnit.id);
+
+    await expect((service.apply as any)(
+      fixture.frontendUnit.id, applicationInput(lease), controller.signal
+    )).rejects.toThrow("DELIVERY_APPLICATION_ABORTED");
+
+    await expectRepositoryState(fixture.frontendGit, targetBefore);
+    expect(fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)[0])
+      .toMatchObject({ status: "applying" });
   });
 
   it("reuses a trusted source commit after a terminal conflict retry", async () => {

@@ -84,6 +84,8 @@ export type LocalIntegrationExecutionInput = FrozenApplicationInput & {
   signal?: AbortSignal;
   onSourceFrozen?: () => void | Promise<void>;
   onSourcePrepared?: (sourceCommit: string) => void | Promise<void>;
+  onBeforeTargetMutation?: () => void | Promise<void>;
+  onTargetMutated?: () => void | Promise<void>;
 };
 
 export type TargetState = {
@@ -112,7 +114,9 @@ async function prepareFrozenSourceCommit(
 ) {
   const baseCommit = snapshot.identity.headCommit;
   if (!baseCommit || snapshot.files.length === 0) throw new Error("SOURCE_EVIDENCE_EMPTY");
+  throwIfApplicationAborted(input.signal);
   await input.onSourceFrozen?.();
+  throwIfApplicationAborted(input.signal);
   const root = await mkdtemp(join(tmpdir(), "ai-workflow-source-commit-"));
   const indexPath = join(root, "index");
   const entries = new Map(snapshot.manifest.entries.map((entry) => [entry.path, entry]));
@@ -340,7 +344,9 @@ export async function preflightLocalIntegration(
 export async function executeLocalIntegration(
   input: LocalIntegrationExecutionInput
 ): Promise<ApplicationResult> {
+  throwIfApplicationAborted(input.signal);
   const preflight = await preflightLocalIntegration({...input,fallbackCommands:input.fallbackCommands||input.commands});
+  throwIfApplicationAborted(input.signal);
   if (!preflight.allowed) {
     const target = await inspectTargetState(input);
     const safe = target.identityValid && target.clean &&
@@ -366,6 +372,7 @@ export async function executeLocalIntegration(
       sourceCommit = await prepareFrozenSourceCommit(input, snapshot);
     }
   } catch (error: any) {
+    throwIfApplicationAborted(input.signal);
     const target = await inspectTargetState(input);
     const safe = target.identityValid && target.clean && target.head === preApplyHead;
     return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
@@ -380,13 +387,19 @@ export async function executeLocalIntegration(
     });
     if (!evidence.diff || evidence.evidenceHash !== input.evidenceHash) throw new Error("提交后的编码证据与原始证据不一致");
     await input.onSourcePrepared?.(sourceCommit!);
+    throwIfApplicationAborted(input.signal);
     const target = await inspectTargetState(input);
     if (!target.identityValid || !target.clean || target.head !== preApplyHead) {
       return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead, targetState: "uncertain" as const,
         statusPorcelain: target.statusPorcelain, error: "目标工作树在应用前发生变化", commandResults: [] };
     }
+    await input.onBeforeTargetMutation?.();
+    throwIfApplicationAborted(input.signal);
     await git(input.targetWorktreePath, ["cherry-pick", "--no-commit", sourceCommit!]);
+    await input.onTargetMutated?.();
+    throwIfApplicationAborted(input.signal);
   } catch (error: any) {
+    throwIfApplicationAborted(input.signal);
     const target = await inspectTargetState(input);
     let cherryPickActive = false;
     try { await git(input.targetWorktreePath, ["rev-parse", "--verify", "CHERRY_PICK_HEAD"]); cherryPickActive = true; }
@@ -444,13 +457,16 @@ export async function executeLocalIntegration(
   const isolatedCommands = commands.filter((item) => !isTrustedIndexCheck(item));
   let trustedCheckFailed = false;
   for (const item of commands.filter(isTrustedIndexCheck)) {
+    throwIfApplicationAborted(input.signal);
     try {
       const result = await git(input.targetWorktreePath, item.argsPrefix);
       commandResults.push({
         command: item.command, args: item.argsPrefix, code: 0,
         stdout: boundedCommandOutput(result.stdout), stderr: boundedCommandOutput(result.stderr)
       });
+      throwIfApplicationAborted(input.signal);
     } catch (error: any) {
+      throwIfApplicationAborted(input.signal);
       trustedCheckFailed = true;
       commandResults.push({
         command: item.command, args: item.argsPrefix,
@@ -490,7 +506,12 @@ export async function executeLocalIntegration(
       error: "本地应用后测试失败" };
   }
   const statusPorcelain = (await git(input.targetWorktreePath, ["status", "--porcelain"])).stdout;
+  throwIfApplicationAborted(input.signal);
   return { status: "completed" as const, preflight, sourceCommit, preApplyHead, targetState: "applied_dirty" as const, statusPorcelain, commandResults, error: null };
+}
+
+function throwIfApplicationAborted(signal: AbortSignal | undefined) {
+  if (signal?.aborted) throw new Error("DELIVERY_APPLICATION_ABORTED", { cause: signal.reason });
 }
 
 function isTrustedIndexCheck(command: VerificationCommand) {
