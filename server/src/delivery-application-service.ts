@@ -121,11 +121,20 @@ export class DeliveryApplicationService {
     const lease = validateAutomationInput(automation);
     const loaded = await this.dependencies.loadContext(unitId);
     const context = validateContext(loaded, unitId, lease.expectedEvidenceVersion);
-    const existing = this.dependencies.applications.listForUnit(unitId)
+    const history = this.dependencies.applications.listForUnit(unitId);
+    const existing = history
       .find((run) => run.status === "applying" && run.resolutionStatus === "pending");
     if (context.unitStatus === "applying" && !existing) {
       throw new Error("DELIVERY_APPLICATION_UNIT_NOT_READY");
     }
+    const trustedSource = existing ?? [...history].reverse().find((run) =>
+      (run.status === "conflicted" || run.status === "failed")
+      && run.sourceCommit !== null
+      && run.projectVersionId === context.projectVersionId
+      && run.evidenceVersion === context.evidenceVersion
+      && run.baseCommit === context.sourceHead
+      && run.evidenceHash === context.evidenceHash
+    );
     const frozenInput: FrozenApplicationInput = {
       projectRepoPath: context.projectRepoPath,
       targetWorktreePath: context.targetWorktreePath,
@@ -135,7 +144,7 @@ export class DeliveryApplicationService {
       evidenceHash: context.evidenceHash,
       sensitivePatterns: context.sensitivePatterns,
       expectedTargetHead: context.targetHead,
-      ...(existing?.sourceCommit ? { sourceCommit: existing.sourceCommit } : {}),
+      ...(trustedSource?.sourceCommit ? { sourceCommit: trustedSource.sourceCommit } : {}),
       changedFiles: context.changedFiles,
       fallbackCommands: context.allowedCommands
     };
@@ -148,6 +157,9 @@ export class DeliveryApplicationService {
       evidenceHash: context.evidenceHash,
       preflight: existing?.preflight ?? preflight
     });
+    if (!claim.sourceCommit && frozenInput.sourceCommit) {
+      claim = this.dependencies.applications.bindSourceCommit(claim, frozenInput.sourceCommit);
+    }
     const result = await executeLocalIntegration({
       ...frozenInput,
       ...(claim.sourceCommit ? { sourceCommit: claim.sourceCommit } : {}),

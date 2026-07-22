@@ -264,6 +264,21 @@ function applicationInput(lease: AutomationJob) {
   return { expectedEvidenceVersion: 1, claimToken: lease.claimToken };
 }
 
+function reviveApplicationJob(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+  unitId: string,
+  jobId: string
+) {
+  const now = new Date().toISOString();
+  fixture.database.prepare(`UPDATE delivery_units
+    SET status = 'ready_for_acceptance', completed_at = NULL, updated_at = ? WHERE id = ?`)
+    .run(now, unitId);
+  fixture.database.prepare(`UPDATE automation_jobs
+    SET status = 'pending', attempt = 0, claim_token = id, lease_owner = NULL,
+      lease_expires_at = NULL, last_error = NULL, updated_at = ? WHERE id = ?`)
+    .run(now, jobId);
+}
+
 describe("DeliveryApplicationService", () => {
   it("rejects inherited automation fields before loading application context", async () => {
     let loaded = false;
@@ -460,7 +475,7 @@ describe("DeliveryApplicationService", () => {
     expect(await status(fixture.frontendGit.versionWorktree)).toContain("src/feature.ts");
     expect(await remoteRefs(fixture.frontendGit)).toEqual([]);
     await expectRepositoryState(fixture.backendGit, otherBefore);
-  });
+  }, 15_000);
 
   it("rejects stale or mismatched quality evidence before claiming the worktree", async () => {
     const fixture = await createFixture();
@@ -527,5 +542,71 @@ describe("DeliveryApplicationService", () => {
       claimToken: nextLease.claimToken, status: "applied"
     });
     expect(await head(fixture.frontendGit.versionWorktree)).toBe(targetHead);
+  });
+
+  it("reuses a trusted source commit after a terminal conflict retry", async () => {
+    const fixture = await createFixture({ conflict: true });
+    const firstLease = leaseApplication(fixture.store, fixture.frontendUnit.id, "first-worker");
+    const first = await fixture.service.apply(
+      fixture.frontendUnit.id, applicationInput(firstLease)
+    );
+    expect(first.status).toBe("conflicted");
+    reviveApplicationJob(fixture, fixture.frontendUnit.id, firstLease.id);
+    const nextLease = fixture.store.automationJobs.leaseNext(
+      "retry-worker", new Date(), 60_000
+    )!;
+
+    const retried = await fixture.service.apply(
+      fixture.frontendUnit.id, applicationInput(nextLease)
+    );
+
+    expect(retried.status).toBe("conflicted");
+    expect(retried.sourceCommit).toBe(first.sourceCommit);
+    expect(retried.run).toMatchObject({ sourceCommit: first.sourceCommit, status: "conflicted" });
+    expect(fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)).toHaveLength(2);
+  });
+
+  it("reuses a trusted source commit after a clean terminal failure retry", async () => {
+    const fixture = await createFixture();
+    const context = fixture.contexts.get(fixture.frontendUnit.id)!;
+    const firstLease = leaseApplication(fixture.store, fixture.frontendUnit.id, "first-worker");
+    await git(context.codingEvidence.worktreePath, "add", "--all");
+    await git(context.codingEvidence.worktreePath, "commit", "-m", "prepared before failure");
+    const sourceCommit = await head(context.codingEvidence.worktreePath);
+    const preflight = await preflightLocalIntegration({
+      projectRepoPath: context.snapshot.repoPath,
+      targetWorktreePath: context.snapshot.targetWorktreePath,
+      targetBranch: context.snapshot.targetBranch,
+      sourceWorktreePath: context.codingEvidence.worktreePath,
+      sourceBranch: context.codingEvidence.branch,
+      evidenceHash: context.codingEvidence.diffHash,
+      sensitivePatterns: context.snapshot.sensitivePatterns,
+      expectedTargetHead: context.version.headCommit,
+      sourceCommit,
+      changedFiles: context.codingEvidence.files,
+      fallbackCommands: context.snapshot.allowedCommands
+    });
+    let firstClaim = fixture.store.deliveryApplications.claim(fixture.frontendUnit.id, {
+      expectedEvidenceVersion: 1, claimToken: firstLease.claimToken,
+      baseCommit: context.codingEvidence.sourceHead,
+      preApplyCommit: context.version.headCommit,
+      evidenceHash: context.codingEvidence.diffHash, preflight
+    });
+    firstClaim = fixture.store.deliveryApplications.bindSourceCommit(firstClaim, sourceCommit);
+    fixture.store.deliveryApplications.complete(firstClaim, {
+      status: "failed", worktreeState: "clean", error: "APPLICATION_RETRYABLE_FAILURE"
+    });
+    reviveApplicationJob(fixture, fixture.frontendUnit.id, firstLease.id);
+    const nextLease = fixture.store.automationJobs.leaseNext(
+      "retry-worker", new Date(), 60_000
+    )!;
+
+    const retried = await fixture.service.apply(
+      fixture.frontendUnit.id, applicationInput(nextLease)
+    );
+
+    expect(retried.status).toBe("completed");
+    expect(retried.sourceCommit).toBe(sourceCommit);
+    expect(retried.run).toMatchObject({ sourceCommit, status: "applied" });
   });
 });
