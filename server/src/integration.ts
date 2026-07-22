@@ -424,7 +424,26 @@ export async function executeLocalIntegration(
   }
   const commandResults: ApplicationCommandResult[] = [];
   const commands=input.changedFiles?preflight.plannedCommands:input.commands;
-  if (commands.length > 0) {
+  const isolatedCommands = commands.filter((item) => !isTrustedIndexCheck(item));
+  let trustedCheckFailed = false;
+  for (const item of commands.filter(isTrustedIndexCheck)) {
+    try {
+      const result = await git(input.targetWorktreePath, item.argsPrefix);
+      commandResults.push({
+        command: item.command, args: item.argsPrefix, code: 0,
+        stdout: boundedCommandOutput(result.stdout), stderr: boundedCommandOutput(result.stderr)
+      });
+    } catch (error: any) {
+      trustedCheckFailed = true;
+      commandResults.push({
+        command: item.command, args: item.argsPrefix,
+        code: Number.isSafeInteger(error?.code) ? error.code : 1,
+        stdout: boundedCommandOutput(error?.stdout),
+        stderr: boundedCommandOutput(error?.stderr || error?.message)
+      });
+    }
+  }
+  if (!trustedCheckFailed && isolatedCommands.length > 0) {
     const verificationSnapshot = await getWorktreeSnapshot(input.targetWorktreePath, {
       sensitivePatterns: input.sensitivePatterns
     });
@@ -433,7 +452,7 @@ export async function executeLocalIntegration(
       sensitivePatterns: input.sensitivePatterns,
       targetWorktree: input.targetWorktreePath,
       gitCommonDir: verificationSnapshot.identity.gitCommonDir,
-      allowedCommands: commands.map((item) => ({
+      allowedCommands: isolatedCommands.map((item) => ({
         command: item.command, argsPrefix: item.argsPrefix
       })),
       acceptanceCriteria: ["post-application verification passes"]
@@ -445,15 +464,24 @@ export async function executeLocalIntegration(
       stdout: boundedCommandOutput(result.stdout),
       stderr: boundedCommandOutput(result.stderr || result.error)
     })));
-    if (verification.result !== "passed") {
-      const statusPorcelain = (await git(input.targetWorktreePath, ["status", "--porcelain"])).stdout;
-      return { status: "test_failed" as const, preflight, sourceCommit, preApplyHead,
-        targetState: "applied_dirty" as const, statusPorcelain, commandResults,
-        error: verification.error ?? "本地应用后测试失败" };
-    }
+    trustedCheckFailed = verification.result !== "passed";
+  }
+  if (trustedCheckFailed) {
+    const statusPorcelain = (await git(input.targetWorktreePath, ["status", "--porcelain"])).stdout;
+    return { status: "test_failed" as const, preflight, sourceCommit, preApplyHead,
+      targetState: "applied_dirty" as const, statusPorcelain, commandResults,
+      error: "本地应用后测试失败" };
   }
   const statusPorcelain = (await git(input.targetWorktreePath, ["status", "--porcelain"])).stdout;
   return { status: "completed" as const, preflight, sourceCommit, preApplyHead, targetState: "applied_dirty" as const, statusPorcelain, commandResults, error: null };
+}
+
+function isTrustedIndexCheck(command: VerificationCommand) {
+  return command.command === "git"
+    && command.argsPrefix.length === 3
+    && command.argsPrefix[0] === "diff"
+    && command.argsPrefix[1] === "--cached"
+    && command.argsPrefix[2] === "--check";
 }
 
 export async function rerunIntegrationTests(repoPath: string, commands: { command: string; argsPrefix: string[] }[]) {
