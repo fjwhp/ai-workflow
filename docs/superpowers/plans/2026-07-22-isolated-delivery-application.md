@@ -10,6 +10,50 @@
 
 ---
 
+## Risk-Based Verification And Review Policy
+
+This policy records the review optimization approved on 2026-07-22. It applies to the
+remaining work in this plan and the following Phase 3 tasks. Quality gates remain
+mandatory; repeated execution of identical evidence does not.
+
+### Risk Classification
+
+| Risk | Examples | Review gate |
+| --- | --- | --- |
+| High | Git or filesystem mutation, process control, concurrency, claim/lease fencing, persistence, recovery, migrations, security boundaries | Independent specification review followed by independent quality/security review |
+| Medium | Ordinary service/API behavior and UI workflows without a new mutation, persistence, concurrency, or security boundary | One reviewer covers separate specification and quality sections |
+| Low | Documentation, copy, and isolated presentation-only changes | One focused review |
+
+For the remaining delivery work, T4 Tasks 3-4 and Phase 3 T5-T6 are high risk. T7 is
+medium risk unless implementation introduces a high-risk boundary. T8 is a milestone
+acceptance gate and does not add a separate code review unless acceptance changes code.
+
+### Test Evidence Ownership
+
+1. The implementer proves RED, then runs the smallest affected GREEN tests while editing.
+2. After the task commit, the coordinator runs one canonical affected suite, affected
+   workspace typechecks, and diff/status checks. This is the task's reusable evidence.
+3. Reviewers inspect their assigned concerns and reuse canonical evidence. They run only
+   a minimal targeted reproduction when they identify a concrete doubt; they do not rerun
+   the same complete suite by default.
+4. A review fix reruns its direct regression and affected suite. The complete affected
+   suite is repeated only when the fix changes shared infrastructure or a behavioral
+   contract. Only the review role that found the issue repeats its review unless the fix
+   also changes the specification contract.
+5. Cross-module full tests, full typecheck/build, browser acceptance, and real-project
+   pilots run once at their milestone gate rather than after every task.
+
+### Non-Negotiable Quality Rules
+
+- RED/GREEN evidence is never replaced by code inspection.
+- Critical and Important findings block progression.
+- Specification and quality responsibilities remain separate on high-risk work.
+- A reviewer cannot approve their own implementation.
+- Evidence is reusable only for the exact commit SHA it verified; any subsequent code
+  change invalidates the affected evidence.
+
+---
+
 ## File Structure
 
 - Create `server/src/delivery-application-merge.ts`: isolated-index three-way merge simulation and bounded conflict evidence.
