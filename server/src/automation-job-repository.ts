@@ -81,7 +81,19 @@ const DELIVERY_JOB_LEASE_ELIGIBLE_SQL = `(
               AND coding.evidence_version = unit.evidence_version
           ))
         OR (automation_jobs.action = 'apply'
-          AND unit.phase = 'acceptance_delivery' AND unit.status = 'ready_for_acceptance')
+          AND unit.phase = 'acceptance_delivery'
+          AND (unit.status = 'ready_for_acceptance' OR (
+            unit.status = 'applying' AND EXISTS (
+              SELECT 1 FROM delivery_application_runs application
+              WHERE application.delivery_unit_id = unit.id
+                AND application.evidence_version = automation_jobs.evidence_version
+                AND application.automation_job_id = automation_jobs.id
+                AND application.automation_attempt = automation_jobs.attempt
+                AND application.claim_token = automation_jobs.claim_token
+                AND application.status = 'applying'
+                AND application.resolution_status = 'pending'
+            )
+          )))
       )
   )
 )`;

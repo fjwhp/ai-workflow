@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -292,13 +292,8 @@ describe("DeliveryApplicationRepository", () => {
     const bound = fixture.store.deliveryApplications.bindSourceCommit(firstClaim, commit("backend-source"));
 
     const retryTime = new Date(CLOCK.getTime() + 10);
-    const secondToken = `lease:${firstLease.id}:worker-two:${randomUUID()}`;
-    fixture.database.prepare(`UPDATE automation_jobs SET attempt = 2, claim_token = ?, lease_owner = ?,
-      updated_at = ?, lease_expires_at = ? WHERE id = ? AND status = 'leased'`).run(
-      secondToken, "worker-two", retryTime.toISOString(),
-      new Date(retryTime.getTime() + 60_000).toISOString(), firstLease.id
-    );
-    const secondLease = fixture.store.automationJobs.get(firstLease.id)!;
+    expect(fixture.store.automationJobs.recoverExpired(retryTime)).toBe(1);
+    const secondLease = fixture.store.automationJobs.leaseNext("worker-two", retryTime, 60_000)!;
     expect(secondLease).toMatchObject({ id: firstLease.id, attempt: 2 });
     const resumed = fixture.store.deliveryApplications.claim(
       fixture.backendUnit.id, claimInput(secondLease, "backend")
