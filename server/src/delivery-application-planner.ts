@@ -75,14 +75,16 @@ function validateInput(input: unknown): {
   const units = ownDataValue(input, "units");
   const dependencies = ownDataValue(input, "dependencies");
   if (!Array.isArray(units) || !Array.isArray(dependencies)) invalidPlan();
-  if (units.length > MAX_DELIVERY_PLAN_UNITS) throw new Error("DELIVERY_PLAN_UNIT_LIMIT");
-  if (dependencies.length > MAX_DELIVERY_PLAN_DEPENDENCIES) {
+  const unitCount = units.length;
+  const dependencyCount = dependencies.length;
+  if (unitCount > MAX_DELIVERY_PLAN_UNITS) throw new Error("DELIVERY_PLAN_UNIT_LIMIT");
+  if (dependencyCount > MAX_DELIVERY_PLAN_DEPENDENCIES) {
     throw new Error("DELIVERY_PLAN_DEPENDENCY_LIMIT");
   }
-  if (!isDenseArray(units) || !isDenseArray(dependencies)) {
-    invalidPlan();
-  }
-  return { units, dependencies };
+  return {
+    units: copyDenseArray(units, unitCount),
+    dependencies: copyDenseArray(dependencies, dependencyCount)
+  };
 }
 
 function validateUnit(value: unknown): DeliveryApplicationUnitInput {
@@ -162,12 +164,19 @@ function ownDataValue(record: Record<string, unknown>, key: string): unknown {
   return descriptor.value;
 }
 
-function isDenseArray(value: unknown[]): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, index);
-    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value")) return false;
+function copyDenseArray(value: unknown[], length: number): unknown[] {
+  const copy = new Array<unknown>(length);
+  for (let index = 0; index < length; index += 1) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, index);
+    } catch {
+      invalidPlan();
+    }
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value")) invalidPlan();
+    copy[index] = descriptor.value;
   }
-  return true;
+  return copy;
 }
 
 function invalidPlan(): never {

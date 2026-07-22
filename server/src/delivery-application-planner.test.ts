@@ -172,6 +172,76 @@ describe("buildApplicationPlan", () => {
     })).toThrow("DELIVERY_PLAN_UNIT_LIMIT");
   });
 
+  it.each([
+    ["own map override", () => {
+      const units = [unit("backend", 0)];
+      Object.defineProperty(units, "map", { configurable: true, value: () => [] });
+      return units;
+    }],
+    ["inherited map override", () => {
+      const units = [unit("backend", 0)];
+      Object.setPrototypeOf(units, { map: () => [] });
+      return units;
+    }],
+    ["own map accessor", () => {
+      const units = [unit("backend", 0)];
+      Object.defineProperty(units, "map", {
+        configurable: true,
+        get(): never { throw new Error("UNIT_MAP_ACCESSED"); }
+      });
+      return units;
+    }]
+  ])("copies units before using a %s", (_, makeUnits) => {
+    expect(buildApplicationPlan({ units: makeUnits(), dependencies: [] })).toEqual(["backend"]);
+  });
+
+  it.each([
+    ["own map override", () => {
+      const dependencies = [dependency("backend", "frontend")];
+      Object.defineProperty(dependencies, "map", { configurable: true, value: () => [] });
+      return dependencies;
+    }],
+    ["inherited map override", () => {
+      const dependencies = [dependency("backend", "frontend")];
+      Object.setPrototypeOf(dependencies, { map: () => [] });
+      return dependencies;
+    }],
+    ["own map accessor", () => {
+      const dependencies = [dependency("backend", "frontend")];
+      Object.defineProperty(dependencies, "map", {
+        configurable: true,
+        get(): never { throw new Error("DEPENDENCY_MAP_ACCESSED"); }
+      });
+      return dependencies;
+    }]
+  ])("copies dependencies before using a %s", (_, makeDependencies) => {
+    expect(buildApplicationPlan({
+      units: [unit("frontend", 0), unit("backend", 1)],
+      dependencies: makeDependencies()
+    })).toEqual(["backend", "frontend"]);
+  });
+
+  it.each([
+    ["unit", () => {
+      const units = [unit("backend", 0)];
+      Object.defineProperty(units, 0, {
+        configurable: true,
+        get(): never { throw new Error("UNIT_ELEMENT_ACCESSED"); }
+      });
+      return { units, dependencies: [] };
+    }],
+    ["dependency", () => {
+      const dependencies = [dependency("backend", "frontend")];
+      Object.defineProperty(dependencies, 0, {
+        configurable: true,
+        get(): never { throw new Error("DEPENDENCY_ELEMENT_ACCESSED"); }
+      });
+      return { units: [unit("backend", 0), unit("frontend", 1)], dependencies };
+    }]
+  ])("rejects a within-limit %s element accessor without executing it", (_, makeInput) => {
+    expect(() => buildApplicationPlan(makeInput())).toThrow("DELIVERY_APPLICATION_PLAN_INVALID");
+  });
+
   it("does not omit a required skipped unit", () => {
     expect(() => buildApplicationPlan({
       units: [unit("backend", 0, { status: "skipped" })],
