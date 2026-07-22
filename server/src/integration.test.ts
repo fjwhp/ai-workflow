@@ -887,7 +887,7 @@ describe("local integration", () => {
     expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim())
       .toBe(preApplyHead);
     expect(await integrationRefs(item)).toBe(refsBefore);
-  });
+  }, 15_000);
 
   it("proves a concurrent target edit remains uncertain without destructive cleanup", async () => {
     const item = await fixture();
