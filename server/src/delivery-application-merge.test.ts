@@ -3,7 +3,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, re
 import { delimiter, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { simulateDeliveryMerge, type DeliveryMergeSimulationInput } from "./delivery-application-merge.js";
 
 const exec = promisify(execFile);
@@ -320,6 +320,7 @@ async function installTermIgnoringDescendantWrapper(fixture: MergeFixture, name:
   const wrapperDirectory = join(fixture.root, `${name}-git`);
   const wrapperPath = join(wrapperDirectory, "git");
   const descendantPidPath = join(fixture.root, `${name}-descendant-pid`);
+  const descendantReadyPath = join(fixture.root, `${name}-descendant-ready`);
   const realGit = (await exec("which", ["git"])).stdout.trim();
   await mkdir(wrapperDirectory);
   await writeFile(wrapperPath, [
@@ -329,8 +330,9 @@ async function installTermIgnoringDescendantWrapper(fixture: MergeFixture, name:
     "  if [ \"$argument\" = \"read-tree\" ]; then is_read_tree=1; fi",
     "done",
     "if [ \"$is_read_tree\" = \"1\" ]; then",
-    `  /bin/sh -c ${JSON.stringify("trap '' TERM INT; exec /bin/sleep 60")} </dev/null >/dev/null 2>&1 &`,
+    `  /bin/sh -c ${JSON.stringify(`trap '' TERM INT; : > ${JSON.stringify(descendantReadyPath)}; exec /bin/sleep 60`)} </dev/null >/dev/null 2>&1 &`,
     "  descendant=$!",
+    `  while [ ! -e ${JSON.stringify(descendantReadyPath)} ]; do /bin/sleep 0.01; done`,
     `  printf '%s\\n' "$descendant" > ${JSON.stringify(descendantPidPath)}`,
     "  /bin/sleep 60",
     "  exit 0",
@@ -655,6 +657,53 @@ describe("simulateDeliveryMerge", () => {
       await expectTargetState(fixture);
     }
   );
+
+  it("bounds cleanup when a killed process group continues to appear alive", async () => {
+    if (process.platform === "win32") return;
+    const fixture = await createMergeFixture("clean");
+    const wrapper = await installTermIgnoringDescendantWrapper(fixture, "stuck-group-probe");
+    const controller = new AbortController();
+    const originalKill = process.kill.bind(process);
+    let observedGroupSigkill = false;
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(((pid, signal) => {
+      if (pid < 0 && signal === "SIGKILL") {
+        const result = originalKill(pid, signal);
+        observedGroupSigkill = true;
+        return result;
+      }
+      if (observedGroupSigkill && pid < 0 && signal === 0) return true;
+      return originalKill(pid, signal);
+    }) as typeof process.kill);
+    const pending = simulateDeliveryMerge({
+      ...fixture.simulationInput,
+      signal: controller.signal,
+      deadlineAt: Date.now() + 10_000
+    });
+    let descendantPid: number | undefined;
+    try {
+      await waitFor(wrapper.descendantPidPath);
+      descendantPid = Number((await readFile(wrapper.descendantPidPath, "utf8")).trim());
+      expect(Number.isSafeInteger(descendantPid)).toBe(true);
+      controller.abort(new Error("LEASE_LOST"));
+
+      await expect(settleWithin(pending, 6_000)).rejects.toThrow(
+        "DELIVERY_APPLICATION_ABORTED"
+      );
+      expect(observedGroupSigkill).toBe(true);
+      expect(processExists(descendantPid)).toBe(false);
+    } finally {
+      killSpy.mockRestore();
+      await pending.catch(() => undefined);
+      wrapper.restore();
+      if (descendantPid !== undefined && processExists(descendantPid)) {
+        try { process.kill(descendantPid, "SIGKILL"); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+      }
+    }
+    await expectTargetState(fixture);
+  }, 8_000);
 
   it("rejects an expired deadline before starting Git", async () => {
     const fixture = await createMergeFixture("clean");

@@ -424,12 +424,15 @@ function createGitProcessTermination(child: ChildProcess, onError: (error: Error
   let barrier = Promise.resolve();
   let escalationTimer: ReturnType<typeof setTimeout> | undefined;
   let groupPollTimer: ReturnType<typeof setTimeout> | undefined;
+  let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
 
   const clearTimers = () => {
     if (escalationTimer) clearTimeout(escalationTimer);
     if (groupPollTimer) clearTimeout(groupPollTimer);
+    if (cleanupTimer) clearTimeout(cleanupTimer);
     escalationTimer = undefined;
     groupPollTimer = undefined;
+    cleanupTimer = undefined;
   };
   const finishBarrier = () => {
     clearTimers();
@@ -471,6 +474,10 @@ function createGitProcessTermination(child: ChildProcess, onError: (error: Error
       if (started) return;
       started = true;
       barrier = new Promise<void>((resolve) => { resolveBarrier = resolve; });
+      cleanupTimer = setTimeout(() => {
+        onError(new Error("DELIVERY_APPLICATION_PROCESS_GROUP_TERMINATION_TIMEOUT"));
+        finishBarrier();
+      }, CLEANUP_TIMEOUT_MS);
       const error = signalGitProcess(child, "SIGTERM");
       if (error) onError(error);
       if (USE_PROCESS_GROUPS && !groupExists()) {
