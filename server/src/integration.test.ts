@@ -35,6 +35,77 @@ async function fixtureWithTwoChangedFiles() {
   return { ...item, evidenceHash: snapshot.evidenceHash };
 }
 
+async function fixtureWithLongChangedPaths() {
+  const item = await fixture();
+  const directory = [
+    `batch-${"a".repeat(180)}`,
+    `nested-${"b".repeat(180)}`,
+    `literal-[*]-${"c".repeat(180)}`
+  ].join("/");
+  const files = Array.from({ length: 22 }, (_, index) =>
+    `${directory}/entry-${String(index).padStart(2, "0")}-${"d".repeat(180)}.txt`
+  );
+  await mkdir(join(item.sourceWorktree, directory), { recursive: true });
+  await Promise.all(files.map((file) => writeFile(join(item.sourceWorktree, file), `${file}\n`)));
+  const snapshot = await getWorktreeSnapshot(item.sourceWorktree);
+  return { ...item, evidenceHash: snapshot.evidenceHash, files };
+}
+
+async function installSourceTreeArgvBudgetWrapper(
+  item: Awaited<ReturnType<typeof fixture>>,
+  budgetBytes: number
+) {
+  const wrapperDirectory = join(item.root, "git-source-tree-argv-wrapper");
+  const wrapper = join(wrapperDirectory, "git");
+  const queries = join(item.root, "source-tree-query-bytes");
+  const rejected = join(item.root, "source-tree-query-rejected");
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  const exists = (path: string) => readFile(path).then(() => true, () => false);
+
+  await mkdir(wrapperDirectory);
+  await writeFile(wrapper, [
+    "#!/bin/sh",
+    "is_source=",
+    "is_ls_tree=",
+    "has_separator=",
+    "has_literal_pathspecs=",
+    "for argument in \"$@\"; do",
+    `  if [ "$argument" = ${JSON.stringify(item.sourceWorktree)} ]; then is_source=1; fi`,
+    "  if [ \"$argument\" = \"ls-tree\" ]; then is_ls_tree=1; fi",
+    "  if [ \"$argument\" = \"--\" ]; then has_separator=1; fi",
+    "  if [ \"$argument\" = \"--literal-pathspecs\" ]; then has_literal_pathspecs=1; fi",
+    "done",
+    "if [ \"$is_source\" = \"1\" ] && [ \"$is_ls_tree\" = \"1\" ] && [ \"$has_separator\" = \"1\" ]; then",
+    "  bytes=4",
+    "  for argument in \"$@\"; do bytes=$((bytes + ${#argument} + 1)); done",
+    `  if [ "$bytes" -gt ${budgetBytes} ]; then`,
+    `    printf '%s\n' "$bytes" > ${JSON.stringify(rejected)}`,
+    "    printf 'SOURCE_RECOVERED_PATH_QUERY_ARGV_TOO_LARGE:%s\n' \"$bytes\" >&2",
+    "    exit 91",
+    "  fi",
+    "  if [ \"$has_literal_pathspecs\" != \"1\" ]; then",
+    `    : > ${JSON.stringify(rejected)}`,
+    "    printf 'SOURCE_RECOVERED_PATH_QUERY_NOT_LITERAL\n' >&2",
+    "    exit 92",
+    "  fi",
+    `  printf '%s\n' "$bytes" >> ${JSON.stringify(queries)}`,
+    "fi",
+    `exec ${JSON.stringify(realGit)} "$@"`
+  ].join("\n"));
+  await chmod(wrapper, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+
+  return {
+    queryBytes: async () => (await readFile(queries, "utf8")).trim().split("\n").map(Number),
+    rejected: () => exists(rejected),
+    restore: () => {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  };
+}
+
 type SourceBoundaryCommand = "update-ref" | "update-index";
 
 async function installSourceGitBoundaryWrapper(
@@ -995,6 +1066,32 @@ describe("local integration", () => {
     expect(result.sourceCommit).toBe(sourceCommit);
     expect((await exec("git", ["-C", item.sourceWorktree, "log", "-1", "--format=%s"])).stdout.trim()).toBe("source evidence");
   });
+
+  it("bounds recovered source tree queries by fixed argv bytes", async () => {
+    const budgetBytes = 16 * 1024;
+    const item = await fixtureWithLongChangedPaths();
+    await exec("git", ["-C", item.sourceWorktree, "add", "--all"]);
+    await exec("git", ["-C", item.sourceWorktree, "commit", "-m", "large source evidence"]);
+    const sourceCommit = (await exec("git", ["-C", item.sourceWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    await exec("git", ["-C", item.sourceWorktree, "update-index", "--force-remove", "--", item.files[0]!]);
+    const marker = await installSourceTreeArgvBudgetWrapper(item, budgetBytes);
+
+    try {
+      const result = await executeLocalIntegration({
+        ...integrationInput(item), sourceCommit, commitMessage: "must not be created", commands: []
+      });
+
+      expect(result.error).toBeNull();
+      expect(result.status).toBe("completed");
+      const queryBytes = await marker.queryBytes();
+      expect(queryBytes.length).toBeGreaterThan(1);
+      expect(queryBytes.every((bytes) => bytes <= budgetBytes)).toBe(true);
+      expect(await marker.rejected()).toBe(false);
+      expect((await exec("git", ["-C", item.sourceWorktree, "status", "--porcelain=v1"])).stdout).toBe("");
+    } finally {
+      marker.restore();
+    }
+  }, 15_000);
 
   it("keeps staged local changes when verification fails", async () => {
     const item = await fixture();

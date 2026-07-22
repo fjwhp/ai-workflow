@@ -21,6 +21,7 @@ const TRUNCATED_OUTPUT_MARKER = "\n[truncated]";
 const APPLICATION_TIMEOUT_MS = 300_000;
 const GIT_COMMAND_TIMEOUT_MS = 30_000;
 const GIT_CLEANUP_TIMEOUT_MS = 30_000;
+const RECOVERED_SOURCE_TREE_ARGV_BUDGET_BYTES = 16 * 1024;
 
 interface GitExecutionContext {
   signal?: AbortSignal;
@@ -285,13 +286,50 @@ async function frozenSourceEntriesFromCommit(
   preparedSourceGit: PreparedGitEnvironment,
   execution: GitExecutionContext
 ) {
-  const entries = parseTreeEntries((await runPreparedGit(preparedSourceGit, [
-    "ls-tree", "-z", sourceCommit, "--", ...files.map(literalPathspec)
-  ], execution)).stdout);
-  if (!entries) throw new Error("SOURCE_COMMIT_TREE_INVALID");
+  const fixedArgv = [
+    "git", "-C", preparedSourceGit.cwd,
+    "--literal-pathspecs", "ls-tree", "-z", sourceCommit, "--"
+  ];
+  const fixedBytes = gitArgvBytes(fixedArgv);
+  if (fixedBytes > RECOVERED_SOURCE_TREE_ARGV_BUDGET_BYTES) {
+    throw new Error("SOURCE_COMMIT_PATH_QUERY_ARGV_BUDGET_EXCEEDED");
+  }
+  const batches: string[][] = [];
+  let batch: string[] = [];
+  let batchBytes = fixedBytes;
+  for (const file of files) {
+    const fileBytes = gitArgvBytes([file]);
+    if (fixedBytes + fileBytes > RECOVERED_SOURCE_TREE_ARGV_BUDGET_BYTES) {
+      throw new Error("SOURCE_COMMIT_PATH_QUERY_ARGV_BUDGET_EXCEEDED");
+    }
+    if (batch.length > 0 && batchBytes + fileBytes > RECOVERED_SOURCE_TREE_ARGV_BUDGET_BYTES) {
+      batches.push(batch);
+      batch = [];
+      batchBytes = fixedBytes;
+    }
+    batch.push(file);
+    batchBytes += fileBytes;
+  }
+  if (batch.length > 0) batches.push(batch);
+
+  const entries = new Map<string, GitIndexEntry>();
+  for (const paths of batches) {
+    const parsed = parseTreeEntries((await runPreparedGit(preparedSourceGit, [
+      "--literal-pathspecs", "ls-tree", "-z", sourceCommit, "--", ...paths
+    ], execution)).stdout);
+    const requested = new Set(paths);
+    if (!parsed || [...parsed.keys()].some((path) => !requested.has(path) || entries.has(path))) {
+      throw new Error("SOURCE_COMMIT_TREE_INVALID");
+    }
+    for (const [path, entry] of parsed) entries.set(path, entry);
+  }
   return new Map<string, FrozenSourceIndexEntry>(
     files.map((file) => [file, entries.get(file)])
   );
+}
+
+function gitArgvBytes(argv: readonly string[]) {
+  return argv.reduce((bytes, argument) => bytes + Buffer.byteLength(argument, "utf8") + 1, 0);
 }
 
 function parseRegisteredWorktrees(output: string) {
@@ -439,6 +477,7 @@ function parseTreeEntries(output: string) {
     const mode = match[1]!;
     const objectId = match[2]!;
     const path = match[3]!;
+    if (entries.has(path)) return undefined;
     entries.set(path, { mode, objectId });
   }
   return entries;
