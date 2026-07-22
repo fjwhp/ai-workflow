@@ -315,7 +315,14 @@ export function createPhase2Schema(db: DatabaseSync) {
       CHECK(
         dedupe_key = action || ':' ||
           CASE WHEN owner_type = 'delivery_unit' THEN owner_id ELSE 'requirement:' || owner_id END ||
-          ':v' || CAST(evidence_version AS TEXT)
+          ':v' || CAST(evidence_version AS TEXT) ||
+          CASE
+            WHEN action = 'apply'
+              AND json_type(payload_json, '$.retryAttempt') = 'integer'
+              AND json_extract(payload_json, '$.retryAttempt') BETWEEN 1 AND 100
+            THEN ':retry' || CAST(json_extract(payload_json, '$.retryAttempt') AS TEXT)
+            ELSE ''
+          END
       ),
       CHECK(
         (status = 'pending' AND attempt < max_attempts)

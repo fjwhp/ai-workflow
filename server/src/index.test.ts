@@ -291,7 +291,7 @@ describe("server entry point", () => {
     const seeded = seedRootPlan(seedStore, directory);
     expect(seedStore.automationJobs.leaseNext("crashed-worker", startedAt, 100)).toMatchObject({ attempt: 1 });
     seedStore.close();
-    writeFileSync(join(directory, "workflow.db.schema-version"), "phase-2-quality-attempt-v14");
+    writeFileSync(join(directory, "workflow.db.schema-version"), "phase-3-application-sequence-v15");
     const recoveredAt = new Date(startedAt.getTime() + 101);
     const coding = vi.fn(async (input: CodingAgentInput) => controlledCodingResult(input));
 
@@ -377,15 +377,17 @@ describe("server entry point", () => {
     expect(events.filter((event) => event === "store:close")).toHaveLength(1);
   });
 
-  it("registers Store-backed quality handlers and preserves explicit handler overrides", async () => {
+  it("registers Store-backed delivery and application handlers and preserves explicit overrides", async () => {
     const directory = mkdtempSync(join(tmpdir(), "automation-startup-handlers-"));
     directories.push(directory);
     const implement = vi.fn(async () => ({} as any));
     const review = vi.fn(async () => ({} as any));
     const test = vi.fn(async () => ({} as any));
+    const apply = vi.fn(async () => ({} as any));
     const overrideTest = vi.fn(async () => {});
     let workerOptions: any;
     let serviceStore: WorkflowStore | undefined;
+    let applicationServiceStore: WorkflowStore | undefined;
     const worker = {
       drainOnce: vi.fn(async () => false), start: vi.fn(), stop: vi.fn(async () => {})
     };
@@ -393,6 +395,10 @@ describe("server entry point", () => {
     const runtime = await startServer({
       env: { DATA_DIR: directory, PORT: "0" },
       createDeliveryService: (store) => { serviceStore = store; return { implement, review, test }; },
+      createDeliveryApplicationService: (store) => {
+        applicationServiceStore = store;
+        return { apply };
+      },
       automationHandlers: { test: overrideTest },
       createWorker: (options) => { workerOptions = options; return worker; },
       buildApplication: async () => fakeApp([]),
@@ -404,11 +410,33 @@ describe("server entry point", () => {
     } as any;
 
     expect(serviceStore).toBe(runtime.store);
+    expect(applicationServiceStore).toBe(runtime.store);
+    expect(typeof workerOptions.handlers.apply).toBe("function");
     await workerOptions.handlers.review(reviewJob);
     await workerOptions.handlers.test({ ...reviewJob, id: "test-job", action: "test" });
+    const applyJob = {
+      ...reviewJob,
+      id: "apply-job",
+      claimToken: "apply-claim",
+      action: "apply",
+      ownerId: "unit-1",
+      payload: {
+        type: "delivery_application_plan",
+        version: 1,
+        requirementId: "requirement-1",
+        cursor: 0,
+        retryAttempt: 0,
+        units: [{ unitId: "unit-1", evidenceVersion: 3 }]
+      }
+    };
+    await workerOptions.handlers.apply(applyJob, { signal: new AbortController().signal });
     expect(review).toHaveBeenCalledWith("unit-1", 3, "review-job", undefined);
     expect(test).not.toHaveBeenCalled();
     expect(overrideTest).toHaveBeenCalledOnce();
+    expect(apply).toHaveBeenCalledWith("unit-1", {
+      expectedEvidenceVersion: 3,
+      claimToken: "apply-claim"
+    }, expect.any(AbortSignal));
     await runtime.close();
   });
 
@@ -460,7 +488,7 @@ async function seedExpiredJob(directory: string) {
   });
   store.automationJobs.leaseNext("old-worker", new Date(), 1);
   store.close();
-  writeFileSync(`${databasePath}.schema-version`, "phase-2-quality-attempt-v14");
+  writeFileSync(`${databasePath}.schema-version`, "phase-3-application-sequence-v15");
   await new Promise((resolve) => setTimeout(resolve, 5));
   return { jobId: queued.id };
 }
@@ -486,7 +514,7 @@ function seedLeasedImplementation(directory: string, now: Date, leaseMs: number)
   store.automationJobs.leaseNext("old-worker", now, leaseMs);
   const claim = store.deliveryExecutions.claimImplementation(unit.id, "old-model");
   store.close();
-  writeFileSync(`${databasePath}.schema-version`, "phase-2-quality-attempt-v14");
+  writeFileSync(`${databasePath}.schema-version`, "phase-3-application-sequence-v15");
   return { jobId: job.id, unitId: unit.id, runId: claim.runId, executionId: claim.executionId };
 }
 

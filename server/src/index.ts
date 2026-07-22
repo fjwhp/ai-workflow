@@ -5,6 +5,7 @@ import { WorkflowStore } from "./store.js";
 import { buildApp } from "./app.js";
 import { prepareCleanDatabase, writeDatabaseVersionMarker } from "./database-reset.js";
 import {
+  createDeliveryApplicationAutomationHandlers,
   createAutomationWorker,
   type AutomationHandlers,
   type AutomationWorker,
@@ -17,6 +18,7 @@ import {
 } from "./delivery-execution-service.js";
 import { cleanupVerificationQuarantines } from "./verification-cleanup.js";
 import { currentSchemaVersion } from "./schema-version.js";
+import { DeliveryApplicationService } from "./delivery-application-service.js";
 
 interface StartupApp {
   addHook(name: "onClose", hook: () => Promise<void> | void): unknown;
@@ -35,6 +37,9 @@ export interface StartupOptions {
   createDeliveryService?: (
     store: WorkflowStore
   ) => Pick<DeliveryExecutionService, "implement" | "review" | "test">;
+  createDeliveryApplicationService?: (
+    store: WorkflowStore
+  ) => Pick<DeliveryApplicationService, "apply">;
   automationHandlers?: Partial<AutomationHandlers>;
   clock?: () => Date;
   onWorkerEvent?: (event: AutomationWorkerEvent) => void;
@@ -129,10 +134,16 @@ export async function startServer(options: StartupOptions = {}) {
     const deliveryService = (options.createDeliveryService ?? ((workflowStore) => new DeliveryExecutionService(
       workflowStore.deliveryExecutions, undefined, undefined, workflowStore.deliveryQuality
     )))(store);
+    const applicationService = (options.createDeliveryApplicationService ?? ((workflowStore) =>
+      new DeliveryApplicationService({
+        applications: workflowStore.deliveryApplications,
+        loadContext: (unitId) => workflowStore.loadDeliveryApplicationContext(unitId)
+      })))(store);
     const workerOptions: AutomationWorkerOptions = {
       jobs: store.automationJobs,
       handlers: {
         ...createDeliveryAutomationHandlers(deliveryService),
+        ...createDeliveryApplicationAutomationHandlers(applicationService),
         ...options.automationHandlers
       },
       clock,

@@ -289,6 +289,38 @@ describe("Phase 2 database schema", () => {
     db.close();
   });
 
+  it("rejects application retry keys that do not exactly match the payload attempt", () => {
+    const db = openFreshStoreDatabase();
+    insertRequirement(db);
+    const retryPayload = JSON.stringify({ retryAttempt: 2 });
+
+    expect(() => insertAutomationJob(db, {
+      id: "retry-base-key",
+      action: "apply",
+      payloadJson: retryPayload,
+      dedupeKey: "apply:requirement:r1:v1"
+    })).toThrow();
+    expect(() => insertAutomationJob(db, {
+      id: "retry-wrong-attempt",
+      action: "apply",
+      payloadJson: retryPayload,
+      dedupeKey: "apply:requirement:r1:v1:retry1"
+    })).toThrow();
+    expect(() => insertAutomationJob(db, {
+      id: "retry-arbitrary-suffix",
+      action: "apply",
+      payloadJson: retryPayload,
+      dedupeKey: "apply:requirement:r1:v1:anything"
+    })).toThrow();
+    expect(() => insertAutomationJob(db, {
+      id: "retry-canonical",
+      action: "apply",
+      payloadJson: retryPayload,
+      dedupeKey: "apply:requirement:r1:v1:retry2"
+    })).not.toThrow();
+    db.close();
+  });
+
   it("creates the delivery foreign keys and safety indexes", () => {
     const db = openFreshStoreDatabase();
     expect(foreignKeys(db, "delivery_units")).toEqual(expect.arrayContaining([

@@ -6,6 +6,7 @@ import {
   retryable,
   type AutomationWorkerEvent
 } from "./automation-worker.js";
+import * as automationWorkerModule from "./automation-worker.js";
 import { WorkflowStore } from "./store.js";
 
 const stores: WorkflowStore[] = [];
@@ -46,6 +47,68 @@ function createFixture(action: AutomationAction = "implement", maxAttempts = 3) 
 }
 
 describe("automation worker handler lifecycle", () => {
+  it("dispatches an application job with its fenced lease identity", async () => {
+    const createApplicationHandlers = (automationWorkerModule as any)
+      .createDeliveryApplicationAutomationHandlers;
+    expect(typeof createApplicationHandlers).toBe("function");
+    const apply = vi.fn(async () => ({ status: "completed" }));
+    const handlers = createApplicationHandlers({ apply });
+    const job = {
+      id: "apply-job",
+      claimToken: "lease-token",
+      ownerType: "delivery_unit",
+      ownerId: "backend-unit",
+      evidenceVersion: 3,
+      action: "apply",
+      payload: {
+        type: "delivery_application_plan",
+        version: 1,
+        requirementId: "requirement-1",
+        cursor: 0,
+        retryAttempt: 0,
+        units: [{ unitId: "backend-unit", evidenceVersion: 3 }]
+      }
+    };
+    const signal = new AbortController().signal;
+
+    await handlers.apply(job, { signal });
+
+    expect(apply).toHaveBeenCalledWith(
+      "backend-unit",
+      { expectedEvidenceVersion: 3, claimToken: "lease-token" },
+      signal
+    );
+  });
+
+  it("rejects a forged application cursor before invoking the application service", async () => {
+    const apply = vi.fn(async () => ({ status: "completed" }));
+    const handlers = (automationWorkerModule as any)
+      .createDeliveryApplicationAutomationHandlers({ apply });
+    const job = {
+      id: "apply-job",
+      claimToken: "lease-token",
+      ownerType: "delivery_unit",
+      ownerId: "frontend-unit",
+      evidenceVersion: 3,
+      action: "apply",
+      payload: {
+        type: "delivery_application_plan",
+        version: 1,
+        requirementId: "requirement-1",
+        cursor: 0,
+        retryAttempt: 0,
+        units: [
+          { unitId: "backend-unit", evidenceVersion: 3 },
+          { unitId: "frontend-unit", evidenceVersion: 3 }
+        ]
+      }
+    };
+
+    await expect(handlers.apply(job, { signal: new AbortController().signal }))
+      .rejects.toThrow("DELIVERY_APPLICATION_JOB_PAYLOAD_INVALID");
+    expect(apply).not.toHaveBeenCalled();
+  });
+
   it.each(["", "   ", "lowercase", "AUTOMATION\0BAD"])("rejects an unsafe retryable code %j", (code) => {
     expect(() => retryable(code)).toThrow("AUTOMATION_WORKER_ERROR_CODE_INVALID");
   });

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { AutomationAction } from "@ai-workflow/shared";
 import type { AutomationJob, AutomationJobPersistence } from "./automation-job-repository.js";
+import { parseDeliveryApplicationJob } from "./delivery-coordinator.js";
+import type { DeliveryApplicationService } from "./delivery-application-service.js";
 
 export interface AutomationHandlerContext {
   signal: AbortSignal;
@@ -39,6 +41,23 @@ export interface AutomationWorker {
   drainOnce(): Promise<boolean>;
   start(): void;
   stop(): Promise<void>;
+}
+
+export function createDeliveryApplicationAutomationHandlers(
+  service: Pick<DeliveryApplicationService, "apply">
+): Pick<AutomationHandlers, "apply"> {
+  if (!service || typeof service.apply !== "function") {
+    throw new Error("DELIVERY_APPLICATION_HANDLER_INVALID");
+  }
+  return {
+    apply: async (job, context) => {
+      parseDeliveryApplicationJob(job);
+      await service.apply(job.ownerId, {
+        expectedEvidenceVersion: job.evidenceVersion,
+        claimToken: job.claimToken
+      }, context.signal);
+    }
+  };
 }
 
 export class RetryableAutomationError extends Error {

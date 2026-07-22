@@ -1,9 +1,19 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { MAX_AUTOMATION_EVIDENCE_VERSION } from "@ai-workflow/shared";
+import {
+  aggregateDeliveryStatus,
+  MAX_AUTOMATION_EVIDENCE_VERSION,
+  MAX_DELIVERY_PLAN_UNITS,
+  type DeliveryUnitStatus
+} from "@ai-workflow/shared";
 import { deliveryUnitHasActiveWork } from "./delivery-unit-eligibility.js";
-import { AutomationJobRepository } from "./automation-job-repository.js";
+import {
+  AutomationJobRepository,
+  type AutomationJob
+} from "./automation-job-repository.js";
 import { deliveryUnitDependenciesSatisfied } from "./delivery-unit-eligibility.js";
+import { buildApplicationPlan } from "./delivery-application-planner.js";
+import type { DeliveryApplicationRun } from "./delivery-application-repository.js";
 import {
   DeliveryQualityRepository,
   type DeliveryQualityClaim,
@@ -70,6 +80,8 @@ interface OverrideRow {
 }
 
 export interface DeliveryCoordinationPersistence {
+  acceptRequirement(input: DeliveryAcceptanceInput): DeliveryAcceptance;
+  retryApplication(input: DeliveryApplicationRetryInput): DeliveryApplicationRetry;
   overrideQuality(input: DeliveryQualityOverrideInput): DeliveryQualityOverride;
   listQualityOverrides(unitId: string, evidenceVersion?: number): DeliveryQualityOverride[];
   resolveStale(input: DeliveryStaleResolutionInput): DeliveryStaleDecision;
@@ -78,6 +90,50 @@ export interface DeliveryCoordinationPersistence {
   resumeAutomation(input: RequirementAutomationInput): RequirementAutomationState;
   skipOptional(input: DeliverySkipInput): DeliveryUnitSkip;
   retryUnit(input: DeliveryUnitRetryInput): DeliveryUnitRetryAudit;
+}
+
+export interface DeliveryApplicationRetryInput {
+  unitId: string;
+  actor: string;
+  reason: string;
+}
+
+export interface DeliveryApplicationRetry {
+  deliveryUnitId: string;
+  requirementId: string;
+  evidenceVersion: number;
+  retryAttempt: number;
+  jobId: string;
+}
+
+export interface DeliveryAcceptanceInput {
+  requirementId: string;
+  actor: string;
+  comment: string;
+}
+
+export interface DeliveryAcceptance {
+  id: string;
+  requirementId: string;
+  actor: string;
+  comment: string;
+  plan: DeliveryApplicationPlanEntry[];
+  jobId: string | null;
+  createdAt: string;
+}
+
+export interface DeliveryApplicationPlanEntry {
+  unitId: string;
+  evidenceVersion: number;
+}
+
+export interface DeliveryApplicationPlanPayload {
+  type: "delivery_application_plan";
+  version: 1;
+  requirementId: string;
+  cursor: number;
+  retryAttempt: number;
+  units: DeliveryApplicationPlanEntry[];
 }
 
 export interface DeliveryContractEvidenceInput {
@@ -231,6 +287,248 @@ export class DeliveryCoordinator {
     private readonly db: DatabaseSync,
     private readonly quality = new DeliveryQualityRepository(db)
   ) {}
+
+  acceptRequirementInTransaction(input: DeliveryAcceptanceInput): DeliveryAcceptance {
+    validateAcceptanceInput(input);
+    const requirement = this.db.prepare("SELECT id FROM requirements WHERE id = ?")
+      .get(input.requirementId) as { id: string } | undefined;
+    if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
+    if (this.requirementPaused(requirement.id)) throw new Error("DELIVERY_ACCEPTANCE_NOT_ELIGIBLE");
+    if (this.db.prepare(`SELECT 1 FROM approvals
+      WHERE requirement_id = ? AND stage = 'acceptance_delivery' AND decision = 'approve'`)
+      .get(requirement.id)) {
+      throw new Error("DELIVERY_ACCEPTANCE_ALREADY_RECORDED");
+    }
+    const units = this.db.prepare(`SELECT id, position, required, status, evidence_version
+      FROM delivery_units WHERE requirement_id = ? ORDER BY position, created_at, rowid`)
+      .all(requirement.id) as Array<{
+        id: string; position: number; required: number; status: string; evidence_version: number;
+      }>;
+    const dependencies = this.db.prepare(`SELECT upstream_unit_id, downstream_unit_id, release_condition
+      FROM delivery_dependencies WHERE requirement_id = ? ORDER BY rowid`).all(requirement.id) as Array<{
+        upstream_unit_id: string;
+        downstream_unit_id: string;
+        release_condition: "automated_testing_passed";
+      }>;
+    const unitById = new Map(units.map((unit) => [unit.id, unit]));
+    const order = buildApplicationPlan({
+      units: units.map((unit) => ({
+        id: unit.id,
+        position: unit.position,
+        required: unit.required === 1,
+        status: unit.status as any
+      })),
+      dependencies: dependencies.map((dependency) => ({
+        upstreamUnitId: dependency.upstream_unit_id,
+        downstreamUnitId: dependency.downstream_unit_id,
+        releaseCondition: dependency.release_condition
+      }))
+    });
+    const plan = order.map((unitId) => ({
+      unitId,
+      evidenceVersion: unitById.get(unitId)!.evidence_version
+    }));
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    this.db.prepare(`INSERT INTO approvals
+      (id, requirement_id, stage, decision, comment, condition_text, target_stage,
+       actor_type, artifact_id, reasons_json, return_count, created_at)
+      VALUES (?, ?, 'acceptance_delivery', 'approve', ?, NULL, NULL,
+        'human', NULL, '[]', NULL, ?)`)
+      .run(id, requirement.id, input.comment.trim(), now);
+    let jobId: string | null = null;
+    if (plan.length > 0) {
+      const payload: DeliveryApplicationPlanPayload = {
+        type: "delivery_application_plan",
+        version: 1,
+        requirementId: requirement.id,
+        cursor: 0,
+        retryAttempt: 0,
+        units: plan
+      };
+      jobId = new AutomationJobRepository(this.db).enqueue({
+        ownerType: "delivery_unit",
+        ownerId: plan[0]!.unitId,
+        evidenceVersion: plan[0]!.evidenceVersion,
+        action: "apply",
+        payload,
+        maxAttempts: 3
+      }).id;
+    }
+    this.db.prepare(`UPDATE requirements SET stage = 'acceptance_delivery', status = ?, updated_at = ?
+      WHERE id = ?`).run(plan.length > 0 ? "applying" : "completed", now, requirement.id);
+    return {
+      id,
+      requirementId: requirement.id,
+      actor: input.actor.trim(),
+      comment: input.comment.trim(),
+      plan,
+      jobId,
+      createdAt: now
+    };
+  }
+
+  settleApplicationInTransaction(run: DeliveryApplicationRun): void {
+    const jobs = new AutomationJobRepository(this.db);
+    const job = jobs.get(run.automationJobId);
+    if (!job || job.claimToken !== run.claimToken || job.attempt !== run.automationAttempt
+      || job.status !== "leased") {
+      throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    }
+    if (!isDeliveryApplicationPlanPayload(job.payload)) return;
+    const payload = parseDeliveryApplicationJob(job);
+    if (payload.requirementId !== run.requirementId
+      || payload.units[payload.cursor]!.unitId !== run.deliveryUnitId
+      || payload.units[payload.cursor]!.evidenceVersion !== run.evidenceVersion) {
+      throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    }
+    const rows = this.db.prepare(`SELECT id, requirement_id, evidence_version, required, status
+      FROM delivery_units WHERE requirement_id = ? ORDER BY position, created_at, rowid`)
+      .all(payload.requirementId) as Array<{
+        id: string;
+        requirement_id: string;
+        evidence_version: number;
+        required: number;
+        status: DeliveryUnitStatus;
+      }>;
+    const rowById = new Map(rows.map((row) => [row.id, row]));
+    const participating = rows.filter((row) => row.required === 1 || row.status !== "skipped");
+    if (participating.length !== payload.units.length) {
+      throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    }
+    for (const [index, entry] of payload.units.entries()) {
+      const row = rowById.get(entry.unitId);
+      if (!row || row.evidence_version !== entry.evidenceVersion
+        || (index < payload.cursor && row.status !== "applied")
+        || (index === payload.cursor && row.status !== run.status)
+        || (index > payload.cursor && row.status !== "ready_for_acceptance")) {
+        throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+      }
+    }
+    const planIndex = new Map(payload.units.map((entry, index) => [entry.unitId, index]));
+    const dependencies = this.db.prepare(`SELECT upstream_unit_id, downstream_unit_id
+      FROM delivery_dependencies WHERE requirement_id = ?`).all(payload.requirementId) as Array<{
+        upstream_unit_id: string;
+        downstream_unit_id: string;
+      }>;
+    if (dependencies.some((dependency) => {
+      const upstream = planIndex.get(dependency.upstream_unit_id);
+      const downstream = planIndex.get(dependency.downstream_unit_id);
+      return upstream !== undefined && downstream !== undefined && upstream >= downstream;
+    })) throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+
+    const aggregate = aggregateDeliveryStatus(rows.map((row) => ({
+      required: row.required === 1,
+      status: row.status
+    })));
+    this.db.prepare(`UPDATE requirements SET stage = 'acceptance_delivery', status = ?, updated_at = ?
+      WHERE id = ?`).run(aggregate, new Date().toISOString(), payload.requirementId);
+    if (run.status !== "applied" || payload.cursor + 1 >= payload.units.length
+      || this.requirementPaused(payload.requirementId)) return;
+    const next = payload.units[payload.cursor + 1]!;
+    jobs.enqueue({
+      ownerType: "delivery_unit",
+      ownerId: next.unitId,
+      evidenceVersion: next.evidenceVersion,
+      action: "apply",
+      payload: { ...payload, cursor: payload.cursor + 1, retryAttempt: 0 },
+      maxAttempts: 3
+    });
+  }
+
+  retryApplicationInTransaction(input: DeliveryApplicationRetryInput): DeliveryApplicationRetry {
+    validateApplicationRetryInput(input);
+    const unit = this.db.prepare(`SELECT id, requirement_id, evidence_version, phase, status
+      FROM delivery_units WHERE id = ?`).get(input.unitId) as {
+        id: string;
+        requirement_id: string;
+        evidence_version: number;
+        phase: string;
+        status: string;
+      } | undefined;
+    if (!unit) throw new Error("DELIVERY_UNIT_NOT_FOUND");
+    if (unit.phase !== "acceptance_delivery" || this.requirementPaused(unit.requirement_id)) {
+      throw new Error("DELIVERY_APPLICATION_RETRY_NOT_ELIGIBLE");
+    }
+    const jobs = new AutomationJobRepository(this.db);
+    const activeJobRow = this.db.prepare(`SELECT job.id FROM automation_jobs job
+      WHERE job.owner_type = 'delivery_unit' AND job.owner_id = ? AND job.evidence_version = ?
+        AND job.action = 'apply' AND job.status IN ('pending', 'leased')
+      ORDER BY job.rowid DESC LIMIT 1`).get(unit.id, unit.evidence_version) as { id: string } | undefined;
+    if (activeJobRow) {
+      const active = jobs.get(activeJobRow.id)!;
+      const activePayload = parseDeliveryApplicationJob(active);
+      if (activePayload.retryAttempt === 0) {
+        throw new Error("DELIVERY_APPLICATION_RETRY_NOT_ELIGIBLE");
+      }
+      return {
+        deliveryUnitId: unit.id,
+        requirementId: unit.requirement_id,
+        evidenceVersion: unit.evidence_version,
+        retryAttempt: activePayload.retryAttempt,
+        jobId: active.id
+      };
+    }
+    const previousJobRow = this.db.prepare(`SELECT job.id FROM automation_jobs job
+      WHERE job.owner_type = 'delivery_unit' AND job.owner_id = ? AND job.evidence_version = ?
+        AND job.action = 'apply' AND job.status IN ('completed', 'failed')
+      ORDER BY job.rowid DESC LIMIT 1`).get(unit.id, unit.evidence_version) as { id: string } | undefined;
+    if (!previousJobRow) throw new Error("DELIVERY_APPLICATION_RETRY_NOT_ELIGIBLE");
+    const previous = jobs.get(previousJobRow.id)!;
+    const payload = parseDeliveryApplicationJob(previous);
+    const run = this.db.prepare(`SELECT status, resolution_status FROM delivery_application_runs
+      WHERE automation_job_id = ? AND delivery_unit_id = ? AND evidence_version = ?
+      ORDER BY rowid DESC LIMIT 1`).get(previous.id, unit.id, unit.evidence_version) as {
+        status: string;
+        resolution_status: string;
+      } | undefined;
+    const conflicted = unit.status === "conflicted"
+      && run?.status === "conflicted" && run.resolution_status === "not_required";
+    const cleanFailure = unit.status === "failed"
+      && run?.status === "failed" && run.resolution_status === "not_required";
+    const revertedFailure = unit.status === "ready_for_acceptance"
+      && run?.status === "failed" && run.resolution_status === "reverted";
+    if (!conflicted && !cleanFailure && !revertedFailure) {
+      throw new Error("DELIVERY_APPLICATION_RETRY_NOT_ELIGIBLE");
+    }
+    if (payload.retryAttempt >= 100) throw new Error("DELIVERY_APPLICATION_RETRY_LIMIT");
+    for (const [index, entry] of payload.units.entries()) {
+      const current = this.db.prepare(`SELECT requirement_id, evidence_version, status
+        FROM delivery_units WHERE id = ?`).get(entry.unitId) as {
+          requirement_id: string; evidence_version: number; status: string;
+        } | undefined;
+      if (!current || current.requirement_id !== payload.requirementId
+        || current.evidence_version !== entry.evidenceVersion
+        || (index < payload.cursor && current.status !== "applied")
+        || (index > payload.cursor && current.status !== "ready_for_acceptance")) {
+        throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+      }
+    }
+    if (conflicted || cleanFailure) {
+      const ready = this.db.prepare(`UPDATE delivery_units
+        SET status = 'ready_for_acceptance', completed_at = NULL, updated_at = ?
+        WHERE id = ? AND evidence_version = ? AND phase = 'acceptance_delivery' AND status = ?`)
+        .run(new Date().toISOString(), unit.id, unit.evidence_version,
+          conflicted ? "conflicted" : "failed");
+      if (ready.changes !== 1) throw new Error("DELIVERY_APPLICATION_RETRY_STALE");
+    }
+    const retryAttempt = payload.retryAttempt + 1;
+    const job = jobs.enqueue({
+      ownerType: "delivery_unit",
+      ownerId: unit.id,
+      evidenceVersion: unit.evidence_version,
+      action: "apply",
+      payload: { ...payload, retryAttempt },
+      maxAttempts: 3
+    });
+    return {
+      deliveryUnitId: unit.id,
+      requirementId: unit.requirement_id,
+      evidenceVersion: unit.evidence_version,
+      retryAttempt,
+      jobId: job.id
+    };
+  }
 
   recordQualityInTransaction(
     claim: DeliveryQualityClaim,
@@ -519,6 +817,7 @@ export class DeliveryCoordinator {
       (id, requirement_id, action, actor, reason, created_at) VALUES (?, ?, 'resume', ?, ?, ?)`)
       .run(randomUUID(), input.requirementId, actor, reason, now);
     this.recomputeRequirementInTransaction(input.requirementId, now);
+    this.resumeApplicationSequenceInTransaction(input.requirementId);
     return this.getAutomationState(input.requirementId)!;
   }
 
@@ -1014,6 +1313,48 @@ export class DeliveryCoordinator {
     this.releaseOutgoingInTransaction(unit.id, unit.evidence_version, now);
   }
 
+  private resumeApplicationSequenceInTransaction(requirementId: string) {
+    const latest = this.db.prepare(`SELECT job.id FROM automation_jobs job
+      JOIN delivery_units unit ON job.owner_type = 'delivery_unit' AND unit.id = job.owner_id
+      WHERE unit.requirement_id = ? AND job.action = 'apply'
+      ORDER BY job.rowid DESC LIMIT 1`).get(requirementId) as { id: string } | undefined;
+    if (!latest) return;
+    const jobs = new AutomationJobRepository(this.db);
+    const previous = jobs.get(latest.id);
+    if (!previous) throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    const payload = parseDeliveryApplicationJob(previous);
+    if (payload.requirementId !== requirementId) throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    let cursor = 0;
+    while (cursor < payload.units.length) {
+      const entry = payload.units[cursor]!;
+      const unit = this.db.prepare(`SELECT requirement_id, evidence_version, status
+        FROM delivery_units WHERE id = ?`).get(entry.unitId) as {
+          requirement_id: string; evidence_version: number; status: string;
+        } | undefined;
+      if (!unit || unit.requirement_id !== requirementId || unit.evidence_version !== entry.evidenceVersion) {
+        throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+      }
+      if (unit.status === "applied") {
+        cursor += 1;
+        continue;
+      }
+      if (unit.status !== "ready_for_acceptance") return;
+      const existing = this.db.prepare(`SELECT 1 FROM automation_jobs
+        WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ? AND action = 'apply'
+          AND status IN ('pending', 'leased')`).get(entry.unitId, entry.evidenceVersion);
+      const retryAttempt = payload.cursor === cursor ? payload.retryAttempt : 0;
+      if (!existing) jobs.enqueue({
+        ownerType: "delivery_unit",
+        ownerId: entry.unitId,
+        evidenceVersion: entry.evidenceVersion,
+        action: "apply",
+        payload: { ...payload, cursor, retryAttempt },
+        maxAttempts: 3
+      });
+      return;
+    }
+  }
+
   private loadCurrentIdentity(unitId: string, evidenceVersion: number): UnitIdentityRow {
     const row = this.db.prepare(`SELECT du.id, du.requirement_id, du.evidence_version, du.phase, du.status,
         ce.id AS coding_evidence_id, ce.diff_hash
@@ -1058,6 +1399,103 @@ export class DeliveryCoordinator {
       .get(unitId, evidenceVersion, kind) as OverrideRow | undefined;
     return row ? mapOverride(row) : null;
   }
+}
+
+export function parseDeliveryApplicationJob(
+  job: Pick<AutomationJob, "ownerType" | "ownerId" | "evidenceVersion" | "action" | "payload">
+): DeliveryApplicationPlanPayload {
+  const error = "DELIVERY_APPLICATION_JOB_PAYLOAD_INVALID";
+  if (job.ownerType !== "delivery_unit" || job.action !== "apply") throw new Error(error);
+  const payload = plainRecord(job.payload, error);
+  if (own(payload, "type", error) !== "delivery_application_plan"
+    || own(payload, "version", error) !== 1) throw new Error(error);
+  const requirementId = boundedText(own(payload, "requirementId", error), 256, error);
+  const cursor = safeInteger(own(payload, "cursor", error), 0, MAX_DELIVERY_PLAN_UNITS, error);
+  const retryAttempt = safeInteger(own(payload, "retryAttempt", error), 0, 100, error);
+  const rawUnits = own(payload, "units", error);
+  if (!Array.isArray(rawUnits) || rawUnits.length < 1 || rawUnits.length > MAX_DELIVERY_PLAN_UNITS
+    || cursor >= rawUnits.length) throw new Error(error);
+  const seen = new Set<string>();
+  const units = rawUnits.map((value) => {
+    const entry = plainRecord(value, error);
+    const unitId = boundedText(own(entry, "unitId", error), 256, error);
+    const evidenceVersion = safeInteger(
+      own(entry, "evidenceVersion", error), 1, MAX_AUTOMATION_EVIDENCE_VERSION, error
+    );
+    if (seen.has(unitId)) throw new Error(error);
+    seen.add(unitId);
+    return { unitId, evidenceVersion };
+  });
+  const current = units[cursor]!;
+  if (current.unitId !== job.ownerId || current.evidenceVersion !== job.evidenceVersion) {
+    throw new Error(error);
+  }
+  return {
+    type: "delivery_application_plan",
+    version: 1,
+    requirementId,
+    cursor,
+    retryAttempt,
+    units
+  };
+}
+
+function isDeliveryApplicationPlanPayload(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  let descriptor: PropertyDescriptor | undefined;
+  try { descriptor = Object.getOwnPropertyDescriptor(value, "type"); } catch { return false; }
+  return !!descriptor && "value" in descriptor && descriptor.value === "delivery_application_plan";
+}
+
+function plainRecord(value: unknown, error: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(error);
+  let prototype: object | null;
+  try { prototype = Object.getPrototypeOf(value); } catch { throw new Error(error); }
+  if (prototype !== Object.prototype && prototype !== null) throw new Error(error);
+  return value as Record<string, unknown>;
+}
+
+function own(record: Record<string, unknown>, key: string, error: string): unknown {
+  let descriptor: PropertyDescriptor | undefined;
+  try { descriptor = Object.getOwnPropertyDescriptor(record, key); } catch { throw new Error(error); }
+  if (!descriptor || !("value" in descriptor)) throw new Error(error);
+  return descriptor.value;
+}
+
+function boundedText(value: unknown, max: number, error: string): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > max
+    || value.trim() !== value || value.includes("\0")) throw new Error(error);
+  return value;
+}
+
+function safeInteger(value: unknown, min: number, max: number, error: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < min || (value as number) > max) {
+    throw new Error(error);
+  }
+  return value as number;
+}
+
+function validateAcceptanceInput(input: DeliveryAcceptanceInput) {
+  if (!input || typeof input !== "object"
+    || !validInputText(input.requirementId, 256)
+    || !validInputText(input.actor, 256)
+    || !validInputText(input.comment, 4096)) {
+    throw new Error("DELIVERY_ACCEPTANCE_INPUT_INVALID");
+  }
+}
+
+function validateApplicationRetryInput(input: DeliveryApplicationRetryInput) {
+  if (!input || typeof input !== "object"
+    || !validInputText(input.unitId, 256)
+    || !validInputText(input.actor, 256)
+    || !validInputText(input.reason, 4096)) {
+    throw new Error("DELIVERY_APPLICATION_RETRY_INVALID");
+  }
+}
+
+function validInputText(value: unknown, max: number) {
+  return typeof value === "string" && value.trim().length > 0
+    && value.length <= max && !value.includes("\0");
 }
 
 function validateOverrideInput(input: DeliveryQualityOverrideInput) {

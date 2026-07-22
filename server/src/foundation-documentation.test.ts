@@ -9,7 +9,8 @@ describe("delivery automation documentation contract", () => {
 
   it("documents the automation fresh reset and current delivery boundary", () => {
     for (const file of documentationFiles) {
-      expect(readFileSync(join(root, file), "utf8"), file).toContain("phase-2-quality-attempt-v14");
+      expect(readFileSync(join(root, file), "utf8"), file)
+        .toContain("phase-3-application-sequence-v15");
     }
     expect(documentation).toContain("definition");
     expect(documentation).toContain("solution_design");
@@ -30,7 +31,7 @@ describe("delivery automation documentation contract", () => {
     expect(gettingStarted).toContain("PILOT_DATA_DIR");
     expect(gettingStarted).toContain("Review 与自动化测试分别运行");
     expect(gettingStarted).not.toContain("自动显示只读交付矩阵");
-    expect(gettingStarted).toContain("phase-2-quality-attempt-v14");
+    expect(gettingStarted).toContain("phase-3-application-sequence-v15");
     expect(gettingStarted).toContain("phase-2-quality-coordination-v10");
     expect(gettingStarted).toContain("phase-2-automation-v4");
   });

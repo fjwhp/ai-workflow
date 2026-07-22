@@ -376,9 +376,20 @@ function validateBoundedString(value: unknown, maxLength: number, errorCode: str
   }
 }
 
-function canonicalDedupeKey(input: Pick<AutomationJobInput, "ownerType" | "ownerId" | "evidenceVersion" | "action">) {
+function canonicalDedupeKey(
+  input: Pick<AutomationJobInput, "ownerType" | "ownerId" | "evidenceVersion" | "action" | "payload">
+) {
   const owner = input.ownerType === "delivery_unit" ? input.ownerId : `requirement:${input.ownerId}`;
-  return `${input.action}:${owner}:v${input.evidenceVersion}`;
+  const base = `${input.action}:${owner}:v${input.evidenceVersion}`;
+  const retryAttempt = applicationRetryAttempt(input.action, input.payload);
+  return retryAttempt > 0 ? `${base}:retry${retryAttempt}` : base;
+}
+
+function applicationRetryAttempt(action: AutomationAction, payload: unknown): number {
+  if (action !== "apply" || !isRecord(payload)) return 0;
+  const descriptor = Object.getOwnPropertyDescriptor(payload, "retryAttempt");
+  const value = descriptor && "value" in descriptor ? descriptor.value : 0;
+  return Number.isSafeInteger(value) && value > 0 && value <= 100 ? value : 0;
 }
 
 function truncateCodePoints(value: string, maxCodePoints: number) {
@@ -535,7 +546,7 @@ function decodeAutomationJobRow(row: unknown): AutomationJob {
     const updatedAt = decodeStoredTimestamp(row.updated_at);
     if (updatedAt < createdAt) throw new Error("invalid timestamp order");
     if (leaseExpiresAt !== null && leaseExpiresAt <= updatedAt) throw new Error("invalid lease expiry");
-    if (dedupeKey !== canonicalDedupeKey({ ownerType, ownerId, evidenceVersion, action })) {
+    if (dedupeKey !== canonicalDedupeKey({ ownerType, ownerId, evidenceVersion, action, payload })) {
       throw new Error("invalid dedupe key");
     }
 

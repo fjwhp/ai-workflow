@@ -66,4 +66,4 @@
 
 ## 数据状态边界
 
-`phase-2-quality-attempt-v14` 是唯一 live schema marker。旧数据库先备份主文件及已有 WAL/SHM，再 fresh reset；旧历史只在 backup。系统不做 row migration、dual read/write、fallback 或跨 schema 状态兼容。
+`phase-3-application-sequence-v15` 是唯一 live schema marker。旧数据库先备份主文件及已有 WAL/SHM，再 fresh reset；旧历史只在 backup。系统不做 row migration、dual read/write、fallback 或跨 schema 状态兼容。

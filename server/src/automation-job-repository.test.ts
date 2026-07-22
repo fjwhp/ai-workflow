@@ -335,6 +335,47 @@ describe("AutomationJobRepository", () => {
     }
   });
 
+  it("binds application retry dedupe to unit, evidence, and retry attempt across replays", async () => {
+    const fixture = createFixture();
+    const ownerId = insertCollidingDeliveryOwner(fixture);
+    const baseInput = job(ownerId, {
+      ownerType: "delivery_unit",
+      action: "apply",
+      payload: { retryAttempt: 0 },
+      maxAttempts: 3
+    });
+    const retryInput = job(ownerId, {
+      ownerType: "delivery_unit",
+      action: "apply",
+      payload: { retryAttempt: 1 },
+      maxAttempts: 3
+    });
+
+    const base = fixture.first.enqueue(baseInput);
+    const retry = fixture.first.enqueue(retryInput);
+    const replay = fixture.second.enqueue(retryInput);
+
+    expect(base.dedupeKey).toBe(`apply:${ownerId}:v1`);
+    expect(retry.dedupeKey).toBe(`apply:${ownerId}:v1:retry1`);
+    expect(replay.id).toBe(retry.id);
+    expect(retry.id).not.toBe(base.id);
+
+    const databasePath = fixture.firstDatabase.prepare("PRAGMA database_list").get() as { file: string };
+    const concurrentInput = { ...retryInput, payload: { retryAttempt: 2 } };
+    const first = concurrentEnqueueWorker(concurrentInput, databasePath.file);
+    const second = concurrentEnqueueWorker(concurrentInput, databasePath.file);
+    try {
+      await Promise.all([first.ready, second.ready]);
+      first.worker.postMessage({ type: "go" });
+      second.worker.postMessage({ type: "go" });
+      const [firstJob, secondJob] = await Promise.all([first.result, second.result]);
+      expect(firstJob.id).toBe(secondJob.id);
+      expect(firstJob.dedupeKey).toBe(`apply:${ownerId}:v1:retry2`);
+    } finally {
+      await Promise.all([first.worker.terminate(), second.worker.terminate()]);
+    }
+  }, 15_000);
+
   it("leases one pending job exactly once across simultaneous repository workers", { timeout: 15_000 }, async () => {
     const fixture = createFixture();
     const queued = fixture.first.enqueue(job(fixture.requirement.id));

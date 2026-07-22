@@ -29,6 +29,7 @@ import {
   DeliveryApplicationRepository,
   type DeliveryApplicationPersistence
 } from "./delivery-application-repository.js";
+import type { DeliveryApplicationContext } from "./delivery-application-service.js";
 import {
   DeliveryCoordinator,
   type DeliveryCoordinationPersistence
@@ -150,6 +151,7 @@ export class WorkflowStore {
       complete: (claim, completion) => this.withImmediateTransaction(
         () => {
           const run = this.deliveryApplicationRepository.completeInTransaction(claim, completion);
+          deliveryCoordinator.settleApplicationInTransaction(run);
           this.deliveryApplicationRepository.reconcileAutomationJobsInTransaction(this.clock());
           return run;
         }
@@ -345,6 +347,12 @@ export class WorkflowStore {
       latest: (unitId, kind) => this.deliveryQualityRepository.latest(unitId, kind)
     };
     this.deliveryCoordination = {
+      acceptRequirement: (input) => this.withImmediateTransaction(
+        () => deliveryCoordinator.acceptRequirementInTransaction(input)
+      ),
+      retryApplication: (input) => this.withImmediateTransaction(
+        () => deliveryCoordinator.retryApplicationInTransaction(input)
+      ),
       overrideQuality: (input) => this.withImmediateTransaction(
         () => deliveryCoordinator.overrideQualityInTransaction(input)
       ),
@@ -400,6 +408,52 @@ export class WorkflowStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  loadDeliveryApplicationContext(unitId: string): DeliveryApplicationContext | null {
+    const unit = this.deliveryUnitRepository.get(unitId);
+    if (!unit) return null;
+    const project = this.getProject(unit.projectId);
+    const version = this.getProjectVersion(unit.projectVersionId);
+    if (!project || !version || version.status !== "active") return null;
+    const snapshot = this.db.prepare(`SELECT repo_path, branch, worktree_path, head_commit,
+        allowed_commands_json, sensitive_patterns_json
+      FROM delivery_unit_snapshots WHERE delivery_unit_id = ?`).get(unit.id) as {
+        repo_path: string;
+        branch: string;
+        worktree_path: string;
+        head_commit: string;
+        allowed_commands_json: string;
+        sensitive_patterns_json: string;
+      } | undefined;
+    const codingEvidence = this.deliveryExecutionRepository.getCodingEvidence(
+      unit.id, unit.evidenceVersion
+    ) as DeliveryApplicationContext["codingEvidence"] | null;
+    const codeReview = this.deliveryQualityRepository.latest(unit.id, "code_review");
+    const automatedTesting = this.deliveryQualityRepository.latest(unit.id, "automated_testing");
+    if (!snapshot || !codingEvidence || !codeReview || !automatedTesting) return null;
+    return {
+      unit,
+      project: { id: project.id, repoPath: project.repoPath },
+      version: {
+        id: version.id,
+        projectId: version.projectId,
+        branch: version.branch,
+        worktreePath: version.worktreePath,
+        status: "active",
+        headCommit: version.headCommit
+      },
+      snapshot: {
+        repoPath: snapshot.repo_path,
+        targetBranch: snapshot.branch,
+        targetWorktreePath: snapshot.worktree_path,
+        targetHead: snapshot.head_commit,
+        allowedCommands: JSON.parse(snapshot.allowed_commands_json),
+        sensitivePatterns: JSON.parse(snapshot.sensitive_patterns_json)
+      },
+      codingEvidence,
+      qualityEvidence: { codeReview, automatedTesting }
+    };
   }
 
   private prepareImplementationPublicationInTransaction(

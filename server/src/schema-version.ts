@@ -1,1 +1,1 @@
-export const currentSchemaVersion = "phase-2-quality-attempt-v14";
+export const currentSchemaVersion = "phase-3-application-sequence-v15";

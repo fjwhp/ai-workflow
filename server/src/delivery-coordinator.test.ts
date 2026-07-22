@@ -118,6 +118,58 @@ function units(store: WorkflowStore, requirementId: string) {
   return store.deliveryUnits.listForRequirement(requirementId);
 }
 
+function acceptanceFixture() {
+  const fixture = createFixture([[0, 1]], [true, true]);
+  const [backend, frontend] = fixture.units;
+  settle(fixture.store, backend!.id, "code_review", "passed");
+  settle(fixture.store, backend!.id, "automated_testing", "passed");
+  completeImplementation(fixture.store, frontend!.id);
+  settle(fixture.store, frontend!.id, "code_review", "passed");
+  settle(fixture.store, frontend!.id, "automated_testing", "passed");
+  return { ...fixture, backend: backend!, frontend: frontend! };
+}
+
+function acceptDelivery(fixture: ReturnType<typeof acceptanceFixture>) {
+  return fixture.store.deliveryCoordination.acceptRequirement({
+    requirementId: fixture.requirement.id,
+    actor: "local-human",
+    comment: "Business checks passed"
+  });
+}
+
+function settleApplication(
+  fixture: ReturnType<typeof acceptanceFixture>,
+  unitId: string,
+  status: "applied" | "conflicted" | "failed"
+) {
+  const lease = fixture.store.automationJobs.leaseNext("application-worker", new Date(), 60_000);
+  if (!lease || lease.ownerId !== unitId || lease.action !== "apply") {
+    throw new Error("expected application lease");
+  }
+  let claim = fixture.store.deliveryApplications.claim(unitId, {
+    expectedEvidenceVersion: lease.evidenceVersion,
+    claimToken: lease.claimToken,
+    baseCommit: "b".repeat(40),
+    preApplyCommit: "c".repeat(40),
+    evidenceHash: "d".repeat(64),
+    preflight: { allowed: true, checks: [] }
+  });
+  claim = fixture.store.deliveryApplications.bindSourceCommit(claim, "e".repeat(40));
+  return fixture.store.deliveryApplications.complete(claim, status === "applied"
+    ? { status: "applied", commandResults: [] }
+    : status === "conflicted" ? {
+      status: "conflicted",
+      conflictFiles: ["src/conflict.ts"],
+      commandResults: [],
+      error: "APPLICATION_CONFLICT"
+    } : {
+      status: "failed",
+      worktreeState: "clean",
+      commandResults: [],
+      error: "APPLICATION_PREFLIGHT_FAILED"
+    });
+}
+
 function raceWorker() {
   const worker = new Worker(new URL("./delivery-coordinator-race-worker.ts", import.meta.url), {
     execArgv: ["--import", "tsx"]
@@ -216,6 +268,264 @@ function advanceImplementation(store: WorkflowStore, unitId: string, evidenceVer
 }
 
 describe("DeliveryCoordinator", () => {
+  it("enqueues only the first application after human acceptance", () => {
+    const fixture = acceptanceFixture();
+    const coordination = fixture.store.deliveryCoordination as any;
+
+    expect(typeof coordination.acceptRequirement).toBe("function");
+    coordination.acceptRequirement({
+      requirementId: fixture.requirement.id,
+      actor: "local-human",
+      comment: "Business checks passed"
+    });
+
+    expect(fixture.store.automationJobs.listPending().filter((job) => job.action === "apply").map((job) => ({
+      action: job.action,
+      ownerId: job.ownerId,
+      evidenceVersion: job.evidenceVersion
+    }))).toEqual([{
+      action: "apply",
+      ownerId: fixture.backend.id,
+      evidenceVersion: fixture.backend.evidenceVersion
+    }]);
+  });
+
+  it("requires a non-empty human acceptance comment and serializes duplicate acceptance", async () => {
+    const fixture = acceptanceFixture();
+    expect(() => fixture.store.deliveryCoordination.acceptRequirement({
+      requirementId: fixture.requirement.id,
+      actor: "local-human",
+      comment: "   "
+    })).toThrow("DELIVERY_ACCEPTANCE_INPUT_INVALID");
+    const second = new WorkflowStore(fixture.databasePath);
+    stores.push(second);
+    const input = {
+      requirementId: fixture.requirement.id,
+      actor: "local-human",
+      comment: "Business acceptance is complete"
+    };
+
+    const results = await Promise.allSettled([
+      Promise.resolve().then(() => fixture.store.deliveryCoordination.acceptRequirement(input)),
+      Promise.resolve().then(() => second.deliveryCoordination.acceptRequirement(input))
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toContainEqual(
+      expect.objectContaining({ reason: expect.objectContaining({ message: "DELIVERY_ACCEPTANCE_ALREADY_RECORDED" }) })
+    );
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM approvals
+      WHERE requirement_id = ? AND stage = 'acceptance_delivery'`).get(fixture.requirement.id))
+      .toEqual({ count: 1 });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE action = 'apply' AND owner_id = ?`).get(fixture.backend.id)).toEqual({ count: 1 });
+  });
+
+  it("releases the next frozen application only after the prior unit settles applied", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+
+    settleApplication(fixture, fixture.backend.id, "applied");
+
+    const applications = fixture.store.automationJobs.listPending()
+      .filter((job) => job.action === "apply");
+    expect(applications).toHaveLength(1);
+    expect(applications[0]).toMatchObject({
+      ownerId: fixture.frontend.id,
+      evidenceVersion: fixture.frontend.evidenceVersion,
+      payload: {
+        type: "delivery_application_plan",
+        requirementId: fixture.requirement.id,
+        cursor: 1,
+        retryAttempt: 0,
+        units: [
+          { unitId: fixture.backend.id, evidenceVersion: fixture.backend.evidenceVersion },
+          { unitId: fixture.frontend.id, evidenceVersion: fixture.frontend.evidenceVersion }
+        ]
+      }
+    });
+  });
+
+  it("stops the frozen sequence when an application conflicts", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+
+    settleApplication(fixture, fixture.backend.id, "conflicted");
+
+    expect(fixture.store.deliveryUnits.get(fixture.backend.id)).toMatchObject({ status: "conflicted" });
+    expect(fixture.store.deliveryUnits.get(fixture.frontend.id)).toMatchObject({ status: "ready_for_acceptance" });
+    expect(fixture.store.automationJobs.listPending().filter((job) => job.action === "apply"))
+      .toEqual([]);
+    expect(fixture.store.deliveryApplications.aggregate(fixture.requirement.id)).toBe("blocked");
+  });
+
+  it("rolls application settlement back when the next persistent job cannot be enqueued", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    fixture.database.exec(`CREATE TRIGGER fail_next_application BEFORE INSERT ON automation_jobs
+      WHEN NEW.action = 'apply' AND NEW.owner_id = '${fixture.frontend.id}'
+      BEGIN SELECT RAISE(ABORT, 'forced application enqueue failure'); END;`);
+
+    expect(() => settleApplication(fixture, fixture.backend.id, "applied"))
+      .toThrow("forced application enqueue failure");
+
+    expect(fixture.store.deliveryUnits.get(fixture.backend.id)).toMatchObject({ status: "applying" });
+    expect(fixture.store.deliveryApplications.listForUnit(fixture.backend.id)).toContainEqual(
+      expect.objectContaining({ status: "applying", resolutionStatus: "pending" })
+    );
+  });
+
+  it("defers the next application while paused and resumes the same frozen sequence", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    const lease = fixture.store.automationJobs.leaseNext("application-worker", new Date(), 60_000)!;
+    fixture.store.deliveryCoordination.pauseAutomation({
+      requirementId: fixture.requirement.id,
+      actor: "local-human",
+      reason: "inspect application boundary"
+    });
+    let claim = fixture.store.deliveryApplications.claim(fixture.backend.id, {
+      expectedEvidenceVersion: 1,
+      claimToken: lease.claimToken,
+      baseCommit: "b".repeat(40),
+      preApplyCommit: "c".repeat(40),
+      evidenceHash: "d".repeat(64),
+      preflight: { allowed: true, checks: [] }
+    });
+    claim = fixture.store.deliveryApplications.bindSourceCommit(claim, "e".repeat(40));
+    fixture.store.deliveryApplications.complete(claim, { status: "applied", commandResults: [] });
+
+    expect(fixture.store.automationJobs.listPending().filter((job) => job.action === "apply"))
+      .toEqual([]);
+    fixture.store.deliveryCoordination.resumeAutomation({
+      requirementId: fixture.requirement.id,
+      actor: "local-human",
+      reason: "continue frozen sequence"
+    });
+    expect(fixture.store.automationJobs.listPending().filter((job) => job.action === "apply"))
+      .toContainEqual(expect.objectContaining({ ownerId: fixture.frontend.id }));
+  });
+
+  it("retries only the conflicted unit with unchanged evidence and an attempt-specific dedupe key", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    settleApplication(fixture, fixture.backend.id, "conflicted");
+    const coordination = fixture.store.deliveryCoordination as any;
+
+    expect(typeof coordination.retryApplication).toBe("function");
+    const retry = coordination.retryApplication({
+      unitId: fixture.backend.id,
+      actor: "local-human",
+      reason: "conflict repaired"
+    });
+
+    expect(retry).toMatchObject({
+      deliveryUnitId: fixture.backend.id,
+      evidenceVersion: fixture.backend.evidenceVersion,
+      retryAttempt: 1
+    });
+    const jobs = fixture.database.prepare(`SELECT dedupe_key, payload_json FROM automation_jobs
+      WHERE owner_id = ? AND action = 'apply' ORDER BY rowid`).all(fixture.backend.id) as Array<{
+        dedupe_key: string;
+        payload_json: string;
+      }>;
+    expect(jobs).toHaveLength(2);
+    expect(jobs[1]!.dedupe_key).not.toBe(jobs[0]!.dedupe_key);
+    expect(JSON.parse(jobs[1]!.payload_json)).toMatchObject({
+      cursor: 0,
+      retryAttempt: 1,
+      units: [
+        { unitId: fixture.backend.id, evidenceVersion: fixture.backend.evidenceVersion },
+        { unitId: fixture.frontend.id, evidenceVersion: fixture.frontend.evidenceVersion }
+      ]
+    });
+    expect(fixture.store.deliveryUnits.get(fixture.frontend.id)).toMatchObject({ status: "ready_for_acceptance" });
+  });
+
+  it("resumes a canceled retry without reviving the completed base application", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    settleApplication(fixture, fixture.backend.id, "conflicted");
+    const retry = fixture.store.deliveryCoordination.retryApplication({
+      unitId: fixture.backend.id,
+      actor: "local-human",
+      reason: "conflict repaired"
+    });
+    const retryDedupe = `apply:${fixture.backend.id}:v${fixture.backend.evidenceVersion}:retry1`;
+
+    fixture.store.deliveryCoordination.pauseAutomation({
+      requirementId: fixture.requirement.id,
+      actor: "local-human",
+      reason: "inspect repaired conflict"
+    });
+    expect(fixture.store.automationJobs.byDedupe(retryDedupe)).toMatchObject({
+      id: retry.jobId,
+      status: "canceled"
+    });
+
+    fixture.store.deliveryCoordination.resumeAutomation({
+      requirementId: fixture.requirement.id,
+      actor: "local-human",
+      reason: "continue repaired conflict"
+    });
+
+    expect(fixture.store.automationJobs.byDedupe(retryDedupe)).toMatchObject({
+      id: retry.jobId,
+      status: "pending",
+      payload: expect.objectContaining({ cursor: 0, retryAttempt: 1 })
+    });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND action = 'apply'`).get(fixture.backend.id)).toEqual({ count: 2 });
+    expect(fixture.store.automationJobs.byDedupe(
+      `apply:${fixture.backend.id}:v${fixture.backend.evidenceVersion}`
+    )).toMatchObject({ status: "completed" });
+  });
+
+  it("retries a clean failed application but rejects retry while the initial job is still active", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    expect(() => fixture.store.deliveryCoordination.retryApplication({
+      unitId: fixture.backend.id,
+      actor: "local-human",
+      reason: "premature retry"
+    })).toThrow("DELIVERY_APPLICATION_RETRY_NOT_ELIGIBLE");
+
+    settleApplication(fixture, fixture.backend.id, "failed");
+    const retry = fixture.store.deliveryCoordination.retryApplication({
+      unitId: fixture.backend.id,
+      actor: "local-human",
+      reason: "preflight condition repaired"
+    });
+
+    expect(retry).toMatchObject({ deliveryUnitId: fixture.backend.id, retryAttempt: 1 });
+    expect(fixture.store.deliveryUnits.get(fixture.backend.id)).toMatchObject({
+      status: "ready_for_acceptance"
+    });
+  });
+
+  it("serializes concurrent retry replays to one attempt-specific job", async () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    settleApplication(fixture, fixture.backend.id, "conflicted");
+    const second = new WorkflowStore(fixture.databasePath);
+    stores.push(second);
+    const input = {
+      unitId: fixture.backend.id,
+      actor: "local-human",
+      reason: "conflict repaired"
+    };
+
+    const [first, replay] = await Promise.all([
+      Promise.resolve().then(() => fixture.store.deliveryCoordination.retryApplication(input)),
+      Promise.resolve().then(() => second.deliveryCoordination.retryApplication(input))
+    ]);
+
+    expect(replay.jobId).toBe(first.jobId);
+    expect(replay.retryAttempt).toBe(1);
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND action = 'apply'`).get(fixture.backend.id)).toEqual({ count: 2 });
+  });
+
   it("preserves every fan-in upstream change as an independently auditable active invalidation", () => {
     const fixture = createFixture([[0, 2], [1, 2]], [true, true, true]);
     const [first, second, target] = fixture.units;
