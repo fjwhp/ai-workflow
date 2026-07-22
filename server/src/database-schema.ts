@@ -185,10 +185,16 @@ export function createPhase2Schema(db: DatabaseSync) {
       delivery_unit_id TEXT NOT NULL,
       project_version_id TEXT NOT NULL,
       evidence_version INTEGER NOT NULL CHECK(evidence_version BETWEEN 1 AND 2147483647),
+      automation_job_id TEXT NOT NULL,
+      automation_attempt INTEGER NOT NULL CHECK(automation_attempt BETWEEN 1 AND 100),
+      lease_owner TEXT NOT NULL
+        CHECK(length(lease_owner) BETWEEN 1 AND 128 AND lease_owner NOT GLOB '*[^A-Za-z0-9_-]*'),
       claim_token TEXT NOT NULL UNIQUE
         CHECK(length(claim_token) BETWEEN 1 AND 256 AND instr(claim_token, char(0)) = 0),
-      source_commit TEXT NOT NULL
-        CHECK(length(source_commit) BETWEEN 1 AND 256 AND instr(source_commit, char(0)) = 0),
+      source_commit TEXT CHECK(source_commit IS NULL OR (
+        length(source_commit) IN (40, 64) AND source_commit = lower(source_commit)
+          AND source_commit NOT GLOB '*[^0-9a-f]*'
+      )),
       base_commit TEXT NOT NULL
         CHECK(length(base_commit) BETWEEN 1 AND 256 AND instr(base_commit, char(0)) = 0),
       pre_apply_commit TEXT NOT NULL
@@ -205,18 +211,30 @@ export function createPhase2Schema(db: DatabaseSync) {
           AND length(CAST(conflict_files_json AS BLOB)) <= 1048576),
       error TEXT CHECK(error IS NULL OR (length(error) BETWEEN 1 AND 65536 AND instr(error, char(0)) = 0)),
       status TEXT NOT NULL CHECK(status IN ('applying', 'applied', 'conflicted', 'failed')),
-      resolution_status TEXT NOT NULL CHECK(resolution_status IN ('pending', 'not_required')),
+      resolution_status TEXT NOT NULL
+        CHECK(resolution_status IN ('pending', 'not_required', 'committed', 'reverted')),
       created_at TEXT NOT NULL CHECK(length(created_at) > 0 AND instr(created_at, char(0)) = 0),
       updated_at TEXT NOT NULL CHECK(length(updated_at) > 0 AND instr(updated_at, char(0)) = 0),
       completed_at TEXT,
+      resolved_at TEXT,
       CHECK(
-        (status = 'applying' AND resolution_status = 'pending' AND completed_at IS NULL)
-        OR (status = 'applied' AND resolution_status = 'not_required' AND completed_at IS NOT NULL)
-        OR (status IN ('conflicted', 'failed') AND resolution_status = 'pending' AND completed_at IS NOT NULL)
+        (status = 'applying' AND resolution_status = 'pending'
+          AND completed_at IS NULL AND resolved_at IS NULL)
+        OR (status = 'applied' AND resolution_status = 'pending'
+          AND source_commit IS NOT NULL AND completed_at IS NOT NULL AND resolved_at IS NULL)
+        OR (status = 'applied' AND resolution_status IN ('committed', 'reverted')
+          AND source_commit IS NOT NULL AND completed_at IS NOT NULL AND resolved_at IS NOT NULL)
+        OR (status = 'conflicted' AND resolution_status = 'not_required'
+          AND source_commit IS NOT NULL AND completed_at IS NOT NULL AND resolved_at IS NULL)
+        OR (status = 'failed' AND resolution_status IN ('pending', 'not_required')
+          AND completed_at IS NOT NULL AND resolved_at IS NULL)
+        OR (status = 'failed' AND resolution_status IN ('committed', 'reverted')
+          AND completed_at IS NOT NULL AND resolved_at IS NOT NULL)
       ),
       FOREIGN KEY(requirement_id) REFERENCES requirements(id),
       FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
-      FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
+      FOREIGN KEY(project_version_id) REFERENCES project_versions(id),
+      FOREIGN KEY(automation_job_id) REFERENCES automation_jobs(id)
     );
     CREATE TABLE IF NOT EXISTS requirement_revisions (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, version INTEGER NOT NULL,
@@ -648,9 +666,9 @@ export function createPhase2Schema(db: DatabaseSync) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_dependency_edge
       ON delivery_dependencies(requirement_id, upstream_unit_id, downstream_unit_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_application_unit_active
-      ON delivery_application_runs(delivery_unit_id) WHERE status = 'applying';
+      ON delivery_application_runs(delivery_unit_id) WHERE resolution_status = 'pending';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_application_version_active
-      ON delivery_application_runs(project_version_id) WHERE status = 'applying';
+      ON delivery_application_runs(project_version_id) WHERE resolution_status = 'pending';
     CREATE INDEX IF NOT EXISTS idx_delivery_application_unit_history
       ON delivery_application_runs(delivery_unit_id, created_at, id);
     CREATE TRIGGER IF NOT EXISTS validate_delivery_application_owner_insert
@@ -663,20 +681,74 @@ export function createPhase2Schema(db: DatabaseSync) {
           AND unit.requirement_id = NEW.requirement_id
           AND unit.project_version_id = NEW.project_version_id
           AND unit.evidence_version = NEW.evidence_version
+          AND unit.phase = 'acceptance_delivery'
+          AND unit.status = 'ready_for_acceptance'
+          AND EXISTS (
+            SELECT 1 FROM automation_jobs job
+            WHERE job.id = NEW.automation_job_id
+              AND job.claim_token = NEW.claim_token
+              AND job.owner_type = 'delivery_unit'
+              AND job.owner_id = unit.id
+              AND job.evidence_version = unit.evidence_version
+              AND job.action = 'apply'
+              AND job.status = 'leased'
+              AND job.attempt = NEW.automation_attempt
+              AND job.lease_owner = NEW.lease_owner
+              AND job.lease_expires_at > NEW.created_at
+          )
       );
     END;
     CREATE TRIGGER IF NOT EXISTS delivery_application_identity_immutable
     BEFORE UPDATE OF id, requirement_id, delivery_unit_id, project_version_id, evidence_version,
-      claim_token, source_commit, base_commit, pre_apply_commit, evidence_hash, preflight_json, created_at
+      automation_job_id, base_commit, pre_apply_commit, evidence_hash, preflight_json, created_at
     ON delivery_application_runs
     BEGIN SELECT RAISE(ABORT, 'DELIVERY_APPLICATION_IDENTITY_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_application_lease_transition
+    BEFORE UPDATE OF claim_token, automation_attempt, lease_owner ON delivery_application_runs
+    WHEN NOT (
+      OLD.status = 'applying' AND NEW.status = 'applying'
+      AND NEW.automation_job_id = OLD.automation_job_id
+      AND NEW.automation_attempt > OLD.automation_attempt
+      AND EXISTS (
+        SELECT 1 FROM automation_jobs job
+        WHERE job.id = NEW.automation_job_id
+          AND job.claim_token = NEW.claim_token
+          AND job.owner_type = 'delivery_unit'
+          AND job.owner_id = NEW.delivery_unit_id
+          AND job.evidence_version = NEW.evidence_version
+          AND job.action = 'apply' AND job.status = 'leased'
+          AND job.attempt = NEW.automation_attempt
+          AND job.lease_owner = NEW.lease_owner
+          AND job.lease_expires_at > NEW.updated_at
+      )
+    )
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_APPLICATION_LEASE_TRANSITION_INVALID'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_application_source_transition
+    BEFORE UPDATE OF source_commit ON delivery_application_runs
+    WHEN NOT (
+      OLD.status = 'applying' AND OLD.source_commit IS NULL AND NEW.source_commit IS NOT NULL
+    )
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_APPLICATION_SOURCE_COMMIT_IMMUTABLE'); END;
     CREATE TRIGGER IF NOT EXISTS delivery_application_status_transition
     BEFORE UPDATE OF status ON delivery_application_runs
     WHEN OLD.status <> 'applying' OR NEW.status NOT IN ('applied', 'conflicted', 'failed')
     BEGIN SELECT RAISE(ABORT, 'DELIVERY_APPLICATION_STATUS_IMMUTABLE'); END;
     CREATE TRIGGER IF NOT EXISTS delivery_application_settled_immutable
     BEFORE UPDATE ON delivery_application_runs
-    WHEN OLD.status <> 'applying'
+    WHEN OLD.status <> 'applying' AND NOT (
+      OLD.status IN ('applied', 'failed') AND OLD.resolution_status = 'pending'
+      AND NEW.status = OLD.status
+      AND NEW.resolution_status IN ('committed', 'reverted')
+      AND NEW.resolved_at IS NOT NULL
+      AND NEW.command_results_json IS OLD.command_results_json
+      AND NEW.conflict_files_json IS OLD.conflict_files_json
+      AND NEW.error IS OLD.error
+      AND NEW.completed_at IS OLD.completed_at
+      AND NEW.source_commit IS OLD.source_commit
+      AND NEW.claim_token IS OLD.claim_token
+      AND NEW.automation_attempt IS OLD.automation_attempt
+      AND NEW.lease_owner IS OLD.lease_owner
+    )
     BEGIN SELECT RAISE(ABORT, 'DELIVERY_APPLICATION_SETTLED_IMMUTABLE'); END;
     CREATE TRIGGER IF NOT EXISTS delivery_application_immutable_delete
     BEFORE DELETE ON delivery_application_runs

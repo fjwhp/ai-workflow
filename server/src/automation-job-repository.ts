@@ -58,6 +58,7 @@ const MAX_LEASE_MS = 86_400_000;
 const MAX_ERROR_LENGTH = 4096;
 const OWNER_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 const WORKER_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+const AUTOMATION_LEASE_CLAIM_TOKEN = /^lease:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}):([A-Za-z0-9_-]{1,128}):[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DELIVERY_JOB_LEASE_ELIGIBLE_SQL = `(
   automation_jobs.owner_type = 'requirement'
   OR EXISTS (
@@ -84,6 +85,14 @@ const DELIVERY_JOB_LEASE_ELIGIBLE_SQL = `(
       )
   )
 )`;
+
+export function parseAutomationLeaseClaimToken(
+  value: unknown
+): { jobId: string; workerId: string } | null {
+  if (typeof value !== "string") return null;
+  const match = AUTOMATION_LEASE_CLAIM_TOKEN.exec(value);
+  return match ? { jobId: match[1]!, workerId: match[2]! } : null;
+}
 
 export class AutomationJobRepository {
   constructor(

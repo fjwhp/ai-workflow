@@ -141,8 +141,14 @@ export class WorkflowStore {
       claim: (unitId, input) => this.withImmediateTransaction(
         () => this.deliveryApplicationRepository.claimInTransaction(unitId, input)
       ),
-      complete: (runId, completion) => this.withImmediateTransaction(
-        () => this.deliveryApplicationRepository.completeInTransaction(runId, completion)
+      bindSourceCommit: (claim, sourceCommit) => this.withImmediateTransaction(
+        () => this.deliveryApplicationRepository.bindSourceCommitInTransaction(claim, sourceCommit)
+      ),
+      complete: (claim, completion) => this.withImmediateTransaction(
+        () => this.deliveryApplicationRepository.completeInTransaction(claim, completion)
+      ),
+      resolve: (run, resolution) => this.withImmediateTransaction(
+        () => this.deliveryApplicationRepository.resolveInTransaction(run, resolution)
       ),
       get: (runId) => this.deliveryApplicationRepository.get(runId),
       listForUnit: (unitId) => this.deliveryApplicationRepository.listForUnit(unitId),
