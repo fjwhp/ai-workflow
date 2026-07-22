@@ -524,6 +524,28 @@ describe("simulateDeliveryMerge", () => {
     await expectTargetState(fixture);
   });
 
+  it("preserves conflict ordering across an oversized path", async () => {
+    const fixture = await createMergeFixture("text");
+    const evidencePath = join(fixture.root, "oversized-ordering-conflicts");
+    const record = (path: string) => `100644 ${"1".repeat(40)} 1\t${path}\0`;
+    await writeFile(evidencePath, [
+      record("a-normal.txt"),
+      record(`m-${"x".repeat(262_143)}`),
+      record("a-normal.txt")
+    ].join(""));
+    const wrapper = await installConflictScanOutputWrapper(fixture, "oversized-ordering-conflicts", {
+      stdoutPath: evidencePath
+    });
+    try {
+      await expect(simulateDeliveryMerge(fixture.simulationInput))
+        .rejects.toThrow("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID");
+      expect(await wrapper.writeTreeStarted()).toBe(false);
+    } finally {
+      wrapper.restore();
+    }
+    await expectTargetState(fixture);
+  });
+
   it("returns conflict without write-tree when bounded evidence omits an oversized path", async () => {
     const fixture = await createMergeFixture("text");
     const wrapperDirectory = join(fixture.root, "oversized-conflict-git");
