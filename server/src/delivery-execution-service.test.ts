@@ -1110,8 +1110,10 @@ describe("DeliveryExecutionService", () => {
       "UPDATE automation_jobs SET status = 'canceled' WHERE dedupe_key = ?"
     ).run(`test:${fixture.unit.id}:v1`);
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      fixture.store.automationJobs.leaseNext(`worker-${attempt}`, new Date(), 30_000);
-      expect(fixture.store.automationJobs.fail(reviewJob.id, `worker-${attempt}`, "provider unavailable", true)).toBe(true);
+      const lease = fixture.store.automationJobs.leaseNext(`worker-${attempt}`, new Date(), 30_000)!;
+      expect(fixture.store.automationJobs.fail(
+        reviewJob.id, `worker-${attempt}`, lease.claimToken, "provider unavailable", true
+      )).toBe(true);
     }
     const finalLease = fixture.store.automationJobs.leaseNext("worker-3", new Date(), 30_000)!;
     fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", finalLease.claimToken);
@@ -1121,7 +1123,7 @@ describe("DeliveryExecutionService", () => {
       BEGIN SELECT RAISE(ABORT, 'QUALITY_ABORT_WRITE_FAILED'); END;`);
 
     expect(() => fixture.store.automationJobs.fail(
-      reviewJob.id, "worker-3", "provider unavailable", true
+      reviewJob.id, "worker-3", finalLease.claimToken, "provider unavailable", true
     )).toThrow("QUALITY_ABORT_WRITE_FAILED");
 
     expect(fixture.store.automationJobs.get(reviewJob.id)).toMatchObject({ status: "leased", attempt: 3 });
@@ -1141,8 +1143,10 @@ describe("DeliveryExecutionService", () => {
       "UPDATE automation_jobs SET status = 'canceled' WHERE dedupe_key = ?"
     ).run(`test:${fixture.unit.id}:v1`);
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      fixture.store.automationJobs.leaseNext(`worker-${attempt}`, new Date(), 30_000);
-      fixture.store.automationJobs.fail(reviewJob.id, `worker-${attempt}`, "provider unavailable", true);
+      const lease = fixture.store.automationJobs.leaseNext(`worker-${attempt}`, new Date(), 30_000)!;
+      fixture.store.automationJobs.fail(
+        reviewJob.id, `worker-${attempt}`, lease.claimToken, "provider unavailable", true
+      );
     }
     const finalLease = fixture.store.automationJobs.leaseNext("worker-3", new Date(), 30_000)!;
     fixture.store.deliveryQuality.claim(fixture.unit.id, 1, "code_review", finalLease.claimToken);

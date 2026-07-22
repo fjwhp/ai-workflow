@@ -99,11 +99,12 @@ function leaseApplication(
   evidenceVersion = 1,
   workerId = "apply-worker",
   now = CLOCK,
-  leaseMs = 60_000
+  leaseMs = 60_000,
+  maxAttempts = 3
 ) {
   const queued = store.automationJobs.enqueue({
     ownerType: "delivery_unit", ownerId: unitId, evidenceVersion,
-    action: "apply", payload: {}, maxAttempts: 3
+    action: "apply", payload: {}, maxAttempts
   });
   const leased = store.automationJobs.leaseNext(workerId, now, leaseMs);
   if (!leased || leased.id !== queued.id) throw new Error("expected application lease");
@@ -305,6 +306,69 @@ describe("DeliveryApplicationRepository", () => {
     expect(() => fixture.store.deliveryApplications.bindSourceCommit(bound, commit("backend-source")))
       .toThrow("DELIVERY_APPLICATION_LEASE_STALE");
     expect(fixture.store.deliveryApplications.complete(resumed, completedResult()).status).toBe("applied");
+  });
+
+  it("atomically reconciles a nonretryable apply failure from another connection", () => {
+    const fixture = createFixture();
+    const claim = bindSource(fixture.store,
+      claimApplication(fixture, fixture.backendUnit, "backend"), "backend");
+    const other = openStore(fixture.path);
+
+    expect(other.automationJobs.fail(
+      claim.automationJobId, claim.leaseOwner, claim.claimToken, "fatal", false
+    )).toBe(true);
+    expect(other.automationJobs.get(claim.automationJobId)?.status).toBe("failed");
+    expect(other.deliveryApplications.get(claim.id)).toMatchObject({
+      status: "failed", resolutionStatus: "pending", error: "DELIVERY_APPLICATION_JOB_TERMINAL"
+    });
+    expect(other.deliveryUnits.get(fixture.backendUnit.id)?.status).toBe("failed");
+  });
+
+  it("reconciles final-attempt expiry without releasing uncertain worktree ownership", () => {
+    const fixture = createFixture();
+    const lease = leaseApplication(
+      fixture.store, fixture.backendUnit.id, 1, "final-worker", CLOCK, 10, 1
+    );
+    const claim = fixture.store.deliveryApplications.claim(
+      fixture.backendUnit.id, claimInput(lease, "backend")
+    );
+
+    expect(fixture.store.automationJobs.recoverExpired(new Date(CLOCK.getTime() + 10))).toBe(1);
+    expect(fixture.store.automationJobs.get(lease.id)?.status).toBe("failed");
+    expect(fixture.store.deliveryApplications.get(claim.id)).toMatchObject({
+      status: "failed", resolutionStatus: "pending"
+    });
+    expect(fixture.store.deliveryUnits.get(fixture.backendUnit.id)?.status).toBe("failed");
+  });
+
+  it("reconciles cancellation without discarding a possibly mutated target", () => {
+    const fixture = createFixture();
+    const claim = bindSource(fixture.store,
+      claimApplication(fixture, fixture.backendUnit, "backend"), "backend");
+
+    expect(fixture.store.automationJobs.cancelByOwnerVersion(fixture.backendUnit.id, 1)).toBe(1);
+    expect(fixture.store.automationJobs.get(claim.automationJobId)?.status).toBe("canceled");
+    expect(fixture.store.deliveryApplications.get(claim.id)).toMatchObject({
+      status: "failed", resolutionStatus: "pending"
+    });
+  });
+
+  it("finalizes an exact application job left incomplete across restart recovery", () => {
+    const fixture = createFixture();
+    const claim = bindSource(fixture.store,
+      claimApplication(fixture, fixture.backendUnit, "backend", fixture.store, "restart-worker"), "backend");
+    const applied = fixture.store.deliveryApplications.complete(claim, completedResult());
+    expect(fixture.store.automationJobs.get(claim.automationJobId)?.status).toBe("completed");
+    const restarted = openStore(fixture.path);
+
+    expect(restarted.automationJobs.recoverExpired(new Date(CLOCK.getTime() + 60_000))).toBe(0);
+    expect(restarted.automationJobs.get(claim.automationJobId)).toMatchObject({
+      status: "completed", claimToken: claim.claimToken
+    });
+    expect(restarted.deliveryApplications.get(applied.id)).toMatchObject({
+      status: "applied", resolutionStatus: "pending"
+    });
+    expect(restarted.deliveryUnits.get(fixture.backendUnit.id)?.status).toBe("applied");
   });
 
   it("requires a prepared source for applied or conflicted settlement but permits clean preflight failure", () => {

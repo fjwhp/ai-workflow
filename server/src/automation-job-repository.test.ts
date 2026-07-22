@@ -87,6 +87,12 @@ function addMs(date: Date, milliseconds: number) {
   return new Date(date.getTime() + milliseconds);
 }
 
+function currentToken(repository: AutomationJobRepository, jobId: string) {
+  const token = repository.get(jobId)?.claimToken;
+  if (!token) throw new Error("expected automation claim token");
+  return token;
+}
+
 function concurrentEnqueueWorker(input: AutomationJobInput, databasePath: string) {
   const worker = new Worker(`
     const { parentPort, workerData } = require("node:worker_threads");
@@ -299,7 +305,7 @@ describe("AutomationJobRepository", () => {
     const input = job(fixture.requirement.id, { action: "review" });
     const queued = fixture.first.enqueue(input);
     const leased = fixture.first.leaseNext("worker-a", now, 30_000)!;
-    fixture.first.fail(queued.id, "worker-a", "provider unavailable", false);
+    fixture.first.fail(queued.id, "worker-a", leased.claimToken, "provider unavailable", false);
 
     const duplicate = fixture.first.enqueue(input);
     const revived = fixture.first.enqueue(input, { reviveTerminal: true });
@@ -605,7 +611,9 @@ describe("AutomationJobRepository", () => {
     expect(fixture.first.leaseNext("worker-unicode-error", now, 30_000)).toMatchObject({
       id: queued.id, leaseOwner: "worker-unicode-error", payload: { message: "构建完成 😀" }
     });
-    expect(fixture.first.fail(queued.id, "worker-unicode-error", "临时错误 😀", false)).toBe(true);
+    expect(fixture.first.fail(
+      queued.id, "worker-unicode-error", currentToken(fixture.first, queued.id), "临时错误 😀", false
+    )).toBe(true);
     expect(fixture.first.get(queued.id)?.lastError).toBe("临时错误 😀");
   });
 
@@ -672,12 +680,18 @@ describe("AutomationJobRepository", () => {
   it("renews only the owning worker's unexpired lease", () => {
     const fixture = createFixture();
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
-    fixture.first.leaseNext("worker-a", now, 30_000);
+    const leased = fixture.first.leaseNext("worker-a", now, 30_000)!;
 
-    expect(fixture.second.renew(queued.id, "worker-b", addMs(now, 1_000), 60_000)).toBe(false);
-    expect(fixture.first.renew(queued.id, "worker-a", addMs(now, 1_000), 60_000)).toBe(true);
+    expect(fixture.second.renew(
+      queued.id, "worker-b", leased.claimToken, addMs(now, 1_000), 60_000
+    )).toBe(false);
+    expect(fixture.first.renew(
+      queued.id, "worker-a", leased.claimToken, addMs(now, 1_000), 60_000
+    )).toBe(true);
     expect(fixture.first.get(queued.id)?.leaseExpiresAt).toBe(addMs(now, 61_000).toISOString());
-    expect(fixture.first.renew(queued.id, "worker-a", addMs(now, 61_000), 60_000)).toBe(false);
+    expect(fixture.first.renew(
+      queued.id, "worker-a", leased.claimToken, addMs(now, 61_000), 60_000
+    )).toBe(false);
   });
 
   it("rejects renew, complete, and fail after expiry even before recovery", () => {
@@ -689,9 +703,15 @@ describe("AutomationJobRepository", () => {
     for (let index = 0; index < 3; index += 1) fixture.first.leaseNext("worker-a", now, 10);
     clock = addMs(now, 10);
 
-    expect(fixture.first.renew(renewJob.id, "worker-a", clock, 10)).toBe(false);
-    expect(fixture.first.complete(completeJob.id, "worker-a")).toBe(false);
-    expect(fixture.first.fail(failJob.id, "worker-a", "late failure", true)).toBe(false);
+    expect(fixture.first.renew(
+      renewJob.id, "worker-a", currentToken(fixture.first, renewJob.id), clock, 10
+    )).toBe(false);
+    expect(fixture.first.complete(
+      completeJob.id, "worker-a", currentToken(fixture.first, completeJob.id)
+    )).toBe(false);
+    expect(fixture.first.fail(
+      failJob.id, "worker-a", currentToken(fixture.first, failJob.id), "late failure", true
+    )).toBe(false);
     for (const queued of [renewJob, completeJob, failJob]) {
       expect(fixture.first.get(queued.id)).toMatchObject({ status: "leased", leaseOwner: "worker-a", attempt: 1 });
     }
@@ -700,16 +720,34 @@ describe("AutomationJobRepository", () => {
   it("blocks late settlement after an expired lease is reassigned", () => {
     const fixture = createFixture();
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
-    fixture.first.leaseNext("worker-a", now, 10);
+    const firstLease = fixture.first.leaseNext("worker-a", now, 10)!;
     expect(fixture.second.recoverExpired(addMs(now, 10))).toBe(1);
-    expect(fixture.second.leaseNext("worker-b", addMs(now, 10), 10)).toMatchObject({ id: queued.id, attempt: 2 });
+    const secondLease = fixture.second.leaseNext("worker-b", addMs(now, 10), 10)!;
+    expect(secondLease).toMatchObject({ id: queued.id, attempt: 2 });
 
-    expect(fixture.first.complete(queued.id, "worker-a")).toBe(false);
-    expect(fixture.second.complete(queued.id, "worker-b")).toBe(true);
+    expect(fixture.first.complete(queued.id, "worker-a", firstLease.claimToken)).toBe(false);
+    expect(fixture.second.complete(queued.id, "worker-b", secondLease.claimToken)).toBe(true);
     expect(fixture.first.get(queued.id)).toMatchObject({
       status: "completed", attempt: 2, leaseOwner: null, leaseExpiresAt: null
     });
-    expect(fixture.second.complete(queued.id, "worker-b")).toBe(false);
+    expect(fixture.second.complete(queued.id, "worker-b", secondLease.claimToken)).toBe(true);
+  });
+
+  it("fences every leased mutation by claim token when the same worker gets attempt two", () => {
+    let clock = now;
+    const fixture = createFixture(() => clock);
+    const queued = fixture.first.enqueue(job(fixture.requirement.id));
+    const first = fixture.first.leaseNext("worker-a", now, 10)!;
+    clock = addMs(now, 10);
+    expect(fixture.second.recoverExpired(clock)).toBe(1);
+    const second = fixture.second.leaseNext("worker-a", clock, 30_000)!;
+    expect(second).toMatchObject({ id: queued.id, attempt: 2, leaseOwner: "worker-a" });
+
+    expect(fixture.first.renew(queued.id, "worker-a", first.claimToken, clock, 30_000)).toBe(false);
+    expect(fixture.first.fail(queued.id, "worker-a", first.claimToken, "stale", false)).toBe(false);
+    expect(fixture.first.complete(queued.id, "worker-a", first.claimToken)).toBe(false);
+    expect(fixture.second.renew(queued.id, "worker-a", second.claimToken, clock, 30_000)).toBe(true);
+    expect(fixture.second.fail(queued.id, "worker-a", second.claimToken, "current", false)).toBe(true);
   });
 
   it("rolls back a failed lease transaction observed by another connection", () => {
@@ -789,7 +827,9 @@ describe("AutomationJobRepository", () => {
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
     fixture.first.leaseNext("worker-a", now, 30_000);
 
-    expect(fixture.first.fail(queued.id, "worker-a", "temporary😀\0outage", true)).toBe(true);
+    expect(fixture.first.fail(
+      queued.id, "worker-a", currentToken(fixture.first, queued.id), "temporary😀\0outage", true
+    )).toBe(true);
 
     expect(fixture.second.get(queued.id)).toMatchObject({
       status: "pending", attempt: 1, lastError: "temporary😀\\0outage",
@@ -803,7 +843,7 @@ describe("AutomationJobRepository", () => {
     fixture.first.leaseNext("worker-a", now, 30_000);
 
     expect(fixture.first.fail(
-      queued.id, "worker-a", new Error("fatal\0failure"), false
+      queued.id, "worker-a", currentToken(fixture.first, queued.id), new Error("fatal\0failure"), false
     )).toBe(true);
 
     expect(fixture.second.get(queued.id)).toMatchObject({
@@ -817,7 +857,9 @@ describe("AutomationJobRepository", () => {
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
     fixture.first.leaseNext("worker-a", now, 30_000);
 
-    expect(() => fixture.first.fail(queued.id, "worker-a", new Error("   "), true))
+    expect(() => fixture.first.fail(
+      queued.id, "worker-a", currentToken(fixture.first, queued.id), new Error("   "), true
+    ))
       .toThrow("AUTOMATION_JOB_ERROR_INVALID");
     expect(fixture.first.get(queued.id)?.status).toBe("leased");
   });
@@ -827,7 +869,9 @@ describe("AutomationJobRepository", () => {
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
     fixture.first.leaseNext("worker-a", now, 30_000);
 
-    expect(fixture.first.fail(queued.id, "worker-a", "temporary outage", true)).toBe(true);
+    expect(fixture.first.fail(
+      queued.id, "worker-a", currentToken(fixture.first, queued.id), "temporary outage", true
+    )).toBe(true);
     expect(fixture.second.get(queued.id)).toMatchObject({
       status: "pending", attempt: 1, lastError: "temporary outage",
       leaseOwner: null, leaseExpiresAt: null
@@ -838,10 +882,10 @@ describe("AutomationJobRepository", () => {
     const fixture = createFixture();
     const queued = fixture.first.enqueue(job(fixture.requirement.id, { maxAttempts: 2 }));
 
-    fixture.first.leaseNext("worker-a", now, 30_000);
-    expect(fixture.first.fail(queued.id, "worker-a", "first", true)).toBe(true);
-    fixture.first.leaseNext("worker-b", addMs(now, 1), 30_000);
-    expect(fixture.first.fail(queued.id, "worker-b", "second", true)).toBe(true);
+    const firstLease = fixture.first.leaseNext("worker-a", now, 30_000)!;
+    expect(fixture.first.fail(queued.id, "worker-a", firstLease.claimToken, "first", true)).toBe(true);
+    const secondLease = fixture.first.leaseNext("worker-b", addMs(now, 1), 30_000)!;
+    expect(fixture.first.fail(queued.id, "worker-b", secondLease.claimToken, "second", true)).toBe(true);
 
     expect(fixture.first.get(queued.id)).toMatchObject({ status: "failed", attempt: 2, lastError: "second" });
     expect(fixture.first.leaseNext("worker-c", addMs(now, 2), 30_000)).toBeNull();
@@ -852,7 +896,9 @@ describe("AutomationJobRepository", () => {
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
     fixture.first.leaseNext("worker-a", now, 30_000);
 
-    expect(fixture.first.fail(queued.id, "worker-a", "invalid evidence", false)).toBe(true);
+    expect(fixture.first.fail(
+      queued.id, "worker-a", currentToken(fixture.first, queued.id), "invalid evidence", false
+    )).toBe(true);
 
     expect(fixture.first.get(queued.id)).toMatchObject({ status: "failed", attempt: 1, lastError: "invalid evidence" });
   });
@@ -862,7 +908,9 @@ describe("AutomationJobRepository", () => {
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
     fixture.first.leaseNext("worker-a", now, 30_000);
 
-    expect(fixture.first.fail(queued.id, "worker-a", "x".repeat(10_000), false)).toBe(true);
+    expect(fixture.first.fail(
+      queued.id, "worker-a", currentToken(fixture.first, queued.id), "x".repeat(10_000), false
+    )).toBe(true);
 
     expect(fixture.first.get(queued.id)?.lastError).toBe("x".repeat(4096));
   });
@@ -872,7 +920,10 @@ describe("AutomationJobRepository", () => {
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
     fixture.first.leaseNext("worker-a", now, 30_000);
 
-    expect(fixture.first.fail(queued.id, "worker-a", `${"x".repeat(4095)}😀tail`, false)).toBe(true);
+    expect(fixture.first.fail(
+      queued.id, "worker-a", currentToken(fixture.first, queued.id),
+      `${"x".repeat(4095)}😀tail`, false
+    )).toBe(true);
 
     const persisted = fixture.first.get(queued.id)?.lastError;
     expect(persisted).toBe(`${"x".repeat(4095)}😀`);
@@ -913,9 +964,9 @@ describe("AutomationJobRepository", () => {
     setCreatedAt.run(addMs(now, -3).toISOString(), addMs(now, -3).toISOString(), leased.id);
     setCreatedAt.run(addMs(now, -2).toISOString(), addMs(now, -2).toISOString(), completed.id);
     setCreatedAt.run(now.toISOString(), now.toISOString(), otherVersion.id);
-    fixture.first.leaseNext("worker-a", now, 30_000);
-    fixture.first.leaseNext("worker-b", now, 30_000);
-    fixture.first.complete(completed.id, "worker-b");
+    const leasedClaim = fixture.first.leaseNext("worker-a", now, 30_000)!;
+    const completedClaim = fixture.first.leaseNext("worker-b", now, 30_000)!;
+    fixture.first.complete(completed.id, "worker-b", completedClaim.claimToken);
 
     expect(fixture.second.cancelByOwnerVersion(fixture.requirement.id, 1, "requirement")).toBe(2);
 
@@ -923,19 +974,22 @@ describe("AutomationJobRepository", () => {
     expect(fixture.first.get(leased.id)).toMatchObject({ status: "canceled", leaseOwner: null, leaseExpiresAt: null });
     expect(fixture.first.get(completed.id)?.status).toBe("completed");
     expect(fixture.first.get(otherVersion.id)?.status).toBe("pending");
-    expect(fixture.first.complete(leased.id, "worker-a")).toBe(false);
+    expect(fixture.first.complete(leased.id, "worker-a", leasedClaim.claimToken)).toBe(false);
   });
 
   it("does not settle a lease for the wrong worker or invalid failure input", () => {
     const fixture = createFixture();
     const queued = fixture.first.enqueue(job(fixture.requirement.id));
-    fixture.first.leaseNext("worker-a", now, 30_000);
+    const leased = fixture.first.leaseNext("worker-a", now, 30_000)!;
 
-    expect(fixture.first.fail(queued.id, "worker-b", "late", true)).toBe(false);
-    expect(() => fixture.first.fail(queued.id, "worker-a", "", true)).toThrow("AUTOMATION_JOB_ERROR_INVALID");
-    expect(() => fixture.first.fail(queued.id, "worker-a", "   ", true))
+    expect(fixture.first.fail(queued.id, "worker-b", leased.claimToken, "late", true)).toBe(false);
+    expect(() => fixture.first.fail(queued.id, "worker-a", leased.claimToken, "", true))
       .toThrow("AUTOMATION_JOB_ERROR_INVALID");
-    expect(() => fixture.first.fail(queued.id, "worker-a", "error", "yes" as unknown as boolean))
+    expect(() => fixture.first.fail(queued.id, "worker-a", leased.claimToken, "   ", true))
+      .toThrow("AUTOMATION_JOB_ERROR_INVALID");
+    expect(() => fixture.first.fail(
+      queued.id, "worker-a", leased.claimToken, "error", "yes" as unknown as boolean
+    ))
       .toThrow("AUTOMATION_JOB_RETRYABLE_INVALID");
     expect(() => fixture.first.cancelByOwnerVersion("", 1)).toThrow("AUTOMATION_JOB_OWNER_INVALID");
     expect(() => fixture.first.cancelByOwnerVersion("unsafe:owner", 1)).toThrow("AUTOMATION_JOB_OWNER_INVALID");

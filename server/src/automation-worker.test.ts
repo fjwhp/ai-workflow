@@ -167,10 +167,11 @@ describe("automation worker lease ownership", () => {
     });
 
     const drain = worker.drainOnce();
-    const originalExpiry = store.automationJobs.get(job.id)!.leaseExpiresAt;
+    const leased = store.automationJobs.get(job.id)!;
+    const originalExpiry = leased.leaseExpiresAt;
     await vi.advanceTimersByTimeAsync(100);
 
-    expect(renew).toHaveBeenCalledWith(job.id, "worker-a", new Date(), 300);
+    expect(renew).toHaveBeenCalledWith(job.id, "worker-a", leased.claimToken, new Date(), 300);
     expect(setTimer).toHaveBeenCalledWith(expect.any(Function), 100);
     expect(store.automationJobs.get(job.id)!.leaseExpiresAt! > originalExpiry!).toBe(true);
     handler.resolve();

@@ -105,7 +105,7 @@ export function createAutomationWorker(options: AutomationWorkerOptions): Automa
     if (!handler) {
       report({ type: "handler_missing", jobId: job.id, action: job.action });
       settle(job.id, "fail", () => options.jobs.fail(
-        job.id, workerId, `AUTOMATION_HANDLER_MISSING:${job.action}`, false
+        job.id, workerId, job.claimToken, `AUTOMATION_HANDLER_MISSING:${job.action}`, false
       ));
       return true;
     }
@@ -125,7 +125,7 @@ export function createAutomationWorker(options: AutomationWorkerOptions): Automa
       heartbeatTimer = undefined;
       if (!heartbeatActive) return;
       try {
-        if (!options.jobs.renew(job.id, workerId, clock(), leaseMs)) {
+        if (!options.jobs.renew(job.id, workerId, job.claimToken, clock(), leaseMs)) {
           ownershipLost = true;
           heartbeatActive = false;
           controller.abort(new Error("AUTOMATION_WORKER_LEASE_LOST"));
@@ -158,7 +158,8 @@ export function createAutomationWorker(options: AutomationWorkerOptions): Automa
     if (ownershipLost) return true;
     if (handlerFailed) {
       settle(job.id, "fail", () => options.jobs.fail(
-        job.id, workerId, handlerError, classifyAutomationError(handlerError) === "retryable"
+        job.id, workerId, job.claimToken, handlerError,
+        classifyAutomationError(handlerError) === "retryable"
       ));
     } else {
       settle(job.id, "complete", () => options.jobs.complete(job.id, workerId, job.claimToken));

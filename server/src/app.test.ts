@@ -767,7 +767,9 @@ describe("live delivery unit detail", () => {
       fixture.store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: fixture.secondary.id,
         evidenceVersion: 1, action, payload: {}, maxAttempts: 1 });
       const job = fixture.store.automationJobs.leaseNext(`worker-${target}`, new Date(), 30_000)!;
-      expect(fixture.store.automationJobs.fail(job.id, job.leaseOwner!, `${target} failed`, false)).toBe(true);
+      expect(fixture.store.automationJobs.fail(
+        job.id, job.leaseOwner!, job.claimToken, `${target} failed`, false
+      )).toBe(true);
       if (target === "implementation") {
         db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id = ?").run(fixture.secondary.id);
       }
@@ -893,7 +895,9 @@ describe("live delivery unit detail", () => {
       store.automationJobs.enqueue({ ownerType: "delivery_unit", ownerId: unit.id, evidenceVersion: 1,
         action: "implement", payload: {}, maxAttempts: 1 });
       const job = store.automationJobs.leaseNext(`worker-${unit.id.slice(0, 8)}`, new Date(), 30_000)!;
-      expect(store.automationJobs.fail(job.id, job.leaseOwner!, "terminal implementation failure", false)).toBe(true);
+      expect(store.automationJobs.fail(
+        job.id, job.leaseOwner!, job.claimToken, "terminal implementation failure", false
+      )).toBe(true);
     }
     db.prepare("UPDATE delivery_units SET status = 'failed' WHERE id IN (?, ?)").run(primary.id, secondary.id);
     const app = await buildApp(store);
@@ -946,7 +950,9 @@ describe("live delivery unit detail", () => {
       action: "review", payload: {}, maxAttempts: 1 });
     const reviewJob = store.automationJobs.leaseNext("quality-worker", new Date(), 30_000)!;
     expect(reviewJob.action).toBe("review");
-    expect(store.automationJobs.fail(reviewJob.id, "quality-worker", "review provider unavailable", false)).toBe(true);
+    expect(store.automationJobs.fail(
+      reviewJob.id, "quality-worker", reviewJob.claimToken, "review provider unavailable", false
+    )).toBe(true);
     const failedReview = (await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` })).json();
     expect(failedReview.deliveryUnits.find((unit: any) => unit.id === primary.id).allowedActions).toEqual([
       { type: "retry_code_review", reasonRequired: true }

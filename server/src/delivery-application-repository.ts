@@ -328,6 +328,59 @@ export class DeliveryApplicationRepository {
     return this.getRequired(fence.id);
   }
 
+  reconcileAutomationJobsInTransaction(now: Date): number {
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+      throw new Error("DELIVERY_APPLICATION_DATE_INVALID");
+    }
+    const nowIso = now.toISOString();
+    const rows = this.db.prepare(`SELECT application.*, job.status AS job_status
+      FROM delivery_application_runs application
+      JOIN automation_jobs job ON job.id = application.automation_job_id
+        AND job.owner_type = 'delivery_unit'
+        AND job.owner_id = application.delivery_unit_id
+        AND job.evidence_version = application.evidence_version
+        AND job.action = 'apply'
+        AND job.attempt = application.automation_attempt
+        AND job.claim_token = application.claim_token
+      WHERE (application.status = 'applying' AND job.status IN ('completed', 'failed', 'canceled'))
+        OR (application.status <> 'applying' AND job.status <> 'completed')
+      ORDER BY application.created_at, application.id`).all() as any[];
+    let reconciled = 0;
+    for (const row of rows) {
+      if (row.status === "applying") {
+        const application = this.db.prepare(`UPDATE delivery_application_runs
+          SET status = 'failed', resolution_status = 'pending',
+            error = 'DELIVERY_APPLICATION_JOB_TERMINAL', updated_at = ?, completed_at = ?
+          WHERE id = ? AND status = 'applying' AND resolution_status = 'pending'
+            AND automation_job_id = ? AND automation_attempt = ? AND claim_token = ?`).run(
+          nowIso, nowIso, row.id, row.automation_job_id, row.automation_attempt, row.claim_token
+        );
+        if (application.changes !== 1) throw new Error("DELIVERY_APPLICATION_RECONCILIATION_STALE");
+        const unit = this.db.prepare(`UPDATE delivery_units
+          SET status = 'failed', updated_at = ?, completed_at = ?
+          WHERE id = ? AND requirement_id = ? AND project_version_id = ? AND evidence_version = ?
+            AND phase = 'acceptance_delivery' AND status = 'applying'`).run(
+          nowIso, nowIso, row.delivery_unit_id, row.requirement_id,
+          row.project_version_id, row.evidence_version
+        );
+        if (unit.changes !== 1) throw new Error("DELIVERY_APPLICATION_RECONCILIATION_STALE");
+        this.aggregateInTransaction(row.requirement_id);
+      } else {
+        const job = this.db.prepare(`UPDATE automation_jobs
+          SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+          WHERE id = ? AND owner_type = 'delivery_unit' AND owner_id = ?
+            AND evidence_version = ? AND action = 'apply' AND attempt = ? AND claim_token = ?
+            AND status <> 'completed'`).run(
+          nowIso, row.automation_job_id, row.delivery_unit_id, row.evidence_version,
+          row.automation_attempt, row.claim_token
+        );
+        if (job.changes !== 1) throw new Error("DELIVERY_APPLICATION_RECONCILIATION_STALE");
+      }
+      reconciled += 1;
+    }
+    return reconciled;
+  }
+
   get(runId: string): DeliveryApplicationRun | null {
     validateId(runId);
     const row = this.db.prepare("SELECT * FROM delivery_application_runs WHERE id = ?").get(runId);

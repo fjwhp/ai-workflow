@@ -40,9 +40,9 @@ export interface AutomationJob {
 export interface AutomationJobPersistence {
   enqueue(input: AutomationJobInput): AutomationJob;
   leaseNext(workerId: string, now: Date, leaseMs: number): AutomationJob | null;
-  renew(jobId: string, workerId: string, now: Date, leaseMs: number): boolean;
-  complete(jobId: string, workerId: string, claimToken?: string): boolean;
-  fail(jobId: string, workerId: string, error: unknown, retryable: boolean): boolean;
+  renew(jobId: string, workerId: string, claimToken: string, now: Date, leaseMs: number): boolean;
+  complete(jobId: string, workerId: string, claimToken: string): boolean;
+  fail(jobId: string, workerId: string, claimToken: string, error: unknown, retryable: boolean): boolean;
   cancelByOwnerVersion(ownerId: string, evidenceVersion: number, ownerType?: AutomationJobOwnerType): number;
   recoverExpired(now: Date): number;
   get(jobId: string): AutomationJob | null;
@@ -200,38 +200,39 @@ export class AutomationJobRepository {
     }
   }
 
-  renew(jobId: string, workerId: string, now: Date, leaseMs: number): boolean {
+  renew(jobId: string, workerId: string, claimToken: string, now: Date, leaseMs: number): boolean {
     validateBoundedId(jobId, "AUTOMATION_JOB_ID_INVALID");
+    validateBoundedId(claimToken, "AUTOMATION_JOB_CLAIM_TOKEN_INVALID");
     const { nowIso, expiresAtIso } = validateLeaseInput(workerId, now, leaseMs);
     const result = this.db.prepare(`UPDATE automation_jobs
       SET lease_expires_at = ?, updated_at = ?
-      WHERE id = ? AND status = 'leased' AND lease_owner = ?
+      WHERE id = ? AND status = 'leased' AND lease_owner = ? AND claim_token = ?
         AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`)
-      .run(expiresAtIso, nowIso, jobId, workerId, nowIso);
+      .run(expiresAtIso, nowIso, jobId, workerId, claimToken, nowIso);
     return Number(result.changes) === 1;
   }
 
-  complete(jobId: string, workerId: string, claimToken?: string): boolean {
+  complete(jobId: string, workerId: string, claimToken: string): boolean {
     validateBoundedId(jobId, "AUTOMATION_JOB_ID_INVALID");
     validateWorkerId(workerId);
-    if (claimToken !== undefined) validateBoundedId(claimToken, "AUTOMATION_JOB_CLAIM_TOKEN_INVALID");
+    validateBoundedId(claimToken, "AUTOMATION_JOB_CLAIM_TOKEN_INVALID");
     const settleNow = validateDate(this.clock());
     const result = this.db.prepare(`UPDATE automation_jobs
       SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-      WHERE id = ? AND status = 'leased' AND lease_owner = ?
+      WHERE id = ? AND status = 'leased' AND lease_owner = ? AND claim_token = ?
         AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`)
-      .run(settleNow, jobId, workerId, settleNow);
+      .run(settleNow, jobId, workerId, claimToken, settleNow);
     if (Number(result.changes) === 1) return true;
-    if (claimToken === undefined) return false;
     if (!claimToken.startsWith(`lease:${jobId}:${workerId}:`)) return false;
     const completed = this.db.prepare(`SELECT 1 FROM automation_jobs
       WHERE id = ? AND status = 'completed' AND claim_token = ?`).get(jobId, claimToken);
     return completed !== undefined;
   }
 
-  fail(jobId: string, workerId: string, error: unknown, retryable: boolean): boolean {
+  fail(jobId: string, workerId: string, claimToken: string, error: unknown, retryable: boolean): boolean {
     validateBoundedId(jobId, "AUTOMATION_JOB_ID_INVALID");
     validateWorkerId(workerId);
+    validateBoundedId(claimToken, "AUTOMATION_JOB_CLAIM_TOKEN_INVALID");
     if (typeof retryable !== "boolean") throw new Error("AUTOMATION_JOB_RETRYABLE_INVALID");
     const lastError = sanitizeFailureError(error);
     const settleNow = validateDate(this.clock());
@@ -248,9 +249,9 @@ export class AutomationJobRepository {
         ELSE 'failed'
       END,
         lease_owner = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ?
-      WHERE id = ? AND status = 'leased' AND lease_owner = ?
+      WHERE id = ? AND status = 'leased' AND lease_owner = ? AND claim_token = ?
         AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`)
-      .run(retryable ? 1 : 0, lastError, settleNow, jobId, workerId, settleNow);
+      .run(retryable ? 1 : 0, lastError, settleNow, jobId, workerId, claimToken, settleNow);
     return Number(result.changes) === 1;
   }
 

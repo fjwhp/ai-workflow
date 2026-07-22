@@ -145,7 +145,11 @@ export class WorkflowStore {
         () => this.deliveryApplicationRepository.bindSourceCommitInTransaction(claim, sourceCommit)
       ),
       complete: (claim, completion) => this.withImmediateTransaction(
-        () => this.deliveryApplicationRepository.completeInTransaction(claim, completion)
+        () => {
+          const run = this.deliveryApplicationRepository.completeInTransaction(claim, completion);
+          this.deliveryApplicationRepository.reconcileAutomationJobsInTransaction(this.clock());
+          return run;
+        }
       ),
       resolve: (run, resolution) => this.withImmediateTransaction(
         () => this.deliveryApplicationRepository.resolveInTransaction(run, resolution)
@@ -289,15 +293,26 @@ export class WorkflowStore {
     this.automationJobs = {
       enqueue: (input) => automationJobRepository.enqueue(input),
       leaseNext: (workerId, now, leaseMs) => automationJobRepository.leaseNext(workerId, now, leaseMs),
-      renew: (jobId, workerId, now, leaseMs) => automationJobRepository.renew(jobId, workerId, now, leaseMs),
-      complete: (jobId, workerId, claimToken) => automationJobRepository.complete(jobId, workerId, claimToken),
-      fail: (jobId, workerId, error, retryable) => this.withImmediateTransaction(() => {
-        const settled = automationJobRepository.fail(jobId, workerId, error, retryable);
-        if (settled) this.deliveryQualityRepository.abortTerminalAutomationClaimsInTransaction();
+      renew: (jobId, workerId, claimToken, now, leaseMs) =>
+        automationJobRepository.renew(jobId, workerId, claimToken, now, leaseMs),
+      complete: (jobId, workerId, claimToken) => this.withImmediateTransaction(() => {
+        const settled = automationJobRepository.complete(jobId, workerId, claimToken);
+        if (settled) this.deliveryApplicationRepository.reconcileAutomationJobsInTransaction(this.clock());
         return settled;
       }),
-      cancelByOwnerVersion: (ownerId, evidenceVersion, ownerType) =>
-        automationJobRepository.cancelByOwnerVersion(ownerId, evidenceVersion, ownerType),
+      fail: (jobId, workerId, claimToken, error, retryable) => this.withImmediateTransaction(() => {
+        const settled = automationJobRepository.fail(jobId, workerId, claimToken, error, retryable);
+        if (settled) {
+          this.deliveryQualityRepository.abortTerminalAutomationClaimsInTransaction();
+          this.deliveryApplicationRepository.reconcileAutomationJobsInTransaction(this.clock());
+        }
+        return settled;
+      }),
+      cancelByOwnerVersion: (ownerId, evidenceVersion, ownerType) => this.withImmediateTransaction(() => {
+        const canceled = automationJobRepository.cancelByOwnerVersion(ownerId, evidenceVersion, ownerType);
+        if (canceled > 0) this.deliveryApplicationRepository.reconcileAutomationJobsInTransaction(this.clock());
+        return canceled;
+      }),
       recoverExpired: (now) => this.withImmediateTransaction(() => {
         if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error("AUTOMATION_JOB_DATE_INVALID");
         const expiredImplementations = this.db.prepare(`SELECT id, owner_id, evidence_version
@@ -307,6 +322,7 @@ export class WorkflowStore {
         const recovered = automationJobRepository.recoverExpired(now);
         this.settleExpiredImplementationsInTransaction(expiredImplementations, now.toISOString());
         this.deliveryQualityRepository.abortTerminalAutomationClaimsInTransaction();
+        this.deliveryApplicationRepository.reconcileAutomationJobsInTransaction(now);
         return recovered;
       }),
       get: (jobId) => automationJobRepository.get(jobId),
