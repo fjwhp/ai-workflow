@@ -27,6 +27,7 @@ export interface FrozenApplicationInput {
   sourceBranch: string;
   evidenceHash: string;
   sensitivePatterns: string[];
+  expectedSourceHead?: string;
   expectedTargetHead?: string;
   sourceCommit?: string;
   changedFiles?: string[];
@@ -295,9 +296,25 @@ export async function preflightLocalIntegration(
       const snapshot = await getWorktreeSnapshot(input.sourceWorktreePath, {
         sensitivePatterns: input.sensitivePatterns
       });
-      checks.push({ id: "source_changes", label: "存在待合并变更", ok: snapshot.files.length > 0 && snapshot.diff.length > 0, detail: `${snapshot.files.length} 个文件` });
-      checks.push({ id: "evidence_valid", label: "编码证据仍有效", ok: snapshot.evidenceHash === input.evidenceHash, detail: snapshot.evidenceHash.slice(0, 12) });
-      evidenceMode = "worktree";
+      if (input.expectedSourceHead && snapshot.identity.headCommit !== input.expectedSourceHead) {
+        const commit = snapshot.identity.headCommit;
+        const evidence = await getCommitSnapshot(input.sourceWorktreePath, commit, {
+          sensitivePatterns: input.sensitivePatterns
+        });
+        const exactFiles = !input.changedFiles
+          || JSON.stringify([...evidence.files].sort()) === JSON.stringify([...input.changedFiles].sort());
+        const valid = evidence.identity.headCommit === input.expectedSourceHead
+          && evidence.files.length > 0 && evidence.diff.length > 0
+          && evidence.evidenceHash === input.evidenceHash && exactFiles;
+        checks.push({ id: "source_changes", label: "存在待合并变更", ok: evidence.files.length > 0 && evidence.diff.length > 0, detail: `${evidence.files.length} 个文件（恢复提交）` });
+        checks.push({ id: "evidence_valid", label: "编码证据仍有效", ok: valid, detail: evidence.evidenceHash.slice(0, 12) });
+        evidenceMode = "commit";
+        if (valid) resolvedSourceCommit = commit;
+      } else {
+        checks.push({ id: "source_changes", label: "存在待合并变更", ok: snapshot.files.length > 0 && snapshot.diff.length > 0, detail: `${snapshot.files.length} 个文件` });
+        checks.push({ id: "evidence_valid", label: "编码证据仍有效", ok: snapshot.evidenceHash === input.evidenceHash, detail: snapshot.evidenceHash.slice(0, 12) });
+        evidenceMode = "worktree";
+      }
     }
   } catch { checks.push({ id: "source_branch", label: "AI 分支匹配", ok: false, detail: "AI worktree 不存在或不可访问" }); }
   const plan=input.changedFiles?await buildVerificationPlan({repoPath:input.targetWorktreePath,changedFiles:input.changedFiles,fallbackCommands:input.fallbackCommands||[]}):{changedModules:[],plannedCommands:input.fallbackCommands||[],commandSource:"project_fallback" as const};

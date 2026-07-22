@@ -544,6 +544,50 @@ describe("DeliveryApplicationService", () => {
     expect(await head(fixture.frontendGit.versionWorktree)).toBe(targetHead);
   });
 
+  it("recovers a prepared source commit when the worker crashes before binding it", async () => {
+    const fixture = await createFixture();
+    let crashBeforeBind = true;
+    const service = new DeliveryApplicationService({
+      applications: {
+        ...fixture.store.deliveryApplications,
+        bindSourceCommit: (claim, sourceCommit) => {
+          if (crashBeforeBind) throw new Error("SIMULATED_CRASH_BEFORE_BIND");
+          return fixture.store.deliveryApplications.bindSourceCommit(claim, sourceCommit);
+        }
+      },
+      loadContext: async (unitId) => {
+        const context = fixture.contexts.get(unitId);
+        const unit = fixture.store.deliveryUnits.get(unitId);
+        return context && unit ? { ...context, unit } : null;
+      }
+    });
+    const context = fixture.contexts.get(fixture.frontendUnit.id)!;
+    const firstLease = leaseApplication(fixture.store, fixture.frontendUnit.id, "first-worker");
+    const targetBefore = await repositoryState(fixture.frontendGit);
+
+    const interrupted = await service.apply(
+      fixture.frontendUnit.id, applicationInput(firstLease)
+    );
+    const preparedCommit = await head(context.codingEvidence.worktreePath);
+    expect(preparedCommit).not.toBe(context.codingEvidence.sourceHead);
+    const firstRun = interrupted.run;
+    expect(interrupted).toMatchObject({ status: "failed", sourceCommit: preparedCommit });
+    expect(firstRun).toMatchObject({ status: "failed", sourceCommit: null });
+    await expectRepositoryState(fixture.frontendGit, targetBefore);
+    reviveApplicationJob(fixture, fixture.frontendUnit.id, firstLease.id);
+    const nextLease = fixture.store.automationJobs.leaseNext("retry-worker", new Date(), 60_000)!;
+    crashBeforeBind = false;
+
+    const result = await service.apply(fixture.frontendUnit.id, applicationInput(nextLease));
+
+    expect(result.status).toBe("completed");
+    expect(result.sourceCommit).toBe(preparedCommit);
+    expect(result.run).toMatchObject({
+      sourceCommit: preparedCommit, automationAttempt: 1, status: "applied"
+    });
+    expect(result.run.id).not.toBe(firstRun.id);
+  });
+
   it("reuses a trusted source commit after a terminal conflict retry", async () => {
     const fixture = await createFixture({ conflict: true });
     const firstLease = leaseApplication(fixture.store, fixture.frontendUnit.id, "first-worker");

@@ -143,6 +143,7 @@ export class DeliveryApplicationService {
       sourceBranch: context.sourceBranch,
       evidenceHash: context.evidenceHash,
       sensitivePatterns: context.sensitivePatterns,
+      expectedSourceHead: context.sourceHead,
       expectedTargetHead: context.targetHead,
       ...(trustedSource?.sourceCommit ? { sourceCommit: trustedSource.sourceCommit } : {}),
       changedFiles: context.changedFiles,
@@ -157,8 +158,9 @@ export class DeliveryApplicationService {
       evidenceHash: context.evidenceHash,
       preflight: existing?.preflight ?? preflight
     });
-    if (!claim.sourceCommit && frozenInput.sourceCommit) {
-      claim = this.dependencies.applications.bindSourceCommit(claim, frozenInput.sourceCommit);
+    const preparedSourceCommit = frozenInput.sourceCommit ?? preflight.sourceCommit;
+    if (!claim.sourceCommit && preparedSourceCommit) {
+      claim = this.dependencies.applications.bindSourceCommit(claim, preparedSourceCommit);
     }
     const result = await executeLocalIntegration({
       ...frozenInput,
