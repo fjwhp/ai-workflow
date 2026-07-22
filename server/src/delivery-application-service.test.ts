@@ -574,16 +574,17 @@ describe("DeliveryApplicationService", () => {
     const firstLease = leaseApplication(fixture.store, fixture.frontendUnit.id, "first-worker");
     const targetBefore = await repositoryState(fixture.frontendGit);
 
-    const interrupted = await service.apply(
+    await expect(service.apply(
       fixture.frontendUnit.id, applicationInput(firstLease)
-    );
+    )).rejects.toThrow("SIMULATED_CRASH_BEFORE_BIND");
     const preparedCommit = await head(context.codingEvidence.worktreePath);
     expect(preparedCommit).not.toBe(context.codingEvidence.sourceHead);
-    const firstRun = interrupted.run;
-    expect(interrupted).toMatchObject({ status: "failed", sourceCommit: preparedCommit });
-    expect(firstRun).toMatchObject({ status: "failed", sourceCommit: null });
+    const firstRun = fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)[0]!;
+    expect(firstRun).toMatchObject({ status: "applying", sourceCommit: null });
     await expectRepositoryState(fixture.frontendGit, targetBefore);
-    reviveApplicationJob(fixture, fixture.frontendUnit.id, firstLease.id);
+    expect(fixture.store.automationJobs.fail(
+      firstLease.id, "first-worker", firstLease.claimToken, "worker crashed", true
+    )).toBe(true);
     const nextLease = fixture.store.automationJobs.leaseNext("retry-worker", new Date(), 60_000)!;
     crashBeforeBind = false;
 
@@ -592,9 +593,9 @@ describe("DeliveryApplicationService", () => {
     expect(result.status).toBe("completed");
     expect(result.sourceCommit).toBe(preparedCommit);
     expect(result.run).toMatchObject({
-      sourceCommit: preparedCommit, automationAttempt: 1, status: "applied"
+      id: firstRun.id, sourceCommit: preparedCommit, automationAttempt: 2, status: "applied"
     });
-    expect(result.run.id).not.toBe(firstRun.id);
+    expect(result.run.id).toBe(firstRun.id);
   });
 
   it("does not mutate the target when the application lease is lost after source binding", async () => {
@@ -653,7 +654,7 @@ describe("DeliveryApplicationService", () => {
     await expect(service.apply(fixture.frontendUnit.id, applicationInput(lease)))
       .rejects.toThrow("DELIVERY_APPLICATION_LEASE_STALE");
 
-    expect(fences).toBe(6);
+    expect(fences).toBe(5);
     expect(await status(fixture.frontendGit.versionWorktree)).toContain("src/feature.ts");
     expect(fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)[0])
       .toMatchObject({ status: "applying" });

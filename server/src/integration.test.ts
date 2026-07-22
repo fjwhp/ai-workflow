@@ -281,6 +281,48 @@ describe("local integration", () => {
     await expect(readFile(join(item.targetWorktree, "race-added.txt"), "utf8")).rejects.toThrow();
   });
 
+  it("propagates a source-frozen ownership callback error unchanged", async () => {
+    const item = await fixture();
+    const callbackError = new Error("SOURCE_FROZEN_LEASE_LOOKUP_FAILED");
+    const targetHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+
+    await expect(executeLocalIntegration({
+      ...integrationInput(item), commitMessage: "REQ-0001 source-frozen callback", commands: [],
+      onSourceFrozen: async () => { throw callbackError; }
+    })).rejects.toBe(callbackError);
+
+    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
+    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toBe("");
+  });
+
+  it("propagates a source-prepared ownership callback error unchanged", async () => {
+    const item = await fixture();
+    const callbackError = new Error("SOURCE_PREPARED_LEASE_LOOKUP_FAILED");
+    const targetHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+
+    await expect(executeLocalIntegration({
+      ...integrationInput(item), commitMessage: "REQ-0001 source-prepared callback", commands: [],
+      onSourcePrepared: async () => { throw callbackError; }
+    })).rejects.toBe(callbackError);
+
+    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
+    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toBe("");
+  });
+
+  it("propagates a pre-mutation ownership callback error unchanged", async () => {
+    const item = await fixture();
+    const callbackError = new Error("TARGET_OWNERSHIP_LOOKUP_FAILED");
+    const targetHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
+
+    await expect(executeLocalIntegration({
+      ...integrationInput(item), commitMessage: "REQ-0001 ownership callback", commands: [],
+      assertTargetOwnership: async () => { throw callbackError; }
+    })).rejects.toBe(callbackError);
+
+    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
+    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toBe("");
+  });
+
   it("rejects a dirty target worktree", async () => {
     const item = await fixture(); await writeFile(join(item.targetWorktree, "dirty.txt"), "dirty\n");
     const check = await preflightLocalIntegration(integrationInput(item));
@@ -343,6 +385,65 @@ describe("local integration", () => {
     expect(await captureConflictState()).toEqual(foreignState);
   });
 
+  it("preserves an owned conflict after another actor starts resolving it", async () => {
+    const item = await fixture();
+    await writeFile(join(item.sourceWorktree, "value.txt"), "delivery source\n");
+    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
+    await writeFile(join(item.targetWorktree, "value.txt"), "target version\n");
+    await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
+    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target version"]);
+
+    const wrapperDirectory = join(item.root, "git-foreign-resolution-wrapper");
+    const wrapper = join(wrapperDirectory, "git");
+    const indexPath = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "--git-path", "index"])).stdout.trim();
+    const cherryPickHeadPath = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "--git-path", "CHERRY_PICK_HEAD"])).stdout.trim();
+    const savedIndex = join(item.root, "foreign-resolution.index");
+    const savedCherryPickHead = join(item.root, "foreign-resolution.cherry-pick-head");
+    const savedValue = join(item.root, "foreign-resolution.value");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    await mkdir(wrapperDirectory);
+    await writeFile(wrapper, [
+      "#!/bin/sh",
+      "is_target=",
+      "is_cherry_pick=",
+      "source_commit=",
+      "for argument in \"$@\"; do",
+      `  if [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
+      "  if [ \"$argument\" = \"cherry-pick\" ]; then is_cherry_pick=1; fi",
+      "  source_commit=$argument",
+      "done",
+      "if [ \"$is_target\" = \"1\" ] && [ \"$is_cherry_pick\" = \"1\" ]; then",
+      `  ${JSON.stringify(realGit)} -C ${JSON.stringify(item.targetWorktree)} cherry-pick \"$source_commit\"`,
+      "  status=$?",
+      `  printf 'foreign resolution\\n' > ${JSON.stringify(join(item.targetWorktree, "value.txt"))}`,
+      `  ${JSON.stringify(realGit)} -C ${JSON.stringify(item.targetWorktree)} add -- value.txt`,
+      `  /bin/cp ${JSON.stringify(indexPath)} ${JSON.stringify(savedIndex)}`,
+      `  /bin/cp ${JSON.stringify(cherryPickHeadPath)} ${JSON.stringify(savedCherryPickHead)}`,
+      `  /bin/cp ${JSON.stringify(join(item.targetWorktree, "value.txt"))} ${JSON.stringify(savedValue)}`,
+      "  exit $status",
+      "fi",
+      `exec ${JSON.stringify(realGit)} \"$@\"`
+    ].join("\n"));
+    await chmod(wrapper, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
+        commitMessage: "REQ-0001 foreign resolution", commands: []
+      });
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+
+    expect(result!.status).toBe("ambiguous");
+    expect(await readFile(indexPath)).toEqual(await readFile(savedIndex));
+    expect(await readFile(cherryPickHeadPath)).toEqual(await readFile(savedCherryPickHead));
+    expect(await readFile(join(item.targetWorktree, "value.txt"))).toEqual(await readFile(savedValue));
+  });
+
   it("rolls back a wildcard filename without touching a matching sibling path", async () => {
     const item = await fixture();
     await writeFile(join(item.sourceWorktree, "new?.txt"), "source wildcard\n");
@@ -400,6 +501,58 @@ describe("local integration", () => {
       controller.abort();
       await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_ABORTED");
       expect(Date.now() - abortedAt).toBeLessThan(1_000);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
+  it("does not start the primary cherry-pick after lease loss during filter lookup", async () => {
+    const item = await fixture();
+    const wrapperDirectory = join(item.root, "git-primary-lease-wrapper");
+    const wrapper = join(wrapperDirectory, "git");
+    const mutationArmed = join(item.root, "primary-mutation-armed");
+    const filterLookupFinished = join(item.root, "primary-filter-lookup-finished");
+    const cherryPickStarted = join(item.root, "primary-cherry-pick-started");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    await mkdir(wrapperDirectory);
+    await writeFile(wrapper, [
+      "#!/bin/sh",
+      "is_target=",
+      "is_config=",
+      "is_cherry_pick=",
+      "for argument in \"$@\"; do",
+      `  if [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
+      "  if [ \"$argument\" = \"config\" ]; then is_config=1; fi",
+      "  if [ \"$argument\" = \"cherry-pick\" ]; then is_cherry_pick=1; fi",
+      "done",
+      `if [ \"$is_target\" = \"1\" ] && [ \"$is_config\" = \"1\" ] && [ -f ${JSON.stringify(mutationArmed)} ]; then`,
+      `  ${JSON.stringify(realGit)} \"$@\"`,
+      "  status=$?",
+      `  : > ${JSON.stringify(filterLookupFinished)}`,
+      "  exit $status",
+      "fi",
+      "if [ \"$is_target\" = \"1\" ] && [ \"$is_cherry_pick\" = \"1\" ]; then",
+      `  : > ${JSON.stringify(cherryPickStarted)}`,
+      "fi",
+      `exec ${JSON.stringify(realGit)} \"$@\"`
+    ].join("\n"));
+    await chmod(wrapper, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+    try {
+      const callbackError = new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+      const pending = executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 primary fence", commands: [],
+        onBeforeTargetMutation: async () => { await writeFile(mutationArmed, ""); },
+        assertTargetOwnership: async () => {
+          if (await readFile(filterLookupFinished).then(() => true, () => false)) throw callbackError;
+        }
+      });
+
+      await expect(pending).rejects.toBe(callbackError);
+      await expect(readFile(cherryPickStarted, "utf8")).rejects.toThrow();
+      expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toBe("");
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
@@ -762,7 +915,8 @@ describe("local integration", () => {
     await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target change"]);
 
     let conflictState: Record<string, string> | undefined;
-    const result = await executeLocalIntegration({
+    const callbackError = new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+    const pending = executeLocalIntegration({
       ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
       commitMessage: "REQ-0001 stale source binding", commands: [],
       onSourcePrepared: async () => {
@@ -774,11 +928,11 @@ describe("local integration", () => {
           status: (await exec("git", ["-C", item.targetWorktree, "status", "--porcelain=v2", "-z"])).stdout,
           value: await readFile(join(item.targetWorktree, "value.txt"), "utf8")
         };
-        throw new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+        throw callbackError;
       }
     });
 
-    expect(result.error).toContain("DELIVERY_APPLICATION_CLAIM_LOST");
+    await expect(pending).rejects.toBe(callbackError);
     expect(conflictState).toBeDefined();
     await expect(Promise.all([
       exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"]).then(({ stdout }) => stdout),

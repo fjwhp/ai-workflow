@@ -156,8 +156,6 @@ async function prepareFrozenSourceCommit(
   const baseCommit = snapshot.identity.headCommit;
   if (!baseCommit || snapshot.files.length === 0) throw new Error("SOURCE_EVIDENCE_EMPTY");
   throwIfApplicationAborted(input.signal);
-  await input.onSourceFrozen?.();
-  throwIfApplicationAborted(input.signal);
   const root = await mkdtemp(join(tmpdir(), "ai-workflow-source-commit-"));
   const indexPath = join(root, "index");
   const entries = new Map(snapshot.manifest.entries.map((entry) => [entry.path, entry]));
@@ -321,6 +319,10 @@ function literalPathspec(path: string) {
 
 type GitIndexEntry = { mode: string; objectId: string };
 
+function sameGitEntry(left: GitIndexEntry | undefined, right: GitIndexEntry | undefined) {
+  return left?.mode === right?.mode && left?.objectId === right?.objectId;
+}
+
 function parseUnmergedIndex(output: string) {
   const entries = new Map<string, Map<number, GitIndexEntry>>();
   for (const record of output.split("\0").filter(Boolean)) {
@@ -357,15 +359,20 @@ async function ownsFailedCherryPickState(
   cherryPickHead: string,
   execution: GitExecutionContext
 ) {
-  if (cherryPickHead) return cherryPickHead === sourceCommit;
+  if (cherryPickHead && cherryPickHead !== sourceCommit) return false;
   const unmerged = parseUnmergedIndex((await git(worktreePath, [
     "ls-files", "-u", "-z"
   ], execution)).stdout);
   if (!unmerged || unmerged.size === 0) return false;
-  const paths = [...unmerged.keys()];
   const sourceParent = (await git(worktreePath, [
     "rev-parse", "--verify", `${sourceCommit}^`
   ], execution)).stdout.trim();
+  const sourcePaths = (await git(worktreePath, [
+    "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", sourceParent, sourceCommit
+  ], execution)).stdout.split("\0").filter(Boolean);
+  const sourcePathSet = new Set(sourcePaths);
+  if ([...unmerged.keys()].some((path) => !sourcePathSet.has(path))) return false;
+  const paths = [...new Set([...sourcePaths, ...unmerged.keys()])];
   const readTree = async (commit: string) => parseTreeEntries((await git(worktreePath, [
     "ls-tree", "-z", commit, "--", ...paths.map(literalPathspec)
   ], execution)).stdout);
@@ -374,11 +381,18 @@ async function ownsFailedCherryPickState(
   ]);
   if (!baseEntries || !targetEntries || !sourceEntries) return false;
   const expectedStages = [baseEntries, targetEntries, sourceEntries] as const;
+  for (const path of sourcePaths) {
+    const base = baseEntries.get(path);
+    const target = targetEntries.get(path);
+    const source = sourceEntries.get(path);
+    const potentiallyConflicting = !sameGitEntry(base, target) && !sameGitEntry(target, source);
+    if (potentiallyConflicting && !unmerged.has(path)) return false;
+  }
   for (const [path, actualStages] of unmerged) {
     for (let stage = 1; stage <= 3; stage += 1) {
       const actual = actualStages.get(stage);
       const expected = expectedStages[stage - 1]!.get(path);
-      if (actual?.mode !== expected?.mode || actual?.objectId !== expected?.objectId) return false;
+      if (!sameGitEntry(actual, expected)) return false;
     }
   }
   return true;
@@ -507,9 +521,10 @@ export async function executeLocalIntegration(
     return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead,
       targetState: "uncertain" as const, statusPorcelain: "", error: "目标工作树 HEAD 在租约获取后发生变化", commandResults: [] };
   }
-  try {
-    if (!sourceCommit) {
-      const snapshot = await getWorktreeSnapshot(input.sourceWorktreePath, {
+  if (!sourceCommit) {
+    let snapshot: Awaited<ReturnType<typeof getWorktreeSnapshot>>;
+    try {
+      snapshot = await getWorktreeSnapshot(input.sourceWorktreePath, {
         sensitivePatterns: input.sensitivePatterns,
         signal: execution.signal,
         deadlineAt: execution.deadlineAt
@@ -517,15 +532,26 @@ export async function executeLocalIntegration(
       if (!snapshot.diff || snapshot.evidenceHash !== input.evidenceHash) {
         throw new Error("SOURCE_EVIDENCE_CHANGED");
       }
-      sourceCommit = await prepareFrozenSourceCommit(input, snapshot, execution);
+    } catch (error: any) {
+      throwIfApplicationAborted(input.signal);
+      const target = await inspectTargetState(input, execution);
+      const safe = target.identityValid && target.clean && target.head === preApplyHead;
+      return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+        targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
+        error: String(error?.stderr || error?.message || error), commandResults: [] };
     }
-  } catch (error: any) {
+    await input.onSourceFrozen?.();
     throwIfApplicationAborted(input.signal);
-    const target = await inspectTargetState(input, execution);
-    const safe = target.identityValid && target.clean && target.head === preApplyHead;
-    return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
-      targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
-      error: String(error?.stderr || error?.message || error), commandResults: [] };
+    try {
+      sourceCommit = await prepareFrozenSourceCommit(input, snapshot, execution);
+    } catch (error: any) {
+      throwIfApplicationAborted(input.signal);
+      const target = await inspectTargetState(input, execution);
+      const safe = target.identityValid && target.clean && target.head === preApplyHead;
+      return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+        targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
+        error: String(error?.stderr || error?.message || error), commandResults: [] };
+    }
   }
   try {
     const sourceIdentityAfterCommit = await inspectRegisteredWorktree(input, "source", execution);
@@ -536,8 +562,6 @@ export async function executeLocalIntegration(
       deadlineAt: execution.deadlineAt
     });
     if (!evidence.diff || evidence.evidenceHash !== input.evidenceHash) throw new Error("提交后的编码证据与原始证据不一致");
-    await input.onSourcePrepared?.(sourceCommit!);
-    throwIfApplicationAborted(input.signal);
   } catch (error: any) {
     throwIfApplicationAborted(input.signal);
     const target = await inspectTargetState(input, execution);
@@ -546,31 +570,36 @@ export async function executeLocalIntegration(
       targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
       error: String(error?.stderr || error?.message || error), commandResults: [] };
   }
+  await input.onSourcePrepared?.(sourceCommit!);
+  throwIfApplicationAborted(input.signal);
   const target = await inspectTargetState(input, execution);
   if (!target.identityValid || !target.clean || target.head !== preApplyHead) {
     return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead, targetState: "uncertain" as const,
       statusPorcelain: target.statusPorcelain, error: "目标工作树在应用前发生变化", commandResults: [] };
   }
-  try {
-    await input.onBeforeTargetMutation?.();
-    await assertTargetOwnership(input);
-  } catch (error: any) {
-    throwIfApplicationAborted(input.signal);
-    const current = await inspectTargetState(input, execution);
-    const safe = current.identityValid && current.clean && current.head === preApplyHead;
-    return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
-      targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: current.statusPorcelain,
-      error: String(error?.stderr || error?.message || error), commandResults: [] };
-  }
+  await input.onBeforeTargetMutation?.();
+  throwIfApplicationAborted(input.signal);
   let cherryPickCompleted = false;
+  let primaryOwnershipError: unknown;
+  const fencePrimaryMutation = async () => {
+    try {
+      await assertTargetOwnership(input);
+    } catch (error) {
+      primaryOwnershipError = error;
+      throw error;
+    }
+  };
   try {
-    await git(input.targetWorktreePath, ["cherry-pick", "--no-commit", sourceCommit!], execution);
+    await git(input.targetWorktreePath, ["cherry-pick", "--no-commit", sourceCommit!], execution, undefined, {
+      before: fencePrimaryMutation,
+      after: fencePrimaryMutation
+    });
     cherryPickCompleted = true;
-    await assertTargetOwnership(input);
     await input.onTargetMutated?.();
     throwIfApplicationAborted(input.signal);
   } catch (error: any) {
     throwIfApplicationAborted(input.signal);
+    if (primaryOwnershipError) throw primaryOwnershipError;
     await assertTargetOwnership(input);
     const cleanupExecution = gitExecutionContext(input.signal, GIT_CLEANUP_TIMEOUT_MS);
     const target = await inspectTargetState(input, cleanupExecution);
