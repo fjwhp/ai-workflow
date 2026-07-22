@@ -662,6 +662,63 @@ describe("local integration", () => {
     }
   });
 
+  it("stops immediately when the target lease is lost as restore completes", async () => {
+    const item = await fixture();
+    await rm(join(item.sourceWorktree, "feature.txt"));
+    await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
+    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
+    await writeFile(join(item.targetWorktree, "value.txt"), "target\n");
+    await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
+    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target conflict"]);
+
+    const wrapperDirectory = join(item.root, "git-cleanup-after-lease-wrapper");
+    const wrapper = join(wrapperDirectory, "git");
+    const restoreFinished = join(item.root, "cleanup-restore-finished");
+    const subsequentCleanupPreparation = join(item.root, "subsequent-cleanup-preparation");
+    const realGit = (await exec("which", ["git"])).stdout.trim();
+    await mkdir(wrapperDirectory);
+    await writeFile(wrapper, [
+      "#!/bin/sh",
+      "is_target=",
+      "is_restore=",
+      "is_config=",
+      "for argument in \"$@\"; do",
+      `  if [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
+      "  if [ \"$argument\" = \"restore\" ]; then is_restore=1; fi",
+      "  if [ \"$argument\" = \"config\" ]; then is_config=1; fi",
+      "done",
+      "if [ \"$is_target\" = \"1\" ] && [ \"$is_restore\" = \"1\" ]; then",
+      `  ${JSON.stringify(realGit)} \"$@\"`,
+      "  status=$?",
+      `  : > ${JSON.stringify(restoreFinished)}`,
+      "  exit $status",
+      "fi",
+      `if [ \"$is_target\" = \"1\" ] && [ \"$is_config\" = \"1\" ] && [ -f ${JSON.stringify(restoreFinished)} ]; then`,
+      `  : > ${JSON.stringify(subsequentCleanupPreparation)}`,
+      "fi",
+      `exec ${JSON.stringify(realGit)} \"$@\"`
+    ].join("\n"));
+    await chmod(wrapper, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+    try {
+      const callbackError = new Error("DELIVERY_APPLICATION_CLAIM_LOST_AFTER_RESTORE");
+      const pending = executeLocalIntegration({
+        ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
+        commitMessage: "REQ-0001 after-fenced cleanup", commands: [],
+        assertTargetOwnership: async () => {
+          if (await readFile(restoreFinished).then(() => true, () => false)) throw callbackError;
+        }
+      });
+
+      await expect(pending).rejects.toBe(callbackError);
+      await expect(readFile(subsequentCleanupPreparation, "utf8")).rejects.toThrow();
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
   it.each([
     ["worktree identity", "rev-parse", "--show-toplevel"],
     ["source evidence", "ls-files", "--ignored"]

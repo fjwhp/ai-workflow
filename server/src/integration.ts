@@ -659,16 +659,23 @@ export async function executeLocalIntegration(
           await git(input.targetWorktreePath, [
             "restore", `--source=${preApplyHead}`, "--staged", "--worktree", "--",
             ...existing.map(literalPathspec)
-          ], cleanupExecution, undefined, { before: fenceCleanupMutation });
+          ], cleanupExecution, undefined, {
+            before: fenceCleanupMutation,
+            after: fenceCleanupMutation
+          });
         }
         if (added.length) {
           await git(input.targetWorktreePath, [
             "rm", "-f", "--ignore-unmatch", "--", ...added.map(literalPathspec)
-          ], cleanupExecution, undefined, { before: fenceCleanupMutation });
+          ], cleanupExecution, undefined, {
+            before: fenceCleanupMutation,
+            after: fenceCleanupMutation
+          });
         }
         try {
           await git(input.targetWorktreePath, ["cherry-pick", "--quit"], cleanupExecution, undefined, {
-            before: fenceCleanupMutation
+            before: fenceCleanupMutation,
+            after: fenceCleanupMutation
           });
         } catch {
           if (cleanupOwnershipError) throw cleanupOwnershipError;
