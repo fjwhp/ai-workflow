@@ -179,6 +179,45 @@ export function createPhase2Schema(db: DatabaseSync) {
       FOREIGN KEY(project_id) REFERENCES projects(id),
       FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
     );
+    CREATE TABLE IF NOT EXISTS delivery_application_runs (
+      id TEXT PRIMARY KEY CHECK(length(id) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0),
+      requirement_id TEXT NOT NULL,
+      delivery_unit_id TEXT NOT NULL,
+      project_version_id TEXT NOT NULL,
+      evidence_version INTEGER NOT NULL CHECK(evidence_version BETWEEN 1 AND 2147483647),
+      claim_token TEXT NOT NULL UNIQUE
+        CHECK(length(claim_token) BETWEEN 1 AND 256 AND instr(claim_token, char(0)) = 0),
+      source_commit TEXT NOT NULL
+        CHECK(length(source_commit) BETWEEN 1 AND 256 AND instr(source_commit, char(0)) = 0),
+      base_commit TEXT NOT NULL
+        CHECK(length(base_commit) BETWEEN 1 AND 256 AND instr(base_commit, char(0)) = 0),
+      pre_apply_commit TEXT NOT NULL
+        CHECK(length(pre_apply_commit) BETWEEN 1 AND 256 AND instr(pre_apply_commit, char(0)) = 0),
+      evidence_hash TEXT NOT NULL
+        CHECK(length(evidence_hash) BETWEEN 1 AND 256 AND instr(evidence_hash, char(0)) = 0),
+      preflight_json TEXT NOT NULL
+        CHECK(json_valid(preflight_json) AND length(CAST(preflight_json AS BLOB)) <= 1048576),
+      command_results_json TEXT NOT NULL DEFAULT '[]'
+        CHECK(json_valid(command_results_json) AND json_type(command_results_json) = 'array'
+          AND length(CAST(command_results_json AS BLOB)) <= 1048576),
+      conflict_files_json TEXT NOT NULL DEFAULT '[]'
+        CHECK(json_valid(conflict_files_json) AND json_type(conflict_files_json) = 'array'
+          AND length(CAST(conflict_files_json AS BLOB)) <= 1048576),
+      error TEXT CHECK(error IS NULL OR (length(error) BETWEEN 1 AND 65536 AND instr(error, char(0)) = 0)),
+      status TEXT NOT NULL CHECK(status IN ('applying', 'applied', 'conflicted', 'failed')),
+      resolution_status TEXT NOT NULL CHECK(resolution_status IN ('pending', 'not_required')),
+      created_at TEXT NOT NULL CHECK(length(created_at) > 0 AND instr(created_at, char(0)) = 0),
+      updated_at TEXT NOT NULL CHECK(length(updated_at) > 0 AND instr(updated_at, char(0)) = 0),
+      completed_at TEXT,
+      CHECK(
+        (status = 'applying' AND resolution_status = 'pending' AND completed_at IS NULL)
+        OR (status = 'applied' AND resolution_status = 'not_required' AND completed_at IS NOT NULL)
+        OR (status IN ('conflicted', 'failed') AND resolution_status = 'pending' AND completed_at IS NOT NULL)
+      ),
+      FOREIGN KEY(requirement_id) REFERENCES requirements(id),
+      FOREIGN KEY(delivery_unit_id) REFERENCES delivery_units(id),
+      FOREIGN KEY(project_version_id) REFERENCES project_versions(id)
+    );
     CREATE TABLE IF NOT EXISTS requirement_revisions (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, version INTEGER NOT NULL,
       title TEXT NOT NULL, business_problem TEXT NOT NULL, expected_outcome TEXT NOT NULL,
@@ -608,6 +647,40 @@ export function createPhase2Schema(db: DatabaseSync) {
       ON delivery_units(requirement_id, project_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_dependency_edge
       ON delivery_dependencies(requirement_id, upstream_unit_id, downstream_unit_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_application_unit_active
+      ON delivery_application_runs(delivery_unit_id) WHERE status = 'applying';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_application_version_active
+      ON delivery_application_runs(project_version_id) WHERE status = 'applying';
+    CREATE INDEX IF NOT EXISTS idx_delivery_application_unit_history
+      ON delivery_application_runs(delivery_unit_id, created_at, id);
+    CREATE TRIGGER IF NOT EXISTS validate_delivery_application_owner_insert
+    BEFORE INSERT ON delivery_application_runs
+    BEGIN
+      SELECT RAISE(ABORT, 'DELIVERY_APPLICATION_OWNER_MISMATCH')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM delivery_units unit
+        WHERE unit.id = NEW.delivery_unit_id
+          AND unit.requirement_id = NEW.requirement_id
+          AND unit.project_version_id = NEW.project_version_id
+          AND unit.evidence_version = NEW.evidence_version
+      );
+    END;
+    CREATE TRIGGER IF NOT EXISTS delivery_application_identity_immutable
+    BEFORE UPDATE OF id, requirement_id, delivery_unit_id, project_version_id, evidence_version,
+      claim_token, source_commit, base_commit, pre_apply_commit, evidence_hash, preflight_json, created_at
+    ON delivery_application_runs
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_APPLICATION_IDENTITY_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_application_status_transition
+    BEFORE UPDATE OF status ON delivery_application_runs
+    WHEN OLD.status <> 'applying' OR NEW.status NOT IN ('applied', 'conflicted', 'failed')
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_APPLICATION_STATUS_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_application_settled_immutable
+    BEFORE UPDATE ON delivery_application_runs
+    WHEN OLD.status <> 'applying'
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_APPLICATION_SETTLED_IMMUTABLE'); END;
+    CREATE TRIGGER IF NOT EXISTS delivery_application_immutable_delete
+    BEFORE DELETE ON delivery_application_runs
+    BEGIN SELECT RAISE(ABORT, 'DELIVERY_APPLICATION_IMMUTABLE'); END;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_unit_active_run
       ON stage_runs(owner_type, owner_id, stage) WHERE status = 'running';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_owner_version
@@ -1213,7 +1286,7 @@ function createDeliveryEventGenerationTriggers(db: DatabaseSync) {
     "delivery_quality_runs", "delivery_quality_evidence", "delivery_quality_overrides",
     "delivery_contract_evidence", "delivery_evidence_invalidations", "delivery_stale_decisions",
     "requirement_automation_state", "requirement_automation_audit", "delivery_unit_skips",
-    "delivery_unit_retry_audit"
+    "delivery_unit_retry_audit", "delivery_application_runs"
   ];
   for (const table of requirementTables) createRequirementGenerationTriggers(db, table);
   createRequirementGenerationTriggers(db, "stage_runs", "NEW.owner_type = 'delivery_unit'", "OLD.owner_type = 'delivery_unit'");

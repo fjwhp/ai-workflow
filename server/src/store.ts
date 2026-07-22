@@ -26,6 +26,10 @@ import {
   type DeliveryQualityPersistence
 } from "./delivery-quality-repository.js";
 import {
+  DeliveryApplicationRepository,
+  type DeliveryApplicationPersistence
+} from "./delivery-application-repository.js";
+import {
   DeliveryCoordinator,
   type DeliveryCoordinationPersistence
 } from "./delivery-coordinator.js";
@@ -96,10 +100,12 @@ export class WorkflowStore {
   private readonly deliveryUnitRepository: DeliveryUnitRepository;
   private readonly deliveryExecutionRepository: DeliveryExecutionRepository;
   private readonly deliveryQualityRepository: DeliveryQualityRepository;
+  private readonly deliveryApplicationRepository: DeliveryApplicationRepository;
   private readonly executionRepository: ExecutionRepository;
   public readonly deliveryUnits: DeliveryUnitPersistence;
   public readonly deliveryExecutions: DeliveryExecutionPersistence;
   public readonly deliveryQuality: DeliveryQualityPersistence;
+  public readonly deliveryApplications: DeliveryApplicationPersistence;
   public readonly deliveryCoordination: DeliveryCoordinationPersistence;
   public readonly deliveryUnitDetails: DeliveryUnitDetailPersistence;
   public readonly automationJobs: AutomationJobPersistence;
@@ -118,6 +124,7 @@ export class WorkflowStore {
     this.deliveryUnitRepository = new DeliveryUnitRepository(this.db);
     this.deliveryExecutionRepository = new DeliveryExecutionRepository(this.db, clock);
     this.deliveryQualityRepository = new DeliveryQualityRepository(this.db, clock);
+    this.deliveryApplicationRepository = new DeliveryApplicationRepository(this.db, clock);
     const deliveryCoordinator = new DeliveryCoordinator(this.db, this.deliveryQualityRepository);
     const deliveryUnitDetails = new DeliveryUnitDetailRepository(this.db, this.deliveryUnitRepository);
     this.executionRepository = new ExecutionRepository(this.db);
@@ -129,6 +136,19 @@ export class WorkflowStore {
       get: (unitId) => this.deliveryUnitRepository.get(unitId),
       listForRequirement: (requirementId) => this.deliveryUnitRepository.listForRequirement(requirementId),
       listDependencies: (requirementId) => this.deliveryUnitRepository.listDependencies(requirementId)
+    };
+    this.deliveryApplications = {
+      claim: (unitId, input) => this.withImmediateTransaction(
+        () => this.deliveryApplicationRepository.claimInTransaction(unitId, input)
+      ),
+      complete: (runId, completion) => this.withImmediateTransaction(
+        () => this.deliveryApplicationRepository.completeInTransaction(runId, completion)
+      ),
+      get: (runId) => this.deliveryApplicationRepository.get(runId),
+      listForUnit: (unitId) => this.deliveryApplicationRepository.listForUnit(unitId),
+      aggregate: (requirementId) => this.withReadTransaction(
+        () => this.deliveryApplicationRepository.aggregate(requirementId)
+      )
     };
     this.deliveryExecutions = {
       claimImplementation: (unitId, model, automation) => this.withImmediateTransaction(
