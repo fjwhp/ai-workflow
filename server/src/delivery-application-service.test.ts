@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, writeFile
+} from "node:fs/promises";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
@@ -49,10 +51,37 @@ async function remoteRefs(project: ProjectGitFixture) {
 }
 
 async function repositoryState(project: ProjectGitFixture) {
+  const captureFiles = async (directory: string, prefix = ""): Promise<Array<{
+    path: string;
+    mode: number;
+    type: "file" | "directory" | "symlink";
+    bytes?: Buffer;
+    link?: Buffer;
+  }>> => {
+    const captured: Awaited<ReturnType<typeof captureFiles>> = [];
+    for (const name of (await readdir(directory)).sort()) {
+      const path = join(directory, name);
+      const relativePath = prefix ? `${prefix}/${name}` : name;
+      const stat = await lstat(path);
+      if (stat.isSymbolicLink()) {
+        captured.push({ path: relativePath, mode: stat.mode, type: "symlink",
+          link: await readlink(path, { encoding: "buffer" }) });
+      } else if (stat.isDirectory()) {
+        captured.push({ path: relativePath, mode: stat.mode, type: "directory" });
+        captured.push(...await captureFiles(path, relativePath));
+      } else {
+        captured.push({ path: relativePath, mode: stat.mode, type: "file", bytes: await readFile(path) });
+      }
+    }
+    return captured;
+  };
+  const indexPath = await git(project.versionWorktree, "rev-parse", "--git-path", "index");
   return {
     head: await head(project.versionWorktree),
     status: await status(project.versionWorktree),
-    refs: await remoteRefs(project)
+    refs: await remoteRefs(project),
+    index: await readFile(indexPath),
+    files: await captureFiles(project.versionWorktree)
   };
 }
 
@@ -350,6 +379,53 @@ async function installServiceSourceIndexWrapper(
   };
 }
 
+async function rejectServiceTargetCherryPick(fixture: Awaited<ReturnType<typeof createFixture>>) {
+  const wrapperDirectory = join(fixture.root, "git-service-target-failure-wrapper");
+  const wrapper = join(wrapperDirectory, "git");
+  const attemptedCherryPicks = join(fixture.root, "service-target-cherry-picks");
+  const destructiveCommands = join(fixture.root, "service-target-destructive-commands");
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  const lines = async (path: string) => (await readFile(path, "utf8").catch(() => ""))
+    .split("\n").filter(Boolean);
+  await mkdir(wrapperDirectory);
+  await writeFile(wrapper, [
+    "#!/bin/sh",
+    "is_target=",
+    "command=",
+    "previous=",
+    "is_no_commit=",
+    "is_abort_or_quit=",
+    "for argument in \"$@\"; do",
+    `  if [ \"$previous\" = \"-C\" ] && [ \"$argument\" = ${JSON.stringify(fixture.frontendGit.versionWorktree)} ]; then is_target=1; fi`,
+    "  if [ -z \"$command\" ] && [ \"$previous\" != \"-C\" ] && [ \"$argument\" != \"-C\" ]; then command=$argument; fi",
+    "  if [ \"$argument\" = \"--no-commit\" ]; then is_no_commit=1; fi",
+    "  if [ \"$argument\" = \"--abort\" ] || [ \"$argument\" = \"--quit\" ]; then is_abort_or_quit=1; fi",
+    "  previous=$argument",
+    "done",
+    "if [ \"$is_target\" = \"1\" ] && [ \"$command\" = \"cherry-pick\" ] && [ \"$is_no_commit\" = \"1\" ]; then",
+    `  printf '%s\\n' \"$*\" >> ${JSON.stringify(attemptedCherryPicks)}`,
+    "  printf 'injected ordinary target Git failure\\n' >&2",
+    "  exit 73",
+    "fi",
+    "if [ \"$is_target\" = \"1\" ] && { [ \"$command\" = \"restore\" ] || [ \"$command\" = \"reset\" ] || [ \"$command\" = \"rm\" ] || [ \"$command\" = \"checkout\" ] || [ \"$command\" = \"clean\" ] || { [ \"$command\" = \"cherry-pick\" ] && [ \"$is_abort_or_quit\" = \"1\" ]; }; }; then",
+    `  printf '%s\\n' \"$*\" >> ${JSON.stringify(destructiveCommands)}`,
+    "  exit 98",
+    "fi",
+    `exec ${JSON.stringify(realGit)} \"$@\"`
+  ].join("\n"));
+  await chmod(wrapper, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+  return {
+    attemptedCherryPicks: () => lines(attemptedCherryPicks),
+    destructiveCommands: () => lines(destructiveCommands),
+    restore: () => {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  };
+}
+
 describe("DeliveryApplicationService", () => {
   it("rejects inherited automation fields before loading application context", async () => {
     let loaded = false;
@@ -518,7 +594,7 @@ describe("DeliveryApplicationService", () => {
     await expectRepositoryState(fixture.backendGit, otherBefore);
   });
 
-  it("rolls a conflict back and settles only the requested unit", async () => {
+  it("settles a deterministic conflict without changing either target", async () => {
     const fixture = await createFixture({ conflict: true });
     const targetBefore = await repositoryState(fixture.frontendGit);
     const otherBefore = await repositoryState(fixture.backendGit);
@@ -528,6 +604,44 @@ describe("DeliveryApplicationService", () => {
 
     expect(result.status).toBe("conflicted");
     expect(result.run).toMatchObject({ status: "conflicted", conflictFiles: ["src/feature.ts"] });
+    await expectRepositoryState(fixture.frontendGit, targetBefore);
+    await expectRepositoryState(fixture.backendGit, otherBefore);
+  });
+
+  it("settles an ordinary target Git failure as dirty or uncertain without cleanup", async () => {
+    const fixture = await createFixture();
+    const targetBefore = await repositoryState(fixture.frontendGit);
+    const otherBefore = await repositoryState(fixture.backendGit);
+    const lease = leaseApplication(fixture.store, fixture.frontendUnit.id);
+    const guard = await rejectServiceTargetCherryPick(fixture);
+    const persistence = fixture.store.deliveryApplications;
+    let completion: Parameters<typeof persistence.complete>[1] | undefined;
+    const service = new DeliveryApplicationService({
+      applications: {
+        ...persistence,
+        complete: (claim, input) => {
+          completion = input;
+          return persistence.complete(claim, input);
+        }
+      },
+      loadContext: async (unitId) => {
+        const context = fixture.contexts.get(unitId);
+        const unit = fixture.store.deliveryUnits.get(unitId);
+        return context && unit ? { ...context, unit } : null;
+      }
+    });
+    let result: Awaited<ReturnType<typeof service.apply>>;
+    try {
+      result = await service.apply(fixture.frontendUnit.id, applicationInput(lease));
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!, JSON.stringify(result)).toMatchObject({ status: "failed", error: "APPLICATION_STATE_UNCERTAIN" });
+    expect(completion).toMatchObject({ status: "failed", worktreeState: "dirty_or_uncertain", commandResults: [] });
+    expect(result!.run).toMatchObject({ status: "failed", resolutionStatus: "pending", commandResults: [] });
+    expect(await guard.attemptedCherryPicks()).toHaveLength(1);
+    expect(await guard.destructiveCommands()).toEqual([]);
     await expectRepositoryState(fixture.frontendGit, targetBefore);
     await expectRepositoryState(fixture.backendGit, otherBefore);
   });
@@ -724,10 +838,14 @@ describe("DeliveryApplicationService", () => {
     } finally {
       marker.restore();
     }
-  });
+  }, 15_000);
 
   it("does not mutate the target when the application lease is lost after source binding", async () => {
     const fixture = await createFixture();
+    const siblingLease = leaseApplication(fixture.store, fixture.backendUnit.id, "sibling-worker");
+    const sibling = await fixture.service.apply(fixture.backendUnit.id, applicationInput(siblingLease));
+    expect(sibling.status).toBe("completed");
+    const siblingApplied = await repositoryState(fixture.backendGit);
     const targetBefore = await repositoryState(fixture.frontendGit);
     const persistence = fixture.store.deliveryApplications;
     const service = new DeliveryApplicationService({
@@ -751,6 +869,8 @@ describe("DeliveryApplicationService", () => {
       .rejects.toThrow("DELIVERY_APPLICATION_LEASE_STALE");
 
     await expectRepositoryState(fixture.frontendGit, targetBefore);
+    await expectRepositoryState(fixture.backendGit, siblingApplied);
+    expect(fixture.store.deliveryApplications.get(sibling.run.id)).toMatchObject({ status: "applied" });
     expect(fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)[0])
       .toMatchObject({ status: "applying", sourceCommit: expect.stringMatching(/^[0-9a-f]{40}$/) });
   });
@@ -817,6 +937,10 @@ describe("DeliveryApplicationService", () => {
 
   it("honors cancellation after source binding before target mutation", async () => {
     const fixture = await createFixture();
+    const siblingLease = leaseApplication(fixture.store, fixture.backendUnit.id, "sibling-worker");
+    const sibling = await fixture.service.apply(fixture.backendUnit.id, applicationInput(siblingLease));
+    expect(sibling.status).toBe("completed");
+    const siblingApplied = await repositoryState(fixture.backendGit);
     const targetBefore = await repositoryState(fixture.frontendGit);
     const controller = new AbortController();
     const persistence = fixture.store.deliveryApplications;
@@ -842,6 +966,8 @@ describe("DeliveryApplicationService", () => {
     )).rejects.toThrow("DELIVERY_APPLICATION_ABORTED");
 
     await expectRepositoryState(fixture.frontendGit, targetBefore);
+    await expectRepositoryState(fixture.backendGit, siblingApplied);
+    expect(fixture.store.deliveryApplications.get(sibling.run.id)).toMatchObject({ status: "applied" });
     expect(fixture.store.deliveryApplications.listForUnit(fixture.frontendUnit.id)[0])
       .toMatchObject({ status: "applying" });
   });

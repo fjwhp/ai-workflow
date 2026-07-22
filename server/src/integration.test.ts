@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, writeFile
+} from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
@@ -11,8 +13,17 @@ const exec = promisify(execFile);
 const roots: string[] = [];
 afterEach(() => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
+async function waitForFile(path: string) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (await readFile(path).then(() => true, () => false)) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`TIMED_OUT_WAITING_FOR_FILE:${path}`);
+}
+
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "flowgate-integration-")); roots.push(root);
+  const root = await realpath(await mkdtemp(join(tmpdir(), "flowgate-integration-"))); roots.push(root);
   const repo = join(root, "repo"), targetWorktree = join(root, "version");
   const sourceWorktree = join(root, ".ai-workflow-worktrees", "repo", "requirements", "REQ-0001");
   await exec("git", ["init", "-b", "main", repo]);
@@ -26,6 +37,119 @@ async function fixture() {
   await writeFile(join(sourceWorktree, "feature.txt"), "implemented\n");
   const snapshot = await getWorktreeSnapshot(sourceWorktree);
   return { root, repo, targetWorktree, sourceWorktree, evidenceHash: snapshot.evidenceHash };
+}
+
+async function fixtureWithDeterministicConflict() {
+  const item = await fixture();
+  await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
+  const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
+  await writeFile(join(item.targetWorktree, "value.txt"), "target\n");
+  await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
+  await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target conflict"]);
+  return { ...item, evidenceHash: sourceSnapshot.evidenceHash };
+}
+
+async function captureIntegrationTargetState(
+  item: Awaited<ReturnType<typeof fixture>>
+) {
+  const captureFiles = async (directory: string, prefix = ""): Promise<Array<{
+    path: string;
+    mode: number;
+    type: "file" | "directory" | "symlink";
+    bytes?: Buffer;
+    link?: Buffer;
+  }>> => {
+    const captured: Awaited<ReturnType<typeof captureFiles>> = [];
+    for (const name of (await readdir(directory)).sort()) {
+      const path = join(directory, name);
+      const relativePath = prefix ? `${prefix}/${name}` : name;
+      const stat = await lstat(path);
+      if (stat.isSymbolicLink()) {
+        captured.push({
+          path: relativePath,
+          mode: stat.mode,
+          type: "symlink",
+          link: await readlink(path, { encoding: "buffer" })
+        });
+      } else if (stat.isDirectory()) {
+        captured.push({ path: relativePath, mode: stat.mode, type: "directory" });
+        captured.push(...await captureFiles(path, relativePath));
+      } else {
+        captured.push({
+          path: relativePath,
+          mode: stat.mode,
+          type: "file",
+          bytes: await readFile(path)
+        });
+      }
+    }
+    return captured;
+  };
+  const indexPath = (await exec("git", [
+    "-C", item.targetWorktree, "rev-parse", "--git-path", "index"
+  ])).stdout.trim();
+  return {
+    head: (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout,
+    branch: (await exec("git", ["-C", item.targetWorktree, "branch", "--show-current"])).stdout,
+    status: (await exec("git", [
+      "-C", item.targetWorktree, "status", "--porcelain=v2", "-z", "--untracked-files=all"
+    ])).stdout,
+    index: await readFile(indexPath),
+    files: await captureFiles(item.targetWorktree),
+    refs: (await exec("git", [
+      "-C", item.repo, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)",
+      "refs/heads/release/1.0", "refs/remotes"
+    ])).stdout
+  };
+}
+
+async function rejectIfTargetMutationStarts(item: Awaited<ReturnType<typeof fixture>>) {
+  const wrapperDirectory = join(item.root, "git-reject-target-mutation-wrapper");
+  const wrapper = join(wrapperDirectory, "git");
+  const targetMutations = join(item.root, "target-mutations");
+  const destructiveCommands = join(item.root, "target-destructive-commands");
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  const lines = async (path: string) => (await readFile(path, "utf8").catch(() => ""))
+    .split("\n").filter(Boolean);
+  await mkdir(wrapperDirectory);
+  await writeFile(wrapper, [
+    "#!/bin/sh",
+    "is_target=",
+    "command=",
+    "previous=",
+    "is_no_commit=",
+    "is_abort_or_quit=",
+    "for argument in \"$@\"; do",
+    `  if [ \"$previous\" = \"-C\" ] && [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
+    "  if [ -z \"$command\" ] && [ \"$previous\" != \"-C\" ] && [ \"$argument\" != \"-C\" ]; then command=$argument; fi",
+    "  if [ \"$argument\" = \"--no-commit\" ]; then is_no_commit=1; fi",
+    "  if [ \"$argument\" = \"--abort\" ] || [ \"$argument\" = \"--quit\" ]; then is_abort_or_quit=1; fi",
+    "  previous=$argument",
+    "done",
+    "if [ \"$is_target\" = \"1\" ]; then",
+    "  if [ \"$command\" = \"cherry-pick\" ] && [ \"$is_no_commit\" = \"1\" ]; then",
+    `    printf '%s\\n' \"$*\" >> ${JSON.stringify(targetMutations)}`,
+    "    printf 'injected ordinary target Git failure\\n' >&2",
+    "    exit 97",
+    "  fi",
+    "  if [ \"$command\" = \"restore\" ] || [ \"$command\" = \"reset\" ] || [ \"$command\" = \"rm\" ] || [ \"$command\" = \"checkout\" ] || [ \"$command\" = \"clean\" ] || { [ \"$command\" = \"cherry-pick\" ] && [ \"$is_abort_or_quit\" = \"1\" ]; }; then",
+    `    printf '%s\\n' \"$*\" >> ${JSON.stringify(destructiveCommands)}`,
+    "    exit 98",
+    "  fi",
+    "fi",
+    `exec ${JSON.stringify(realGit)} \"$@\"`
+  ].join("\n"));
+  await chmod(wrapper, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+  return {
+    targetMutations: () => lines(targetMutations),
+    destructiveCommands: () => lines(destructiveCommands),
+    restore: () => {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  };
 }
 
 async function fixtureWithTwoChangedFiles() {
@@ -52,7 +176,7 @@ async function fixtureWithLongChangedPaths() {
 }
 
 async function fixtureWithDirectoryBoundary(withPadding: boolean) {
-  const root = await mkdtemp(join(tmpdir(), "flowgate-integration-")); roots.push(root);
+  const root = await realpath(await mkdtemp(join(tmpdir(), "flowgate-integration-"))); roots.push(root);
   const repo = join(root, "repo"), targetWorktree = join(root, "version");
   const sourceWorktree = join(root, ".ai-workflow-worktrees", "repo", "requirements", "REQ-0001");
   const parent = "a";
@@ -681,26 +805,83 @@ describe("local integration", () => {
     expect(check.checks.find((entry) => entry.id === "target_clean")?.ok).toBe(false);
   });
 
-  it("aborts a conflicting cherry-pick and keeps the target branch clean", async () => {
+  it("reports a deterministic conflict without starting target mutation or cleanup", async () => {
+    const item = await fixtureWithDeterministicConflict();
+    const targetBefore = await captureIntegrationTargetState(item);
+    const guard = await rejectIfTargetMutationStarts(item);
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), evidenceHash: item.evidenceHash,
+        commitMessage: "REQ-0001 deterministic conflict", commands: []
+      });
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!, JSON.stringify(result)).toMatchObject({
+      status: "conflict",
+      targetState: "untouched_clean",
+      conflictFiles: ["value.txt"],
+      commandResults: []
+    });
+    expect(await guard.targetMutations()).toEqual([]);
+    expect(await guard.destructiveCommands()).toEqual([]);
+    expect(await captureIntegrationTargetState(item)).toEqual(targetBefore);
+  });
+
+  it("returns uncertain without cleanup when the target changes at the concurrent target boundary", async () => {
     const item = await fixture();
-    await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
-    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
-    await writeFile(join(item.targetWorktree, "value.txt"), "target\n");
-    await exec("git", ["-C", item.targetWorktree, "add", "--all"]); await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target"]);
-    const targetHead = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim();
-    const result = await executeLocalIntegration({ ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash, commitMessage: "REQ-0001 conflict", commands: [] });
-    expect(result.status, JSON.stringify(result)).toBe("conflict");
-    expect(result.conflictFiles).toEqual(["value.txt"]);
-    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "HEAD"])).stdout.trim()).toBe(targetHead);
-    expect(await readFile(join(item.targetWorktree, "value.txt"), "utf8")).toBe("target\n");
-    expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toBe("");
-    expect((await exec("git", ["-C", item.targetWorktree, "rev-parse", "--verify", "CHERRY_PICK_HEAD"]).catch(() => ({ stdout: "" }))).stdout).toBe("");
+    const guard = await rejectIfTargetMutationStarts(item);
+    const externalBytes = Buffer.from("external target edit\n\0raw");
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 concurrent target", commands: [],
+        onBeforeTargetMutation: async () => {
+          await writeFile(join(item.targetWorktree, "external.txt"), externalBytes);
+        }
+      });
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!, JSON.stringify(result)).toMatchObject({
+      status: "ambiguous",
+      targetState: "uncertain",
+      commandResults: []
+    });
+    expect(await readFile(join(item.targetWorktree, "external.txt"))).toEqual(externalBytes);
+    expect(await guard.targetMutations()).toEqual([]);
+    expect(await guard.destructiveCommands()).toEqual([]);
+  });
+
+  it("preserves an ordinary target Git failure and returns uncertain without cleanup", async () => {
+    const item = await fixture();
+    const targetBefore = await captureIntegrationTargetState(item);
+    const guard = await rejectIfTargetMutationStarts(item);
+    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
+    try {
+      result = await executeLocalIntegration({
+        ...integrationInput(item), commitMessage: "REQ-0001 ordinary target Git failure", commands: []
+      });
+    } finally {
+      guard.restore();
+    }
+
+    expect(result!, JSON.stringify(result)).toMatchObject({
+      status: "ambiguous",
+      targetState: "uncertain",
+      commandResults: [],
+      error: "injected ordinary target Git failure\n"
+    });
+    expect(await guard.targetMutations()).toHaveLength(1);
+    expect(await guard.destructiveCommands()).toEqual([]);
+    expect(await captureIntegrationTargetState(item)).toEqual(targetBefore);
   });
 
   it("preserves a foreign conflict created immediately before target mutation", async () => {
     const item = await fixture();
-    await rm(join(item.sourceWorktree, "feature.txt"));
-    await writeFile(join(item.sourceWorktree, "value.txt"), "delivery source\n");
     const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
 
     await writeFile(join(item.targetWorktree, "value.txt"), "target version\n");
@@ -736,66 +917,7 @@ describe("local integration", () => {
     expect(await captureConflictState()).toEqual(foreignState);
   });
 
-  it("preserves an owned conflict after another actor starts resolving it", async () => {
-    const item = await fixture();
-    await writeFile(join(item.sourceWorktree, "value.txt"), "delivery source\n");
-    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
-    await writeFile(join(item.targetWorktree, "value.txt"), "target version\n");
-    await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
-    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target version"]);
-
-    const wrapperDirectory = join(item.root, "git-foreign-resolution-wrapper");
-    const wrapper = join(wrapperDirectory, "git");
-    const indexPath = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "--git-path", "index"])).stdout.trim();
-    const cherryPickHeadPath = (await exec("git", ["-C", item.targetWorktree, "rev-parse", "--git-path", "CHERRY_PICK_HEAD"])).stdout.trim();
-    const savedIndex = join(item.root, "foreign-resolution.index");
-    const savedCherryPickHead = join(item.root, "foreign-resolution.cherry-pick-head");
-    const savedValue = join(item.root, "foreign-resolution.value");
-    const realGit = (await exec("which", ["git"])).stdout.trim();
-    await mkdir(wrapperDirectory);
-    await writeFile(wrapper, [
-      "#!/bin/sh",
-      "is_target=",
-      "is_cherry_pick=",
-      "source_commit=",
-      "for argument in \"$@\"; do",
-      `  if [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
-      "  if [ \"$argument\" = \"cherry-pick\" ]; then is_cherry_pick=1; fi",
-      "  source_commit=$argument",
-      "done",
-      "if [ \"$is_target\" = \"1\" ] && [ \"$is_cherry_pick\" = \"1\" ]; then",
-      `  ${JSON.stringify(realGit)} -C ${JSON.stringify(item.targetWorktree)} cherry-pick \"$source_commit\"`,
-      "  status=$?",
-      `  printf 'foreign resolution\\n' > ${JSON.stringify(join(item.targetWorktree, "value.txt"))}`,
-      `  ${JSON.stringify(realGit)} -C ${JSON.stringify(item.targetWorktree)} add -- value.txt`,
-      `  /bin/cp ${JSON.stringify(indexPath)} ${JSON.stringify(savedIndex)}`,
-      `  /bin/cp ${JSON.stringify(cherryPickHeadPath)} ${JSON.stringify(savedCherryPickHead)}`,
-      `  /bin/cp ${JSON.stringify(join(item.targetWorktree, "value.txt"))} ${JSON.stringify(savedValue)}`,
-      "  exit $status",
-      "fi",
-      `exec ${JSON.stringify(realGit)} \"$@\"`
-    ].join("\n"));
-    await chmod(wrapper, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
-    let result: Awaited<ReturnType<typeof executeLocalIntegration>>;
-    try {
-      result = await executeLocalIntegration({
-        ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
-        commitMessage: "REQ-0001 foreign resolution", commands: []
-      });
-    } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-    }
-
-    expect(result!.status).toBe("ambiguous");
-    expect(await readFile(indexPath)).toEqual(await readFile(savedIndex));
-    expect(await readFile(cherryPickHeadPath)).toEqual(await readFile(savedCherryPickHead));
-    expect(await readFile(join(item.targetWorktree, "value.txt"))).toEqual(await readFile(savedValue));
-  });
-
-  it("rolls back a wildcard filename without touching a matching sibling path", async () => {
+  it("reports a wildcard conflict without touching a matching sibling path", async () => {
     const item = await fixture();
     await writeFile(join(item.sourceWorktree, "new?.txt"), "source wildcard\n");
     const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
@@ -843,10 +965,7 @@ describe("local integration", () => {
         ...integrationInput(item), commitMessage: "REQ-0001 abort cherry-pick", commands: [],
         signal: controller.signal
       });
-      for (let attempt = 0; attempt < 200; attempt += 1) {
-        if (await readFile(marker, "utf8").then(() => true, () => false)) break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      await waitForFile(marker);
       await expect(readFile(marker, "utf8")).resolves.toBe("");
       const abortedAt = Date.now();
       controller.abort();
@@ -856,9 +975,9 @@ describe("local integration", () => {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
     }
-  });
+  }, 15_000);
 
-  it("does not start the primary cherry-pick after lease loss during filter lookup", async () => {
+  it("does not start target mutation after ownership loss during the final target read", async () => {
     const item = await fixture();
     const wrapperDirectory = join(item.root, "git-primary-lease-wrapper");
     const wrapper = join(wrapperDirectory, "git");
@@ -892,178 +1011,21 @@ describe("local integration", () => {
     const previousPath = process.env.PATH;
     process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
     try {
-      const callbackError = new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+      const callbackError = new Error("DELIVERY_APPLICATION_CLAIM_LOST_DURING_FINAL_TARGET_READ");
       const pending = executeLocalIntegration({
         ...integrationInput(item), commitMessage: "REQ-0001 primary fence", commands: [],
         onBeforeTargetMutation: async () => { await writeFile(mutationArmed, ""); },
         assertTargetOwnership: async () => {
-          if (await readFile(filterLookupFinished).then(() => true, () => false)) throw callbackError;
-        }
-      });
-
-      await expect(pending).rejects.toBe(callbackError);
-      await expect(readFile(cherryPickStarted, "utf8")).rejects.toThrow();
-      expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toBe("");
-    } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-    }
-  });
-
-  it("does not swallow cancellation while inspecting an owned cherry-pick conflict", async () => {
-    const item = await fixture();
-    await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
-    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
-    await writeFile(join(item.targetWorktree, "value.txt"), "target\n");
-    await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
-    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target conflict"]);
-
-    const wrapperDirectory = join(item.root, "git-cleanup-wrapper");
-    const wrapper = join(wrapperDirectory, "git");
-    const marker = join(item.root, "cleanup-inspection-started");
-    const realGit = (await exec("which", ["git"])).stdout.trim();
-    await mkdir(wrapperDirectory);
-    await writeFile(wrapper, [
-      "#!/bin/sh",
-      "for argument in \"$@\"; do",
-      "  if [ \"$argument\" = \"CHERRY_PICK_HEAD\" ]; then",
-      `    : > ${JSON.stringify(marker)}`,
-      "    exec /bin/sleep 2",
-      "  fi",
-      "done",
-      `exec ${JSON.stringify(realGit)} \"$@\"`
-    ].join("\n"));
-    await chmod(wrapper, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
-    const controller = new AbortController();
-    try {
-      const pending = executeLocalIntegration({
-        ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
-        commitMessage: "REQ-0001 abort cleanup", commands: [], signal: controller.signal
-      });
-      for (let attempt = 0; attempt < 200; attempt += 1) {
-        if (await readFile(marker, "utf8").then(() => true, () => false)) break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      await expect(readFile(marker, "utf8")).resolves.toBe("");
-      controller.abort();
-      await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_ABORTED");
-    } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-    }
-  });
-
-  it("does not start destructive cleanup after the target lease is lost during diagnostics", async () => {
-    const item = await fixture();
-    await rm(join(item.sourceWorktree, "feature.txt"));
-    await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
-    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
-    await writeFile(join(item.targetWorktree, "value.txt"), "target\n");
-    await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
-    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target conflict"]);
-
-    const wrapperDirectory = join(item.root, "git-cleanup-lease-wrapper");
-    const wrapper = join(wrapperDirectory, "git");
-    const diagnosticsFinished = join(item.root, "cleanup-diagnostics-finished");
-    const destructiveCommandStarted = join(item.root, "destructive-cleanup-started");
-    const realGit = (await exec("which", ["git"])).stdout.trim();
-    await mkdir(wrapperDirectory);
-    await writeFile(wrapper, [
-      "#!/bin/sh",
-      "is_target=",
-      "is_ls_tree=",
-      "is_destructive=",
-      "for argument in \"$@\"; do",
-      `  if [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
-      "  if [ \"$argument\" = \"ls-tree\" ]; then is_ls_tree=1; fi",
-      "  if [ \"$argument\" = \"restore\" ] || [ \"$argument\" = \"rm\" ] || [ \"$argument\" = \"--quit\" ]; then is_destructive=1; fi",
-      "done",
-      "if [ \"$is_target\" = \"1\" ] && [ \"$is_ls_tree\" = \"1\" ]; then",
-      `  ${JSON.stringify(realGit)} \"$@\"`,
-      "  status=$?",
-      `  : > ${JSON.stringify(diagnosticsFinished)}`,
-      "  exit $status",
-      "fi",
-      "if [ \"$is_target\" = \"1\" ] && [ \"$is_destructive\" = \"1\" ]; then",
-      `  : > ${JSON.stringify(destructiveCommandStarted)}`,
-      "fi",
-      `exec ${JSON.stringify(realGit)} \"$@\"`
-    ].join("\n"));
-    await chmod(wrapper, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
-    try {
-      const pending = executeLocalIntegration({
-        ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
-        commitMessage: "REQ-0001 fenced cleanup", commands: [],
-        assertTargetOwnership: async () => {
-          if (await readFile(diagnosticsFinished).then(() => true, () => false)) {
-            throw new Error("DELIVERY_APPLICATION_CLAIM_LOST");
+          if (await readFile(filterLookupFinished).then(() => true, () => false)) {
+            throw callbackError;
           }
         }
       });
 
-      await expect(pending).rejects.toThrow("DELIVERY_APPLICATION_CLAIM_LOST");
-      await expect(readFile(destructiveCommandStarted, "utf8")).rejects.toThrow();
-    } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-    }
-  });
-
-  it("stops immediately when the target lease is lost as restore completes", async () => {
-    const item = await fixture();
-    await rm(join(item.sourceWorktree, "feature.txt"));
-    await writeFile(join(item.sourceWorktree, "value.txt"), "source\n");
-    const sourceSnapshot = await getWorktreeSnapshot(item.sourceWorktree);
-    await writeFile(join(item.targetWorktree, "value.txt"), "target\n");
-    await exec("git", ["-C", item.targetWorktree, "add", "--all"]);
-    await exec("git", ["-C", item.targetWorktree, "commit", "-m", "target conflict"]);
-
-    const wrapperDirectory = join(item.root, "git-cleanup-after-lease-wrapper");
-    const wrapper = join(wrapperDirectory, "git");
-    const restoreFinished = join(item.root, "cleanup-restore-finished");
-    const subsequentCleanupPreparation = join(item.root, "subsequent-cleanup-preparation");
-    const realGit = (await exec("which", ["git"])).stdout.trim();
-    await mkdir(wrapperDirectory);
-    await writeFile(wrapper, [
-      "#!/bin/sh",
-      "is_target=",
-      "is_restore=",
-      "is_config=",
-      "for argument in \"$@\"; do",
-      `  if [ \"$argument\" = ${JSON.stringify(item.targetWorktree)} ]; then is_target=1; fi`,
-      "  if [ \"$argument\" = \"restore\" ]; then is_restore=1; fi",
-      "  if [ \"$argument\" = \"config\" ]; then is_config=1; fi",
-      "done",
-      "if [ \"$is_target\" = \"1\" ] && [ \"$is_restore\" = \"1\" ]; then",
-      `  ${JSON.stringify(realGit)} \"$@\"`,
-      "  status=$?",
-      `  : > ${JSON.stringify(restoreFinished)}`,
-      "  exit $status",
-      "fi",
-      `if [ \"$is_target\" = \"1\" ] && [ \"$is_config\" = \"1\" ] && [ -f ${JSON.stringify(restoreFinished)} ]; then`,
-      `  : > ${JSON.stringify(subsequentCleanupPreparation)}`,
-      "fi",
-      `exec ${JSON.stringify(realGit)} \"$@\"`
-    ].join("\n"));
-    await chmod(wrapper, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
-    try {
-      const callbackError = new Error("DELIVERY_APPLICATION_CLAIM_LOST_AFTER_RESTORE");
-      const pending = executeLocalIntegration({
-        ...integrationInput(item), evidenceHash: sourceSnapshot.evidenceHash,
-        commitMessage: "REQ-0001 after-fenced cleanup", commands: [],
-        assertTargetOwnership: async () => {
-          if (await readFile(restoreFinished).then(() => true, () => false)) throw callbackError;
-        }
-      });
-
       await expect(pending).rejects.toBe(callbackError);
-      await expect(readFile(subsequentCleanupPreparation, "utf8")).rejects.toThrow();
+      await expect(readFile(filterLookupFinished, "utf8")).resolves.toBe("");
+      await expect(readFile(cherryPickStarted, "utf8")).rejects.toThrow();
+      expect((await exec("git", ["-C", item.targetWorktree, "status", "--porcelain"])).stdout).toBe("");
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
@@ -1158,7 +1120,7 @@ describe("local integration", () => {
   it.each([
     { batchBoundary: "same query batch", withPadding: false, expectedSplit: false },
     { batchBoundary: "different query batches", withPadding: true, expectedSplit: true }
-  ])("treats a recovered file replaced by a directory as a deletion across $batchBoundary", async ({
+  ])("conservatively reports a recovered file-to-directory boundary conflict across $batchBoundary", async ({
     withPadding, expectedSplit
   }) => {
     const budgetBytes = 16 * 1024;
@@ -1166,6 +1128,7 @@ describe("local integration", () => {
     await exec("git", ["-C", item.sourceWorktree, "add", "--all"]);
     await exec("git", ["-C", item.sourceWorktree, "commit", "-m", "replace file with directory"]);
     const sourceCommit = (await exec("git", ["-C", item.sourceWorktree, "rev-parse", "HEAD"])).stdout.trim();
+    const targetBefore = await captureIntegrationTargetState(item);
     const marker = await installSourceTreeArgvBudgetWrapper(item, budgetBytes, [item.parent, item.child]);
 
     try {
@@ -1182,10 +1145,15 @@ describe("local integration", () => {
       }).toEqual({
         boundaryPathsQueried: true,
         boundaryQueriesSplit: expectedSplit,
-        targetMutationStarted: true,
-        status: "completed",
-        error: null
+        targetMutationStarted: false,
+        status: "conflict",
+        error: "APPLICATION_CONFLICT"
       });
+      expect(result.conflictFiles?.length).toBeGreaterThan(0);
+      expect(result.conflictFiles?.some((path) =>
+        path === item.parent || path.startsWith(`${item.parent}/`)
+      )).toBe(true);
+      expect(await captureIntegrationTargetState(item)).toEqual(targetBefore);
       expect((await exec("git", ["-C", item.sourceWorktree, "status", "--porcelain=v1"])).stdout).toBe("");
     } finally {
       marker.restore();

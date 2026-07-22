@@ -4,6 +4,7 @@ import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { runIsolatedVerification } from "./automated-testing.js";
+import { simulateDeliveryMerge } from "./delivery-application-merge.js";
 import {
   codingFilterOverrides,
   codingGitEnvironmentWithFsmonitor,
@@ -15,12 +16,9 @@ import { buildVerificationPlan, type VerificationCommand } from "./verification-
 
 const execFileAsync = promisify(execFile);
 const MAX_COMMAND_OUTPUT_BYTES = 16_384;
-const MAX_CONFLICT_FILES = 1_024;
-const MAX_CONFLICT_FILES_BYTES = 262_144;
 const TRUNCATED_OUTPUT_MARKER = "\n[truncated]";
 const APPLICATION_TIMEOUT_MS = 300_000;
 const GIT_COMMAND_TIMEOUT_MS = 30_000;
-const GIT_CLEANUP_TIMEOUT_MS = 30_000;
 const RECOVERED_SOURCE_TREE_ARGV_BUDGET_BYTES = 16 * 1024;
 
 interface GitExecutionContext {
@@ -93,8 +91,6 @@ export type ApplicationResult = {
   commandResults: ApplicationCommandResult[];
   error: string | null;
   conflictFiles?: string[];
-  rollbackError?: string;
-  rollbackPostcondition?: TargetState;
 };
 
 export type LocalIntegrationExecutionInput = FrozenApplicationInput & {
@@ -399,7 +395,7 @@ async function inspectRegisteredWorktree(
     }
     return { valid: true as const, path: candidate, headCommit: identity.headCommit };
   } catch (error) {
-    throwIfApplicationAborted(execution.signal);
+    throwIfApplicationStopped(error, execution.signal);
     return { valid: false as const, status: "not_accessible", path: candidatePath };
   }
 }
@@ -417,18 +413,9 @@ async function inspectTargetState(
     ]);
     return { identityValid: true, clean: statusPorcelain.length === 0, head: head.trim(), statusPorcelain };
   } catch (error) {
-    throwIfApplicationAborted(execution.signal);
+    throwIfApplicationStopped(error, execution.signal);
     return { identityValid: false, clean: false, head: "", statusPorcelain: "" };
   }
-}
-
-async function changedTargetFiles(worktreePath: string, execution: GitExecutionContext) {
-  const outputs = await Promise.all([
-    git(worktreePath, ["diff", "--name-only", "-z"], execution),
-    git(worktreePath, ["diff", "--cached", "--name-only", "-z"], execution),
-    git(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"], execution)
-  ]);
-  return [...new Set(outputs.flatMap(({ stdout }) => stdout.split("\0").filter(Boolean)))];
 }
 
 function boundedCommandOutput(value: unknown) {
@@ -441,44 +428,8 @@ function boundedCommandOutput(value: unknown) {
   return `${prefix}${TRUNCATED_OUTPUT_MARKER}`;
 }
 
-function boundedConflictFiles(files: string[]) {
-  const result: string[] = [];
-  let bytes = 2;
-  for (const file of files.slice(0, MAX_CONFLICT_FILES)) {
-    const nextBytes = Buffer.byteLength(JSON.stringify(file)) + (result.length ? 1 : 0);
-    if (bytes + nextBytes > MAX_CONFLICT_FILES_BYTES) break;
-    result.push(file);
-    bytes += nextBytes;
-  }
-  return result;
-}
-
-function literalPathspec(path: string) {
-  return `:(literal)${path}`;
-}
-
 type GitIndexEntry = { mode: string; objectId: string };
 type GitTreeEntry = GitIndexEntry & { objectType: string };
-
-function sameGitEntry(left: GitIndexEntry | undefined, right: GitIndexEntry | undefined) {
-  return left?.mode === right?.mode && left?.objectId === right?.objectId;
-}
-
-function parseUnmergedIndex(output: string) {
-  const entries = new Map<string, Map<number, GitIndexEntry>>();
-  for (const record of output.split("\0").filter(Boolean)) {
-    const match = /^([0-7]{6}) ([0-9a-f]+) ([123])\t([\s\S]+)$/.exec(record);
-    if (!match) return undefined;
-    const mode = match[1]!;
-    const objectId = match[2]!;
-    const stageValue = match[3]!;
-    const path = match[4]!;
-    const stages = entries.get(path) ?? new Map<number, GitIndexEntry>();
-    stages.set(Number(stageValue), { mode, objectId });
-    entries.set(path, stages);
-  }
-  return entries;
-}
 
 function parseTreeEntries(output: string) {
   const entries = new Map<string, GitTreeEntry>();
@@ -493,52 +444,6 @@ function parseTreeEntries(output: string) {
     entries.set(path, { mode, objectType, objectId });
   }
   return entries;
-}
-
-async function ownsFailedCherryPickState(
-  worktreePath: string,
-  sourceCommit: string,
-  preApplyHead: string,
-  cherryPickHead: string,
-  execution: GitExecutionContext
-) {
-  if (cherryPickHead && cherryPickHead !== sourceCommit) return false;
-  const unmerged = parseUnmergedIndex((await git(worktreePath, [
-    "ls-files", "-u", "-z"
-  ], execution)).stdout);
-  if (!unmerged || unmerged.size === 0) return false;
-  const sourceParent = (await git(worktreePath, [
-    "rev-parse", "--verify", `${sourceCommit}^`
-  ], execution)).stdout.trim();
-  const sourcePaths = (await git(worktreePath, [
-    "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", sourceParent, sourceCommit
-  ], execution)).stdout.split("\0").filter(Boolean);
-  const sourcePathSet = new Set(sourcePaths);
-  if ([...unmerged.keys()].some((path) => !sourcePathSet.has(path))) return false;
-  const paths = [...new Set([...sourcePaths, ...unmerged.keys()])];
-  const readTree = async (commit: string) => parseTreeEntries((await git(worktreePath, [
-    "ls-tree", "-z", commit, "--", ...paths.map(literalPathspec)
-  ], execution)).stdout);
-  const [baseEntries, targetEntries, sourceEntries] = await Promise.all([
-    readTree(sourceParent), readTree(preApplyHead), readTree(sourceCommit)
-  ]);
-  if (!baseEntries || !targetEntries || !sourceEntries) return false;
-  const expectedStages = [baseEntries, targetEntries, sourceEntries] as const;
-  for (const path of sourcePaths) {
-    const base = baseEntries.get(path);
-    const target = targetEntries.get(path);
-    const source = sourceEntries.get(path);
-    const potentiallyConflicting = !sameGitEntry(base, target) && !sameGitEntry(target, source);
-    if (potentiallyConflicting && !unmerged.has(path)) return false;
-  }
-  for (const [path, actualStages] of unmerged) {
-    for (let stage = 1; stage <= 3; stage += 1) {
-      const actual = actualStages.get(stage);
-      const expected = expectedStages[stage - 1]!.get(path);
-      if (!sameGitEntry(actual, expected)) return false;
-    }
-  }
-  return true;
 }
 
 export async function preflightLocalIntegration(
@@ -794,14 +699,66 @@ export async function executeLocalIntegration(
       error: String(error?.stderr || error?.message || error), commandResults: [] };
   }
   throwIfApplicationAborted(input.signal);
-  const target = await inspectTargetState(input, execution);
-  if (!target.identityValid || !target.clean || target.head !== preApplyHead) {
+  const targetBeforeSimulation = await inspectTargetState(input, execution);
+  if (!targetBeforeSimulation.identityValid
+    || !targetBeforeSimulation.clean
+    || targetBeforeSimulation.head !== preApplyHead) {
     return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead, targetState: "uncertain" as const,
-      statusPorcelain: target.statusPorcelain, error: "目标工作树在应用前发生变化", commandResults: [] };
+      statusPorcelain: targetBeforeSimulation.statusPorcelain,
+      error: "TARGET_CHANGED_BEFORE_APPLICATION", commandResults: [] };
+  }
+  let simulation: Awaited<ReturnType<typeof simulateDeliveryMerge>>;
+  try {
+    simulation = await simulateDeliveryMerge({
+      repoPath: input.projectRepoPath,
+      sourceCommit: sourceCommit!,
+      preApplyHead,
+      signal: input.signal,
+      deadlineAt: execution.deadlineAt
+    });
+  } catch (error: any) {
+    throwIfApplicationStopped(error, input.signal);
+    const target = await inspectTargetState(input, execution);
+    const safe = target.identityValid && target.clean && target.head === preApplyHead;
+    return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+      targetState: safe ? "untouched_clean" as const : "uncertain" as const,
+      statusPorcelain: target.statusPorcelain,
+      error: String(error?.stderr || error?.message || error), commandResults: [] };
+  }
+  const targetAfterSimulation = await inspectTargetState(input, execution);
+  const simulationPreservedTarget = targetAfterSimulation.identityValid
+    && targetAfterSimulation.clean
+    && targetAfterSimulation.head === preApplyHead;
+  if (!simulationPreservedTarget) {
+    return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+      targetState: "uncertain" as const, statusPorcelain: targetAfterSimulation.statusPorcelain,
+      error: "TARGET_CHANGED_BEFORE_APPLICATION", commandResults: [] };
+  }
+  if (simulation.status === "conflict") {
+    return { status: "conflict" as const, preflight, sourceCommit, preApplyHead,
+      targetState: "untouched_clean" as const, statusPorcelain: "",
+      conflictFiles: simulation.conflictFiles, error: "APPLICATION_CONFLICT", commandResults: [] };
+  }
+  let preparedTargetGit: PreparedGitEnvironment;
+  try {
+    preparedTargetGit = await prepareGitEnvironment(input.targetWorktreePath, execution);
+  } catch (error: any) {
+    throwIfApplicationStopped(error, input.signal);
+    const target = await inspectTargetState(input, execution);
+    const safe = target.identityValid && target.clean && target.head === preApplyHead;
+    return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+      targetState: safe ? "untouched_clean" as const : "uncertain" as const,
+      statusPorcelain: target.statusPorcelain,
+      error: String(error?.stderr || error?.message || error), commandResults: [] };
   }
   await input.onBeforeTargetMutation?.();
   throwIfApplicationAborted(input.signal);
-  let cherryPickCompleted = false;
+  const finalTarget = await inspectTargetState(input, execution);
+  if (!finalTarget.identityValid || !finalTarget.clean || finalTarget.head !== preApplyHead) {
+    return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+      targetState: "uncertain" as const, statusPorcelain: finalTarget.statusPorcelain,
+      error: "TARGET_CHANGED_BEFORE_APPLICATION", commandResults: [] };
+  }
   let primaryOwnershipError: unknown;
   const fencePrimaryMutation = async () => {
     try {
@@ -812,113 +769,18 @@ export async function executeLocalIntegration(
     }
   };
   try {
-    await git(input.targetWorktreePath, ["cherry-pick", "--no-commit", sourceCommit!], execution, undefined, {
+    await runPreparedGit(preparedTargetGit, ["cherry-pick", "--no-commit", sourceCommit!], execution, {
       before: fencePrimaryMutation,
       after: fencePrimaryMutation
     });
-    cherryPickCompleted = true;
     await input.onTargetMutated?.();
     throwIfApplicationAborted(input.signal);
   } catch (error: any) {
-    throwIfApplicationAborted(input.signal);
     if (primaryOwnershipError) throw primaryOwnershipError;
-    await assertTargetOwnership(input);
-    const cleanupExecution = gitExecutionContext(input.signal, GIT_CLEANUP_TIMEOUT_MS);
-    const target = await inspectTargetState(input, cleanupExecution);
-    let cherryPickHead = "";
-    try {
-      cherryPickHead = (await git(input.targetWorktreePath, [
-        "rev-parse", "--verify", "CHERRY_PICK_HEAD"
-      ], cleanupExecution)).stdout.trim();
-    }
-    catch { throwIfApplicationAborted(input.signal); /* No active cherry-pick. */ }
-    const ownsFailedCherryPick = !cherryPickCompleted && await ownsFailedCherryPickState(
-      input.targetWorktreePath, sourceCommit!, preApplyHead, cherryPickHead, cleanupExecution
-    );
-    if (!ownsFailedCherryPick) {
-      const safe = target.identityValid && target.clean && target.head === preApplyHead;
-      return { status: safe ? "failed" as const : "ambiguous" as const, preflight, sourceCommit, preApplyHead,
-        targetState: safe ? "untouched_clean" as const : "uncertain" as const, statusPorcelain: target.statusPorcelain,
-        error: String(error?.stderr || error?.message || error), commandResults: [] };
-    }
-    let conflictFiles: string[] = [];
-    try {
-      conflictFiles = boundedConflictFiles((await git(input.targetWorktreePath, [
-        "diff", "--name-only", "--diff-filter=U", "-z"
-      ], cleanupExecution)).stdout.split("\0").filter(Boolean));
-    }
-    catch { throwIfApplicationAborted(input.signal); /* Preserve the original error. */ }
-    const evidence = await getCommitSnapshot(input.sourceWorktreePath, sourceCommit!, {
-      sensitivePatterns: input.sensitivePatterns,
-      signal: cleanupExecution.signal,
-      deadlineAt: cleanupExecution.deadlineAt
-    });
-    let changedFiles: string[] = [];
-    try { changedFiles = await changedTargetFiles(input.targetWorktreePath, cleanupExecution); }
-    catch { throwIfApplicationAborted(input.signal); }
-    let rollbackError = "";
-    let rollbackPostcondition: TargetState | undefined;
-    if (changedFiles.every((file) => evidence.files.includes(file))) {
-      let cleanupOwnershipError: unknown;
-      const fenceCleanupMutation = async () => {
-        try {
-          await assertTargetOwnership(input);
-        } catch (error) {
-          cleanupOwnershipError = error;
-          throw error;
-        }
-      };
-      try {
-        const existing: string[] = [], added: string[] = [];
-        const preApplyFiles = new Set((await git(input.targetWorktreePath, [
-          "ls-tree", "-r", "--name-only", "-z", preApplyHead
-        ], cleanupExecution)).stdout.split("\0").filter(Boolean));
-        for (const file of evidence.files) {
-          if (preApplyFiles.has(file)) existing.push(file);
-          else added.push(file);
-        }
-        if (existing.length) {
-          await git(input.targetWorktreePath, [
-            "restore", `--source=${preApplyHead}`, "--staged", "--worktree", "--",
-            ...existing.map(literalPathspec)
-          ], cleanupExecution, undefined, {
-            before: fenceCleanupMutation,
-            after: fenceCleanupMutation
-          });
-        }
-        if (added.length) {
-          await git(input.targetWorktreePath, [
-            "rm", "-f", "--ignore-unmatch", "--", ...added.map(literalPathspec)
-          ], cleanupExecution, undefined, {
-            before: fenceCleanupMutation,
-            after: fenceCleanupMutation
-          });
-        }
-        try {
-          await git(input.targetWorktreePath, ["cherry-pick", "--quit"], cleanupExecution, undefined, {
-            before: fenceCleanupMutation,
-            after: fenceCleanupMutation
-          });
-        } catch {
-          if (cleanupOwnershipError) throw cleanupOwnershipError;
-          throwIfApplicationAborted(input.signal);
-        }
-        const restored = await inspectTargetState(input, cleanupExecution);
-        rollbackPostcondition = restored;
-        if (restored.identityValid && restored.clean && restored.head === preApplyHead) {
-          return { status: "conflict" as const, preflight, sourceCommit, preApplyHead,
-            targetState: "rolled_back_clean" as const, statusPorcelain: "", conflictFiles,
-            error: String(error?.stderr || error?.message || error), commandResults: [] };
-        }
-      } catch (rollbackCause: any) {
-        if (cleanupOwnershipError) throw cleanupOwnershipError;
-        throwIfApplicationAborted(input.signal);
-        rollbackError = String(rollbackCause?.stderr || rollbackCause?.message || rollbackCause);
-      }
-    }
-    return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead, targetState: "uncertain" as const,
-      statusPorcelain: target.statusPorcelain, conflictFiles, rollbackError,
-      rollbackPostcondition,
+    throwIfApplicationStopped(error, input.signal);
+    const target = await inspectTargetState(input, execution);
+    return { status: "ambiguous" as const, preflight, sourceCommit, preApplyHead,
+      targetState: "uncertain" as const, statusPorcelain: target.statusPorcelain,
       error: String(error?.stderr || error?.message || error), commandResults: [] };
   }
   const commandResults: ApplicationCommandResult[] = [];
@@ -1002,6 +864,13 @@ export async function executeLocalIntegration(
 
 function throwIfApplicationAborted(signal: AbortSignal | undefined) {
   if (signal?.aborted) throw new Error("DELIVERY_APPLICATION_ABORTED", { cause: signal.reason });
+}
+
+function throwIfApplicationStopped(error: unknown, signal: AbortSignal | undefined) {
+  throwIfApplicationAborted(signal);
+  if (error instanceof Error && error.message === "DELIVERY_APPLICATION_DEADLINE_EXCEEDED") {
+    throw error;
+  }
 }
 
 async function assertSourceOwnership(input: LocalIntegrationExecutionInput) {
