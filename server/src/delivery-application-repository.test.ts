@@ -353,6 +353,50 @@ describe("DeliveryApplicationRepository", () => {
     });
   });
 
+  it("reconciles a newer apply attempt that fails before application takeover", () => {
+    const fixture = createFixture();
+    const firstLease = leaseApplication(
+      fixture.store, fixture.backendUnit.id, 1, "worker-one", CLOCK, 10
+    );
+    const claim = bindSource(fixture.store, fixture.store.deliveryApplications.claim(
+      fixture.backendUnit.id, claimInput(firstLease, "backend")
+    ), "backend");
+    const retryTime = new Date(CLOCK.getTime() + 10);
+
+    expect(fixture.store.automationJobs.recoverExpired(retryTime)).toBe(1);
+    const secondLease = fixture.store.automationJobs.leaseNext("worker-two", retryTime, 60_000)!;
+    expect(secondLease).toMatchObject({ id: firstLease.id, attempt: 2 });
+    expect(fixture.store.automationJobs.fail(
+      secondLease.id, "worker-two", secondLease.claimToken, "fatal", false
+    )).toBe(true);
+
+    expect(fixture.store.deliveryApplications.get(claim.id)).toMatchObject({
+      status: "failed", resolutionStatus: "pending", error: "DELIVERY_APPLICATION_JOB_TERMINAL"
+    });
+    expect(fixture.store.deliveryUnits.get(fixture.backendUnit.id)?.status).toBe("failed");
+  });
+
+  it("reconciles a newer apply attempt canceled before application takeover", () => {
+    const fixture = createFixture();
+    const firstLease = leaseApplication(
+      fixture.store, fixture.backendUnit.id, 1, "worker-one", CLOCK, 10
+    );
+    const claim = bindSource(fixture.store, fixture.store.deliveryApplications.claim(
+      fixture.backendUnit.id, claimInput(firstLease, "backend")
+    ), "backend");
+    const retryTime = new Date(CLOCK.getTime() + 10);
+
+    expect(fixture.store.automationJobs.recoverExpired(retryTime)).toBe(1);
+    const secondLease = fixture.store.automationJobs.leaseNext("worker-two", retryTime, 60_000)!;
+    expect(secondLease).toMatchObject({ id: firstLease.id, attempt: 2 });
+    expect(fixture.store.automationJobs.cancelByOwnerVersion(fixture.backendUnit.id, 1)).toBe(1);
+
+    expect(fixture.store.deliveryApplications.get(claim.id)).toMatchObject({
+      status: "failed", resolutionStatus: "pending", error: "DELIVERY_APPLICATION_JOB_TERMINAL"
+    });
+    expect(fixture.store.deliveryUnits.get(fixture.backendUnit.id)?.status).toBe("failed");
+  });
+
   it("finalizes an exact application job left incomplete across restart recovery", () => {
     const fixture = createFixture();
     const claim = bindSource(fixture.store,

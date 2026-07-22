@@ -333,21 +333,29 @@ export class DeliveryApplicationRepository {
       throw new Error("DELIVERY_APPLICATION_DATE_INVALID");
     }
     const nowIso = now.toISOString();
-    const rows = this.db.prepare(`SELECT application.*, job.status AS job_status
+    const rows = this.db.prepare(`SELECT application.*, job.status AS job_status,
+        job.attempt AS job_attempt, job.claim_token AS job_claim_token
       FROM delivery_application_runs application
       JOIN automation_jobs job ON job.id = application.automation_job_id
         AND job.owner_type = 'delivery_unit'
         AND job.owner_id = application.delivery_unit_id
         AND job.evidence_version = application.evidence_version
         AND job.action = 'apply'
-        AND job.attempt = application.automation_attempt
-        AND job.claim_token = application.claim_token
       WHERE (application.status = 'applying' AND job.status IN ('completed', 'failed', 'canceled'))
         OR (application.status <> 'applying' AND job.status <> 'completed')
       ORDER BY application.created_at, application.id`).all() as any[];
     let reconciled = 0;
     for (const row of rows) {
+      const exactLineage = row.job_attempt === row.automation_attempt
+        && row.job_claim_token === row.claim_token;
       if (row.status === "applying") {
+        const applicationLease = parseAutomationLeaseClaimToken(row.claim_token);
+        const terminalLease = parseAutomationLeaseClaimToken(row.job_claim_token);
+        const newerLineage = Number.isSafeInteger(row.job_attempt)
+          && row.job_attempt > row.automation_attempt
+          && applicationLease?.jobId === row.automation_job_id
+          && terminalLease?.jobId === row.automation_job_id;
+        if (!exactLineage && !newerLineage) continue;
         const application = this.db.prepare(`UPDATE delivery_application_runs
           SET status = 'failed', resolution_status = 'pending',
             error = 'DELIVERY_APPLICATION_JOB_TERMINAL', updated_at = ?, completed_at = ?
@@ -366,6 +374,7 @@ export class DeliveryApplicationRepository {
         if (unit.changes !== 1) throw new Error("DELIVERY_APPLICATION_RECONCILIATION_STALE");
         this.aggregateInTransaction(row.requirement_id);
       } else {
+        if (!exactLineage) continue;
         const job = this.db.prepare(`UPDATE automation_jobs
           SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
           WHERE id = ? AND owner_type = 'delivery_unit' AND owner_id = ?
