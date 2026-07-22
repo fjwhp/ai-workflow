@@ -44,6 +44,8 @@ interface MergeFixture {
   sourceCommit: string;
   targetTagObject: string;
   sourceTagObject: string;
+  targetReplacementObject: string;
+  sourceReplacementObject: string;
   simulationInput: DeliveryMergeSimulationInput;
   before: TargetSnapshot;
 }
@@ -165,6 +167,16 @@ async function createMergeFixture(kind: MergeKind): Promise<MergeFixture> {
     .stdout.toString("utf8").trim();
   const sourceTagObject = (await git(repoPath, "rev-parse", "source-object^{tag}"))
     .stdout.toString("utf8").trim();
+  const targetReplacementFile = join(root, "target-replacement-object");
+  const sourceReplacementFile = join(root, "source-replacement-object");
+  await writeFile(targetReplacementFile, "target replacement object\n");
+  await writeFile(sourceReplacementFile, "source replacement object\n");
+  const targetReplacementObject = (await git(repoPath, "hash-object", "-w", targetReplacementFile))
+    .stdout.toString("utf8").trim();
+  const sourceReplacementObject = (await git(repoPath, "hash-object", "-w", sourceReplacementFile))
+    .stdout.toString("utf8").trim();
+  await git(repoPath, "update-ref", `refs/replace/${targetReplacementObject}`, targetCommit);
+  await git(repoPath, "update-ref", `refs/replace/${sourceReplacementObject}`, sourceCommit);
 
   await exec("git", ["init", "--bare", remotePath]);
   await git(repoPath, "remote", "add", "origin", remotePath);
@@ -182,6 +194,8 @@ async function createMergeFixture(kind: MergeKind): Promise<MergeFixture> {
     sourceCommit,
     targetTagObject,
     sourceTagObject,
+    targetReplacementObject,
+    sourceReplacementObject,
     simulationInput: {
       repoPath,
       sourceCommit,
@@ -231,6 +245,59 @@ async function installBlockingReadTreeWrapper(fixture: MergeFixture) {
   return {
     started,
     terminated: () => exists(terminated),
+    restore: () => {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  };
+}
+
+function oversizedValidConflictRecords() {
+  const paths = [
+    ...Array.from({ length: 1_024 }, (_, index) => `file-${String(index).padStart(6, "0")}`),
+    ...Array.from({ length: 6_000 }, (_, index) =>
+      `zz-padding-${String(index).padStart(6, "0")}-${"x".repeat(900)}`
+    )
+  ];
+  return paths.map((path) => {
+    return [1, 2].map((stage) =>
+      `100644 ${String(stage).repeat(40)} ${stage}\t${path}\0`
+    ).join("");
+  }).join("");
+}
+
+async function installConflictScanOutputWrapper(
+  fixture: MergeFixture,
+  name: string,
+  output: { stdoutPath?: string; stderrPath?: string }
+) {
+  const wrapperDirectory = join(fixture.root, `${name}-git`);
+  const wrapperPath = join(wrapperDirectory, "git");
+  const writeTreeStarted = join(fixture.root, `${name}-write-tree-started`);
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  await mkdir(wrapperDirectory);
+  await writeFile(wrapperPath, [
+    "#!/bin/sh",
+    "is_unmerged=",
+    "is_write_tree=",
+    "for argument in \"$@\"; do",
+    "  if [ \"$argument\" = \"-u\" ]; then is_unmerged=1; fi",
+    "  if [ \"$argument\" = \"write-tree\" ]; then is_write_tree=1; fi",
+    "done",
+    "if [ \"$is_unmerged\" = \"1\" ]; then",
+    ...(output.stderrPath ? [`  /bin/cat ${JSON.stringify(output.stderrPath)} >&2`] : []),
+    ...(output.stdoutPath ? [`  exec /bin/cat ${JSON.stringify(output.stdoutPath)}`] : ["  exit 0"]),
+    "fi",
+    "if [ \"$is_write_tree\" = \"1\" ]; then",
+    `  : > ${JSON.stringify(writeTreeStarted)}`,
+    "fi",
+    `exec ${JSON.stringify(realGit)} \"$@\"`
+  ].join("\n"));
+  await chmod(wrapperPath, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+  return {
+    writeTreeStarted: () => exists(writeTreeStarted),
     restore: () => {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
@@ -384,6 +451,19 @@ describe("simulateDeliveryMerge", () => {
     await expectTargetState(fixture);
   });
 
+  it.each([
+    ["sourceCommit", "sourceReplacementObject"],
+    ["preApplyHead", "targetReplacementObject"]
+  ] as const)("ignores replace refs for a non-commit %s", async (inputField, fixtureField) => {
+    const fixture = await createMergeFixture("clean");
+
+    await expect(simulateDeliveryMerge({
+      ...fixture.simulationInput,
+      [inputField]: fixture[fixtureField]
+    })).rejects.toThrow("DELIVERY_APPLICATION_MERGE_COMMIT_INVALID");
+    await expectTargetState(fixture);
+  });
+
   it("rejects duplicate conflict stages as malformed evidence", async () => {
     const fixture = await createMergeFixture("text");
     const wrapperDirectory = join(fixture.root, "malformed-conflict-git");
@@ -467,12 +547,7 @@ describe("simulateDeliveryMerge", () => {
     const evidencePath = join(fixture.root, "oversized-conflicts");
     const writeTreeStarted = join(fixture.root, "capture-limit-write-tree-started");
     const realGit = (await exec("which", ["git"])).stdout.trim();
-    const records = Array.from({ length: 85_000 }, (_, index) => {
-      const path = `file-${String(index).padStart(6, "0")}`;
-      return [1, 2].map((stage) =>
-        `100644 ${String(stage).repeat(40)} ${stage}\t${path}\0`
-      ).join("");
-    }).join("");
+    const records = oversizedValidConflictRecords();
     expect(Buffer.byteLength(records)).toBeGreaterThan(10 * 1024 * 1024);
     await writeFile(evidencePath, records);
     await mkdir(wrapperDirectory);
@@ -507,6 +582,47 @@ describe("simulateDeliveryMerge", () => {
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
+    }
+    await expectTargetState(fixture);
+  });
+
+  it.each([
+    ["traversal path", `100644 ${"3".repeat(40)} 1\t../escape\0`],
+    ["duplicate stage", `100644 ${"9".repeat(40)} 1\tfile-000000\0`]
+  ])("rejects a %s after the conflict capture cutoff", async (name, invalidRecord) => {
+    const fixture = await createMergeFixture("text");
+    const evidencePath = join(fixture.root, `post-cutoff-${name.replace(" ", "-")}`);
+    await writeFile(evidencePath, `${oversizedValidConflictRecords()}${invalidRecord}`);
+    const wrapper = await installConflictScanOutputWrapper(fixture, `post-cutoff-${name.replace(" ", "-")}`, {
+      stdoutPath: evidencePath
+    });
+    try {
+      await expect(simulateDeliveryMerge({
+        ...fixture.simulationInput,
+        deadlineAt: Date.now() + 10_000
+      })).rejects.toThrow("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID");
+      expect(await wrapper.writeTreeStarted()).toBe(false);
+    } finally {
+      wrapper.restore();
+    }
+    await expectTargetState(fixture);
+  });
+
+  it("fails closed when a clean conflict scan exceeds the stderr bound", async () => {
+    const fixture = await createMergeFixture("clean");
+    const stderrPath = join(fixture.root, "oversized-conflict-stderr");
+    await writeFile(stderrPath, Buffer.alloc(10 * 1024 * 1024 + 1, 0x65));
+    const wrapper = await installConflictScanOutputWrapper(fixture, "oversized-conflict-stderr", {
+      stderrPath
+    });
+    try {
+      await expect(simulateDeliveryMerge({
+        ...fixture.simulationInput,
+        deadlineAt: Date.now() + 10_000
+      })).rejects.toThrow("DELIVERY_APPLICATION_MERGE_GIT_FAILED");
+      expect(await wrapper.writeTreeStarted()).toBe(false);
+    } finally {
+      wrapper.restore();
     }
     await expectTargetState(fixture);
   });

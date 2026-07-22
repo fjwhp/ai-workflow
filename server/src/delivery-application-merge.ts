@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash, type Hash } from "node:crypto";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, posix, resolve } from "node:path";
@@ -8,6 +9,7 @@ const COMMIT_ID = /^[0-9a-f]{40}$/;
 const MAX_GIT_OUTPUT_BYTES = 10 * 1024 * 1024;
 const MAX_CONFLICT_FILES = 1_024;
 const MAX_CONFLICT_FILES_BYTES = 262_144;
+const MAX_CONFLICT_RECORDS = 262_144;
 const GIT_COMMAND_TIMEOUT_MS = 30_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
 const TERMINATION_GRACE_MS = 250;
@@ -62,10 +64,9 @@ export async function simulateDeliveryMerge(
     await runGit(isolatedExecution, [
       "read-tree", "-m", sourceParent, input.preApplyHead, input.sourceCommit
     ]);
-    const conflictScan = await runGit(isolatedExecution, [
+    const conflictEvidence = await runConflictScan(isolatedExecution, [
       "ls-files", "-u", "-z"
-    ], { allowOutputOverflow: true });
-    const conflictEvidence = parseConflictFiles(conflictScan.stdout, conflictScan.outputOverflow);
+    ]);
     if (conflictEvidence.hasConflicts) {
       return { status: "conflict", mergedTree: null, conflictFiles: conflictEvidence.files };
     }
@@ -186,37 +187,36 @@ function preserveExecutionError(error: unknown): void {
 
 async function runGit(
   execution: GitExecution,
-  args: readonly string[],
-  options: { allowOutputOverflow?: boolean } = {}
+  args: readonly string[]
 ) {
   throwIfAborted(execution.signal);
   const timeout = Math.min(requireRemainingTime(execution.deadlineAt), GIT_COMMAND_TIMEOUT_MS);
+  const result = await spawnGit(execution, args, gitEnvironment(execution), timeout);
+  throwIfAborted(execution.signal);
+  requireRemainingTime(execution.deadlineAt);
+  if (result.outputOverflow || result.error || result.exitCode !== 0) {
+    throw new Error("DELIVERY_APPLICATION_MERGE_GIT_FAILED", { cause: result.error });
+  }
+  return { stdout: Buffer.concat(result.stdout), stderr: Buffer.concat(result.stderr) };
+}
+
+function gitEnvironment(execution: GitExecution) {
   const env = codingGitEnvironmentWithFsmonitor(SAFE_GIT_CONFIG);
   env.LC_ALL = "C";
   env.GIT_TERMINAL_PROMPT = "0";
   env.GIT_ASKPASS = "/usr/bin/false";
   env.SSH_ASKPASS = "/usr/bin/false";
   env.GIT_OPTIONAL_LOCKS = "0";
+  env.GIT_NO_REPLACE_OBJECTS = "1";
   if (execution.indexPath) env.GIT_INDEX_FILE = execution.indexPath;
-  const result = await spawnGit(execution, args, env, timeout, !options.allowOutputOverflow);
-  throwIfAborted(execution.signal);
-  requireRemainingTime(execution.deadlineAt);
-  if ((!options.allowOutputOverflow && result.outputOverflow) || result.error || result.exitCode !== 0) {
-    throw new Error("DELIVERY_APPLICATION_MERGE_GIT_FAILED", { cause: result.error });
-  }
-  return {
-    stdout: Buffer.concat(result.stdout),
-    stderr: Buffer.concat(result.stderr),
-    outputOverflow: result.outputOverflow
-  };
+  return env;
 }
 
 function spawnGit(
   execution: GitExecution,
   args: readonly string[],
   env: NodeJS.ProcessEnv,
-  timeout: number,
-  terminateOnOverflow: boolean
+  timeout: number
 ): Promise<{
   exitCode: number;
   stdout: Buffer[];
@@ -256,7 +256,7 @@ function spawnGit(
         if (remaining > 0) target.push(chunk.subarray(0, remaining));
         capturedBytes = MAX_GIT_OUTPUT_BYTES;
         outputOverflow = true;
-        if (terminateOnOverflow) terminate();
+        terminate();
         return;
       }
       target.push(chunk);
@@ -298,6 +298,116 @@ function spawnGit(
   });
 }
 
+async function runConflictScan(execution: GitExecution, args: readonly string[]) {
+  throwIfAborted(execution.signal);
+  const timeout = Math.min(requireRemainingTime(execution.deadlineAt), GIT_COMMAND_TIMEOUT_MS);
+  const parser = new ConflictRecordParser();
+  const result = await spawnConflictScan(
+    execution,
+    args,
+    gitEnvironment(execution),
+    timeout,
+    parser
+  );
+  throwIfAborted(execution.signal);
+  requireRemainingTime(execution.deadlineAt);
+  if (result.validationError) throw result.validationError;
+  if (result.stderrOverflow || result.error || result.exitCode !== 0) {
+    throw new Error("DELIVERY_APPLICATION_MERGE_GIT_FAILED", { cause: result.error });
+  }
+  return parser.finish();
+}
+
+function spawnConflictScan(
+  execution: GitExecution,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+  timeout: number,
+  parser: ConflictRecordParser
+): Promise<{
+  exitCode: number;
+  stderrOverflow: boolean;
+  validationError?: Error;
+  error?: Error;
+}> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn("git", ["-C", execution.repoPath, ...args], {
+      env,
+      shell: false,
+      detached: false,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stderrBytes = 0;
+    let stderrOverflow = false;
+    let validationError: Error | undefined;
+    let aborted = false;
+    let timedOut = false;
+    let terminating = false;
+    let spawnError: Error | undefined;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const terminate = () => {
+      if (terminating || child.exitCode !== null || child.signalCode !== null) return;
+      terminating = true;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }, TERMINATION_GRACE_MS);
+    };
+    const abort = () => {
+      aborted = true;
+      terminate();
+    };
+    const deadlineTimer = setTimeout(() => {
+      timedOut = true;
+      terminate();
+    }, timeout);
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (validationError) return;
+      try { parser.write(chunk); }
+      catch (error) {
+        validationError = error instanceof Error
+          ? error
+          : new Error("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID");
+        terminate();
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      const remaining = MAX_GIT_OUTPUT_BYTES - stderrBytes;
+      if (chunk.length > remaining) {
+        stderrBytes = MAX_GIT_OUTPUT_BYTES;
+        stderrOverflow = true;
+        terminate();
+        return;
+      }
+      stderrBytes += chunk.length;
+    });
+    child.once("error", (error) => { spawnError = error; });
+    execution.signal?.addEventListener("abort", abort, { once: true });
+    if (execution.signal?.aborted) abort();
+    child.once("close", (code) => {
+      clearTimeout(deadlineTimer);
+      if (killTimer) clearTimeout(killTimer);
+      execution.signal?.removeEventListener("abort", abort);
+      if (aborted) {
+        rejectPromise(new Error("DELIVERY_APPLICATION_ABORTED", { cause: execution.signal?.reason }));
+        return;
+      }
+      if (timedOut) {
+        rejectPromise(new Error("DELIVERY_APPLICATION_DEADLINE_EXCEEDED"));
+        return;
+      }
+      resolvePromise({
+        exitCode: code ?? -1,
+        stderrOverflow,
+        ...(validationError ? { validationError } : {}),
+        ...(spawnError ? { error: spawnError } : {})
+      });
+    });
+  });
+}
+
 function throwIfAborted(signal: AbortSignal | undefined) {
   if (signal?.aborted) throw new Error("DELIVERY_APPLICATION_ABORTED", { cause: signal.reason });
 }
@@ -324,42 +434,155 @@ function decodeObjectId(output: Buffer) {
   return objectId;
 }
 
-function parseConflictFiles(output: Buffer, outputOverflow = false) {
-  if (output.length === 0) {
-    return { hasConflicts: outputOverflow, files: [] as string[] };
+class ConflictRecordParser {
+  private state: "prefix" | "path" = "prefix";
+  private readonly prefixBytes: number[] = [];
+  private stage = "";
+  private decoder: TextDecoder | undefined;
+  private pathHash: Hash | undefined;
+  private pathBytes = 0;
+  private segmentBytes = 0;
+  private segmentAllDots = true;
+  private retainedPath: string[] | undefined;
+  private recordCount = 0;
+  private readonly seenStages = new Set<string>();
+  private readonly seenPaths = new Set<string>();
+  private files: string[] = [];
+  private evidenceBytes = 2;
+
+  write(chunk: Buffer) {
+    let offset = 0;
+    while (offset < chunk.length) {
+      if (this.state === "prefix") {
+        const byte = chunk[offset]!;
+        if (byte === 0) conflictEvidenceInvalid();
+        if (byte === 0x09) {
+          this.startPath();
+        } else {
+          if (byte > 0x7f || this.prefixBytes.length >= 64) conflictEvidenceInvalid();
+          this.prefixBytes.push(byte);
+        }
+        offset += 1;
+        continue;
+      }
+
+      const terminator = chunk.indexOf(0, offset);
+      const end = terminator < 0 ? chunk.length : terminator;
+      if (end > offset) this.consumePath(chunk.subarray(offset, end));
+      if (terminator < 0) return;
+      this.finishRecord();
+      offset = terminator + 1;
+    }
   }
-  let completeOutput = output;
-  if (output[output.length - 1] !== 0) {
-    if (!outputOverflow) conflictEvidenceInvalid();
-    const finalTerminator = output.lastIndexOf(0);
-    if (finalTerminator < 0) return { hasConflicts: true as const, files: [] as string[] };
-    completeOutput = output.subarray(0, finalTerminator + 1);
+
+  finish() {
+    if (this.state !== "prefix" || this.prefixBytes.length !== 0) conflictEvidenceInvalid();
+    return {
+      hasConflicts: this.recordCount > 0,
+      files: [...this.files]
+    };
   }
-  const files = new Set<string>();
-  const seenStages = new Set<string>();
-  for (const record of splitNulRecords(completeOutput, "DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID")) {
-    const tab = record.indexOf(0x09);
-    if (tab <= 0 || tab === record.length - 1) conflictEvidenceInvalid();
-    const prefix = record.subarray(0, tab).toString("ascii");
+
+  private startPath() {
+    const prefix = Buffer.from(this.prefixBytes).toString("ascii");
     const match = /^(?:100644|100755|120000|160000) [0-9a-f]{40} ([123])$/.exec(prefix);
     if (!match) conflictEvidenceInvalid();
-    const pathBytes = record.subarray(tab + 1);
-    const path = decodeGitPath(pathBytes, "DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID");
-    const stageKey = `${match[1]}\0${path}`;
-    if (seenStages.has(stageKey)) conflictEvidenceInvalid();
-    seenStages.add(stageKey);
-    files.add(path);
+    this.state = "path";
+    this.stage = match[1]!;
+    this.decoder = new TextDecoder("utf-8", { fatal: true });
+    this.pathHash = createHash("sha256");
+    this.pathBytes = 0;
+    this.segmentBytes = 0;
+    this.segmentAllDots = true;
+    this.retainedPath = [];
   }
-  const result: string[] = [];
-  let bytes = 2;
-  for (const path of [...files].sort()) {
-    if (result.length >= MAX_CONFLICT_FILES) break;
-    const nextBytes = Buffer.byteLength(JSON.stringify(path), "utf8") + (result.length ? 1 : 0);
-    if (bytes + nextBytes > MAX_CONFLICT_FILES_BYTES) break;
-    result.push(path);
-    bytes += nextBytes;
+
+  private consumePath(bytes: Buffer) {
+    this.pathHash!.update(bytes);
+    for (const byte of bytes) {
+      if (byte === 0x2f) {
+        this.validateSegment();
+        this.segmentBytes = 0;
+        this.segmentAllDots = true;
+      } else {
+        this.segmentBytes += 1;
+        if (byte !== 0x2e) this.segmentAllDots = false;
+      }
+    }
+    this.pathBytes += bytes.length;
+    let decoded: string;
+    try { decoded = this.decoder!.decode(bytes, { stream: true }); }
+    catch (error) {
+      throw new Error("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID", { cause: error });
+    }
+    if (this.retainedPath && this.pathBytes <= MAX_CONFLICT_FILES_BYTES) {
+      this.retainedPath.push(decoded);
+    } else {
+      this.retainedPath = undefined;
+    }
   }
-  return { hasConflicts: true as const, files: result };
+
+  private finishRecord() {
+    this.validateSegment();
+    let finalText: string;
+    try { finalText = this.decoder!.decode(); }
+    catch (error) {
+      throw new Error("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_INVALID", { cause: error });
+    }
+    this.recordCount += 1;
+    if (this.recordCount > MAX_CONFLICT_RECORDS) {
+      throw new Error("DELIVERY_APPLICATION_CONFLICT_EVIDENCE_LIMIT_EXCEEDED");
+    }
+    const digest = this.pathHash!.digest("hex");
+    const stageKey = `${this.stage}:${digest}`;
+    if (this.seenStages.has(stageKey)) conflictEvidenceInvalid();
+    this.seenStages.add(stageKey);
+    if (!this.seenPaths.has(digest)) {
+      this.seenPaths.add(digest);
+      if (this.retainedPath) {
+        this.retainedPath.push(finalText);
+        this.addEvidence(this.retainedPath.join(""));
+      }
+    }
+    this.state = "prefix";
+    this.prefixBytes.length = 0;
+    this.stage = "";
+    this.decoder = undefined;
+    this.pathHash = undefined;
+    this.retainedPath = undefined;
+  }
+
+  private validateSegment() {
+    if (this.segmentBytes === 0
+      || this.segmentAllDots && (this.segmentBytes === 1 || this.segmentBytes === 2)) {
+      conflictEvidenceInvalid();
+    }
+  }
+
+  private addEvidence(path: string) {
+    const last = this.files[this.files.length - 1];
+    if (last !== undefined && path > last) {
+      if (this.files.length >= MAX_CONFLICT_FILES) return;
+      const nextBytes = Buffer.byteLength(JSON.stringify(path), "utf8") + 1;
+      if (this.evidenceBytes + nextBytes > MAX_CONFLICT_FILES_BYTES) return;
+      this.files.push(path);
+      this.evidenceBytes += nextBytes;
+      return;
+    }
+    const candidates = [...this.files, path].sort();
+    const bounded: string[] = [];
+    let bytes = 2;
+    for (const candidate of candidates) {
+      if (bounded.length >= MAX_CONFLICT_FILES) break;
+      const nextBytes = Buffer.byteLength(JSON.stringify(candidate), "utf8")
+        + (bounded.length ? 1 : 0);
+      if (bytes + nextBytes > MAX_CONFLICT_FILES_BYTES) break;
+      bounded.push(candidate);
+      bytes += nextBytes;
+    }
+    this.files = bounded;
+    this.evidenceBytes = bytes;
+  }
 }
 
 function conflictEvidenceInvalid(): never {
