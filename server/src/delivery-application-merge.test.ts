@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { delimiter, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
@@ -219,6 +219,38 @@ async function waitFor(path: string) {
   throw new Error(`marker not created: ${path}`);
 }
 
+async function settleWithin<T>(promise: Promise<T>, timeoutMs: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("SIMULATION_DID_NOT_SETTLE")), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function processExists(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function waitForProcessExit(pid: number) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (!processExists(pid)) return;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  throw new Error(`process did not exit: ${pid}`);
+}
+
 async function installBlockingReadTreeWrapper(fixture: MergeFixture) {
   const wrapperDirectory = join(fixture.root, "blocking-git");
   const wrapperPath = join(wrapperDirectory, "git");
@@ -245,6 +277,38 @@ async function installBlockingReadTreeWrapper(fixture: MergeFixture) {
   return {
     started,
     terminated: () => exists(terminated),
+    restore: () => {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  };
+}
+
+async function installDescendantPipeWrapper(fixture: MergeFixture, name: string) {
+  const wrapperDirectory = join(fixture.root, `${name}-git`);
+  const wrapperPath = join(wrapperDirectory, "git");
+  const descendantPidPath = join(fixture.root, `${name}-descendant-pid`);
+  const realGit = (await exec("which", ["git"])).stdout.trim();
+  await mkdir(wrapperDirectory);
+  await writeFile(wrapperPath, [
+    "#!/bin/sh",
+    "is_read_tree=",
+    "for argument in \"$@\"; do",
+    "  if [ \"$argument\" = \"read-tree\" ]; then is_read_tree=1; fi",
+    "done",
+    "if [ \"$is_read_tree\" = \"1\" ]; then",
+    "  /bin/sleep 60 &",
+    "  descendant=$!",
+    `  printf '%s\\n' "$descendant" > ${JSON.stringify(descendantPidPath)}`,
+    "  exit 0",
+    "fi",
+    `exec ${JSON.stringify(realGit)} "$@"`
+  ].join("\n"));
+  await chmod(wrapperPath, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${wrapperDirectory}${delimiter}${previousPath ?? ""}`;
+  return {
+    descendantPidPath,
     restore: () => {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
@@ -346,6 +410,84 @@ describe("simulateDeliveryMerge", () => {
       .toEqual(INVALID_UTF8_LINK_TARGET);
   });
 
+  it("applies a clean source rename without touching the target", async () => {
+    const fixture = await createMergeFixture("clean");
+    await git(fixture.repoPath, "switch", "-c", "rename-source", fixture.baseCommit);
+    await rename(join(fixture.repoPath, "value.txt"), join(fixture.repoPath, "renamed.txt"));
+    const renamedSource = await commit(fixture.repoPath, "rename value");
+    const targetBefore = await targetSnapshot(fixture);
+    expect((await git(fixture.repoPath, "rev-parse", `${renamedSource}^`)).stdout.toString("utf8").trim())
+      .toBe(fixture.baseCommit);
+    expect((await git(fixture.repoPath, "ls-tree", fixture.targetCommit, "value.txt")).stdout)
+      .toEqual((await git(fixture.repoPath, "ls-tree", fixture.baseCommit, "value.txt")).stdout);
+    expect((await git(fixture.repoPath, "ls-tree", renamedSource, "value.txt")).stdout).toHaveLength(0);
+
+    const result = await simulateDeliveryMerge({
+      ...fixture.simulationInput,
+      sourceCommit: renamedSource
+    });
+
+    expect(result).toEqual({
+      status: "clean",
+      mergedTree: expect.stringMatching(/^[0-9a-f]{40}$/),
+      conflictFiles: []
+    });
+    if (result.status !== "clean") throw new Error("expected a clean simulation");
+    const names = (await git(fixture.repoPath, "ls-tree", "-r", "--name-only", "-z", result.mergedTree))
+      .stdout.toString("utf8").split("\0").filter(Boolean);
+    expect(names).toContain("renamed.txt");
+    expect(names).not.toContain("value.txt");
+    await expectTargetState(fixture, targetBefore);
+  });
+
+  it("applies a clean source gitlink without touching the target", async () => {
+    const fixture = await createMergeFixture("clean");
+    await git(fixture.repoPath, "switch", "-c", "gitlink-source", fixture.baseCommit);
+    await git(
+      fixture.repoPath,
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      `160000,${fixture.baseCommit},module`
+    );
+    await git(fixture.repoPath, "commit", "-m", "add gitlink");
+    const gitlinkSource = (await git(fixture.repoPath, "rev-parse", "HEAD"))
+      .stdout.toString("utf8").trim();
+    const targetBefore = await targetSnapshot(fixture);
+
+    const result = await simulateDeliveryMerge({
+      ...fixture.simulationInput,
+      sourceCommit: gitlinkSource
+    });
+
+    expect(result.status).toBe("clean");
+    if (result.status !== "clean") throw new Error("expected a clean simulation");
+    expect((await git(fixture.repoPath, "ls-tree", result.mergedTree, "module")).stdout.toString("utf8"))
+      .toMatch(/^160000 commit [0-9a-f]{40}\tmodule\n$/);
+    await expectTargetState(fixture, targetBefore);
+  });
+
+  it("applies clean paths containing tabs, newlines, and multibyte characters", async () => {
+    const fixture = await createMergeFixture("clean");
+    await git(fixture.repoPath, "switch", "-c", "special-path-source", fixture.baseCommit);
+    const specialPaths = ["tab\tname.txt", "line\nname.txt", "\u591a\u5b57\u8282.txt"];
+    await Promise.all(specialPaths.map((path) => writeFile(join(fixture.repoPath, path), "special\n")));
+    const specialSource = await commit(fixture.repoPath, "add special paths");
+    const targetBefore = await targetSnapshot(fixture);
+
+    const result = await simulateDeliveryMerge({
+      ...fixture.simulationInput,
+      sourceCommit: specialSource
+    });
+
+    expect(result.status).toBe("clean");
+    if (result.status !== "clean") throw new Error("expected a clean simulation");
+    const names = (await git(fixture.repoPath, "ls-tree", "-r", "--name-only", "-z", result.mergedTree))
+      .stdout.toString("utf8").split("\0").filter(Boolean);
+    expect(names).toEqual(expect.arrayContaining(specialPaths));
+    await expectTargetState(fixture, targetBefore);
+  });
+
   it.each([
     ["text", "value.txt"],
     ["add-delete", "value.txt"],
@@ -399,6 +541,45 @@ describe("simulateDeliveryMerge", () => {
     }
     await expectTargetState(fixture);
   });
+
+  it.each(["abort", "deadline"] as const)(
+    "terminates pipe-holding descendants on %s",
+    async (termination) => {
+      if (process.platform === "win32") return;
+      const fixture = await createMergeFixture("clean");
+      const wrapper = await installDescendantPipeWrapper(fixture, `descendant-${termination}`);
+      const controller = new AbortController();
+      const pending = simulateDeliveryMerge({
+        ...fixture.simulationInput,
+        signal: controller.signal,
+        deadlineAt: Date.now() + (termination === "deadline" ? 750 : 5_000)
+      });
+      let descendantPid: number | undefined;
+      try {
+        await waitFor(wrapper.descendantPidPath);
+        descendantPid = Number((await readFile(wrapper.descendantPidPath, "utf8")).trim());
+        expect(Number.isSafeInteger(descendantPid)).toBe(true);
+        if (termination === "abort") controller.abort(new Error("LEASE_LOST"));
+
+        await expect(settleWithin(pending, 2_000)).rejects.toThrow(
+          termination === "abort"
+            ? "DELIVERY_APPLICATION_ABORTED"
+            : "DELIVERY_APPLICATION_DEADLINE_EXCEEDED"
+        );
+        await waitForProcessExit(descendantPid);
+      } finally {
+        if (descendantPid !== undefined && processExists(descendantPid)) {
+          try { process.kill(descendantPid, "SIGKILL"); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          }
+        }
+        await pending.catch(() => undefined);
+        wrapper.restore();
+      }
+      await expectTargetState(fixture);
+    }
+  );
 
   it("rejects an expired deadline before starting Git", async () => {
     const fixture = await createMergeFixture("clean");
@@ -470,6 +651,29 @@ describe("simulateDeliveryMerge", () => {
       ...fixture.simulationInput,
       [inputField]: fixture[fixtureField]
     })).rejects.toThrow("DELIVERY_APPLICATION_MERGE_COMMIT_INVALID");
+    await expectTargetState(fixture);
+  });
+
+  it("fails closed without lazy-fetching a missing promisor object", async () => {
+    const fixture = await createMergeFixture("text");
+    const objectDirectoryOutput = (await git(fixture.repoPath, "rev-parse", "--git-path", "objects"))
+      .stdout.toString("utf8").trim();
+    const objectDirectory = resolve(fixture.repoPath, objectDirectoryOutput);
+    const sourceObjectPath = join(
+      objectDirectory,
+      fixture.sourceCommit.slice(0, 2),
+      fixture.sourceCommit.slice(2)
+    );
+    expect(await exists(sourceObjectPath)).toBe(true);
+    await git(fixture.repoPath, "config", "remote.origin.promisor", "true");
+    await git(fixture.repoPath, "config", "remote.origin.partialclonefilter", "blob:none");
+    await rm(sourceObjectPath);
+    const objectsBefore = await captureEntries(objectDirectory);
+
+    await expect(simulateDeliveryMerge(fixture.simulationInput))
+      .rejects.toThrow("DELIVERY_APPLICATION_MERGE_COMMIT_INVALID");
+
+    expect(await captureEntries(objectDirectory)).toEqual(objectsBefore);
     await expectTargetState(fixture);
   });
 

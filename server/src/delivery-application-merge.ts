@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, posix, resolve } from "node:path";
@@ -12,6 +12,7 @@ const GIT_COMMAND_TIMEOUT_MS = 30_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
 const TERMINATION_GRACE_MS = 250;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
+const USE_PROCESS_GROUPS = process.platform !== "win32";
 
 const SAFE_GIT_CONFIG: readonly GitConfigEntry[] = [
   ["core.hooksPath", "/dev/null"],
@@ -60,7 +61,7 @@ export async function simulateDeliveryMerge(
   let primaryError: unknown;
   try {
     await runGit(isolatedExecution, [
-      "read-tree", "-m", sourceParent, input.preApplyHead, input.sourceCommit
+      "read-tree", "-m", "--aggressive", sourceParent, input.preApplyHead, input.sourceCommit
     ]);
     const conflictEvidence = await runConflictScan(isolatedExecution, [
       "ls-files", "-u", "-z"
@@ -205,6 +206,7 @@ function gitEnvironment(execution: GitExecution) {
   env.GIT_ASKPASS = "/usr/bin/false";
   env.SSH_ASKPASS = "/usr/bin/false";
   env.GIT_OPTIONAL_LOCKS = "0";
+  env.GIT_NO_LAZY_FETCH = "1";
   env.GIT_NO_REPLACE_OBJECTS = "1";
   if (execution.indexPath) env.GIT_INDEX_FILE = execution.indexPath;
   return env;
@@ -226,7 +228,7 @@ function spawnGit(
     const child = spawn("git", ["-C", execution.repoPath, ...args], {
       env,
       shell: false,
-      detached: false,
+      detached: USE_PROCESS_GROUPS,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -241,11 +243,11 @@ function spawnGit(
     let killTimer: ReturnType<typeof setTimeout> | undefined;
 
     const terminate = () => {
-      if (terminating || child.exitCode !== null || child.signalCode !== null) return;
+      if (terminating) return;
       terminating = true;
-      child.kill("SIGTERM");
+      spawnError ??= signalGitProcess(child, "SIGTERM");
       killTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        spawnError ??= signalGitProcess(child, "SIGKILL");
       }, TERMINATION_GRACE_MS);
     };
     const capture = (target: Buffer[], chunk: Buffer) => {
@@ -335,7 +337,7 @@ function spawnConflictScan(
     const child = spawn("git", ["-C", execution.repoPath, ...args], {
       env,
       shell: false,
-      detached: false,
+      detached: USE_PROCESS_GROUPS,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -351,11 +353,11 @@ function spawnConflictScan(
     let killTimer: ReturnType<typeof setTimeout> | undefined;
 
     const terminate = () => {
-      if (terminating || child.exitCode !== null || child.signalCode !== null) return;
+      if (terminating) return;
       terminating = true;
-      child.kill("SIGTERM");
+      spawnError ??= signalGitProcess(child, "SIGTERM");
       killTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        spawnError ??= signalGitProcess(child, "SIGKILL");
       }, TERMINATION_GRACE_MS);
     };
     const abort = () => {
@@ -418,6 +420,22 @@ function spawnConflictScan(
       });
     });
   });
+}
+
+function signalGitProcess(child: ChildProcess, signal: NodeJS.Signals) {
+  if (USE_PROCESS_GROUPS && child.pid !== undefined) {
+    try { process.kill(-child.pid, signal); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+        return;
+      }
+      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+      return error instanceof Error ? error : new Error("Git process group termination failed");
+    }
+    return;
+  }
+  if (child.exitCode === null && child.signalCode === null) child.kill(signal);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined) {
