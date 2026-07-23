@@ -585,6 +585,15 @@ export class DeliveryCoordinator {
       if (activePayload.retryAttempt === 0) {
         throw new Error("DELIVERY_APPLICATION_RETRY_NOT_ELIGIBLE");
       }
+      const audit = this.db.prepare(`SELECT actor, reason FROM delivery_unit_retry_audit
+        WHERE job_id = ? AND requirement_id = ? AND delivery_unit_id = ? AND evidence_version = ?
+          AND target = 'application' AND attempt = ?`).get(
+            active.id, unit.requirement_id, unit.id, unit.evidence_version, activePayload.retryAttempt
+          ) as { actor: string; reason: string } | undefined;
+      if (!audit) throw new Error("DELIVERY_APPLICATION_RETRY_AUDIT_STALE");
+      if (audit.actor !== actor || audit.reason !== reason) {
+        throw new Error("DELIVERY_APPLICATION_RETRY_AUDIT_CONFLICT");
+      }
       return {
         deliveryUnitId: unit.id,
         requirementId: unit.requirement_id,

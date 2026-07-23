@@ -679,6 +679,8 @@ export function createPhase2Schema(db: DatabaseSync) {
       ON delivery_application_runs(delivery_unit_id) WHERE resolution_status = 'pending';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_application_version_active
       ON delivery_application_runs(project_version_id) WHERE resolution_status = 'pending';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_unit_retry_audit_authority
+      ON delivery_unit_retry_audit(job_id, target, attempt);
     CREATE INDEX IF NOT EXISTS idx_delivery_application_unit_history
       ON delivery_application_runs(delivery_unit_id, created_at, id);
     CREATE TRIGGER IF NOT EXISTS validate_delivery_application_owner_insert

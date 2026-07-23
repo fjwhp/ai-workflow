@@ -344,6 +344,9 @@ describe("Phase 2 database schema", () => {
     expect(indexSql(db, "idx_delivery_dependency_edge")).toMatch(/UNIQUE[\s\S]*delivery_dependencies\s*\(requirement_id,\s*upstream_unit_id,\s*downstream_unit_id\)/i);
     expect(indexSql(db, "idx_delivery_unit_active_run")).toMatch(/UNIQUE[\s\S]*stage_runs\s*\(owner_type,\s*owner_id,\s*stage\)[\s\S]*WHERE status = 'running'/i);
     expect(indexSql(db, "idx_automation_job_dedupe")).toMatch(/UNIQUE[\s\S]*automation_jobs\s*\(dedupe_key\)/i);
+    expect(indexSql(db, "idx_delivery_unit_retry_audit_authority")).toMatch(
+      /UNIQUE[\s\S]*delivery_unit_retry_audit\s*\(job_id,\s*target,\s*attempt\)/i
+    );
     expect(indexSql(db, "idx_automation_jobs_pending_lease")).toMatch(
       /automation_jobs\s*\(status,\s*created_at,\s*id\)[\s\S]*WHERE status = 'pending' AND attempt < max_attempts/i
     );

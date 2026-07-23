@@ -788,6 +788,84 @@ describe("DeliveryCoordinator", () => {
     });
   });
 
+  it("idempotently replays one active application retry for the same audit identity across Store reopen", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    settleApplication(fixture, fixture.backend.id, "conflicted");
+    const input = {
+      unitId: fixture.backend.id,
+      actor: "release-operator",
+      reason: "conflict repaired"
+    };
+
+    const first = fixture.store.deliveryCoordination.retryApplication(input);
+    const sameStoreReplay = fixture.store.deliveryCoordination.retryApplication(input);
+    stores.splice(stores.indexOf(fixture.store), 1);
+    fixture.store.close();
+    const reopened = new WorkflowStore(fixture.databasePath);
+    stores.push(reopened);
+    const reopenedReplay = reopened.deliveryCoordination.retryApplication(input);
+
+    expect(sameStoreReplay).toEqual(first);
+    expect(reopenedReplay).toEqual(first);
+    expect(reopened.deliveryCoordination.listApplicationRetryAudits(fixture.backend.id)).toEqual([
+      expect.objectContaining({
+        jobId: first.jobId,
+        attempt: 1,
+        actor: input.actor,
+        reason: input.reason
+      })
+    ]);
+    expect((reopened as any).db.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND action = 'apply'`).get(fixture.backend.id)).toEqual({ count: 2 });
+  });
+
+  it.each([
+    ["actor", { actor: "different-operator", reason: "conflict repaired" }],
+    ["reason", { actor: "release-operator", reason: "different repair" }]
+  ] as const)("rejects an active application retry replay with a different %s", (_field, replay) => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    settleApplication(fixture, fixture.backend.id, "conflicted");
+    const first = fixture.store.deliveryCoordination.retryApplication({
+      unitId: fixture.backend.id,
+      actor: "release-operator",
+      reason: "conflict repaired"
+    });
+
+    expect(() => fixture.store.deliveryCoordination.retryApplication({
+      unitId: fixture.backend.id,
+      ...replay
+    })).toThrow("DELIVERY_APPLICATION_RETRY_AUDIT_CONFLICT");
+
+    expect(fixture.store.deliveryCoordination.listApplicationRetryAudits(fixture.backend.id)).toEqual([
+      expect.objectContaining({ jobId: first.jobId, actor: "release-operator", reason: "conflict repaired" })
+    ]);
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND action = 'apply'`).get(fixture.backend.id)).toEqual({ count: 2 });
+  });
+
+  it("fails closed when an active application retry has no authoritative audit", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    settleApplication(fixture, fixture.backend.id, "conflicted");
+    const input = {
+      unitId: fixture.backend.id,
+      actor: "release-operator",
+      reason: "conflict repaired"
+    };
+    fixture.store.deliveryCoordination.retryApplication(input);
+    fixture.database.exec("DROP TRIGGER delivery_unit_retry_audit_immutable_delete");
+    fixture.database.prepare("DELETE FROM delivery_unit_retry_audit WHERE delivery_unit_id = ?")
+      .run(fixture.backend.id);
+
+    expect(() => fixture.store.deliveryCoordination.retryApplication(input))
+      .toThrow("DELIVERY_APPLICATION_RETRY_AUDIT_STALE");
+    expect(fixture.store.deliveryCoordination.listApplicationRetryAudits(fixture.backend.id)).toEqual([]);
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND action = 'apply'`).get(fixture.backend.id)).toEqual({ count: 2 });
+  });
+
   it("serializes concurrent retry replays to one attempt-specific job", async () => {
     const fixture = acceptanceFixture();
     acceptDelivery(fixture);
@@ -807,6 +885,46 @@ describe("DeliveryCoordinator", () => {
 
     expect(replay.jobId).toBe(first.jobId);
     expect(replay.retryAttempt).toBe(1);
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE owner_id = ? AND action = 'apply'`).get(fixture.backend.id)).toEqual({ count: 2 });
+    expect(fixture.store.deliveryCoordination.listApplicationRetryAudits(fixture.backend.id)).toEqual([
+      expect.objectContaining({ jobId: first.jobId, attempt: 1, actor: input.actor, reason: input.reason })
+    ]);
+  });
+
+  it("lets at most one concurrent application retry identity become authoritative", async () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    settleApplication(fixture, fixture.backend.id, "conflicted");
+    const second = new WorkflowStore(fixture.databasePath);
+    stores.push(second);
+    const inputs = [{
+      unitId: fixture.backend.id,
+      actor: "release-operator-a",
+      reason: "repair path a"
+    }, {
+      unitId: fixture.backend.id,
+      actor: "release-operator-b",
+      reason: "repair path b"
+    }];
+
+    const results = await Promise.allSettled([
+      Promise.resolve().then(() => fixture.store.deliveryCoordination.retryApplication(inputs[0]!)),
+      Promise.resolve().then(() => second.deliveryCoordination.retryApplication(inputs[1]!))
+    ]);
+
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason)
+      .toEqual(expect.objectContaining({ message: "DELIVERY_APPLICATION_RETRY_AUDIT_CONFLICT" }));
+    const audits = fixture.store.deliveryCoordination.listApplicationRetryAudits(fixture.backend.id);
+    expect(audits).toHaveLength(1);
+    expect(inputs).toContainEqual(expect.objectContaining({
+      actor: audits[0]!.actor,
+      reason: audits[0]!.reason
+    }));
     expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
       WHERE owner_id = ? AND action = 'apply'`).get(fixture.backend.id)).toEqual({ count: 2 });
   });
@@ -856,6 +974,12 @@ describe("DeliveryCoordinator", () => {
     const database = (reopened as any).db;
     expect(() => database.prepare(`UPDATE delivery_unit_retry_audit SET reason = 'rewritten'
       WHERE job_id = ?`).run(first.jobId)).toThrow("DELIVERY_UNIT_RETRY_AUDIT_IMMUTABLE");
+    expect(() => database.prepare(`INSERT INTO delivery_unit_retry_audit
+      (id, requirement_id, delivery_unit_id, evidence_version, job_id, target, attempt,
+       actor, reason, created_at)
+      SELECT 'duplicate-application-retry-audit', requirement_id, delivery_unit_id, evidence_version,
+        job_id, target, attempt, 'other-operator', 'contradictory reason', created_at
+      FROM delivery_unit_retry_audit WHERE job_id = ?`).run(second.jobId)).toThrow();
   });
 
   it("preserves every fan-in upstream change as an independently auditable active invalidation", () => {
