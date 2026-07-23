@@ -33,6 +33,24 @@ npm run dev
 - marker：`workflow.db.schema-version`
 - backup：`workflow.db.backup-<timestamp>` 及对应的 `-wal`、`-shm`
 
+时间戳将 ISO 时间中的 `:` 和 `.` 替换为 `-`。如果完整 backup set 的任一目标名已存在，服务不覆盖旧文件，而是对 backup base 追加 `-1`、`-2` 等碰撞后缀；例如主库为 `workflow.db.backup-2026-07-23T04-00-00-000Z-1` 时，sidecar 为同一 base 的 `-wal`、`-shm`。只有主库及所有当时存在的 sidecar 都复制成功后，旧 live WAL、SHM、marker 和主库才按主库最后的顺序删除；复制失败会保留原 live set。
+
+启动 reset 备份是原始 SQLite 文件集，不生成 checksum 或 manifest sidecar。它与人工备份 API 不同：
+
+```bash
+curl -X POST http://127.0.0.1:3210/api/backups
+```
+
+`POST /api/backups` 将主库复制到 `BACKUP_DIR`（默认 `data/backups`）下的 `workflow-<timestamp>.db`，并生成同名 `.db.json` manifest，其中包含数据库文件名和 SHA-256。不要把这份手动 manifest 的保证写到启动 reset 备份上；reset backup base 旁没有 `.json`。
+
+### 隔离恢复与重新登记
+
+1. 停止 Flowgate，保留整个 reset backup set，不要改名或只取主文件。
+2. 新建一个不作为当前 `DATA_DIR` 的隔离目录，把 `workflow.db.backup-<timestamp>[-N]` 复制为隔离目录中的 `workflow.db`；存在 `-wal`、`-shm` 时分别复制为 `workflow.db-wal`、`workflow.db-shm`。
+3. 只用兼容备份原 marker/schema、且绕过 destructive startup reset 的旧代码或 SQLite 只读工具在隔离目录读取或导出。当前 `phase-3-application-audit-v16` 服务不能导入、迁移或并行读取该旧库，也不要直接对旧库执行新版本启动。
+4. 回到当前版本，以空的 `phase-3-application-audit-v16` live DB 启动服务。在“项目”重新登记仍存在的本地 repository，再为每个项目重新登记当前 active version branch/worktree，最后重新创建需求及项目/版本关联；需要的旧内容从隔离导出人工核对后重录。
+5. 验证每个登记路径的 repository identity、branch、HEAD 和 dirty status。数据库 reset 从不运行 `git reset`，也不删除 source repository、version worktree 或 requirement worktree；这些 Git 路径仍保持 reset 前的内容与历史。
+
 不要把旧备份交给当前服务打开。需要查历史时，使用兼容旧 schema 的代码在隔离目录只读导出；不要把导出结果写回 `phase-3-application-audit-v16` live DB。
 
 ## 建立新工作流
@@ -82,7 +100,7 @@ seed 要求目标目录尚不存在。它先在目标同级的 owned `sibling st
 - tag
 - 创建 PR
 
-本地应用只能产生未提交改动，并由人工检查。当前尚未开放总体业务验收和应用恢复的 HTTP/UI 入口。
+本地应用只能产生未提交改动，并由人工检查。总体业务验收与 application retry 的 HTTP/UI 入口已经开放；按钮资格始终来自服务端 `allowedActions`。retry 只处理失败的 delivery unit，不会重置已经应用的 sibling。
 
 ## 验证开发环境
 
