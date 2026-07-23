@@ -6,11 +6,14 @@ import {
   AcceptanceDeliveryPanel,
   ApplicationRunsToggle,
   ApplicationRunsView,
+  RetryApplicationDialog,
   acceptanceCommentSubmission,
   acceptanceDeliveryView,
   acceptanceErrorView,
   loadApplicationRuns,
+  runValueKey,
   submitAcceptanceAction,
+  submitRetryIfAllowed,
   toggleApplicationRuns,
   type ApplicationRunsState,
   type ApplicationRunsResponse
@@ -107,6 +110,24 @@ describe("AcceptanceDeliveryPanel", () => {
     expect(css).toMatch(/@media\(max-width:620px\)[^{]*\{[\s\S]*?\.acceptance-unit-row\{[^}]*grid-template-columns:1fr/);
     expect(css).toMatch(/@media\(max-width:620px\)[^{]*\{[\s\S]*?\.acceptance-unit-actions button\{[^}]*width:100%/);
   });
+
+  it("closes a stale retry dialog and refuses submission after the live whitelist is revoked", async () => {
+    const dialogProps = {
+      retryUnitId: "unit-frontend", busy: false, error: "",
+      onClose: () => undefined, onSubmit: async () => undefined
+    };
+    const authorized = renderToStaticMarkup(<RetryApplicationDialog {...dialogProps} units={units}/>);
+    const revokedUnits = units.map((unit) => ({ ...unit, allowedActions: [] }));
+    const revoked = renderToStaticMarkup(<RetryApplicationDialog {...dialogProps} units={revokedUnits}/>);
+    const onRetry = vi.fn(async () => undefined);
+
+    expect(authorized).toContain('role="alertdialog"');
+    expect(authorized).toContain("重试应用");
+    expect(revoked).toBe("");
+    expect(await submitRetryIfAllowed(revokedUnits, "unit-frontend", "conflict fixed", onRetry))
+      .toBe(false);
+    expect(onRetry).not.toHaveBeenCalled();
+  });
 });
 
 describe("acceptance delivery integration", () => {
@@ -187,9 +208,15 @@ describe("acceptance delivery mutations", () => {
     expect(acceptanceErrorView(new Error(error.message))).toBe("操作失败，请重试");
   });
 
-  it("preserves only an explicitly user-readable ordinary Error message", () => {
-    expect(acceptanceErrorView(new Error("网络连接已中断，请稍后重试"))).toBe("网络连接已中断，请稍后重试");
-    expect(acceptanceErrorView("VALIDATION_ERROR")).toBe("操作失败，请重试");
+  it.each([
+    [new TypeError("Failed to fetch"), "网络连接失败，请检查网络后重试"],
+    [new TypeError("NetworkError when attempting to fetch resource."), "网络连接失败，请检查网络后重试"],
+    [new Error("/Users/alice/private/worktree failed"), "操作失败，请重试"],
+    [new Error("git status failed with exit 128"), "操作失败，请重试"],
+    [new Error("网络连接已中断，请稍后重试"), "操作失败，请重试"],
+    ["VALIDATION_ERROR", "操作失败，请重试"]
+  ])("maps non-API error %s without exposing internal details", (error, expected) => {
+    expect(acceptanceErrorView(error)).toBe(expected);
   });
 
   it.each([
@@ -269,6 +296,13 @@ describe("acceptance delivery mutations", () => {
 });
 
 describe("ApplicationRunsView", () => {
+  it("keys repeated compact values by field identity and position instead of raw commit text", () => {
+    const repeatedCommit = "a".repeat(40);
+    const keys = [repeatedCommit, repeatedCommit].map((_value, index) => runValueKey("提交", index));
+    expect(keys).toEqual(["提交-0", "提交-1"]);
+    expect(new Set(keys).size).toBe(2);
+  });
+
   it("collapses loaded and error disclosures, then reloads only after returning to idle", async () => {
     const request = vi.fn(async () => ({ runs: [], retries: [] }));
     const loading = new Set<string>();

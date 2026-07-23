@@ -1,4 +1,4 @@
-import { useRef, useState, type FormEvent, type MutableRefObject, type ReactNode } from "react";
+import { Fragment, useRef, useState, type FormEvent, type MutableRefObject } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -71,8 +71,9 @@ export function acceptanceErrorView(error: unknown) {
     return "服务暂时不可用，请稍后重试";
   }
   if (status !== undefined || code !== undefined) return "操作失败，请重试";
-  if (error instanceof Error && error.message && !/^[A-Z][A-Z0-9_]+$/.test(error.message)) {
-    return error.message;
+  if (error instanceof TypeError
+    && /(failed to fetch|fetch failed|networkerror|load failed)/i.test(error.message)) {
+    return "网络连接失败，请检查网络后重试";
   }
   return "操作失败，请重试";
 }
@@ -160,6 +161,24 @@ export function acceptanceCommentSubmission(comment: string) {
     : { ok: false as const, error: "请填写验收意见" };
 }
 
+export function retryApplicationUnit(units: readonly DeliveryUnitView[], unitId: string | null) {
+  if (!unitId) return null;
+  return units.find((unit) => unit.id === unitId
+    && unit.allowedActions?.some((action) => action.type === "retry_application")) ?? null;
+}
+
+export async function submitRetryIfAllowed(
+  units: readonly DeliveryUnitView[],
+  unitId: string | null,
+  reason: string,
+  onRetry: (unitId: string, reason: string) => Promise<void>
+) {
+  const unit = retryApplicationUnit(units, unitId);
+  if (!unit) return false;
+  await onRetry(unit.id, reason);
+  return true;
+}
+
 export async function submitAcceptanceAction(options: {
   busy: MutableRefObject<boolean>;
   setBusy: (busy: boolean) => void;
@@ -242,9 +261,10 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
     await runMutation(() => onAccept(submission.value.comment), () => setComment(""));
   };
   const submitRetry = async (reason: string) => {
-    if (!retryUnitId) return;
-    const unitId = retryUnitId;
-    await runMutation(() => onRetry(unitId, reason), () => setRetryUnitId(null));
+    const submitted = await submitRetryIfAllowed(units, retryUnitId, reason,
+      async (unitId, currentReason) => runMutation(() => onRetry(unitId, currentReason),
+        () => setRetryUnitId(null)));
+    if (!submitted) setRetryUnitId(null);
   };
   const toggleRuns = async (unitId: string, state: ApplicationRunsState) => {
     await toggleApplicationRuns(unitId, state, loadingRunIds.current, onLoadRuns,
@@ -295,10 +315,24 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
     </form>}
     {(validationError || actionError) && <p className="acceptance-action-error" role="alert">
       {validationError || actionError}</p>}
-    {retryUnitId && <DeliveryActionDialog action={{ type: "retry_application", label: "重试应用",
-      reasonRequired: true, unitId: retryUnitId }} busy={busy} error={actionError}
-      onClose={() => { if (!busy) setRetryUnitId(null); }} onSubmit={submitRetry}/>}
+    <RetryApplicationDialog units={units} retryUnitId={retryUnitId} busy={busy} error={actionError}
+      onClose={() => { if (!busy) setRetryUnitId(null); }} onSubmit={submitRetry}/>
   </section>;
+}
+
+export function RetryApplicationDialog({ units, retryUnitId, busy, error, onClose, onSubmit }: {
+  units: readonly DeliveryUnitView[];
+  retryUnitId: string | null;
+  busy: boolean;
+  error: string;
+  onClose: () => void;
+  onSubmit: (reason: string) => Promise<void>;
+}) {
+  const activeRetryUnit = retryApplicationUnit(units, retryUnitId);
+  if (!activeRetryUnit) return null;
+  return <DeliveryActionDialog action={{ type: "retry_application", label: "重试应用",
+    reasonRequired: true, unitId: activeRetryUnit.id }} busy={busy} error={error}
+    onClose={onClose} onSubmit={onSubmit}/>;
 }
 
 export function ApplicationRunsToggle({ state, id, onToggle }: {
@@ -354,9 +388,14 @@ function RunValues({ label, values, compact = false }: {
 }) {
   const visible = values?.filter((value): value is string => Boolean(value)) ?? [];
   if (visible.length === 0) return null;
-  return <p><b>{label}</b><span>{visible.map((value) => compact && value.length > 16
-    ? <code key={value}>{value.slice(0, 12)}</code> : value).reduce<ReactNode[]>((items, value, index) =>
-      [...items, ...(index ? [" · "] : []), value], [])}</span></p>;
+  return <p><b>{label}</b><span>{visible.map((value, index) => <Fragment key={runValueKey(label, index)}>
+    {index > 0 ? " · " : ""}{compact && value.length > 16
+      ? <code>{value.slice(0, 12)}</code> : value}
+  </Fragment>)}</span></p>;
+}
+
+export function runValueKey(label: string, index: number) {
+  return `${label}-${index}`;
 }
 
 function isConflict(error: unknown): error is { status: 409 } {
