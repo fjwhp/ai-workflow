@@ -17,6 +17,30 @@ afterEach(() => {
 });
 
 describe("production server package runtime", () => {
+  it("pins the packed server's nested fast-uri dependency to the copied root lock", () => {
+    const workspace = copyCleanWorkspace("flowgate-offline-package-");
+    const packageJson = installedAppPackage(workspace, "flowgate-offline-smoke", {
+      "@ai-workflow/shared": "file:shared.tgz",
+      "@ai-workflow/server": "file:server.tgz"
+    });
+    const lock = JSON.parse(readFileSync(resolve(workspace, "package-lock.json"), "utf8"));
+    const fastUriVersion = lock.packages?.["node_modules/fast-json-stringify/node_modules/fast-uri"]?.version;
+
+    expect(fastUriVersion).toEqual(expect.any(String));
+    expect(packageJson).toMatchObject({
+      overrides: { "fast-json-stringify": { "fast-uri": fastUriVersion } }
+    });
+  });
+
+  it("fails explicitly when the copied root lock lacks the nested offline dependency", () => {
+    const workspace = mkdtempSync(resolve(tmpdir(), "flowgate-offline-lock-missing-"));
+    directories.push(workspace);
+    writeFileSync(resolve(workspace, "package-lock.json"), JSON.stringify({ packages: {} }));
+
+    expect(() => installedAppPackage(workspace, "flowgate-offline-smoke", {}))
+      .toThrow("PRODUCTION_TEST_NESTED_DEPENDENCY_LOCK_MISSING");
+  });
+
   it("installs a clean source workspace with lifecycle scripts enabled", { timeout: 45_000 }, async () => {
     const workspace = copyCleanWorkspace("flowgate-source-install-");
 
@@ -77,13 +101,12 @@ describe("production server package runtime", () => {
 
     const installedApp = resolve(workspace, "installed-app");
     mkdirSync(installedApp);
-    writeFileSync(resolve(installedApp, "package.json"), JSON.stringify({
-      name: "flowgate-installed-smoke", private: true, type: "module",
-      dependencies: {
+    writeFileSync(resolve(installedApp, "package.json"), JSON.stringify(
+      installedAppPackage(workspace, "flowgate-installed-smoke", {
         "@ai-workflow/shared": `file:${resolve(packageDir, sharedPack.filename)}`,
         "@ai-workflow/server": `file:${resolve(packageDir, serverPack.filename)}`
-      }
-    }));
+      })
+    ));
     const installBin = resolve(installedApp, "install-bin");
     mkdirSync(installBin, { mode: 0o700 });
     const compiler = resolve(installBin, "cc");
@@ -131,13 +154,12 @@ printf 'installed-target-helper' > "$out"
 
     const noCompilerApp = resolve(workspace, "installed-app-no-compiler");
     mkdirSync(noCompilerApp);
-    writeFileSync(resolve(noCompilerApp, "package.json"), JSON.stringify({
-      name: "flowgate-no-compiler-smoke", private: true, type: "module",
-      dependencies: {
+    writeFileSync(resolve(noCompilerApp, "package.json"), JSON.stringify(
+      installedAppPackage(workspace, "flowgate-no-compiler-smoke", {
         "@ai-workflow/shared": `file:${resolve(packageDir, sharedPack.filename)}`,
         "@ai-workflow/server": `file:${resolve(packageDir, serverPack.filename)}`
-      }
-    }));
+      })
+    ));
     const failingBin = resolve(noCompilerApp, "install-bin");
     mkdirSync(failingBin, { mode: 0o700 });
     writeFileSync(resolve(failingBin, "cc"), "#!/bin/sh\nexit 1\n");
@@ -184,6 +206,26 @@ function copyCleanWorkspace(prefix: string) {
     });
   }
   return workspace;
+}
+
+function installedAppPackage(workspace: string, name: string, dependencies: Record<string, string>) {
+  let lock: { packages?: Record<string, { version?: unknown }> };
+  try {
+    lock = JSON.parse(readFileSync(resolve(workspace, "package-lock.json"), "utf8"));
+  } catch (cause) {
+    throw new Error("PRODUCTION_TEST_ROOT_LOCK_INVALID", { cause });
+  }
+  const fastUriVersion = lock.packages?.["node_modules/fast-json-stringify/node_modules/fast-uri"]?.version;
+  if (typeof fastUriVersion !== "string" || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(fastUriVersion)) {
+    throw new Error("PRODUCTION_TEST_NESTED_DEPENDENCY_LOCK_MISSING");
+  }
+  return {
+    name,
+    private: true,
+    type: "module",
+    dependencies,
+    overrides: { "fast-json-stringify": { "fast-uri": fastUriVersion } }
+  };
 }
 
 async function packWorkspace(workspace: string, destination: string, name: "shared" | "server") {

@@ -94,6 +94,7 @@ describe("project versions fresh schema", () => {
       "idx_delivery_quality_run_active",
       "idx_delivery_unit_active_run",
       "idx_delivery_unit_project",
+      "idx_delivery_unit_retry_audit_authority",
       "idx_executions_delivery_unit_version",
       "idx_implementation_publication_claim",
       "idx_implementation_publication_unit_version",

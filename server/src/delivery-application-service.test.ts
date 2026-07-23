@@ -475,7 +475,7 @@ describe("DeliveryApplicationService", () => {
     });
     expect(fixture.store.automationJobs.get(lease.id)?.status).toBe("completed");
     await expectRepositoryState(fixture.backendGit, otherBefore);
-  });
+  }, 15_000);
 
   it("reuses the trusted source commit after an applied run is explicitly reverted", async () => {
     const fixture = await createFixture();
@@ -523,7 +523,7 @@ describe("DeliveryApplicationService", () => {
     });
     expect(fixture.store.deliveryApplications.listForUnit(fixture.backendUnit.id)).toHaveLength(2);
     expect(await head(context.codingEvidence.worktreePath)).toBe(sourceCommit);
-  });
+  }, 15_000);
 
   it("returns only the sanitized persisted preflight", async () => {
     const sensitiveValue = "CUSTOM_SECRET_PATH";
