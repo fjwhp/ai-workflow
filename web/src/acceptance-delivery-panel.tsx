@@ -1,4 +1,4 @@
-import { Fragment, useRef, useState, type FormEvent, type MutableRefObject } from "react";
+import { Fragment, useEffect, useRef, useState, type FormEvent, type MutableRefObject } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -167,6 +167,13 @@ export function retryApplicationUnit(units: readonly DeliveryUnitView[], unitId:
     && unit.allowedActions?.some((action) => action.type === "retry_application")) ?? null;
 }
 
+export function reconcileRetryUnitId(
+  units: readonly DeliveryUnitView[],
+  retryUnitId: string | null
+) {
+  return retryApplicationUnit(units, retryUnitId)?.id ?? null;
+}
+
 export async function submitRetryIfAllowed(
   units: readonly DeliveryUnitView[],
   unitId: string | null,
@@ -239,6 +246,13 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
   const loadingRunIds = useRef(new Set<string>());
   const view = acceptanceDeliveryView(units, allowedActions);
   const projectById = new Map(projects.map((project) => [project.projectId, project]));
+
+  useEffect(() => {
+    const currentRetryUnitId = reconcileRetryUnitId(units, retryUnitId);
+    if (currentRetryUnitId === retryUnitId) return;
+    setRetryUnitId(currentRetryUnitId);
+    setActionError("");
+  }, [units, retryUnitId]);
 
   const runMutation = async (mutate: () => Promise<void>, onMutationSuccess: () => void) => {
     setActionError("");

@@ -11,6 +11,7 @@ import {
   acceptanceDeliveryView,
   acceptanceErrorView,
   loadApplicationRuns,
+  reconcileRetryUnitId,
   runValueKey,
   submitAcceptanceAction,
   submitRetryIfAllowed,
@@ -58,6 +59,20 @@ describe("acceptanceDeliveryView", () => {
     expect(acceptanceDeliveryView(ready, [{ type: "accept_delivery", commentRequired: true }]))
       .toMatchObject({ status: "awaiting_acceptance", canAccept: true, retryUnitId: null });
     expect(acceptanceDeliveryView(ready, [])).toMatchObject({ canAccept: false });
+  });
+});
+
+describe("retry dialog authorization transitions", () => {
+  it("clears a revoked selection and does not revive it when permission returns", () => {
+    const revoked = units.map((unit) => ({ ...unit, allowedActions: [] }));
+
+    const cleared = reconcileRetryUnitId(revoked, "unit-frontend");
+
+    expect(cleared).toBeNull();
+    expect(reconcileRetryUnitId(units, cleared)).toBeNull();
+    const source = readFileSync(new URL("./acceptance-delivery-panel.tsx", import.meta.url), "utf8");
+    expect(source).toContain("reconcileRetryUnitId(units, retryUnitId)");
+    expect(source).toContain('setActionError("")');
   });
 });
 
