@@ -72,7 +72,7 @@ function App() {
         await post(action.path, action.body);
       }} onLoadApplicationRuns={(unitId) => api<ApplicationRunsResponse>(
         `/delivery-units/${unitId}/application-runs`
-      )} onDeliveryRefreshError={() => setError("操作已成功，但刷新失败，请重新打开需求")}/> :
+      )} onDeliveryRefreshError={() => setError("数据刷新失败，请重新打开需求")}/> :
        page === "projects" ? <ProjectManagement/> : page === "settings" ? <SettingsPage/> : <Dashboard items={visibleItems} queues={queues} queueFilter={queueFilter} onQueue={selectQueue} onClearFilter={()=>setQueueFilter(null)} onOpen={open}/>}
     </main>
     {modal === "new" && <NewRequirement

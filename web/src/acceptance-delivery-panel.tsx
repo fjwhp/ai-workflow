@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   ChevronDown,
+  ChevronUp,
   ClipboardCheck,
   FileClock,
   RefreshCw
@@ -57,6 +58,25 @@ export type ApplicationRunsState =
   | { state: "loaded"; data: ApplicationRunsResponse }
   | { state: "error"; error: string };
 
+export function acceptanceErrorView(error: unknown) {
+  const value = typeof error === "object" && error !== null
+    ? error as { status?: unknown; code?: unknown; error?: unknown; message?: unknown }
+    : null;
+  const status = typeof value?.status === "number" ? value.status : undefined;
+  const code = typeof value?.code === "string" ? value.code
+    : typeof value?.error === "string" ? value.error : undefined;
+  if (status === 400 || code === "VALIDATION_ERROR") return "输入内容无效，请检查后重试";
+  if (status === 404 || code === "NOT_FOUND") return "记录不存在或已变化，请刷新后重试";
+  if ((status !== undefined && status >= 500) || code === "INTERNAL_ERROR") {
+    return "服务暂时不可用，请稍后重试";
+  }
+  if (status !== undefined || code !== undefined) return "操作失败，请重试";
+  if (error instanceof Error && error.message && !/^[A-Z][A-Z0-9_]+$/.test(error.message)) {
+    return error.message;
+  }
+  return "操作失败，请重试";
+}
+
 export async function loadApplicationRuns(
   unitId: string,
   loadingUnitIds: Set<string>,
@@ -70,11 +90,26 @@ export async function loadApplicationRuns(
     setState({ state: "loaded", data: await request(unitId) });
     return true;
   } catch (error) {
-    setState({ state: "error", error: error instanceof Error ? error.message : "应用记录加载失败" });
+    setState({ state: "error", error: acceptanceErrorView(error) });
     return false;
   } finally {
     loadingUnitIds.delete(unitId);
   }
+}
+
+export async function toggleApplicationRuns(
+  unitId: string,
+  state: ApplicationRunsState,
+  loadingUnitIds: Set<string>,
+  request: (unitId: string) => Promise<ApplicationRunsResponse>,
+  setState: (state: ApplicationRunsState) => void
+) {
+  if (state.state === "loading") return false;
+  if (state.state !== "idle") {
+    setState({ state: "idle" });
+    return true;
+  }
+  return loadApplicationRuns(unitId, loadingUnitIds, request, setState);
 }
 
 const aggregateLabels: Record<AggregateDeliveryStatus, string> = {
@@ -147,10 +182,11 @@ export async function submitAcceptanceAction(options: {
     return true;
   } catch (error) {
     if (isConflict(error)) {
-      options.onConflict("交付状态已变化，已刷新最新状态");
       try {
         await options.refresh();
+        options.onConflict("交付状态已变化，已刷新最新状态");
       } catch (refreshError) {
+        options.onConflict("交付状态已变化，但刷新失败，请重新打开需求");
         options.onRefreshError(refreshError);
       }
       return false;
@@ -192,7 +228,7 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
         refresh: onRefresh, onRefreshError,
         onConflict: setActionError });
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : "操作失败，请重试");
+      setActionError(acceptanceErrorView(error));
     }
   };
   const submitAcceptance = async (event: FormEvent) => {
@@ -210,8 +246,8 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
     const unitId = retryUnitId;
     await runMutation(() => onRetry(unitId, reason), () => setRetryUnitId(null));
   };
-  const loadRuns = async (unitId: string) => {
-    await loadApplicationRuns(unitId, loadingRunIds.current, onLoadRuns,
+  const toggleRuns = async (unitId: string, state: ApplicationRunsState) => {
+    await toggleApplicationRuns(unitId, state, loadingRunIds.current, onLoadRuns,
       (state) => setRunsByUnit((states) => ({ ...states, [unitId]: state })));
   };
 
@@ -239,11 +275,8 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
           <span className={`acceptance-application-status ${unit.status}`} data-acceptance-field="status">
             {applicationLabels[unit.status]}</span>
           <div className="acceptance-unit-actions" data-acceptance-field="actions">
-            <button type="button" className="secondary compact-action" aria-expanded={runState.state !== "idle"}
-              aria-controls={runsId}
-              onClick={() => loadRuns(unit.id)} disabled={runState.state === "loading"}>
-              {runState.state === "loading" ? <RefreshCw className="spin" size={14}/> : <ChevronDown size={14}/>}应用记录
-            </button>
+            <ApplicationRunsToggle id={runsId} state={runState}
+              onToggle={() => toggleRuns(unit.id, runState)}/>
             {canRetry && <button type="button" className="secondary compact-action"
               onClick={() => { setActionError(""); setRetryUnitId(unit.id); }}>
               <RefreshCw size={14}/>重试应用
@@ -266,6 +299,21 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
       reasonRequired: true, unitId: retryUnitId }} busy={busy} error={actionError}
       onClose={() => { if (!busy) setRetryUnitId(null); }} onSubmit={submitRetry}/>}
   </section>;
+}
+
+export function ApplicationRunsToggle({ state, id, onToggle }: {
+  state: ApplicationRunsState;
+  id: string;
+  onToggle: () => void;
+}) {
+  const loading = state.state === "loading";
+  const expanded = state.state !== "idle";
+  return <button type="button" className="secondary compact-action" aria-expanded={expanded}
+    aria-controls={id} onClick={onToggle} disabled={loading}>
+    {loading ? <RefreshCw className="spin" size={14}/> : expanded
+      ? <ChevronUp size={14}/> : <ChevronDown size={14}/>}<span>{loading ? "正在加载" : expanded
+        ? "收起记录" : "应用记录"}</span>
+  </button>;
 }
 
 export function ApplicationRunsView({ state, id }: { state: ApplicationRunsState; id?: string }) {

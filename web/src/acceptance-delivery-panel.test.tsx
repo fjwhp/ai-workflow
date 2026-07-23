@@ -4,16 +4,20 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import {
   AcceptanceDeliveryPanel,
+  ApplicationRunsToggle,
   ApplicationRunsView,
   acceptanceCommentSubmission,
   acceptanceDeliveryView,
+  acceptanceErrorView,
   loadApplicationRuns,
   submitAcceptanceAction,
+  toggleApplicationRuns,
+  type ApplicationRunsState,
   type ApplicationRunsResponse
 } from "./acceptance-delivery-panel.js";
 import { acceptanceDeliveryRequest } from "./delivery-unit-view.js";
 import { DeliveryMatrix, type DeliveryUnitView } from "./delivery-matrix.js";
-import { RequirementDetail } from "./requirement-detail.js";
+import { RequirementAcceptanceDelivery, RequirementDetail } from "./requirement-detail.js";
 
 const projects = [{
   projectId: "backend", projectName: "Backend", projectVersionId: "backend-v1",
@@ -106,6 +110,32 @@ describe("AcceptanceDeliveryPanel", () => {
 });
 
 describe("acceptance delivery integration", () => {
+  it("keeps historical delivery tabs read-only while preserving current acceptance actions", () => {
+    const onRetry = vi.fn(async () => undefined);
+    const props = {
+      item: { id: "requirement-1", stage: "acceptance_delivery" as const,
+        deliveryUnits: units, allowedActions: [{ type: "accept_delivery" as const,
+          commentRequired: true as const }] },
+      projects, onAcceptDelivery: async () => undefined, onApplicationRetry: onRetry,
+      onRefresh: async () => undefined, onDeliveryRefreshError: () => undefined,
+      onLoadApplicationRuns: async () => ({ runs: [], retries: [] })
+    };
+    const current = renderToStaticMarkup(<RequirementAcceptanceDelivery {...props}
+      viewStage="acceptance_delivery"/>);
+    const historicalImplementation = renderToStaticMarkup(<RequirementAcceptanceDelivery {...props}
+      viewStage="implementation"/>);
+    const historicalQuality = renderToStaticMarkup(<RequirementAcceptanceDelivery {...props}
+      viewStage="quality_verification"/>);
+
+    expect(current).toContain("确认验收");
+    expect(current).toContain("重试应用");
+    for (const historical of [historicalImplementation, historicalQuality]) {
+      expect(historical).toBe("");
+      expect(historical).not.toMatch(/确认验收|重试应用/);
+    }
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
   it("renders the unframed acceptance section before the delivery matrix in requirement detail", () => {
     const markup = renderToStaticMarkup(<RequirementDetail item={{
       id: "requirement-1", code: "REQ-1", title: "Acceptance", businessProblem: "Apply safely",
@@ -148,6 +178,21 @@ describe("acceptance delivery integration", () => {
 
 describe("acceptance delivery mutations", () => {
   it.each([
+    [{ status: 400, code: "VALIDATION_ERROR", message: "VALIDATION_ERROR" }, "输入内容无效，请检查后重试"],
+    [{ status: 404, code: "NOT_FOUND", message: "NOT_FOUND" }, "记录不存在或已变化，请刷新后重试"],
+    [{ status: 500, code: "INTERNAL_ERROR", message: "INTERNAL_ERROR" }, "服务暂时不可用，请稍后重试"],
+    [{ status: 418, code: "UNKNOWN_API_CODE", message: "UNKNOWN_API_CODE" }, "操作失败，请重试"]
+  ])("maps API error %s to a stable user-facing message", (error, expected) => {
+    expect(acceptanceErrorView(error)).toBe(expected);
+    expect(acceptanceErrorView(new Error(error.message))).toBe("操作失败，请重试");
+  });
+
+  it("preserves only an explicitly user-readable ordinary Error message", () => {
+    expect(acceptanceErrorView(new Error("网络连接已中断，请稍后重试"))).toBe("网络连接已中断，请稍后重试");
+    expect(acceptanceErrorView("VALIDATION_ERROR")).toBe("操作失败，请重试");
+  });
+
+  it.each([
     ["accept", acceptanceDeliveryRequest("requirement-1", { type: "accept_delivery", comment: "checked" }),
       { path: "/requirements/requirement-1/accept-delivery", body: { comment: "checked" } }],
     ["retry", acceptanceDeliveryRequest("requirement-1", {
@@ -187,19 +232,102 @@ describe("acceptance delivery mutations", () => {
     expect(events).toEqual(["mutation", "success", "refresh", "refresh-warning"]);
   });
 
-  it("shows a stable conflict message and refreshes so server-owned actions converge", async () => {
-    const onConflict = vi.fn();
-    const refresh = vi.fn(async () => undefined);
+  it("announces a refreshed conflict only after refresh succeeds without settling the mutation", async () => {
+    const events: string[] = [];
+    const onMutationSuccess = vi.fn();
+    const onConflict = vi.fn((message: string) => events.push(message));
+    const refresh = vi.fn(async () => { events.push("refresh"); });
     const result = await submitAcceptanceAction({ busy: { current: false }, setBusy: () => undefined,
       mutate: async () => { throw Object.assign(new Error("conflict"), { status: 409 }); },
-      onMutationSuccess: vi.fn(), refresh, onRefreshError: vi.fn(), onConflict });
+      onMutationSuccess, refresh, onRefreshError: vi.fn(), onConflict });
     expect(result).toBe(false);
     expect(onConflict).toHaveBeenCalledWith("交付状态已变化，已刷新最新状态");
+    expect(events).toEqual(["refresh", "交付状态已变化，已刷新最新状态"]);
+    expect(onMutationSuccess).not.toHaveBeenCalled();
     expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports the refresh failure truthfully after a conflict and uses the refresh warning channel", async () => {
+    const onConflict = vi.fn();
+    const onRefreshError = vi.fn();
+    const refreshError = new Error("offline");
+    const result = await submitAcceptanceAction({ busy: { current: false }, setBusy: () => undefined,
+      mutate: async () => { throw Object.assign(new Error("conflict"), { status: 409 }); },
+      onMutationSuccess: vi.fn(), refresh: async () => { throw refreshError; },
+      onRefreshError, onConflict });
+
+    expect(result).toBe(false);
+    expect(onConflict).toHaveBeenCalledWith("交付状态已变化，但刷新失败，请重新打开需求");
+    expect(onRefreshError).toHaveBeenCalledWith(refreshError);
+  });
+
+  it("uses a neutral global refresh failure message", () => {
+    const source = readFileSync(new URL("./main.tsx", import.meta.url), "utf8");
+    expect(source).toContain('onDeliveryRefreshError={() => setError("数据刷新失败，请重新打开需求")}');
+    expect(source).not.toContain("操作已成功，但刷新失败，请重新打开需求");
   });
 });
 
 describe("ApplicationRunsView", () => {
+  it("collapses loaded and error disclosures, then reloads only after returning to idle", async () => {
+    const request = vi.fn(async () => ({ runs: [], retries: [] }));
+    const loading = new Set<string>();
+    let state: ApplicationRunsState = { state: "loaded", data: { runs: [], retries: [] } };
+    const setState = (next: ApplicationRunsState) => { state = next; };
+
+    expect(await toggleApplicationRuns("unit-frontend", state, loading, request, setState)).toBe(true);
+    expect(state).toEqual({ state: "idle" });
+    expect(request).not.toHaveBeenCalled();
+    expect(renderToStaticMarkup(<ApplicationRunsView state={state}/>)).toBe("");
+
+    expect(await toggleApplicationRuns("unit-frontend", state, loading, request, setState)).toBe(true);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(state.state).toBe("loaded");
+
+    state = { state: "error", error: "记录不存在" };
+    expect(await toggleApplicationRuns("unit-frontend", state, loading, request, setState)).toBe(true);
+    expect(state).toEqual({ state: "idle" });
+  });
+
+  it("renders accurate disclosure ARIA, labels, and Lucide direction icons", () => {
+    const idle = renderToStaticMarkup(<ApplicationRunsToggle id="runs-unit" state={{ state: "idle" }}
+      onToggle={() => undefined}/>);
+    const loaded = renderToStaticMarkup(<ApplicationRunsToggle id="runs-unit"
+      state={{ state: "loaded", data: { runs: [], retries: [] } }} onToggle={() => undefined}/>);
+    const error = renderToStaticMarkup(<ApplicationRunsToggle id="runs-unit"
+      state={{ state: "error", error: "offline" }} onToggle={() => undefined}/>);
+
+    expect(idle).toContain('aria-expanded="false"');
+    expect(idle).toContain('aria-controls="runs-unit"');
+    expect(idle).toContain("lucide-chevron-down");
+    expect(idle).toContain("应用记录");
+    for (const open of [loaded, error]) {
+      expect(open).toContain('aria-expanded="true"');
+      expect(open).toContain("lucide-chevron-up");
+      expect(open).toContain("收起记录");
+    }
+  });
+
+  it("keeps an in-flight disclosure load guarded against duplicate toggles", async () => {
+    const request = vi.fn(async () => ({ runs: [], retries: [] }));
+    const loading = new Set(["unit-frontend"]);
+    const setState = vi.fn();
+    const result = await toggleApplicationRuns("unit-frontend", { state: "loading" }, loading,
+      request, setState);
+    expect(result).toBe(false);
+    expect(request).not.toHaveBeenCalled();
+    expect(setState).not.toHaveBeenCalled();
+  });
+
+  it("uses the shared friendly error mapper for application-runs failures", async () => {
+    const states: ApplicationRunsState[] = [];
+    await loadApplicationRuns("unit-frontend", new Set(), async () => {
+      throw { status: 404, code: "NOT_FOUND", message: "NOT_FOUND" };
+    }, (state) => states.push(state));
+
+    expect(states.at(-1)).toEqual({ state: "error", error: "记录不存在或已变化，请刷新后重试" });
+  });
+
   it("blocks duplicate lazy loads until the current application-runs request settles", async () => {
     let release!: (value: ApplicationRunsResponse) => void;
     const pending = new Promise<ApplicationRunsResponse>((resolve) => { release = resolve; });

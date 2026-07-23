@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type ComponentProps } from "react";
 import { AlertTriangle, Bot, Check, Code2, FileText, Play, RefreshCw, ShieldCheck } from "lucide-react";
 import { stageLabels, workflowStages, type Requirement, type WorkflowStage, type WorkflowStatus } from "@ai-workflow/shared";
-import { DeliveryMatrix, type DeliveryDependencyView, type DeliveryMatrixActionRequest, type DeliveryUnitView } from "./delivery-matrix.js";
+import { DeliveryMatrix, type DeliveryDependencyView, type DeliveryMatrixActionRequest,
+  type DeliveryProjectView, type DeliveryUnitView } from "./delivery-matrix.js";
 import { gateLabel, gateReasons, latestGateForStage } from "./gate-view.js";
 import { InlineRunStream } from "./inline-run-stream.js";
 import { productArtifactView } from "./product-artifact-view.js";
@@ -55,6 +56,17 @@ type RequirementDetailProps = {
   onDeliveryRefreshError?: (error: unknown) => void;
 };
 
+type RequirementAcceptanceDeliveryProps = {
+  item: Pick<Detail, "id" | "stage" | "deliveryUnits" | "allowedActions">;
+  viewStage: WorkflowStage;
+  projects: readonly DeliveryProjectView[];
+  onAcceptDelivery?: (comment: string) => Promise<void>;
+  onApplicationRetry?: (unitId: string, reason: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onDeliveryRefreshError?: (error: unknown) => void;
+  onLoadApplicationRuns?: (unitId: string) => Promise<ApplicationRunsResponse>;
+};
+
 export function Status({ stage, status }: { stage: WorkflowStage; status: WorkflowStatus }) {
   return <span className={`status ${status}`}>{requirementStatusLabel(stage, status)}</span>;
 }
@@ -70,6 +82,23 @@ const deliveryOwnedStages: readonly WorkflowStage[] = [
 export function shouldShowLegacyDeliveryEvidence(itemStage: WorkflowStage, viewStage: WorkflowStage) {
   const isDeliveryOwned = deliveryOwnedStages.includes(itemStage);
   return !isDeliveryOwned && deliveryOwnedStages.includes(viewStage);
+}
+
+export function RequirementAcceptanceDelivery({ item, viewStage, projects, onAcceptDelivery,
+  onApplicationRetry, onRefresh, onDeliveryRefreshError,
+  onLoadApplicationRuns }: RequirementAcceptanceDeliveryProps) {
+  if (viewStage !== item.stage || !deliveryOwnedStages.includes(viewStage)
+    || !item.deliveryUnits?.length || !onAcceptDelivery || !onApplicationRetry
+    || !onLoadApplicationRuns) return null;
+  return <AcceptanceDeliveryPanel requirementId={item.id}
+    units={item.deliveryUnits}
+    projects={projects}
+    allowedActions={item.allowedActions ?? []}
+    onAccept={onAcceptDelivery}
+    onRetry={onApplicationRetry}
+    onRefresh={onRefresh}
+    onRefreshError={onDeliveryRefreshError ?? (() => undefined)}
+    onLoadRuns={onLoadApplicationRuns}/>;
 }
 
 export function RequirementDetail({ item, onRun, onViewRun, onEdit, onApprove, onRefresh, onManageProjects,
@@ -103,17 +132,11 @@ export function RequirementDetail({ item, onRun, onViewRun, onEdit, onApprove, o
     <div className="timeline">{workflowStages.map((stage, index) => <button type="button" onClick={() => setViewStage(stage)} className={`step ${stage === item.stage ? "current" : workflowStages.indexOf(item.stage) > index ? "done" : ""} ${stage === viewStage ? "selected" : ""}`} key={stage}><span>{workflowStages.indexOf(item.stage) > index ? <Check size={14}/> : index + 1}</span><small>{steps[index]}</small></button>)}</div>
     <div className="detail-grid"><section className="section"><div className="section-head"><div><h2>{stageLabels[viewStage]}</h2><p>当前需求版本 v{item.version || 1} · {isCurrentView ? (aiStage ? "当前阶段成果与人工门禁" : "项目交付进度") : "历史阶段产物"}</p></div>{isCurrentView && aiStage && item.status === "ai_running" && stageRun ? <button className="run-status-button" onClick={() => onViewRun(stageRun)} title="查看 AI 执行详情"><Status stage={item.stage} status={item.status}/></button> : isCurrentView ? <Status stage={item.stage} status={item.status}/> : <span className="status">历史</span>}</div>
       <PlannedDelivery items={projects} stage={viewStage}/>
-      {showsDeliveryMatrix && item.deliveryUnits?.length && onAcceptDelivery && onApplicationRetry
-        && onLoadApplicationRuns ? <AcceptanceDeliveryPanel requirementId={item.id}
-          units={item.deliveryUnits}
-          projects={projects.map((project) => ({ ...project,
-            projectName: project.projectName || project.projectId }))}
-          allowedActions={isCurrentView ? item.allowedActions ?? [] : []}
-          onAccept={onAcceptDelivery}
-          onRetry={onApplicationRetry}
-          onRefresh={onRefresh}
-          onRefreshError={onDeliveryRefreshError ?? (() => undefined)}
-          onLoadRuns={onLoadApplicationRuns}/> : null}
+      <RequirementAcceptanceDelivery item={item} viewStage={viewStage}
+        projects={projects.map((project) => ({ ...project, projectName: project.projectName || project.projectId }))}
+        onAcceptDelivery={onAcceptDelivery} onApplicationRetry={onApplicationRetry}
+        onRefresh={onRefresh} onDeliveryRefreshError={onDeliveryRefreshError}
+        onLoadApplicationRuns={onLoadApplicationRuns}/>
       {showsDeliveryMatrix && <DeliveryMatrix
         units={item.deliveryUnits || []}
         dependencies={item.deliveryDependencies || []}
