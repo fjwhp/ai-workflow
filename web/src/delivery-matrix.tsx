@@ -272,6 +272,7 @@ export function DeliveryMatrix({ units, dependencies, projects, automation, onAc
           automation: unit.automation ?? { status: "active" },
           allowedActions: unit.allowedActions ?? []
         });
+        const matrixActions = live.actions.filter((action) => action.type !== "retry_application");
         const graphInvalid = view.blocker === "交付依赖数据异常";
         const blocker = graphInvalid ? view.blocker : unit.blocker === undefined ? view.blocker : live.blocker;
         const version = project?.projectVersionName ?? unit.projectVersionId;
@@ -284,8 +285,8 @@ export function DeliveryMatrix({ units, dependencies, projects, automation, onAc
           <DeliveryField label="自动化测试" field="automated-testing" value={hasLiveDetail ? <EvidenceValue view={live.testing}/> : view.automatedTestingLabel}/>
           <DeliveryField label="应用" value={view.applicationLabel}/>
           <DeliveryField label="Blocker" value={blocker ?? "无"} blocker={Boolean(blocker) && (unit.status !== "skipped" || unit.required)}/>
-          <DeliveryField label="下一步" field="next-action" value={onAction && live.actions.length > 0
-            ? <div className="delivery-actions">{live.actions.map((action) => <button type="button" className="secondary compact-action"
+          <DeliveryField label="下一步" field="next-action" value={onAction && matrixActions.length > 0
+            ? <div className="delivery-actions">{matrixActions.map((action) => <button type="button" className="secondary compact-action"
               key={action.type} onClick={() => openAction({ ...action, unitId: unit.id })}>
               <ActionIcon type={action.type}/><span>{action.label}</span>
             </button>)}</div>

@@ -9,7 +9,8 @@ export type DeliveryUnitActionType =
   | "retry_automated_testing"
   | "reuse_evidence"
   | "rerun"
-  | "skip_optional";
+  | "skip_optional"
+  | "retry_application";
 
 export interface DeliveryUnitAllowedAction {
   type: DeliveryUnitActionType;
@@ -70,7 +71,8 @@ const actionLabels: Record<DeliveryUnitActionType, string> = {
   retry_automated_testing: "重试测试",
   reuse_evidence: "复用证据",
   rerun: "重新执行",
-  skip_optional: "跳过可选交付"
+  skip_optional: "跳过可选交付",
+  retry_application: "重试应用"
 };
 
 const implementationStatusLabels: Record<LiveDeliveryUnit["status"], { label: string; tone: DeliveryTone }> = {
@@ -138,6 +140,9 @@ export function deliveryActionRequest(requirementId: string, request: {
     };
   }
   if (!request.unitId) throw new Error("DELIVERY_UNIT_ACTION_ID_REQUIRED");
+  if (request.type === "retry_application") return {
+    path: `/delivery-units/${request.unitId}/application/retry`, body: { reason: request.reason }
+  };
   if (request.type === "reuse_evidence" || request.type === "rerun") return {
     path: `/delivery-units/${request.unitId}/stale-resolution`,
     body: { decision: request.type === "reuse_evidence" ? "reuse" : "rerun", reason: request.reason }
@@ -148,6 +153,19 @@ export function deliveryActionRequest(requirementId: string, request: {
   const target = request.type === "retry_implementation" ? "implementation"
     : request.type === "retry_code_review" ? "code_review" : "automated_testing";
   return { path: `/delivery-units/${request.unitId}/retry`, body: { target, reason: request.reason } };
+}
+
+export function acceptanceDeliveryRequest(requirementId: string, request: {
+  type: "accept_delivery";
+  comment: string;
+} | {
+  type: "retry_application";
+  unitId: string;
+  reason: string;
+}) {
+  return request.type === "accept_delivery"
+    ? { path: `/requirements/${requirementId}/accept-delivery`, body: { comment: request.comment } }
+    : { path: `/delivery-units/${request.unitId}/application/retry`, body: { reason: request.reason } };
 }
 
 function implementationView(unit: LiveDeliveryUnit): { label: string; tone: DeliveryTone } {

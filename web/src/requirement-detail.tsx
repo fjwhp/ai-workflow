@@ -11,6 +11,11 @@ import { latestRunForStage, type StageRun } from "./run-observability.js";
 import { workflowSteps } from "./workflow-view.js";
 import { requirementStatusLabel } from "./workflow-presentation.js";
 import { subscribeDeliveryLiveRefresh } from "./delivery-live-refresh.js";
+import {
+  AcceptanceDeliveryPanel,
+  type AcceptanceDeliveryAction,
+  type ApplicationRunsResponse
+} from "./acceptance-delivery-panel.js";
 
 export type Detail = Requirement & {
   projectId?: string;
@@ -22,6 +27,7 @@ export type Detail = Requirement & {
   deliveryUnits?: DeliveryUnitView[];
   deliveryDependencies?: DeliveryDependencyView[];
   automation?: ComponentProps<typeof DeliveryMatrix>["automation"];
+  allowedActions?: AcceptanceDeliveryAction[];
   version?: number;
   clarifications?: string;
   artifacts: any[];
@@ -43,6 +49,9 @@ type RequirementDetailProps = {
   onRefresh: () => Promise<void>;
   onManageProjects: () => void;
   onDeliveryAction?: (request: DeliveryMatrixActionRequest) => Promise<void>;
+  onAcceptDelivery?: (comment: string) => Promise<void>;
+  onApplicationRetry?: (unitId: string, reason: string) => Promise<void>;
+  onLoadApplicationRuns?: (unitId: string) => Promise<ApplicationRunsResponse>;
   onDeliveryRefreshError?: (error: unknown) => void;
 };
 
@@ -64,7 +73,8 @@ export function shouldShowLegacyDeliveryEvidence(itemStage: WorkflowStage, viewS
 }
 
 export function RequirementDetail({ item, onRun, onViewRun, onEdit, onApprove, onRefresh, onManageProjects,
-  onDeliveryAction, onDeliveryRefreshError }: RequirementDetailProps) {
+    onDeliveryAction, onAcceptDelivery, onApplicationRetry, onLoadApplicationRuns,
+    onDeliveryRefreshError }: RequirementDetailProps) {
   const [viewStage, setViewStage] = useState<WorkflowStage>(item.stage);
   useEffect(() => setViewStage(item.stage), [item.id, item.stage]);
   const latest = item.artifacts.find((artifact: any) => artifact.stage === viewStage);
@@ -93,6 +103,17 @@ export function RequirementDetail({ item, onRun, onViewRun, onEdit, onApprove, o
     <div className="timeline">{workflowStages.map((stage, index) => <button type="button" onClick={() => setViewStage(stage)} className={`step ${stage === item.stage ? "current" : workflowStages.indexOf(item.stage) > index ? "done" : ""} ${stage === viewStage ? "selected" : ""}`} key={stage}><span>{workflowStages.indexOf(item.stage) > index ? <Check size={14}/> : index + 1}</span><small>{steps[index]}</small></button>)}</div>
     <div className="detail-grid"><section className="section"><div className="section-head"><div><h2>{stageLabels[viewStage]}</h2><p>当前需求版本 v{item.version || 1} · {isCurrentView ? (aiStage ? "当前阶段成果与人工门禁" : "项目交付进度") : "历史阶段产物"}</p></div>{isCurrentView && aiStage && item.status === "ai_running" && stageRun ? <button className="run-status-button" onClick={() => onViewRun(stageRun)} title="查看 AI 执行详情"><Status stage={item.stage} status={item.status}/></button> : isCurrentView ? <Status stage={item.stage} status={item.status}/> : <span className="status">历史</span>}</div>
       <PlannedDelivery items={projects} stage={viewStage}/>
+      {showsDeliveryMatrix && item.deliveryUnits?.length && onAcceptDelivery && onApplicationRetry
+        && onLoadApplicationRuns ? <AcceptanceDeliveryPanel requirementId={item.id}
+          units={item.deliveryUnits}
+          projects={projects.map((project) => ({ ...project,
+            projectName: project.projectName || project.projectId }))}
+          allowedActions={isCurrentView ? item.allowedActions ?? [] : []}
+          onAccept={onAcceptDelivery}
+          onRetry={onApplicationRetry}
+          onRefresh={onRefresh}
+          onRefreshError={onDeliveryRefreshError ?? (() => undefined)}
+          onLoadRuns={onLoadApplicationRuns}/> : null}
       {showsDeliveryMatrix && <DeliveryMatrix
         units={item.deliveryUnits || []}
         dependencies={item.deliveryDependencies || []}
