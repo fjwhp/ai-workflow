@@ -16,7 +16,7 @@ afterEach(() => {
   directories.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true }));
 });
 
-function createAcceptanceFixture(options: { frontendQuality?: boolean } = {}) {
+function createAcceptanceFixture(options: { frontendQuality?: boolean; frontendRequired?: boolean } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "delivery-acceptance-route-"));
   directories.push(directory);
   const databasePath = join(directory, "workflow.db");
@@ -50,7 +50,7 @@ function createAcceptanceFixture(options: { frontendQuality?: boolean } = {}) {
     projectVersionId: versions[position]!.id,
     role: position === 0 ? "primary" as const : "collaborator" as const,
     usage: "delivery" as const,
-    deliveryRequired: true,
+    deliveryRequired: position === 0 || options.frontendRequired !== false,
     moduleMode: "all" as const,
     moduleIds: [],
     position
@@ -77,6 +77,7 @@ function createAcceptanceFixture(options: { frontendQuality?: boolean } = {}) {
   completeImplementation(store, frontend!.id);
   if (options.frontendQuality !== false) passQuality(store, frontend!.id);
   store.updateRequirementState(requirement.id, "implementation", "ai_ready");
+  for (const unit of plan.units) store.automationJobs.cancelByOwnerVersion(unit.id, unit.evidenceVersion);
   return { store, databasePath, projects, versions, requirement, backend: backend!, frontend: frontend! };
 }
 
@@ -375,6 +376,62 @@ describe("delivery acceptance routes", () => {
     await app.close();
   });
 
+  it("blocks acceptance while a quality automation lease remains active after readiness", async () => {
+    const fixture = createAcceptanceFixture();
+    const database = (fixture.store as any).db;
+    const qualityJob = database.prepare(`SELECT id FROM automation_jobs
+      WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ? AND action = 'test'`)
+      .get(fixture.frontend.id, fixture.frontend.evidenceVersion) as { id: string };
+    database.prepare(`UPDATE automation_jobs SET status = 'leased', attempt = 1,
+      lease_owner = 'quality-callback', lease_expires_at = '2099-01-01T00:00:00.000Z', updated_at = ?
+      WHERE id = ?`).run(new Date().toISOString(), qualityJob.id);
+    const app = await buildApp(fixture.store);
+
+    const detail = (await app.inject({ method: "GET",
+      url: `/api/requirements/${fixture.requirement.id}` })).json();
+    const response = await app.inject({ method: "POST",
+      url: `/api/requirements/${fixture.requirement.id}/accept-delivery`,
+      payload: { comment: "Must wait for lease settlement" } });
+
+    expect(detail.allowedActions).toEqual([]);
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: "APPLICATION_ALREADY_ACTIVE",
+      detailCode: "DELIVERY_ACCEPTANCE_ACTIVE_WORK"
+    });
+    expect(fixture.store.listApprovals(fixture.requirement.id)).toEqual([]);
+    expect(database.prepare("SELECT COUNT(*) AS count FROM automation_jobs WHERE action = 'apply'").get())
+      .toEqual({ count: 0 });
+    await app.close();
+  });
+
+  it("ignores active work owned by an optional unit that no longer participates", async () => {
+    const fixture = createAcceptanceFixture({ frontendRequired: false });
+    fixture.store.deliveryCoordination.skipOptional({
+      unitId: fixture.frontend.id,
+      actor: "local-human",
+      reason: "Exclude optional delivery"
+    });
+    const database = (fixture.store as any).db;
+    const qualityJob = database.prepare(`SELECT id FROM automation_jobs
+      WHERE owner_type = 'delivery_unit' AND owner_id = ? AND evidence_version = ? AND action = 'test'`)
+      .get(fixture.frontend.id, fixture.frontend.evidenceVersion) as { id: string };
+    database.prepare(`UPDATE automation_jobs SET status = 'leased', attempt = 1,
+      lease_owner = 'ignored-quality', lease_expires_at = '2099-01-01T00:00:00.000Z', updated_at = ?
+      WHERE id = ?`).run(new Date().toISOString(), qualityJob.id);
+    const app = await buildApp(fixture.store);
+
+    const detail = (await app.inject({ method: "GET",
+      url: `/api/requirements/${fixture.requirement.id}` })).json();
+    const response = await app.inject({ method: "POST",
+      url: `/api/requirements/${fixture.requirement.id}/accept-delivery`,
+      payload: { comment: "Accept participating delivery" } });
+
+    expect(detail.allowedActions).toEqual([{ type: "accept_delivery", commentRequired: true }]);
+    expect(response.statusCode).toBe(202);
+    await app.close();
+  });
+
   it("maps ineligible and conflicting retry identities to APPLICATION_RETRY_NOT_ALLOWED", async () => {
     const fixture = createAcceptanceFixture();
     acceptInStore(fixture);
@@ -409,6 +466,75 @@ describe("delivery acceptance routes", () => {
     await app.close();
   });
 
+  it("blocks retry when another requirement actively owns the target project version", async () => {
+    const fixture = createAcceptanceFixture();
+    acceptInStore(fixture);
+    settleApplication(fixture, fixture.backend.id, "applied");
+    settleApplication(fixture, fixture.frontend.id, "conflicted");
+    const blocker = fixture.store.createRequirement({
+      title: "Occupy retry version",
+      businessProblem: "Another requirement is applying the same version",
+      expectedOutcome: "Retry waits for version ownership",
+      priority: "high",
+      primaryProjectId: fixture.projects[1]!.id,
+      primaryProjectVersionId: fixture.versions[1]!.id
+    });
+    fixture.store.replaceRequirementProjects(blocker.id, [{
+      projectId: fixture.projects[1]!.id,
+      projectVersionId: fixture.versions[1]!.id,
+      role: "primary",
+      usage: "delivery",
+      deliveryRequired: true,
+      moduleMode: "all",
+      moduleIds: [],
+      position: 0
+    }]);
+    const blockerUnit = fixture.store.deliveryUnits.createPlan({
+      requirementId: blocker.id,
+      snapshot: fixture.store.createRequirementProjectSnapshot(blocker.id),
+      plan: { units: [{ projectId: fixture.projects[1]!.id, moduleIds: [], acceptanceCriteria: ["done"] }],
+        dependencies: [] }
+    }).units[0]!;
+    completeImplementation(fixture.store, blockerUnit.id);
+    passQuality(fixture.store, blockerUnit.id);
+    fixture.store.automationJobs.cancelByOwnerVersion(blockerUnit.id, blockerUnit.evidenceVersion);
+    fixture.store.updateRequirementState(blocker.id, "implementation", "ai_ready");
+    fixture.store.deliveryCoordination.acceptRequirement({
+      requirementId: blocker.id,
+      actor: "local-human",
+      comment: "Start competing application"
+    });
+    const blockerLease = fixture.store.automationJobs.leaseNext("competing-application", new Date(), 60_000)!;
+    expect(blockerLease.ownerId).toBe(blockerUnit.id);
+    fixture.store.deliveryApplications.claim(blockerUnit.id, {
+      expectedEvidenceVersion: blockerLease.evidenceVersion,
+      claimToken: blockerLease.claimToken,
+      baseCommit: "4".repeat(40),
+      preApplyCommit: "5".repeat(40),
+      evidenceHash: "6".repeat(64),
+      preflight: { allowed: true }
+    });
+    const beforeJobs = (fixture.store as any).db.prepare(
+      "SELECT COUNT(*) AS count FROM automation_jobs WHERE owner_id = ? AND action = 'apply'"
+    ).get(fixture.frontend.id);
+    const app = await buildApp(fixture.store);
+
+    const detail = (await app.inject({ method: "GET",
+      url: `/api/requirements/${fixture.requirement.id}` })).json();
+    const response = await app.inject({ method: "POST",
+      url: `/api/delivery-units/${fixture.frontend.id}/application/retry`,
+      payload: { reason: "Wait for competing application" } });
+
+    expect(detail.deliveryUnits.find((unit: any) => unit.id === fixture.frontend.id).allowedActions).toEqual([]);
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: "PROJECT_VERSION_APPLICATION_BUSY" });
+    expect((fixture.store as any).db.prepare(
+      "SELECT COUNT(*) AS count FROM automation_jobs WHERE owner_id = ? AND action = 'apply'"
+    ).get(fixture.frontend.id)).toEqual(beforeJobs);
+    expect(fixture.store.deliveryCoordination.listApplicationRetryAudits(fixture.frontend.id)).toEqual([]);
+    await app.close();
+  });
+
   it("rejects acceptance when a participating project version has an active application", async () => {
     const fixture = createAcceptanceFixture();
     const blocker = fixture.store.createRequirement({
@@ -438,6 +564,7 @@ describe("delivery acceptance routes", () => {
     const blockerUnit = blockerPlan.units[0]!;
     completeImplementation(fixture.store, blockerUnit.id);
     passQuality(fixture.store, blockerUnit.id);
+    fixture.store.automationJobs.cancelByOwnerVersion(blockerUnit.id, blockerUnit.evidenceVersion);
     fixture.store.updateRequirementState(blocker.id, "implementation", "ai_ready");
     fixture.store.deliveryCoordination.acceptRequirement({
       requirementId: blocker.id,
@@ -485,6 +612,49 @@ describe("delivery acceptance routes", () => {
     expect(response.json()).toEqual({ error: "INTERNAL_ERROR" });
     expect(response.body).not.toContain("password");
     expect(response.body).not.toContain("super-secret-value");
+    await app.close();
+  });
+
+  it.each(["DATABASE_NOT_FOUND", "DATABASE_INVALID", "database password=super-secret-value"])(
+    "does not classify unknown coordinator code %s by suffix",
+    async (code) => {
+      const fixture = createAcceptanceFixture();
+      (fixture.store.deliveryCoordination as any).acceptRequirement = () => { throw new Error(code); };
+      (fixture.store.deliveryCoordination as any).retryApplication = () => { throw new Error(code); };
+      const app = await buildApp(fixture.store);
+
+      const responses = await Promise.all([
+        app.inject({ method: "POST", url: `/api/requirements/${fixture.requirement.id}/accept-delivery`,
+          payload: { comment: "Attempt acceptance" } }),
+        app.inject({ method: "POST", url: `/api/delivery-units/${fixture.frontend.id}/application/retry`,
+          payload: { reason: "Attempt recovery" } })
+      ]);
+
+      for (const response of responses) {
+        expect(response.statusCode).toBe(500);
+        expect(response.json()).toEqual({ error: "INTERNAL_ERROR" });
+        expect(response.body).not.toContain(code);
+      }
+      await app.close();
+    }
+  );
+
+  it("maps retry sequence conflicts to APPLICATION_RETRY_NOT_ALLOWED", async () => {
+    const fixture = createAcceptanceFixture();
+    (fixture.store.deliveryCoordination as any).retryApplication = () => {
+      throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    };
+    const app = await buildApp(fixture.store);
+
+    const response = await app.inject({ method: "POST",
+      url: `/api/delivery-units/${fixture.frontend.id}/application/retry`,
+      payload: { reason: "Attempt recovery" } });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: "APPLICATION_RETRY_NOT_ALLOWED",
+      detailCode: "DELIVERY_APPLICATION_SEQUENCE_STALE"
+    });
     await app.close();
   });
 
@@ -566,6 +736,31 @@ describe("delivery acceptance routes", () => {
     const retryActive = (await app.inject({ method: "GET",
       url: `/api/requirements/${fixture.requirement.id}` })).json();
     expect(retryActive.deliveryUnits.find((unit: any) => unit.id === fixture.frontend.id).allowedActions).toEqual([]);
+    await app.close();
+  });
+
+  it("exposes skip_optional before acceptance but suppresses it after plan membership is frozen", async () => {
+    const fixture = createAcceptanceFixture({ frontendRequired: false });
+    const app = await buildApp(fixture.store);
+
+    const before = (await app.inject({ method: "GET",
+      url: `/api/requirements/${fixture.requirement.id}` })).json();
+    expect(before.deliveryUnits.find((unit: any) => unit.id === fixture.frontend.id).allowedActions).toEqual([
+      { type: "skip_optional", reasonRequired: true }
+    ]);
+
+    acceptInStore(fixture);
+    expect(fixture.store.deliveryApplications.listForUnit(fixture.frontend.id)).toEqual([]);
+    const after = (await app.inject({ method: "GET",
+      url: `/api/requirements/${fixture.requirement.id}` })).json();
+    expect(after.deliveryUnits.find((unit: any) => unit.id === fixture.frontend.id).allowedActions).toEqual([]);
+
+    (fixture.store as any).db.prepare("UPDATE delivery_units SET evidence_version = 2 WHERE id = ?")
+      .run(fixture.backend.id);
+    const afterOwnerEvidenceChange = (await app.inject({ method: "GET",
+      url: `/api/requirements/${fixture.requirement.id}` })).json();
+    expect(afterOwnerEvidenceChange.deliveryUnits
+      .find((unit: any) => unit.id === fixture.frontend.id).allowedActions).toEqual([]);
     await app.close();
   });
 });

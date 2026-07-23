@@ -79,6 +79,7 @@ function acceptanceReadyFixture() {
     store.deliveryQuality.complete(claim, { result: "passed", content: { result: "passed" } });
   }
   store.updateRequirementState(requirement.id, "implementation", "ai_ready");
+  store.automationJobs.cancelByOwnerVersion(unit.id, unit.evidenceVersion);
   return { store, requirement, unit };
 }
 

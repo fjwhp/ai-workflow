@@ -132,6 +132,9 @@ function acceptanceFixture(required: boolean[] = [true, true]) {
   fixture.store.updateRequirementState(
     fixture.requirement.id, "implementation", "ai_ready"
   );
+  for (const unit of fixture.units) {
+    fixture.store.automationJobs.cancelByOwnerVersion(unit.id, unit.evidenceVersion);
+  }
   return { ...fixture, backend: backend!, frontend: frontend! };
 }
 

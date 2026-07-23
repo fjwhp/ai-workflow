@@ -23,7 +23,7 @@ export async function registerDeliveryAcceptanceRoutes(app: FastifyInstance, { s
         ? publicApplicationJob(store.automationJobs.get(acceptance.jobId)) : null;
       return reply.code(202).send({ acceptance, applicationJob });
     } catch (error) {
-      return acceptanceError(reply, error);
+      return acceptanceError(reply, error, "accept");
     }
   });
 
@@ -40,7 +40,7 @@ export async function registerDeliveryAcceptanceRoutes(app: FastifyInstance, { s
       });
       return reply.code(202).send({ retry, applicationJob: publicApplicationJob(store.automationJobs.get(retry.jobId)) });
     } catch (error) {
-      return acceptanceError(reply, error);
+      return acceptanceError(reply, error, "retry");
     }
   });
 
@@ -92,25 +92,41 @@ function boundedText(value: unknown) {
     && !value.includes("\0") ? value.trim() : null;
 }
 
-function acceptanceError(reply: FastifyReply, error: unknown) {
+function acceptanceError(reply: FastifyReply, error: unknown, operation: "accept" | "retry") {
   const code = error instanceof Error ? error.message : "DELIVERY_ACCEPTANCE_FAILED";
-  if (code.endsWith("_NOT_FOUND")) return notFound(reply, code);
-  if (code.endsWith("_INVALID")) return badRequest(reply);
-  if (code === "QUALITY_NOT_COMPLETE" || code === "DELIVERY_UNIT_NOT_VERIFIED"
-    || code === "DELIVERY_ACCEPTANCE_NOT_ELIGIBLE") {
-    return conflict(reply, "QUALITY_NOT_COMPLETE", code);
-  }
-  if (code === "STALE_DELIVERY_EVIDENCE") return conflict(reply, code);
-  if (code === "APPLICATION_ALREADY_ACTIVE" || code === "DELIVERY_ACCEPTANCE_ALREADY_RECORDED"
-    || code === "DELIVERY_APPLICATION_RUN_ACTIVE" || code === "DELIVERY_APPLICATION_SEQUENCE_ACTIVE") {
-    return conflict(reply, "APPLICATION_ALREADY_ACTIVE", code);
-  }
-  if (code === "APPLICATION_RETRY_NOT_ALLOWED" || code.startsWith("DELIVERY_APPLICATION_RETRY_")) {
+  if (operation === "accept") {
+    if (code === "QUALITY_NOT_COMPLETE" || code === "DELIVERY_UNIT_NOT_VERIFIED"
+      || code === "DELIVERY_ACCEPTANCE_NOT_ELIGIBLE") {
+      return conflict(reply, "QUALITY_NOT_COMPLETE", code);
+    }
+    if (code === "STALE_DELIVERY_EVIDENCE") return conflict(reply, code);
+    if (ACCEPTANCE_ACTIVE_CODES.has(code)) {
+      return conflict(reply, "APPLICATION_ALREADY_ACTIVE", code);
+    }
+  } else if (APPLICATION_RETRY_CODES.has(code)) {
     return conflict(reply, "APPLICATION_RETRY_NOT_ALLOWED", code);
   }
   if (code === "PROJECT_VERSION_APPLICATION_BUSY") return conflict(reply, code);
   return reply.code(500).send({ error: "INTERNAL_ERROR" });
 }
+
+const ACCEPTANCE_ACTIVE_CODES = new Set([
+  "APPLICATION_ALREADY_ACTIVE",
+  "DELIVERY_ACCEPTANCE_ALREADY_RECORDED",
+  "DELIVERY_ACCEPTANCE_ACTIVE_WORK",
+  "DELIVERY_APPLICATION_RUN_ACTIVE",
+  "DELIVERY_APPLICATION_SEQUENCE_ACTIVE"
+]);
+
+const APPLICATION_RETRY_CODES = new Set([
+  "APPLICATION_RETRY_NOT_ALLOWED",
+  "DELIVERY_APPLICATION_RETRY_NOT_ELIGIBLE",
+  "DELIVERY_APPLICATION_RETRY_AUDIT_STALE",
+  "DELIVERY_APPLICATION_RETRY_AUDIT_CONFLICT",
+  "DELIVERY_APPLICATION_RETRY_STALE",
+  "DELIVERY_APPLICATION_RETRY_LIMIT",
+  "DELIVERY_APPLICATION_SEQUENCE_STALE"
+]);
 
 function conflict(reply: FastifyReply, error: string, detailCode?: string) {
   return reply.code(409).send(detailCode && detailCode !== error ? { error, detailCode } : { error });

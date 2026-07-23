@@ -327,6 +327,26 @@ export class DeliveryCoordinator {
     if (units.some((unit) => unit.status === "potentially_stale")) {
       throw new Error("STALE_DELIVERY_EVIDENCE");
     }
+    if (this.db.prepare(`SELECT 1 FROM delivery_units unit
+      WHERE unit.requirement_id = ? AND (unit.required = 1 OR unit.status <> 'skipped') AND (
+        EXISTS (SELECT 1 FROM automation_jobs job
+          WHERE job.owner_type = 'delivery_unit' AND job.owner_id = unit.id
+            AND job.evidence_version = unit.evidence_version AND job.status IN ('pending', 'leased'))
+        OR EXISTS (SELECT 1 FROM delivery_quality_runs quality
+          WHERE quality.delivery_unit_id = unit.id AND quality.evidence_version = unit.evidence_version
+            AND quality.status = 'running')
+        OR EXISTS (SELECT 1 FROM stage_runs run
+          WHERE run.owner_type = 'delivery_unit' AND run.owner_id = unit.id
+            AND run.evidence_version = unit.evidence_version AND run.status = 'running')
+        OR EXISTS (SELECT 1 FROM executions execution
+          WHERE execution.delivery_unit_id = unit.id AND execution.evidence_version = unit.evidence_version
+            AND execution.status = 'running')
+        OR EXISTS (SELECT 1 FROM delivery_application_runs application
+          WHERE application.delivery_unit_id = unit.id AND application.evidence_version = unit.evidence_version
+            AND application.resolution_status = 'pending')
+      ) LIMIT 1`).get(requirement.id)) {
+      throw new Error("DELIVERY_ACCEPTANCE_ACTIVE_WORK");
+    }
     if (this.db.prepare(`SELECT 1 FROM delivery_application_runs application
       WHERE application.resolution_status = 'pending' AND application.project_version_id IN (
         SELECT project_version_id FROM delivery_units WHERE requirement_id = ?
@@ -571,10 +591,11 @@ export class DeliveryCoordinator {
     validateApplicationRetryInput(input);
     const actor = input.actor.trim();
     const reason = input.reason.trim();
-    const unit = this.db.prepare(`SELECT id, requirement_id, evidence_version, phase, status
+    const unit = this.db.prepare(`SELECT id, requirement_id, project_version_id, evidence_version, phase, status
       FROM delivery_units WHERE id = ?`).get(input.unitId) as {
         id: string;
         requirement_id: string;
+        project_version_id: string;
         evidence_version: number;
         phase: string;
         status: string;
@@ -634,6 +655,11 @@ export class DeliveryCoordinator {
       && run?.status === "applied" && run.resolution_status === "reverted";
     if (!conflicted && !cleanFailure && !revertedFailure && !revertedApplication) {
       throw new Error("DELIVERY_APPLICATION_RETRY_NOT_ELIGIBLE");
+    }
+    if (this.db.prepare(`SELECT 1 FROM delivery_application_runs
+      WHERE project_version_id = ? AND resolution_status = 'pending' LIMIT 1`)
+      .get(unit.project_version_id)) {
+      throw new Error("PROJECT_VERSION_APPLICATION_BUSY");
     }
     if (payload.retryAttempt >= 100) throw new Error("DELIVERY_APPLICATION_RETRY_LIMIT");
     for (const [index, entry] of payload.units.entries()) {

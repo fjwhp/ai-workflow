@@ -76,6 +76,7 @@ interface DeliveryDetailSnapshot {
     projectVersionId: string;
   }>;
   activeApplicationProjectVersions: Set<string>;
+  frozenApplicationUnits: Set<string>;
 }
 
 export class DeliveryUnitDetailRepository {
@@ -156,16 +157,32 @@ export class DeliveryUnitDetailRepository {
     }
 
     const jobs = new Map<string, CurrentJobState>();
+    const frozenApplicationUnits = new Set<string>();
     const jobRows = this.db.prepare(`SELECT job.owner_id AS delivery_unit_id, job.action, job.status,
-        job.last_error, job.updated_at, job.rowid
+        job.last_error, job.updated_at, job.rowid, NULL AS frozen_unit_id,
+        NULL AS frozen_evidence_version
       FROM automation_jobs job
       JOIN delivery_units unit ON job.owner_type = 'delivery_unit' AND unit.id = job.owner_id
         AND unit.evidence_version = job.evidence_version
       WHERE unit.requirement_id = ?
-      ORDER BY job.updated_at DESC, job.rowid DESC`).all(requirementId) as Array<{
-        delivery_unit_id: string; action: string; status: string; last_error: string | null;
+      UNION ALL
+      SELECT NULL, NULL, NULL, NULL, job.updated_at, job.rowid,
+        json_extract(plan_unit.value, '$.unitId'),
+        json_extract(plan_unit.value, '$.evidenceVersion')
+      FROM automation_jobs job, json_each(job.payload_json, '$.units') plan_unit
+      WHERE job.owner_type = 'delivery_unit' AND job.action = 'apply'
+        AND json_extract(job.payload_json, '$.type') = 'delivery_application_plan'
+        AND json_extract(job.payload_json, '$.requirementId') = ?
+      ORDER BY job.updated_at DESC, job.rowid DESC`).all(requirementId, requirementId) as Array<{
+        delivery_unit_id: string | null; action: string | null; status: string | null;
+        last_error: string | null;
+        frozen_unit_id: string | null; frozen_evidence_version: number | null;
       }>;
     for (const row of jobRows) {
+      if (row.frozen_unit_id !== null && row.frozen_evidence_version !== null) {
+        frozenApplicationUnits.add(applicationUnitKey(row.frozen_unit_id, row.frozen_evidence_version));
+      }
+      if (row.delivery_unit_id === null || row.action === null || row.status === null) continue;
       const state = jobs.get(row.delivery_unit_id) ?? {
         pending: false, leased: false, failedActions: new Set<string>()
       };
@@ -257,7 +274,8 @@ export class DeliveryUnitDetailRepository {
     }
     return {
       implementationEvidence, qualityEvidence, jobs, activeRuns, activeInvalidations,
-      dependenciesSatisfied, dependencyReleases, latestApplications, activeApplicationProjectVersions
+      dependenciesSatisfied, dependencyReleases, latestApplications, activeApplicationProjectVersions,
+      frozenApplicationUnits
     };
   }
 
@@ -271,11 +289,17 @@ export class DeliveryUnitDetailRepository {
     const requirement = this.db.prepare("SELECT stage, status FROM requirements WHERE id = ?")
       .get(requirementId) as { stage: string; status: string } | undefined;
     if (requirement?.stage !== "implementation" || requirement.status !== "ai_ready") return [];
-    if (units.some((unit) => unit.status === "potentially_stale"
-      || (unit.required ? unit.status !== "ready_for_acceptance"
-        : unit.status !== "ready_for_acceptance" && unit.status !== "skipped")
-      || !(snapshot.dependenciesSatisfied.get(unit.id) ?? true)
-      || snapshot.activeApplicationProjectVersions.has(unit.projectVersionId))) return [];
+    if (units.some((unit) => {
+      const participating = unit.required || unit.status !== "skipped";
+      return unit.status === "potentially_stale"
+        || (unit.required ? unit.status !== "ready_for_acceptance"
+          : unit.status !== "ready_for_acceptance" && unit.status !== "skipped")
+        || (participating && (!(snapshot.dependenciesSatisfied.get(unit.id) ?? true)
+          || snapshot.jobs.get(unit.id)?.pending
+          || snapshot.jobs.get(unit.id)?.leased
+          || snapshot.activeRuns.has(unit.id)))
+        || snapshot.activeApplicationProjectVersions.has(unit.projectVersionId);
+    })) return [];
     return [{ type: "accept_delivery", commentRequired: true }];
   }
 
@@ -295,7 +319,13 @@ export class DeliveryUnitDetailRepository {
     if (active) return [];
     if (unit.phase === "acceptance_delivery") {
       const application = snapshot.latestApplications.get(unit.id);
-      if (!application || snapshot.activeApplicationProjectVersions.has(unit.projectVersionId)) return [];
+      if (!application) {
+        return !unit.required && unit.status === "ready_for_acceptance"
+          && !snapshot.frozenApplicationUnits.has(applicationUnitKey(unit.id, unit.evidenceVersion))
+          ? [action("skip_optional")]
+          : [];
+      }
+      if (snapshot.activeApplicationProjectVersions.has(unit.projectVersionId)) return [];
       const retryable = (unit.status === "conflicted" && application.status === "conflicted"
           && application.resolutionStatus === "not_required")
         || (unit.status === "failed" && application.status === "failed"
@@ -364,6 +394,10 @@ function action(type: DeliveryUnitActionType): AllowedDeliveryUnitAction {
 
 function qualityKey(unitId: string, kind: DeliveryQualityKind) {
   return `${unitId}:${kind}`;
+}
+
+function applicationUnitKey(unitId: string, evidenceVersion: number) {
+  return `${unitId}:${evidenceVersion}`;
 }
 
 function appendDependency(

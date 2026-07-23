@@ -980,6 +980,7 @@ describe("live delivery unit detail", () => {
     completeImplementation(store, secondary.id);
     passQuality(store, secondary.id, 1);
     store.updateRequirementState(requirement.id, "implementation", "ai_ready");
+    for (const unit of [primary, secondary]) store.automationJobs.cancelByOwnerVersion(unit.id, 1);
     const app = await buildApp(store);
 
     const detail = await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` });
