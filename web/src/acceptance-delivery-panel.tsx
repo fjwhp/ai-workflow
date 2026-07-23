@@ -82,15 +82,19 @@ export async function loadApplicationRuns(
   unitId: string,
   loadingUnitIds: Set<string>,
   request: (unitId: string) => Promise<ApplicationRunsResponse>,
-  setState: (state: ApplicationRunsState) => void
+  setState: (state: ApplicationRunsState) => void,
+  isCurrent: () => boolean = () => true
 ) {
   if (loadingUnitIds.has(unitId)) return false;
   loadingUnitIds.add(unitId);
   setState({ state: "loading" });
   try {
-    setState({ state: "loaded", data: await request(unitId) });
+    const data = await request(unitId);
+    if (!isCurrent()) return false;
+    setState({ state: "loaded", data });
     return true;
   } catch (error) {
+    if (!isCurrent()) return false;
     setState({ state: "error", error: acceptanceErrorView(error) });
     return false;
   } finally {
@@ -103,14 +107,15 @@ export async function toggleApplicationRuns(
   state: ApplicationRunsState,
   loadingUnitIds: Set<string>,
   request: (unitId: string) => Promise<ApplicationRunsResponse>,
-  setState: (state: ApplicationRunsState) => void
+  setState: (state: ApplicationRunsState) => void,
+  isCurrent: () => boolean = () => true
 ) {
   if (state.state === "loading") return false;
   if (state.state !== "idle") {
     setState({ state: "idle" });
     return true;
   }
-  return loadApplicationRuns(unitId, loadingUnitIds, request, setState);
+  return loadApplicationRuns(unitId, loadingUnitIds, request, setState, isCurrent);
 }
 
 const aggregateLabels: Record<AggregateDeliveryStatus, string> = {
@@ -224,8 +229,7 @@ export async function submitAcceptanceAction(options: {
   }
 }
 
-export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAccept, onRetry,
-  onRefresh, onRefreshError, onLoadRuns }: {
+type AcceptanceDeliveryPanelProps = {
   requirementId: string;
   units: readonly DeliveryUnitView[];
   projects: readonly DeliveryProjectView[];
@@ -235,7 +239,15 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
   onRefresh: () => Promise<void>;
   onRefreshError: (error: unknown) => void;
   onLoadRuns: (unitId: string) => Promise<ApplicationRunsResponse>;
-}) {
+};
+
+export function AcceptanceDeliveryPanel(props: AcceptanceDeliveryPanelProps) {
+  const { requirementId } = props;
+  return <AcceptanceDeliveryPanelState key={requirementId} {...props}/>;
+}
+
+function AcceptanceDeliveryPanelState({ requirementId, units, projects, allowedActions, onAccept, onRetry,
+  onRefresh, onRefreshError, onLoadRuns }: AcceptanceDeliveryPanelProps) {
   const [comment, setComment] = useState("");
   const [validationError, setValidationError] = useState("");
   const [actionError, setActionError] = useState("");
@@ -244,6 +256,7 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
   const [retryUnitId, setRetryUnitId] = useState<string | null>(null);
   const [runsByUnit, setRunsByUnit] = useState<Record<string, ApplicationRunsState>>({});
   const loadingRunIds = useRef(new Set<string>());
+  const activeRequirementId = useRef<string | null>(requirementId);
   const view = acceptanceDeliveryView(units, allowedActions);
   const projectById = new Map(projects.map((project) => [project.projectId, project]));
 
@@ -253,6 +266,10 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
     setRetryUnitId(currentRetryUnitId);
     setActionError("");
   }, [units, retryUnitId]);
+
+  useEffect(() => () => {
+    activeRequirementId.current = null;
+  }, [requirementId]);
 
   const runMutation = async (mutate: () => Promise<void>, onMutationSuccess: () => void) => {
     setActionError("");
@@ -282,7 +299,8 @@ export function AcceptanceDeliveryPanel({ units, projects, allowedActions, onAcc
   };
   const toggleRuns = async (unitId: string, state: ApplicationRunsState) => {
     await toggleApplicationRuns(unitId, state, loadingRunIds.current, onLoadRuns,
-      (state) => setRunsByUnit((states) => ({ ...states, [unitId]: state })));
+      (state) => setRunsByUnit((states) => ({ ...states, [unitId]: state })),
+      () => activeRequirementId.current === requirementId);
   };
 
   return <section className="acceptance-delivery" aria-labelledby="acceptance-delivery-title">

@@ -143,6 +143,32 @@ describe("AcceptanceDeliveryPanel", () => {
       .toBe(false);
     expect(onRetry).not.toHaveBeenCalled();
   });
+
+  it("resets requirement-owned state and ignores application runs from the previous requirement", async () => {
+    let currentRequirementId = "requirement-1";
+    let release!: (value: ApplicationRunsResponse) => void;
+    const pending = new Promise<ApplicationRunsResponse>((resolve) => { release = resolve; });
+    const states: ApplicationRunsState[] = [];
+    const scopedLoad = loadApplicationRuns as unknown as (
+      unitId: string,
+      loadingUnitIds: Set<string>,
+      request: (unitId: string) => Promise<ApplicationRunsResponse>,
+      setState: (state: ApplicationRunsState) => void,
+      isCurrent: () => boolean
+    ) => Promise<boolean>;
+    const request = scopedLoad("unit-frontend", new Set(), async () => pending,
+      (state) => states.push(state), () => currentRequirementId === "requirement-1");
+
+    currentRequirementId = "requirement-2";
+    release({ runs: [{ id: "old-run", deliveryUnitId: "unit-frontend", projectVersionId: "frontend-v1",
+      evidenceVersion: 3, automationAttempt: 1, status: "conflicted", resolutionStatus: "pending",
+      createdAt: "2026-07-23T01:00:00.000Z", updatedAt: "2026-07-23T01:01:00.000Z" }], retries: [] });
+    await request;
+
+    const source = readFileSync(new URL("./acceptance-delivery-panel.tsx", import.meta.url), "utf8");
+    expect.soft(states).toEqual([{ state: "loading" }]);
+    expect.soft(source).toContain("<AcceptanceDeliveryPanelState key={requirementId}");
+  });
 });
 
 describe("acceptance delivery integration", () => {
