@@ -153,7 +153,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isSafePublicText(value: string) {
-  return !/(?:^|[^A-Za-z0-9_./-])(?:\/(?!\/)|[A-Za-z]:[\\/]|\\\\)|file:\/\/|(?:^|[^:])\/\//i
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/.test(value)) return false;
+  return !/(?:^|[^A-Za-z0-9_./-])(?:\/(?!\/)|[A-Za-z]:[\\/]|\\\\)|file:\/\/|(?:^|[^A-Za-z0-9_./:%?&#+~-])\/\//i
     .test(value);
 }
 

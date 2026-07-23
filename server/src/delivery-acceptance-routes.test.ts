@@ -294,9 +294,9 @@ describe("delivery acceptance routes", () => {
     acceptInStore(fixture);
     settleApplication(fixture, fixture.backend.id, "applied");
     settleApplication(fixture, fixture.frontend.id, "conflicted", {
-      baseCommit: "//server/share/base",
-      preApplyCommit: "wrapped=(\\\\server\\share\\pre-apply)",
-      evidenceHash: "FiLe://server/share/evidence",
+      baseCommit: "\x1b[31m/Users/alice/Clients/SecretCo/base",
+      preApplyCommit: "\x1b[31mC:\\Users\\alice\\pre-apply",
+      evidenceHash: "\x1b[31m\\\\server\\share\\evidence",
       preflight: {
         allowed: true,
         checks: [{ id: "target_identity", label: "Target identity", ok: true,
@@ -305,13 +305,17 @@ describe("delivery acceptance routes", () => {
           "src/file.ts",
           "/Users/alice/Clients/SecretCo/private-module",
           "//server/share/private-module",
-          "FILE://server/share/uri-module"
+          "FILE://server/share/uri-module",
+          "\x1b[31m/Users/alice/Clients/SecretCo/ansi-module",
+          "\x1b[31mC:\\Users\\alice\\drive-module",
+          "\x1b[31m\\\\server\\share\\ansi-module"
         ],
         plannedCommands: [
           { command: "npm", argsPrefix: ["test"] },
           { command: "node", argsPrefix: ["//server/share/tool.js"] },
           { command: "bash", argsPrefix: ["\\\\server\\share\\tool.sh"] },
-          { command: "sh", argsPrefix: ["file://server/share/tool.sh"] }
+          { command: "sh", argsPrefix: ["file://server/share/tool.sh"] },
+          { command: "cmd", argsPrefix: ["\x1b[31mC:\\Users\\alice\\tool.cmd"] }
         ],
         commandSource: "module_inference",
         evidenceMode: "commit",
@@ -326,7 +330,7 @@ describe("delivery acceptance routes", () => {
       },
       commandResults: [
         { command: "npm", args: ["test"], code: 0,
-          stdout: "docs https://example.com/guide", stderr: "relative src/file.ts" },
+          stdout: "docs https://example.com/a//b", stderr: "relative src/file.ts" },
         { command: "node", args: ["run"], code: 1,
           stdout: "wrapped=(//server/share/output)", stderr: "FiLe://server/share/error" },
         { command: "git", args: ["status"], stdout: "\\\\server\\share\\secret" },
@@ -334,9 +338,11 @@ describe("delivery acceptance routes", () => {
         { command: "sh", args: ["//server/share/arg"],
           identity: { repositoryPath: "/opt/private/repo" } },
         { command: "cat", args: ["config"],
-          stdout: "loaded path:/Users/alice/Clients/SecretCo/config via file:///opt/private/tool" }
+          stdout: "loaded path:/Users/alice/Clients/SecretCo/config via file:///opt/private/tool" },
+        { command: "ansi", args: ["check"],
+          stdout: "\x1b[31m\\\\server\\share\\stdout", stderr: "\x1b[31m/Users/alice/stderr" }
       ],
-      error: "APPLICATION_CONFLICT at FILE://server/share/error"
+      error: "APPLICATION_CONFLICT at \x1b[31mC:\\Users\\alice\\error"
     });
     fixture.store.deliveryCoordination.retryApplication({
       unitId: fixture.frontend.id,
@@ -378,12 +384,13 @@ describe("delivery acceptance routes", () => {
         },
         commandResults: [
           { command: "npm", args: ["test"], code: 0,
-            stdout: "docs https://example.com/guide", stderr: "relative src/file.ts" },
+            stdout: "docs https://example.com/a//b", stderr: "relative src/file.ts" },
           { command: "node", args: ["run"], code: 1 },
           { command: "git", args: ["status"] },
           { command: "status" },
           { command: "sh" },
-          { command: "cat", args: ["config"] }
+          { command: "cat", args: ["config"] },
+          { command: "ansi", args: ["check"] }
         ],
         conflictFiles: ["src/conflict.ts"],
         error: null,
@@ -409,6 +416,8 @@ describe("delivery acceptance routes", () => {
     expect(response.body).not.toContain("//server/share");
     expect(response.body).not.toContain("\\\\server\\share");
     expect(response.body.toLowerCase()).not.toContain("file://server/share");
+    expect(response.body).not.toContain("C:\\\\Users");
+    expect(response.body).not.toContain("\\u001b");
     await app.close();
   });
 
