@@ -294,17 +294,24 @@ describe("delivery acceptance routes", () => {
     acceptInStore(fixture);
     settleApplication(fixture, fixture.backend.id, "applied");
     settleApplication(fixture, fixture.frontend.id, "conflicted", {
-      baseCommit: "path:/Users/alice/Clients/SecretCo/base",
-      preApplyCommit: "/opt/private/pre-apply",
-      evidenceHash: "file:///Users/alice/Clients/SecretCo/evidence",
+      baseCommit: "//server/share/base",
+      preApplyCommit: "wrapped=(\\\\server\\share\\pre-apply)",
+      evidenceHash: "FiLe://server/share/evidence",
       preflight: {
         allowed: true,
         checks: [{ id: "target_identity", label: "Target identity", ok: true,
-          name: "identity", passed: true, code: "OK", detail: "/Users/alice/Clients/SecretCo/target" }],
-        changedModules: ["packages/app", "/Users/alice/Clients/SecretCo/private-module"],
+          name: "identity", passed: true, code: "OK", detail: "wrapped=(//server/share/check)" }],
+        changedModules: [
+          "src/file.ts",
+          "/Users/alice/Clients/SecretCo/private-module",
+          "//server/share/private-module",
+          "FILE://server/share/uri-module"
+        ],
         plannedCommands: [
           { command: "npm", argsPrefix: ["test"] },
-          { command: "node", argsPrefix: ["/opt/private/tool.js"] }
+          { command: "node", argsPrefix: ["//server/share/tool.js"] },
+          { command: "bash", argsPrefix: ["\\\\server\\share\\tool.sh"] },
+          { command: "sh", argsPrefix: ["file://server/share/tool.sh"] }
         ],
         commandSource: "module_inference",
         evidenceMode: "commit",
@@ -317,11 +324,19 @@ describe("delivery acceptance routes", () => {
         repositoryPath: "/Users/alice/Clients/SecretCo/repo",
         identity: { gitCommonDir: "/Users/alice/Clients/SecretCo/repo/.git" }
       },
-      commandResults: [{ command: "npm", args: ["test"], code: 0,
-        stdout: "loaded path:/Users/alice/Clients/SecretCo/config.json via file:///opt/private/tool",
-        stderr: "warning only",
-        identity: { repositoryPath: "/opt/private/repo" } }],
-      error: "APPLICATION_CONFLICT at /Users/alice/Clients/SecretCo/target"
+      commandResults: [
+        { command: "npm", args: ["test"], code: 0,
+          stdout: "docs https://example.com/guide", stderr: "relative src/file.ts" },
+        { command: "node", args: ["run"], code: 1,
+          stdout: "wrapped=(//server/share/output)", stderr: "FiLe://server/share/error" },
+        { command: "git", args: ["status"], stdout: "\\\\server\\share\\secret" },
+        { command: "status", stderr: "ordinary // text" },
+        { command: "sh", args: ["//server/share/arg"],
+          identity: { repositoryPath: "/opt/private/repo" } },
+        { command: "cat", args: ["config"],
+          stdout: "loaded path:/Users/alice/Clients/SecretCo/config via file:///opt/private/tool" }
+      ],
+      error: "APPLICATION_CONFLICT at FILE://server/share/error"
     });
     fixture.store.deliveryCoordination.retryApplication({
       unitId: fixture.frontend.id,
@@ -352,7 +367,7 @@ describe("delivery acceptance routes", () => {
           allowed: true,
           checks: [{ id: "target_identity", label: "Target identity", ok: true,
             name: "identity", passed: true, code: "OK" }],
-          changedModules: ["packages/app"],
+          changedModules: ["src/file.ts"],
           plannedCommands: [{ command: "npm", argsPrefix: ["test"] }],
           commandSource: "module_inference",
           evidenceMode: "commit",
@@ -361,7 +376,15 @@ describe("delivery acceptance routes", () => {
           targetBranch: "main",
           targetHead: "f".repeat(40)
         },
-        commandResults: [{ command: "npm", args: ["test"], code: 0, stderr: "warning only" }],
+        commandResults: [
+          { command: "npm", args: ["test"], code: 0,
+            stdout: "docs https://example.com/guide", stderr: "relative src/file.ts" },
+          { command: "node", args: ["run"], code: 1 },
+          { command: "git", args: ["status"] },
+          { command: "status" },
+          { command: "sh" },
+          { command: "cat", args: ["config"] }
+        ],
         conflictFiles: ["src/conflict.ts"],
         error: null,
         status: "conflicted",
@@ -383,6 +406,9 @@ describe("delivery acceptance routes", () => {
     expect(response.body).not.toContain("leaseOwner");
     expect(response.body).not.toContain("/Users/alice/Clients/SecretCo");
     expect(response.body).not.toContain("/opt/private");
+    expect(response.body).not.toContain("//server/share");
+    expect(response.body).not.toContain("\\\\server\\share");
+    expect(response.body.toLowerCase()).not.toContain("file://server/share");
     await app.close();
   });
 
