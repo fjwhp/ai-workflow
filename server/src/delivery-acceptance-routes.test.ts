@@ -132,7 +132,11 @@ function acceptInStore(fixture: ReturnType<typeof createAcceptanceFixture>) {
 function settleApplication(
   fixture: ReturnType<typeof createAcceptanceFixture>,
   unitId: string,
-  status: "applied" | "conflicted"
+  status: "applied" | "conflicted",
+  options: {
+    baseCommit?: string; preApplyCommit?: string; evidenceHash?: string;
+    preflight?: unknown; commandResults?: unknown[]; error?: string;
+  } = {}
 ): DeliveryApplicationRun {
   const lease = fixture.store.automationJobs.leaseNext("application-route-worker", new Date(), 60_000);
   if (!lease || lease.ownerId !== unitId || lease.action !== "apply") {
@@ -141,20 +145,70 @@ function settleApplication(
   let claim = fixture.store.deliveryApplications.claim(unitId, {
     expectedEvidenceVersion: lease.evidenceVersion,
     claimToken: lease.claimToken,
-    baseCommit: "b".repeat(40),
-    preApplyCommit: "c".repeat(40),
-    evidenceHash: "d".repeat(64),
-    preflight: { allowed: true, token: "secret-preflight" }
+    baseCommit: options.baseCommit ?? "b".repeat(40),
+    preApplyCommit: options.preApplyCommit ?? "c".repeat(40),
+    evidenceHash: options.evidenceHash ?? "d".repeat(64),
+    preflight: options.preflight ?? { allowed: true, token: "secret-preflight" }
   });
   claim = fixture.store.deliveryApplications.bindSourceCommit(claim, "e".repeat(40));
   return fixture.store.deliveryApplications.complete(claim, status === "applied"
-    ? { status: "applied", commandResults: [{ command: "git", stdout: "ok" }] }
+    ? { status: "applied", commandResults: options.commandResults ?? [{ command: "git", stdout: "ok" }] }
     : {
       status: "conflicted",
       conflictFiles: ["src/conflict.ts"],
-      commandResults: [{ command: "git", stderr: "secret-command" }],
-      error: "APPLICATION_CONFLICT secret-error"
+      commandResults: options.commandResults ?? [{ command: "git", stderr: "secret-command" }],
+      error: options.error ?? "APPLICATION_CONFLICT secret-error"
     });
+}
+
+function occupyProjectVersion(
+  fixture: ReturnType<typeof createAcceptanceFixture>,
+  position: number,
+  worker: string
+) {
+  const blocker = fixture.store.createRequirement({
+    title: `Occupy project version ${position}`,
+    businessProblem: "Another requirement owns this project version",
+    expectedOutcome: "Acceptance respects participating version ownership",
+    priority: "high",
+    primaryProjectId: fixture.projects[position]!.id,
+    primaryProjectVersionId: fixture.versions[position]!.id
+  });
+  fixture.store.replaceRequirementProjects(blocker.id, [{
+    projectId: fixture.projects[position]!.id,
+    projectVersionId: fixture.versions[position]!.id,
+    role: "primary",
+    usage: "delivery",
+    deliveryRequired: true,
+    moduleMode: "all",
+    moduleIds: [],
+    position: 0
+  }]);
+  const unit = fixture.store.deliveryUnits.createPlan({
+    requirementId: blocker.id,
+    snapshot: fixture.store.createRequirementProjectSnapshot(blocker.id),
+    plan: { units: [{ projectId: fixture.projects[position]!.id, moduleIds: [], acceptanceCriteria: ["done"] }],
+      dependencies: [] }
+  }).units[0]!;
+  completeImplementation(fixture.store, unit.id);
+  passQuality(fixture.store, unit.id);
+  fixture.store.automationJobs.cancelByOwnerVersion(unit.id, unit.evidenceVersion);
+  fixture.store.updateRequirementState(blocker.id, "implementation", "ai_ready");
+  fixture.store.deliveryCoordination.acceptRequirement({
+    requirementId: blocker.id,
+    actor: "local-human",
+    comment: "Start blocking application"
+  });
+  const lease = fixture.store.automationJobs.leaseNext(worker, new Date(), 60_000)!;
+  expect(lease.ownerId).toBe(unit.id);
+  return fixture.store.deliveryApplications.claim(unit.id, {
+    expectedEvidenceVersion: lease.evidenceVersion,
+    claimToken: lease.claimToken,
+    baseCommit: "7".repeat(40),
+    preApplyCommit: "8".repeat(40),
+    evidenceHash: "9".repeat(64),
+    preflight: { allowed: true }
+  });
 }
 
 describe("delivery acceptance routes", () => {
@@ -239,7 +293,36 @@ describe("delivery acceptance routes", () => {
     const fixture = createAcceptanceFixture();
     acceptInStore(fixture);
     settleApplication(fixture, fixture.backend.id, "applied");
-    settleApplication(fixture, fixture.frontend.id, "conflicted");
+    settleApplication(fixture, fixture.frontend.id, "conflicted", {
+      baseCommit: "path:/Users/alice/Clients/SecretCo/base",
+      preApplyCommit: "/opt/private/pre-apply",
+      evidenceHash: "file:///Users/alice/Clients/SecretCo/evidence",
+      preflight: {
+        allowed: true,
+        checks: [{ id: "target_identity", label: "Target identity", ok: true,
+          name: "identity", passed: true, code: "OK", detail: "/Users/alice/Clients/SecretCo/target" }],
+        changedModules: ["packages/app", "/Users/alice/Clients/SecretCo/private-module"],
+        plannedCommands: [
+          { command: "npm", argsPrefix: ["test"] },
+          { command: "node", argsPrefix: ["/opt/private/tool.js"] }
+        ],
+        commandSource: "module_inference",
+        evidenceMode: "commit",
+        sourceCommit: "e".repeat(40),
+        sourceBranch: "feature/1",
+        targetBranch: "main",
+        targetHead: "f".repeat(40),
+        sourceWorktreePath: "/Users/alice/Clients/SecretCo/source",
+        targetWorktreePath: "/Users/alice/Clients/SecretCo/target",
+        repositoryPath: "/Users/alice/Clients/SecretCo/repo",
+        identity: { gitCommonDir: "/Users/alice/Clients/SecretCo/repo/.git" }
+      },
+      commandResults: [{ command: "npm", args: ["test"], code: 0,
+        stdout: "loaded path:/Users/alice/Clients/SecretCo/config.json via file:///opt/private/tool",
+        stderr: "warning only",
+        identity: { repositoryPath: "/opt/private/repo" } }],
+      error: "APPLICATION_CONFLICT at /Users/alice/Clients/SecretCo/target"
+    });
     fixture.store.deliveryCoordination.retryApplication({
       unitId: fixture.frontend.id,
       actor: "local-human",
@@ -262,13 +345,25 @@ describe("delivery acceptance routes", () => {
         deliveryUnitId: fixture.frontend.id,
         automationAttempt: 1,
         sourceCommit: "e".repeat(40),
-        baseCommit: "b".repeat(40),
-        preApplyCommit: "c".repeat(40),
-        evidenceHash: "d".repeat(64),
-        preflight: { allowed: true, token: "[REDACTED]" },
-        commandResults: [{ command: "git", stderr: "[REDACTED]command" }],
+        baseCommit: null,
+        preApplyCommit: null,
+        evidenceHash: null,
+        preflight: {
+          allowed: true,
+          checks: [{ id: "target_identity", label: "Target identity", ok: true,
+            name: "identity", passed: true, code: "OK" }],
+          changedModules: ["packages/app"],
+          plannedCommands: [{ command: "npm", argsPrefix: ["test"] }],
+          commandSource: "module_inference",
+          evidenceMode: "commit",
+          sourceCommit: "e".repeat(40),
+          sourceBranch: "feature/1",
+          targetBranch: "main",
+          targetHead: "f".repeat(40)
+        },
+        commandResults: [{ command: "npm", args: ["test"], code: 0, stderr: "warning only" }],
         conflictFiles: ["src/conflict.ts"],
-        error: "APPLICATION_CONFLICT [REDACTED]error",
+        error: null,
         status: "conflicted",
         resolutionStatus: "not_required",
         createdAt: expect.any(String),
@@ -286,6 +381,8 @@ describe("delivery acceptance routes", () => {
     });
     expect(response.body).not.toContain("claimToken");
     expect(response.body).not.toContain("leaseOwner");
+    expect(response.body).not.toContain("/Users/alice/Clients/SecretCo");
+    expect(response.body).not.toContain("/opt/private");
     await app.close();
   });
 
@@ -429,6 +526,47 @@ describe("delivery acceptance routes", () => {
 
     expect(detail.allowedActions).toEqual([{ type: "accept_delivery", commentRequired: true }]);
     expect(response.statusCode).toBe(202);
+    await app.close();
+  });
+
+  it("ignores a busy project version owned only by a skipped optional unit", async () => {
+    const fixture = createAcceptanceFixture({ frontendRequired: false });
+    fixture.store.deliveryCoordination.skipOptional({
+      unitId: fixture.frontend.id,
+      actor: "local-human",
+      reason: "Exclude optional project"
+    });
+    occupyProjectVersion(fixture, 1, "skipped-version-owner");
+    const app = await buildApp(fixture.store);
+
+    const detail = (await app.inject({ method: "GET",
+      url: `/api/requirements/${fixture.requirement.id}` })).json();
+    const response = await app.inject({ method: "POST",
+      url: `/api/requirements/${fixture.requirement.id}/accept-delivery`,
+      payload: { comment: "Accept required project only" } });
+
+    expect(detail.allowedActions).toEqual([{ type: "accept_delivery", commentRequired: true }]);
+    expect(response.statusCode).toBe(202);
+    expect(response.json().acceptance.plan).toEqual([
+      { unitId: fixture.backend.id, evidenceVersion: fixture.backend.evidenceVersion }
+    ]);
+    await app.close();
+  });
+
+  it("keeps a busy optional ready project version in the participating set", async () => {
+    const fixture = createAcceptanceFixture({ frontendRequired: false });
+    occupyProjectVersion(fixture, 1, "optional-version-owner");
+    const app = await buildApp(fixture.store);
+
+    const detail = (await app.inject({ method: "GET",
+      url: `/api/requirements/${fixture.requirement.id}` })).json();
+    const response = await app.inject({ method: "POST",
+      url: `/api/requirements/${fixture.requirement.id}/accept-delivery`,
+      payload: { comment: "Cannot accept occupied optional project" } });
+
+    expect(detail.allowedActions).toEqual([]);
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: "PROJECT_VERSION_APPLICATION_BUSY" });
     await app.close();
   });
 
@@ -736,6 +874,101 @@ describe("delivery acceptance routes", () => {
     const retryActive = (await app.inject({ method: "GET",
       url: `/api/requirements/${fixture.requirement.id}` })).json();
     expect(retryActive.deliveryUnits.find((unit: any) => unit.id === fixture.frontend.id).allowedActions).toEqual([]);
+    await app.close();
+  });
+
+  it.each(["evidence", "status"] as const)(
+    "hides retry_application when a frozen prefix %s no longer matches",
+    async (mismatch) => {
+      const fixture = createAcceptanceFixture();
+      acceptInStore(fixture);
+      settleApplication(fixture, fixture.backend.id, "applied");
+      settleApplication(fixture, fixture.frontend.id, "conflicted");
+      const database = (fixture.store as any).db;
+      if (mismatch === "evidence") {
+        database.prepare("UPDATE delivery_units SET evidence_version = 2 WHERE id = ?").run(fixture.backend.id);
+      } else {
+        database.prepare("UPDATE delivery_units SET status = 'ready_for_acceptance' WHERE id = ?")
+          .run(fixture.backend.id);
+      }
+      const app = await buildApp(fixture.store);
+
+      const detail = (await app.inject({ method: "GET",
+        url: `/api/requirements/${fixture.requirement.id}` })).json();
+      const response = await app.inject({ method: "POST",
+        url: `/api/delivery-units/${fixture.frontend.id}/application/retry`,
+        payload: { reason: "Attempt stale retry" } });
+
+      expect(detail.deliveryUnits.find((unit: any) => unit.id === fixture.frontend.id).allowedActions).toEqual([]);
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toEqual({
+        error: "APPLICATION_RETRY_NOT_ALLOWED",
+        detailCode: "DELIVERY_APPLICATION_SEQUENCE_STALE"
+      });
+      await app.close();
+    }
+  );
+
+  it("hides retry_application when a reverted run has a non-retryable status", async () => {
+    const fixture = createAcceptanceFixture();
+    acceptInStore(fixture);
+    settleApplication(fixture, fixture.backend.id, "applied");
+    const conflict = settleApplication(fixture, fixture.frontend.id, "conflicted");
+    const database = (fixture.store as any).db;
+    database.exec("DROP TRIGGER delivery_application_settled_immutable; PRAGMA ignore_check_constraints = ON");
+    database.prepare(`UPDATE delivery_application_runs
+      SET resolution_status = 'reverted', resolved_at = updated_at WHERE id = ?`).run(conflict.id);
+    database.prepare("UPDATE delivery_units SET status = 'ready_for_acceptance' WHERE id = ?")
+      .run(fixture.frontend.id);
+    const app = await buildApp(fixture.store);
+
+    const detail = (await app.inject({ method: "GET",
+      url: `/api/requirements/${fixture.requirement.id}` })).json();
+    const response = await app.inject({ method: "POST",
+      url: `/api/delivery-units/${fixture.frontend.id}/application/retry`,
+      payload: { reason: "Reject mismatched reverted run" } });
+
+    expect(detail.deliveryUnits.find((unit: any) => unit.id === fixture.frontend.id).allowedActions).toEqual([]);
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: "APPLICATION_RETRY_NOT_ALLOWED",
+      detailCode: "DELIVERY_APPLICATION_RETRY_NOT_ELIGIBLE"
+    });
+    await app.close();
+  });
+
+  it("hides retry_application when the settled retry job has no authoritative audit", async () => {
+    const fixture = createAcceptanceFixture();
+    acceptInStore(fixture);
+    settleApplication(fixture, fixture.backend.id, "applied");
+    const firstConflict = settleApplication(fixture, fixture.frontend.id, "conflicted");
+    const previousJob = fixture.store.automationJobs.get(firstConflict.automationJobId)!;
+    (fixture.store as any).db.prepare(
+      "UPDATE delivery_units SET status = 'ready_for_acceptance' WHERE id = ?"
+    ).run(fixture.frontend.id);
+    fixture.store.automationJobs.enqueue({
+      ownerType: "delivery_unit",
+      ownerId: fixture.frontend.id,
+      evidenceVersion: fixture.frontend.evidenceVersion,
+      action: "apply",
+      payload: { ...(previousJob.payload as any), retryAttempt: 1 },
+      maxAttempts: 3
+    });
+    settleApplication(fixture, fixture.frontend.id, "conflicted");
+    const app = await buildApp(fixture.store);
+
+    const detail = (await app.inject({ method: "GET",
+      url: `/api/requirements/${fixture.requirement.id}` })).json();
+    const response = await app.inject({ method: "POST",
+      url: `/api/delivery-units/${fixture.frontend.id}/application/retry`,
+      payload: { reason: "Retry without audit" } });
+
+    expect(detail.deliveryUnits.find((unit: any) => unit.id === fixture.frontend.id).allowedActions).toEqual([]);
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: "APPLICATION_RETRY_NOT_ALLOWED",
+      detailCode: "DELIVERY_APPLICATION_RETRY_AUDIT_STALE"
+    });
     await app.close();
   });
 

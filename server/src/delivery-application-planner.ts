@@ -27,6 +27,20 @@ export interface DeliveryApplicationPlanInput {
   readonly dependencies: readonly DeliveryApplicationDependencyInput[];
 }
 
+export interface FrozenApplicationPlanEntry {
+  readonly unitId: string;
+  readonly evidenceVersion: number;
+}
+
+export interface FrozenApplicationUnitState extends DeliveryApplicationUnitInput {
+  readonly evidenceVersion: number;
+}
+
+export interface FrozenApplicationDependencyState extends DeliveryApplicationDependencyInput {
+  readonly releasedByEvidenceVersion: number | null;
+  readonly releasedAt: string | null;
+}
+
 export function buildApplicationPlan(input: DeliveryApplicationPlanInput): string[] {
   const { units, dependencies } = validateInput(input);
   const unitIds = new Set<string>();
@@ -65,6 +79,56 @@ export function buildApplicationPlan(input: DeliveryApplicationPlanInput): strin
     participatingUnitIds,
     mapGraphDependencies(participatingDependencies)
   ).order;
+}
+
+export function frozenApplicationRetryPlanValid(input: {
+  entries: readonly FrozenApplicationPlanEntry[];
+  cursor: number;
+  targetUnitId: string;
+  units: readonly FrozenApplicationUnitState[];
+  dependencies: readonly FrozenApplicationDependencyState[];
+}): boolean {
+  try {
+    if (!Number.isSafeInteger(input.cursor) || input.cursor < 0 || input.cursor >= input.entries.length
+      || input.entries[input.cursor]?.unitId !== input.targetUnitId) return false;
+    const unitIds = new Set(input.units.map((unit) => unit.id));
+    if (unitIds.size !== input.units.length) return false;
+    const allOrderedIds = orderUnitIds(input.units.map((unit, sourceIndex) => ({ unit, sourceIndex })));
+    validateDeliveryGraph(allOrderedIds, mapGraphDependencies([...input.dependencies]));
+    const skipped = new Set(input.units
+      .filter((unit) => !unit.required && unit.status === "skipped")
+      .map((unit) => unit.id));
+    const participating = input.units.filter((unit) => !skipped.has(unit.id));
+    const orderedIds = allOrderedIds.filter((unitId) => !skipped.has(unitId));
+    const participatingDependencies = input.dependencies.filter((dependency) => {
+      const bothEndpointsExist = unitIds.has(dependency.upstreamUnitId)
+        && unitIds.has(dependency.downstreamUnitId);
+      return !bothEndpointsExist
+        || (!skipped.has(dependency.upstreamUnitId) && !skipped.has(dependency.downstreamUnitId));
+    });
+    const expected = validateDeliveryGraph(
+      orderedIds,
+      mapGraphDependencies(participatingDependencies)
+    ).order;
+    if (expected.length !== input.entries.length
+      || expected.some((unitId, index) => input.entries[index]?.unitId !== unitId)) return false;
+    const byId = new Map(input.units.map((unit) => [unit.id, unit]));
+    for (const [index, entry] of input.entries.entries()) {
+      const unit = byId.get(entry.unitId);
+      if (!unit || unit.evidenceVersion !== entry.evidenceVersion
+        || (index < input.cursor && unit.status !== "applied")
+        || (index > input.cursor && unit.status !== "ready_for_acceptance")) return false;
+    }
+    const plannedIds = new Set(input.entries.map((entry) => entry.unitId));
+    return !input.dependencies.some((dependency) => {
+      if (!plannedIds.has(dependency.upstreamUnitId) || !plannedIds.has(dependency.downstreamUnitId)) return false;
+      const upstream = byId.get(dependency.upstreamUnitId);
+      return !upstream || dependency.releasedAt === null
+        || dependency.releasedByEvidenceVersion !== upstream.evidenceVersion;
+    });
+  } catch {
+    return false;
+  }
 }
 
 function validateInput(input: unknown): {

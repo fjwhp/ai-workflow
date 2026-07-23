@@ -12,7 +12,10 @@ import {
   type AutomationJob
 } from "./automation-job-repository.js";
 import { deliveryUnitDependenciesSatisfied } from "./delivery-unit-eligibility.js";
-import { buildApplicationPlan } from "./delivery-application-planner.js";
+import {
+  buildApplicationPlan,
+  frozenApplicationRetryPlanValid
+} from "./delivery-application-planner.js";
 import type {
   DeliveryApplicationResolution,
   DeliveryApplicationRun
@@ -349,7 +352,8 @@ export class DeliveryCoordinator {
     }
     if (this.db.prepare(`SELECT 1 FROM delivery_application_runs application
       WHERE application.resolution_status = 'pending' AND application.project_version_id IN (
-        SELECT project_version_id FROM delivery_units WHERE requirement_id = ?
+        SELECT project_version_id FROM delivery_units
+        WHERE requirement_id = ? AND (required = 1 OR status <> 'skipped')
       ) LIMIT 1`).get(requirement.id)) {
       throw new Error("PROJECT_VERSION_APPLICATION_BUSY");
     }
@@ -662,17 +666,46 @@ export class DeliveryCoordinator {
       throw new Error("PROJECT_VERSION_APPLICATION_BUSY");
     }
     if (payload.retryAttempt >= 100) throw new Error("DELIVERY_APPLICATION_RETRY_LIMIT");
-    for (const [index, entry] of payload.units.entries()) {
-      const current = this.db.prepare(`SELECT requirement_id, evidence_version, status
-        FROM delivery_units WHERE id = ?`).get(entry.unitId) as {
-          requirement_id: string; evidence_version: number; status: string;
-        } | undefined;
-      if (!current || current.requirement_id !== payload.requirementId
-        || current.evidence_version !== entry.evidenceVersion
-        || (index < payload.cursor && current.status !== "applied")
-        || (index > payload.cursor && current.status !== "ready_for_acceptance")) {
-        throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
-      }
+    const planUnits = this.db.prepare(`SELECT id, requirement_id, position, required, status, evidence_version
+      FROM delivery_units WHERE requirement_id = ? ORDER BY position, created_at, rowid`)
+      .all(payload.requirementId) as Array<{
+        id: string; requirement_id: string; position: number; required: number;
+        status: DeliveryUnitStatus; evidence_version: number;
+      }>;
+    const planDependencies = this.db.prepare(`SELECT upstream_unit_id, downstream_unit_id, release_condition,
+        released_by_evidence_version, released_at FROM delivery_dependencies WHERE requirement_id = ?`)
+      .all(payload.requirementId) as Array<{
+        upstream_unit_id: string; downstream_unit_id: string;
+        release_condition: "automated_testing_passed";
+        released_by_evidence_version: number | null; released_at: string | null;
+      }>;
+    if (unit.requirement_id !== payload.requirementId || !frozenApplicationRetryPlanValid({
+      entries: payload.units,
+      cursor: payload.cursor,
+      targetUnitId: unit.id,
+      units: planUnits.map((current) => ({
+        id: current.id,
+        position: current.position,
+        required: current.required === 1,
+        status: current.status,
+        evidenceVersion: current.evidence_version
+      })),
+      dependencies: planDependencies.map((dependency) => ({
+        upstreamUnitId: dependency.upstream_unit_id,
+        downstreamUnitId: dependency.downstream_unit_id,
+        releaseCondition: dependency.release_condition,
+        releasedByEvidenceVersion: dependency.released_by_evidence_version,
+        releasedAt: dependency.released_at
+      }))
+    })) {
+      throw new Error("DELIVERY_APPLICATION_SEQUENCE_STALE");
+    }
+    if (payload.retryAttempt > 0 && !this.db.prepare(`SELECT 1 FROM delivery_unit_retry_audit
+      WHERE job_id = ? AND requirement_id = ? AND delivery_unit_id = ? AND evidence_version = ?
+        AND target = 'application' AND attempt = ?`).get(
+          previous.id, unit.requirement_id, unit.id, unit.evidence_version, payload.retryAttempt
+        )) {
+      throw new Error("DELIVERY_APPLICATION_RETRY_AUDIT_STALE");
     }
     if (conflicted || cleanFailure) {
       const ready = this.db.prepare(`UPDATE delivery_units

@@ -56,8 +56,108 @@ export async function registerDeliveryAcceptanceRoutes(app: FastifyInstance, { s
 }
 
 function publicApplicationRun(run: DeliveryApplicationRun) {
-  const { claimToken: _claimToken, leaseOwner: _leaseOwner, ...safe } = run;
-  return safe;
+  return {
+    id: run.id,
+    requirementId: run.requirementId,
+    deliveryUnitId: run.deliveryUnitId,
+    projectVersionId: run.projectVersionId,
+    evidenceVersion: run.evidenceVersion,
+    automationJobId: run.automationJobId,
+    automationAttempt: run.automationAttempt,
+    sourceCommit: run.sourceCommit,
+    baseCommit: publicText(run.baseCommit),
+    preApplyCommit: publicText(run.preApplyCommit),
+    evidenceHash: publicText(run.evidenceHash),
+    preflight: publicPreflight(run.preflight),
+    commandResults: publicCommandResults(run.commandResults),
+    conflictFiles: run.conflictFiles.filter(isSafePublicText),
+    error: run.error !== null && isSafePublicText(run.error) ? run.error : null,
+    status: run.status,
+    resolutionStatus: run.resolutionStatus,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    completedAt: run.completedAt,
+    resolvedAt: run.resolvedAt
+  };
+}
+
+function publicPreflight(value: unknown) {
+  if (!isRecord(value)) return {};
+  const result: Record<string, unknown> = {};
+  if (typeof value.allowed === "boolean") result.allowed = value.allowed;
+  if (Array.isArray(value.checks)) {
+    result.checks = value.checks.flatMap((check) => {
+      if (!isRecord(check)) return [];
+      const projected: Record<string, unknown> = {};
+      for (const key of ["id", "label", "name"] as const) {
+        if (typeof check[key] === "string" && isSafePublicText(check[key])) projected[key] = check[key];
+      }
+      for (const key of ["ok", "passed"] as const) {
+        if (typeof check[key] === "boolean") projected[key] = check[key];
+      }
+      if ((typeof check.code === "string" && isSafePublicText(check.code))
+        || typeof check.code === "number") projected.code = check.code;
+      return [projected];
+    });
+  }
+  if (Array.isArray(value.changedModules)) {
+    result.changedModules = value.changedModules.filter(
+      (module): module is string => typeof module === "string" && isSafePublicText(module)
+    );
+  }
+  if (Array.isArray(value.plannedCommands)) {
+    result.plannedCommands = value.plannedCommands.flatMap((command) => {
+      const projected = publicCommand(command, "argsPrefix");
+      return projected ? [projected] : [];
+    });
+  }
+  if (value.commandSource === "module_inference" || value.commandSource === "project_fallback"
+    || value.commandSource === "unavailable") result.commandSource = value.commandSource;
+  if (value.evidenceMode === "worktree" || value.evidenceMode === "commit") {
+    result.evidenceMode = value.evidenceMode;
+  }
+  for (const key of ["sourceCommit", "sourceBranch", "targetBranch", "targetHead"] as const) {
+    if (typeof value[key] === "string" && isSafePublicText(value[key])) result[key] = value[key];
+  }
+  return result;
+}
+
+function publicCommandResults(values: unknown[]) {
+  return values.flatMap((value) => {
+    const projected = publicCommand(value, "args");
+    if (!projected || !isRecord(value)) return [];
+    for (const key of ["code", "exitCode"] as const) {
+      if (typeof value[key] === "number" && Number.isFinite(value[key])) projected[key] = value[key];
+    }
+    for (const key of ["stdout", "stderr"] as const) {
+      if (typeof value[key] === "string" && isSafePublicText(value[key])) projected[key] = value[key];
+    }
+    return [projected];
+  });
+}
+
+function publicCommand(value: unknown, argsKey: "args" | "argsPrefix") {
+  if (!isRecord(value) || typeof value.command !== "string" || !isSafePublicText(value.command)) return null;
+  const result: Record<string, unknown> = { command: value.command };
+  const args = value[argsKey];
+  if (Array.isArray(args) && args.every((arg) => typeof arg === "string" && isSafePublicText(arg))) {
+    result[argsKey] = args;
+  } else if (argsKey === "argsPrefix" && Array.isArray(args)) {
+    return null;
+  }
+  return result;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isSafePublicText(value: string) {
+  return !/(?:^|[^A-Za-z0-9_./-])(?:\/(?!\/)|[A-Za-z]:[\\/]|\\\\)|file:\/\/\//i.test(value);
+}
+
+function publicText(value: string) {
+  return isSafePublicText(value) ? value : null;
 }
 
 function publicApplicationJob(job: AutomationJob | null) {

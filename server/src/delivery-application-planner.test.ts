@@ -6,8 +6,11 @@ import {
 } from "@ai-workflow/shared";
 import {
   buildApplicationPlan,
+  frozenApplicationRetryPlanValid,
   type DeliveryApplicationDependencyInput,
-  type DeliveryApplicationUnitInput
+  type DeliveryApplicationUnitInput,
+  type FrozenApplicationDependencyState,
+  type FrozenApplicationUnitState
 } from "./delivery-application-planner.js";
 
 function unit(
@@ -36,6 +39,27 @@ function oversizedUnits(): DeliveryApplicationUnitInput[] {
 
 function oversizedDependencies(): DeliveryApplicationDependencyInput[] {
   return Array.from({ length: MAX_DELIVERY_PLAN_DEPENDENCIES + 1 }, () => dependency("a", "b"));
+}
+
+function frozenUnit(
+  id: string,
+  position: number,
+  evidenceVersion: number,
+  options: { required?: boolean; status?: DeliveryUnitStatus } = {}
+): FrozenApplicationUnitState {
+  return { ...unit(id, position, options), evidenceVersion };
+}
+
+function releasedDependency(
+  upstreamUnitId: string,
+  downstreamUnitId: string,
+  releasedByEvidenceVersion: number
+): FrozenApplicationDependencyState {
+  return {
+    ...dependency(upstreamUnitId, downstreamUnitId),
+    releasedByEvidenceVersion,
+    releasedAt: "2026-07-23T00:00:00.000Z"
+  };
 }
 
 describe("buildApplicationPlan", () => {
@@ -476,5 +500,67 @@ describe("buildApplicationPlan", () => {
     }]
   ])("returns an empty plan for %s input", (_, input) => {
     expect(buildApplicationPlan(input)).toEqual([]);
+  });
+});
+
+describe("frozenApplicationRetryPlanValid", () => {
+  function validRetryPlan() {
+    return {
+      entries: [
+        { unitId: "backend", evidenceVersion: 2 },
+        { unitId: "frontend", evidenceVersion: 3 },
+        { unitId: "docs", evidenceVersion: 4 }
+      ],
+      cursor: 1,
+      targetUnitId: "frontend",
+      units: [
+        frozenUnit("backend", 0, 2, { status: "applied" }),
+        frozenUnit("frontend", 1, 3, { status: "conflicted" }),
+        frozenUnit("docs", 2, 4),
+        frozenUnit("examples", 3, 1, { required: false, status: "skipped" })
+      ],
+      dependencies: [
+        releasedDependency("backend", "frontend", 2),
+        releasedDependency("frontend", "docs", 3),
+        releasedDependency("docs", "examples", 4)
+      ]
+    };
+  }
+
+  it("accepts a complete frozen plan with applied prefix, retry target, and ready suffix", () => {
+    expect(frozenApplicationRetryPlanValid(validRetryPlan())).toBe(true);
+  });
+
+  it.each([
+    ["frozen evidence", (input: ReturnType<typeof validRetryPlan>) => {
+      input.entries[0] = { ...input.entries[0]!, evidenceVersion: 1 };
+    }],
+    ["applied prefix", (input: ReturnType<typeof validRetryPlan>) => {
+      input.units[0] = { ...input.units[0]!, status: "ready_for_acceptance" };
+    }],
+    ["ready suffix", (input: ReturnType<typeof validRetryPlan>) => {
+      input.units[2] = { ...input.units[2]!, status: "failed" };
+    }],
+    ["topological order", (input: ReturnType<typeof validRetryPlan>) => {
+      [input.entries[0], input.entries[1]] = [input.entries[1]!, input.entries[0]!];
+      input.cursor = 0;
+    }],
+    ["dependency release evidence", (input: ReturnType<typeof validRetryPlan>) => {
+      input.dependencies[0] = { ...input.dependencies[0]!, releasedByEvidenceVersion: 1 };
+    }],
+    ["dependency release timestamp", (input: ReturnType<typeof validRetryPlan>) => {
+      input.dependencies[0] = { ...input.dependencies[0]!, releasedAt: null };
+    }]
+  ] as const)("rejects stale %s", (_, mutate) => {
+    const input = validRetryPlan();
+    mutate(input);
+    expect(frozenApplicationRetryPlanValid(input)).toBe(false);
+  });
+
+  it("fails closed when a skipped unit has an invalid dependency", () => {
+    const input = validRetryPlan();
+    input.dependencies.push(releasedDependency("examples", "examples", 1));
+
+    expect(frozenApplicationRetryPlanValid(input)).toBe(false);
   });
 });

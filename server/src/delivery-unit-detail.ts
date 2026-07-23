@@ -7,6 +7,8 @@ import {
 } from "./delivery-quality-repository.js";
 import type { DeliveryDependency, DeliveryUnit, DeliveryUnitRepository } from "./delivery-unit-repository.js";
 import { isDeliveryUnitActiveWork } from "./delivery-unit-eligibility.js";
+import { frozenApplicationRetryPlanValid } from "./delivery-application-planner.js";
+import { parseDeliveryApplicationJob } from "./delivery-coordinator.js";
 
 export type DeliveryUnitActionType =
   | "retry_implementation"
@@ -77,6 +79,7 @@ interface DeliveryDetailSnapshot {
   }>;
   activeApplicationProjectVersions: Set<string>;
   frozenApplicationUnits: Set<string>;
+  retryableApplicationUnits: Set<string>;
 }
 
 export class DeliveryUnitDetailRepository {
@@ -158,17 +161,28 @@ export class DeliveryUnitDetailRepository {
 
     const jobs = new Map<string, CurrentJobState>();
     const frozenApplicationUnits = new Set<string>();
+    const settledApplicationJobs = new Map<string, {
+      id: string; evidenceVersion: number; payloadJson: string;
+      retryAuditAttempt: number | null; rowid: number;
+    }>();
     const jobRows = this.db.prepare(`SELECT job.owner_id AS delivery_unit_id, job.action, job.status,
-        job.last_error, job.updated_at, job.rowid, NULL AS frozen_unit_id,
-        NULL AS frozen_evidence_version
+        job.last_error, job.updated_at, job.rowid AS job_rowid, NULL AS frozen_unit_id,
+        NULL AS frozen_evidence_version, job.id AS job_id,
+        job.evidence_version AS job_evidence_version, job.payload_json,
+        retry_audit.attempt AS retry_audit_attempt
       FROM automation_jobs job
       JOIN delivery_units unit ON job.owner_type = 'delivery_unit' AND unit.id = job.owner_id
         AND unit.evidence_version = job.evidence_version
+      LEFT JOIN delivery_unit_retry_audit retry_audit ON retry_audit.job_id = job.id
+        AND retry_audit.requirement_id = unit.requirement_id
+        AND retry_audit.delivery_unit_id = unit.id
+        AND retry_audit.evidence_version = unit.evidence_version
+        AND retry_audit.target = 'application'
       WHERE unit.requirement_id = ?
       UNION ALL
       SELECT NULL, NULL, NULL, NULL, job.updated_at, job.rowid,
         json_extract(plan_unit.value, '$.unitId'),
-        json_extract(plan_unit.value, '$.evidenceVersion')
+        json_extract(plan_unit.value, '$.evidenceVersion'), NULL, NULL, NULL, NULL
       FROM automation_jobs job, json_each(job.payload_json, '$.units') plan_unit
       WHERE job.owner_type = 'delivery_unit' AND job.action = 'apply'
         AND json_extract(job.payload_json, '$.type') = 'delivery_application_plan'
@@ -177,12 +191,27 @@ export class DeliveryUnitDetailRepository {
         delivery_unit_id: string | null; action: string | null; status: string | null;
         last_error: string | null;
         frozen_unit_id: string | null; frozen_evidence_version: number | null;
+        job_id: string | null; job_evidence_version: number | null; payload_json: string | null;
+        retry_audit_attempt: number | null; job_rowid: number;
       }>;
     for (const row of jobRows) {
       if (row.frozen_unit_id !== null && row.frozen_evidence_version !== null) {
         frozenApplicationUnits.add(applicationUnitKey(row.frozen_unit_id, row.frozen_evidence_version));
       }
       if (row.delivery_unit_id === null || row.action === null || row.status === null) continue;
+      if (row.action === "apply" && (row.status === "completed" || row.status === "failed")
+        && row.job_id !== null && row.job_evidence_version !== null && row.payload_json !== null) {
+        const existing = settledApplicationJobs.get(row.delivery_unit_id);
+        if (!existing || existing.rowid < row.job_rowid) {
+          settledApplicationJobs.set(row.delivery_unit_id, {
+            id: row.job_id,
+            evidenceVersion: row.job_evidence_version,
+            payloadJson: row.payload_json,
+            retryAuditAttempt: row.retry_audit_attempt,
+            rowid: row.job_rowid
+          });
+        }
+      }
       const state = jobs.get(row.delivery_unit_id) ?? {
         pending: false, leased: false, failedActions: new Set<string>()
       };
@@ -230,9 +259,13 @@ export class DeliveryUnitDetailRepository {
     const latestApplications = new Map<string, {
       status: string; resolutionStatus: string; projectVersionId: string;
     }>();
+    const applicationsByJobId = new Map<string, {
+      deliveryUnitId: string; evidenceVersion: number; status: string; resolutionStatus: string;
+    }>();
     const activeApplicationProjectVersions = new Set<string>();
     const applicationRows = this.db.prepare(`SELECT application.delivery_unit_id,
-        application.project_version_id, application.status, application.resolution_status
+        application.project_version_id, application.evidence_version, application.automation_job_id,
+        application.status, application.resolution_status
       FROM delivery_application_runs application
       WHERE application.delivery_unit_id IN (
           SELECT id FROM delivery_units WHERE requirement_id = ?
@@ -243,6 +276,7 @@ export class DeliveryUnitDetailRepository {
         requirementId, requirementId
       ) as Array<{
         delivery_unit_id: string; project_version_id: string;
+        evidence_version: number; automation_job_id: string;
         status: string; resolution_status: string;
       }>;
     const ownUnitIds = new Set(units.map((unit) => unit.id));
@@ -255,6 +289,14 @@ export class DeliveryUnitDetailRepository {
           status: row.status,
           resolutionStatus: row.resolution_status,
           projectVersionId: row.project_version_id
+        });
+      }
+      if (ownUnitIds.has(row.delivery_unit_id) && !applicationsByJobId.has(row.automation_job_id)) {
+        applicationsByJobId.set(row.automation_job_id, {
+          deliveryUnitId: row.delivery_unit_id,
+          evidenceVersion: row.evidence_version,
+          status: row.status,
+          resolutionStatus: row.resolution_status
         });
       }
     }
@@ -272,10 +314,59 @@ export class DeliveryUnitDetailRepository {
         dependenciesSatisfied.set(dependency.downstreamUnitId, false);
       }
     }
+    const retryableApplicationUnits = new Set<string>();
+    for (const unit of units) {
+      const job = settledApplicationJobs.get(unit.id);
+      if (!job) continue;
+      const application = applicationsByJobId.get(job.id);
+      if (!application || application.deliveryUnitId !== unit.id
+        || application.evidenceVersion !== unit.evidenceVersion) continue;
+      const retryable = (unit.status === "conflicted" && application.status === "conflicted"
+          && application.resolutionStatus === "not_required")
+        || (unit.status === "failed" && application.status === "failed"
+          && application.resolutionStatus === "not_required")
+        || (unit.status === "ready_for_acceptance"
+          && (application.status === "failed" || application.status === "applied")
+          && application.resolutionStatus === "reverted");
+      if (!retryable) continue;
+      try {
+        const payload = parseDeliveryApplicationJob({
+          ownerType: "delivery_unit",
+          ownerId: unit.id,
+          evidenceVersion: job.evidenceVersion,
+          action: "apply",
+          payload: JSON.parse(job.payloadJson)
+        });
+        if (payload.requirementId !== unit.requirementId || payload.retryAttempt >= 100
+          || (payload.retryAttempt > 0 && job.retryAuditAttempt !== payload.retryAttempt)
+          || !frozenApplicationRetryPlanValid({
+            entries: payload.units,
+            cursor: payload.cursor,
+            targetUnitId: unit.id,
+            units: units.map((current) => ({
+              id: current.id,
+              position: current.position,
+              required: current.required,
+              status: current.status,
+              evidenceVersion: current.evidenceVersion
+            })),
+            dependencies: dependencies.map((dependency) => ({
+              upstreamUnitId: dependency.upstreamUnitId,
+              downstreamUnitId: dependency.downstreamUnitId,
+              releaseCondition: dependency.releaseCondition,
+              releasedByEvidenceVersion: dependency.releasedByEvidenceVersion,
+              releasedAt: dependency.releasedAt
+            }))
+          })) continue;
+        retryableApplicationUnits.add(unit.id);
+      } catch {
+        // Malformed persisted jobs fail closed in the public action projection.
+      }
+    }
     return {
       implementationEvidence, qualityEvidence, jobs, activeRuns, activeInvalidations,
       dependenciesSatisfied, dependencyReleases, latestApplications, activeApplicationProjectVersions,
-      frozenApplicationUnits
+      frozenApplicationUnits, retryableApplicationUnits
     };
   }
 
@@ -297,8 +388,8 @@ export class DeliveryUnitDetailRepository {
         || (participating && (!(snapshot.dependenciesSatisfied.get(unit.id) ?? true)
           || snapshot.jobs.get(unit.id)?.pending
           || snapshot.jobs.get(unit.id)?.leased
-          || snapshot.activeRuns.has(unit.id)))
-        || snapshot.activeApplicationProjectVersions.has(unit.projectVersionId);
+          || snapshot.activeRuns.has(unit.id)
+          || snapshot.activeApplicationProjectVersions.has(unit.projectVersionId)));
     })) return [];
     return [{ type: "accept_delivery", commentRequired: true }];
   }
@@ -326,12 +417,7 @@ export class DeliveryUnitDetailRepository {
           : [];
       }
       if (snapshot.activeApplicationProjectVersions.has(unit.projectVersionId)) return [];
-      const retryable = (unit.status === "conflicted" && application.status === "conflicted"
-          && application.resolutionStatus === "not_required")
-        || (unit.status === "failed" && application.status === "failed"
-          && application.resolutionStatus === "not_required")
-        || (unit.status === "ready_for_acceptance" && application.resolutionStatus === "reverted");
-      return retryable ? [action("retry_application")] : [];
+      return snapshot.retryableApplicationUnits.has(unit.id) ? [action("retry_application")] : [];
     }
     if (["waiting_dependency", "running", "applying", "applied", "skipped"].includes(unit.status)) return [];
     const dependenciesSatisfied = snapshot.dependenciesSatisfied.get(unit.id) ?? true;
