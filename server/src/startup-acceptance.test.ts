@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 describe("real server startup acceptance", () => {
-  it("backs up deployed automation v4 before creating the application sequence v15 schema", { timeout: 15_000 }, async () => {
+  it("backs up deployed automation v4 before creating the application audit v16 schema", { timeout: 15_000 }, async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "workflow-startup-acceptance-"));
     tempDirectories.push(dataDir);
     const databasePath = join(dataDir, "workflow.db");
@@ -88,7 +88,7 @@ describe("real server startup acceptance", () => {
       expect(object(backup, "index", "idx_automation_jobs_pending_lease")).toBeUndefined();
       backup.close();
       await expect(readFile(`${databasePath}.schema-version`, "utf8"))
-        .resolves.toBe("phase-3-application-sequence-v15");
+        .resolves.toBe("phase-3-application-audit-v16");
     } finally {
       await stopChild(child);
     }

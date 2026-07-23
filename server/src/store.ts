@@ -359,6 +359,9 @@ export class WorkflowStore {
       retryApplication: (input) => this.withImmediateTransaction(
         () => deliveryCoordinator.retryApplicationInTransaction(input)
       ),
+      listApplicationRetryAudits: (unitId) => this.withReadTransaction(
+        () => deliveryCoordinator.listApplicationRetryAudits(unitId)
+      ),
       overrideQuality: (input) => this.withImmediateTransaction(
         () => deliveryCoordinator.overrideQualityInTransaction(input)
       ),
@@ -1304,12 +1307,19 @@ export class WorkflowStore {
 
   insertApprovalInTransaction(requirementId: string, stage: WorkflowStage, input: any, now: string) {
     const id = randomUUID();
+    const actorType = input.actorType ?? "human";
+    const actor = input.actor ?? (actorType === "human" ? "local-human" : actorType);
     this.db.prepare(`INSERT INTO approvals
-      (id, requirement_id, stage, decision, comment, condition_text, target_stage, created_at, actor_type, artifact_id, reasons_json, return_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(id, requirementId, stage, input.decision, input.comment, input.condition ?? null, input.targetStage ?? null, now,
-        input.actorType ?? "human", input.artifactId ?? null, JSON.stringify(input.reasons ?? []), input.returnCount ?? null);
-    return { id, requirement_id: requirementId, stage, decision: input.decision, comment: input.comment, target_stage: input.targetStage ?? null, created_at: now, actor_type: input.actorType ?? "human", artifact_id: input.artifactId ?? null, return_count: input.returnCount ?? null };
+      (id, requirement_id, stage, decision, comment, condition_text, target_stage, created_at,
+       actor_type, actor, artifact_id, reasons_json, return_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, requirementId, stage, input.decision, input.comment, input.condition ?? null,
+        input.targetStage ?? null, now, actorType, actor, input.artifactId ?? null,
+        JSON.stringify(input.reasons ?? []), input.returnCount ?? null);
+    return { id, requirement_id: requirementId, stage, decision: input.decision,
+      comment: input.comment, target_stage: input.targetStage ?? null, created_at: now,
+      actor_type: actorType, actor, artifact_id: input.artifactId ?? null,
+      return_count: input.returnCount ?? null };
   }
 
   applyRequirementApproval(input: { requirementId: string; expectedStage: WorkflowStage; approval: any }) {

@@ -66,7 +66,7 @@ DATA_DIR="$PWD/.local/delivery-pilot" AUTOMATION_WORKER_ENABLED=false npm run de
 
 ## 数据重建 SOP
 
-升级到 `phase-3-application-sequence-v15` 前停止服务。旧 live DB 先备份主文件及现有 WAL/SHM，再创建空的新库。旧 history 只保存在 backup；没有 row migration、dual read/write 或 schema fallback。
+升级到 `phase-3-application-audit-v16` 前停止服务。旧 live DB 先备份主文件及现有 WAL/SHM，再创建空的新库。旧 history 只保存在 backup；没有 row migration、dual read/write 或 schema fallback。
 
 ## 安全边界
 

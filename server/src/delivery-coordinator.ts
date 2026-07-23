@@ -85,6 +85,7 @@ interface OverrideRow {
 export interface DeliveryCoordinationPersistence {
   acceptRequirement(input: DeliveryAcceptanceInput): DeliveryAcceptance;
   retryApplication(input: DeliveryApplicationRetryInput): DeliveryApplicationRetry;
+  listApplicationRetryAudits(unitId: string): DeliveryApplicationRetryAudit[];
   overrideQuality(input: DeliveryQualityOverrideInput): DeliveryQualityOverride;
   listQualityOverrides(unitId: string, evidenceVersion?: number): DeliveryQualityOverride[];
   resolveStale(input: DeliveryStaleResolutionInput): DeliveryStaleDecision;
@@ -107,6 +108,19 @@ export interface DeliveryApplicationRetry {
   evidenceVersion: number;
   retryAttempt: number;
   jobId: string;
+}
+
+export interface DeliveryApplicationRetryAudit {
+  id: string;
+  requirementId: string;
+  deliveryUnitId: string;
+  evidenceVersion: number;
+  jobId: string;
+  target: "application";
+  attempt: number;
+  actor: string;
+  reason: string;
+  createdAt: string;
 }
 
 export interface DeliveryAcceptanceInput {
@@ -293,25 +307,31 @@ export class DeliveryCoordinator {
 
   acceptRequirementInTransaction(input: DeliveryAcceptanceInput): DeliveryAcceptance {
     validateAcceptanceInput(input);
-    const requirement = this.db.prepare("SELECT id FROM requirements WHERE id = ?")
-      .get(input.requirementId) as { id: string } | undefined;
+    const requirement = this.db.prepare("SELECT id, stage, status FROM requirements WHERE id = ?")
+      .get(input.requirementId) as { id: string; stage: string; status: string } | undefined;
     if (!requirement) throw new Error("REQUIREMENT_NOT_FOUND");
-    if (this.requirementPaused(requirement.id)) throw new Error("DELIVERY_ACCEPTANCE_NOT_ELIGIBLE");
     if (this.db.prepare(`SELECT 1 FROM approvals
       WHERE requirement_id = ? AND stage = 'acceptance_delivery' AND decision = 'approve'`)
       .get(requirement.id)) {
       throw new Error("DELIVERY_ACCEPTANCE_ALREADY_RECORDED");
+    }
+    if (requirement.stage !== "implementation" || requirement.status !== "ai_ready"
+      || this.requirementPaused(requirement.id)) {
+      throw new Error("DELIVERY_ACCEPTANCE_NOT_ELIGIBLE");
     }
     const units = this.db.prepare(`SELECT id, position, required, status, evidence_version
       FROM delivery_units WHERE requirement_id = ? ORDER BY position, created_at, rowid`)
       .all(requirement.id) as Array<{
         id: string; position: number; required: number; status: string; evidence_version: number;
       }>;
-    const dependencies = this.db.prepare(`SELECT upstream_unit_id, downstream_unit_id, release_condition
+    const dependencies = this.db.prepare(`SELECT upstream_unit_id, downstream_unit_id, release_condition,
+        released_by_evidence_version, released_at
       FROM delivery_dependencies WHERE requirement_id = ? ORDER BY rowid`).all(requirement.id) as Array<{
         upstream_unit_id: string;
         downstream_unit_id: string;
         release_condition: "automated_testing_passed";
+        released_by_evidence_version: number | null;
+        released_at: string | null;
       }>;
     const unitById = new Map(units.map((unit) => [unit.id, unit]));
     const order = buildApplicationPlan({
@@ -331,14 +351,23 @@ export class DeliveryCoordinator {
       unitId,
       evidenceVersion: unitById.get(unitId)!.evidence_version
     }));
+    if (plan.length === 0) throw new Error("DELIVERY_ACCEPTANCE_NOT_ELIGIBLE");
+    const plannedIds = new Set(plan.map((entry) => entry.unitId));
+    if (dependencies.some((dependency) => plannedIds.has(dependency.upstream_unit_id)
+      && plannedIds.has(dependency.downstream_unit_id)
+      && (dependency.released_at === null
+        || dependency.released_by_evidence_version
+          !== unitById.get(dependency.upstream_unit_id)!.evidence_version))) {
+      throw new Error("DELIVERY_ACCEPTANCE_NOT_ELIGIBLE");
+    }
     const now = new Date().toISOString();
     const id = randomUUID();
     this.db.prepare(`INSERT INTO approvals
       (id, requirement_id, stage, decision, comment, condition_text, target_stage,
-       actor_type, artifact_id, reasons_json, return_count, created_at)
+       actor_type, actor, artifact_id, reasons_json, return_count, created_at)
       VALUES (?, ?, 'acceptance_delivery', 'approve', ?, NULL, NULL,
-        'human', NULL, '[]', NULL, ?)`)
-      .run(id, requirement.id, input.comment.trim(), now);
+        'human', ?, NULL, '[]', NULL, ?)`)
+      .run(id, requirement.id, input.comment.trim(), input.actor.trim(), now);
     let jobId: string | null = null;
     if (plan.length > 0) {
       const payload: DeliveryApplicationPlanPayload = {
@@ -531,6 +560,8 @@ export class DeliveryCoordinator {
 
   retryApplicationInTransaction(input: DeliveryApplicationRetryInput): DeliveryApplicationRetry {
     validateApplicationRetryInput(input);
+    const actor = input.actor.trim();
+    const reason = input.reason.trim();
     const unit = this.db.prepare(`SELECT id, requirement_id, evidence_version, phase, status
       FROM delivery_units WHERE id = ?`).get(input.unitId) as {
         id: string;
@@ -616,6 +647,14 @@ export class DeliveryCoordinator {
       payload: { ...payload, retryAttempt },
       maxAttempts: 3
     });
+    const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO delivery_unit_retry_audit
+      (id, requirement_id, delivery_unit_id, evidence_version, job_id, target, attempt,
+       actor, reason, created_at)
+      VALUES (?, ?, ?, ?, ?, 'application', ?, ?, ?, ?)`).run(
+        randomUUID(), unit.requirement_id, unit.id, unit.evidence_version, job.id,
+        retryAttempt, actor, reason, now
+      );
     return {
       deliveryUnitId: unit.id,
       requirementId: unit.requirement_id,
@@ -623,6 +662,29 @@ export class DeliveryCoordinator {
       retryAttempt,
       jobId: job.id
     };
+  }
+
+  listApplicationRetryAudits(unitId: string): DeliveryApplicationRetryAudit[] {
+    const id = boundedText(unitId, 256, "DELIVERY_APPLICATION_ID_INVALID");
+    const rows = this.db.prepare(`SELECT * FROM delivery_unit_retry_audit
+      WHERE delivery_unit_id = ? AND target = 'application' ORDER BY attempt, created_at, rowid`)
+      .all(id) as Array<{
+        id: string; requirement_id: string; delivery_unit_id: string; evidence_version: number;
+        job_id: string; target: "application"; attempt: number; actor: string; reason: string;
+        created_at: string;
+      }>;
+    return rows.map((row) => ({
+      id: row.id,
+      requirementId: row.requirement_id,
+      deliveryUnitId: row.delivery_unit_id,
+      evidenceVersion: row.evidence_version,
+      jobId: row.job_id,
+      target: row.target,
+      attempt: row.attempt,
+      actor: row.actor,
+      reason: row.reason,
+      createdAt: row.created_at
+    }));
   }
 
   recordQualityInTransaction(
@@ -953,6 +1015,14 @@ export class DeliveryCoordinator {
           AND run.status = 'running')`).get(unit.id, unit.evidence_version, unit.id, unit.evidence_version,
       unit.id, unit.evidence_version);
     if (active) throw new Error("DELIVERY_UNIT_SKIP_NOT_ELIGIBLE");
+    const frozen = this.db.prepare(`SELECT 1 FROM automation_jobs job, json_each(job.payload_json, '$.units') entry
+      WHERE job.owner_type = 'delivery_unit' AND job.action = 'apply'
+        AND json_extract(job.payload_json, '$.type') = 'delivery_application_plan'
+        AND json_extract(job.payload_json, '$.requirementId') = ?
+        AND json_extract(entry.value, '$.unitId') = ?
+        AND json_extract(entry.value, '$.evidenceVersion') = ?
+      LIMIT 1`).get(unit.requirement_id, unit.id, unit.evidence_version);
+    if (frozen) throw new Error("DELIVERY_UNIT_SKIP_NOT_ELIGIBLE");
     const now = new Date().toISOString();
     this.db.prepare(`INSERT INTO delivery_unit_skips
       (id, requirement_id, delivery_unit_id, evidence_version, actor, reason, created_at)
@@ -1001,8 +1071,9 @@ export class DeliveryCoordinator {
       evidenceVersion: unit.evidence_version, jobId: job.id, target: input.target, actor, reason, createdAt: now
     };
     this.db.prepare(`INSERT INTO delivery_unit_retry_audit
-      (id, requirement_id, delivery_unit_id, evidence_version, job_id, target, actor, reason, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(audit.id, audit.requirementId, audit.deliveryUnitId,
+      (id, requirement_id, delivery_unit_id, evidence_version, job_id, target, attempt,
+       actor, reason, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`).run(audit.id, audit.requirementId, audit.deliveryUnitId,
       audit.evidenceVersion, audit.jobId, audit.target, audit.actor, audit.reason, audit.createdAt);
     if (input.target === "implementation") {
       const updated = this.db.prepare(`UPDATE delivery_units SET status = 'ready', updated_at = ?

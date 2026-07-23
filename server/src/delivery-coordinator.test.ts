@@ -121,14 +121,17 @@ function units(store: WorkflowStore, requirementId: string) {
   return store.deliveryUnits.listForRequirement(requirementId);
 }
 
-function acceptanceFixture() {
-  const fixture = createFixture([[0, 1]], [true, true]);
+function acceptanceFixture(required: boolean[] = [true, true]) {
+  const fixture = createFixture([[0, 1]], required);
   const [backend, frontend] = fixture.units;
   settle(fixture.store, backend!.id, "code_review", "passed");
   settle(fixture.store, backend!.id, "automated_testing", "passed");
   completeImplementation(fixture.store, frontend!.id);
   settle(fixture.store, frontend!.id, "code_review", "passed");
   settle(fixture.store, frontend!.id, "automated_testing", "passed");
+  fixture.store.updateRequirementState(
+    fixture.requirement.id, "implementation", "ai_ready"
+  );
   return { ...fixture, backend: backend!, frontend: frontend! };
 }
 
@@ -271,6 +274,142 @@ function advanceImplementation(store: WorkflowStore, unitId: string, evidenceVer
 }
 
 describe("DeliveryCoordinator", () => {
+  it("rejects skipping a frozen optional suffix while the first application is leased", () => {
+    const fixture = acceptanceFixture([true, false]);
+    acceptDelivery(fixture);
+    const first = fixture.store.automationJobs.leaseNext(
+      "application-worker", new Date(), 60_000
+    )!;
+    expect(first.ownerId).toBe(fixture.backend.id);
+
+    expect(() => fixture.store.deliveryCoordination.skipOptional({
+      unitId: fixture.frontend.id,
+      actor: "local-human",
+      reason: "skip after freeze"
+    })).toThrow("DELIVERY_UNIT_SKIP_NOT_ELIGIBLE");
+
+    expect(fixture.store.deliveryUnits.get(fixture.frontend.id)).toMatchObject({
+      status: "ready_for_acceptance"
+    });
+    expect(() => fixture.database.prepare(`INSERT INTO delivery_unit_skips
+      (id, requirement_id, delivery_unit_id, evidence_version, actor, reason, created_at)
+      VALUES ('forged-frozen-skip', ?, ?, ?, 'local-human', 'bypass coordinator', ?)`)
+      .run(fixture.requirement.id, fixture.frontend.id, fixture.frontend.evidenceVersion,
+        new Date().toISOString())).toThrow("DELIVERY_UNIT_SKIP_OWNER_MISMATCH");
+  });
+
+  it("rejects skipping a frozen optional suffix after its predecessor is applied", () => {
+    const fixture = acceptanceFixture([true, false]);
+    acceptDelivery(fixture);
+    settleApplication(fixture, fixture.backend.id, "applied");
+    expect(fixture.store.automationJobs.byDedupe(
+      `apply:${fixture.frontend.id}:v${fixture.frontend.evidenceVersion}`
+    )).toMatchObject({ status: "pending" });
+
+    expect(() => fixture.store.deliveryCoordination.skipOptional({
+      unitId: fixture.frontend.id,
+      actor: "local-human",
+      reason: "skip pending suffix"
+    })).toThrow("DELIVERY_UNIT_SKIP_NOT_ELIGIBLE");
+
+    expect(fixture.store.automationJobs.byDedupe(
+      `apply:${fixture.frontend.id}:v${fixture.frontend.evidenceVersion}`
+    )).toMatchObject({ status: "pending" });
+  });
+
+  it("keeps an optional skip legal before the application plan is frozen", () => {
+    const fixture = acceptanceFixture([true, false]);
+
+    const skipped = fixture.store.deliveryCoordination.skipOptional({
+      unitId: fixture.frontend.id,
+      actor: "local-human",
+      reason: "not delivered in this version"
+    });
+
+    expect(skipped).toMatchObject({ deliveryUnitId: fixture.frontend.id });
+    expect(fixture.store.deliveryUnits.get(fixture.frontend.id)).toMatchObject({ status: "skipped" });
+  });
+
+  it.each([
+    ["new requirement", "definition", "ai_ready"],
+    ["wrong pre-delivery stage", "solution_design", "ai_ready"],
+    ["active parent run", "implementation", "ai_running"],
+    ["already entering acceptance", "acceptance_delivery", "awaiting_approval"],
+    ["completed requirement", "implementation", "completed"],
+    ["closed requirement", "implementation", "closed"],
+    ["cancelled requirement", "implementation", "cancelled"]
+  ] as const)("rejects acceptance for %s without mutating its lifecycle", (_label, stage, status) => {
+    const fixture = acceptanceFixture();
+    fixture.store.updateRequirementState(fixture.requirement.id, stage, status);
+    const before = fixture.store.getRequirement(fixture.requirement.id)!;
+
+    expect(() => acceptDelivery(fixture)).toThrow("DELIVERY_ACCEPTANCE_NOT_ELIGIBLE");
+
+    expect(fixture.store.getRequirement(fixture.requirement.id)).toMatchObject({
+      stage: before.stage,
+      status: before.status,
+      updatedAt: before.updatedAt
+    });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM approvals
+      WHERE requirement_id = ?`).get(fixture.requirement.id)).toEqual({ count: 0 });
+    expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
+      WHERE action = 'apply'`).get()).toEqual({ count: 0 });
+  });
+
+  it("rejects acceptance without a non-empty delivery plan and leaves no audit or job", () => {
+    const directory = mkdtempSync(join(tmpdir(), "delivery-acceptance-empty-"));
+    directories.push(directory);
+    const store = new WorkflowStore(join(directory, "workflow.db"));
+    stores.push(store);
+    const project = store.createProject({
+      name: "Empty delivery", repoPath: join(directory, "project"), defaultBranch: "main",
+      allowedCommands: [], sensitivePatterns: []
+    });
+    const version = store.createProjectVersion({
+      projectId: project.id, name: "v1", branch: "feature/v1", baseBranch: "main",
+      worktreePath: join(directory, "worktree"), headCommit: "head"
+    });
+    const requirement = store.createRequirement({
+      title: "No delivery plan", businessProblem: "Nothing was planned",
+      expectedOutcome: "Acceptance is blocked", priority: "high",
+      primaryProjectId: project.id, primaryProjectVersionId: version.id
+    });
+    store.updateRequirementState(requirement.id, "implementation", "ai_ready");
+    const before = store.getRequirement(requirement.id)!;
+
+    expect(() => store.deliveryCoordination.acceptRequirement({
+      requirementId: requirement.id,
+      actor: "local-human",
+      comment: "Cannot accept an empty plan"
+    })).toThrow("DELIVERY_ACCEPTANCE_NOT_ELIGIBLE");
+
+    expect(store.getRequirement(requirement.id)).toMatchObject({
+      stage: before.stage,
+      status: before.status,
+      updatedAt: before.updatedAt
+    });
+    expect(store.listApprovals(requirement.id)).toEqual([]);
+    expect(store.automationJobs.listPending().filter((job) => job.action === "apply")).toEqual([]);
+  });
+
+  it("rejects acceptance when a participating dependency is not released by current evidence", () => {
+    const fixture = acceptanceFixture();
+    fixture.database.prepare(`UPDATE delivery_dependencies
+      SET released_by_evidence_version = NULL, released_at = NULL
+      WHERE requirement_id = ?`).run(fixture.requirement.id);
+    const before = fixture.store.getRequirement(fixture.requirement.id)!;
+
+    expect(() => acceptDelivery(fixture)).toThrow("DELIVERY_ACCEPTANCE_NOT_ELIGIBLE");
+
+    expect(fixture.store.getRequirement(fixture.requirement.id)).toMatchObject({
+      stage: before.stage,
+      status: before.status,
+      updatedAt: before.updatedAt
+    });
+    expect(fixture.store.listApprovals(fixture.requirement.id)).toEqual([]);
+    expect(fixture.store.automationJobs.listPending().filter((job) => job.action === "apply")).toEqual([]);
+  });
+
   it("enqueues only the first application after human acceptance", () => {
     const fixture = acceptanceFixture();
     const coordination = fixture.store.deliveryCoordination as any;
@@ -322,6 +461,22 @@ describe("DeliveryCoordinator", () => {
       .toEqual({ count: 1 });
     expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
       WHERE action = 'apply' AND owner_id = ?`).get(fixture.backend.id)).toEqual({ count: 1 });
+  });
+
+  it("persists the concrete human acceptance actor and comment across Store reopen", () => {
+    const fixture = acceptanceFixture();
+    const accepted = acceptDelivery(fixture);
+    stores.splice(stores.indexOf(fixture.store), 1);
+    fixture.store.close();
+    const reopened = new WorkflowStore(fixture.databasePath);
+    stores.push(reopened);
+
+    expect(reopened.listApprovals(fixture.requirement.id)).toContainEqual(expect.objectContaining({
+      id: accepted.id,
+      actor: "local-human",
+      actor_type: "human",
+      comment: "Business checks passed"
+    }));
   });
 
   it("releases the next frozen application only after the prior unit settles applied", () => {
@@ -654,6 +809,53 @@ describe("DeliveryCoordinator", () => {
     expect(replay.retryAttempt).toBe(1);
     expect(fixture.database.prepare(`SELECT COUNT(*) AS count FROM automation_jobs
       WHERE owner_id = ? AND action = 'apply'`).get(fixture.backend.id)).toEqual({ count: 2 });
+  });
+
+  it("persists immutable application retry audits for every attempt across Store reopen", () => {
+    const fixture = acceptanceFixture();
+    acceptDelivery(fixture);
+    settleApplication(fixture, fixture.backend.id, "conflicted");
+    const first = fixture.store.deliveryCoordination.retryApplication({
+      unitId: fixture.backend.id,
+      actor: "release-operator",
+      reason: "repair first conflict"
+    });
+    settleApplication(fixture, fixture.backend.id, "conflicted");
+    const second = fixture.store.deliveryCoordination.retryApplication({
+      unitId: fixture.backend.id,
+      actor: "release-operator",
+      reason: "repair second conflict"
+    });
+    stores.splice(stores.indexOf(fixture.store), 1);
+    fixture.store.close();
+    const reopened = new WorkflowStore(fixture.databasePath);
+    stores.push(reopened);
+    const coordination = reopened.deliveryCoordination as any;
+
+    expect(typeof coordination.listApplicationRetryAudits).toBe("function");
+    expect(coordination.listApplicationRetryAudits(fixture.backend.id)).toEqual([
+      expect.objectContaining({
+        deliveryUnitId: fixture.backend.id,
+        evidenceVersion: fixture.backend.evidenceVersion,
+        jobId: first.jobId,
+        target: "application",
+        attempt: 1,
+        actor: "release-operator",
+        reason: "repair first conflict"
+      }),
+      expect.objectContaining({
+        deliveryUnitId: fixture.backend.id,
+        evidenceVersion: fixture.backend.evidenceVersion,
+        jobId: second.jobId,
+        target: "application",
+        attempt: 2,
+        actor: "release-operator",
+        reason: "repair second conflict"
+      })
+    ]);
+    const database = (reopened as any).db;
+    expect(() => database.prepare(`UPDATE delivery_unit_retry_audit SET reason = 'rewritten'
+      WHERE job_id = ?`).run(first.jobId)).toThrow("DELIVERY_UNIT_RETRY_AUDIT_IMMUTABLE");
   });
 
   it("preserves every fan-in upstream change as an independently auditable active invalidation", () => {

@@ -70,7 +70,7 @@ describe("delivery pilot fixture", () => {
       expect(persistedPaths.every((path) => path.startsWith(`${dataDir}/`))).toBe(true);
       expect(persistedPaths.every((path) => lstatSync(path).isDirectory())).toBe(true);
       expect(readFileSync(`${seeded.databasePath}.schema-version`, "utf8"))
-        .toBe("phase-3-application-sequence-v15");
+        .toBe("phase-3-application-audit-v16");
     } finally {
       store.close();
     }

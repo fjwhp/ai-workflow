@@ -18,7 +18,7 @@ Flowgate 是本地优先的 AI 研发工作台，使用五个职责互斥的阶�
 - worker 执行 implementation、独立 Review 和独立自动化测试；两条质量证据均通过后才释放下游。
 - 上游实现或契约变化会传播 stale evidence；人工可 pause/resume、reuse/rerun、override、optional skip 或 retry，所有操作保留审计。
 - 详情 API 提供 server-owned `allowedActions`，Web 通过 SSE generation 实时刷新，并在连接失败时退回有界轮询。
-- 总体业务验收及验收后的 dependency-ordered no-commit local application 属于下一阶段，不能由当前自动化替代。
+- 总体业务验收必须由人工明确触发；批准后系统按依赖顺序执行 no-commit local application，不自动 commit、merge 或发布。
 
 自动化 worker 生命周期已经接入服务启动，`AUTOMATION_WORKER_ENABLED` 默认关闭。需要执行 pending job 时显式设为 `true`；只浏览状态或运行 pilot 时可保持关闭。
 
@@ -26,7 +26,7 @@ Flowgate 是本地优先的 AI 研发工作台，使用五个职责互斥的阶�
 
 ## 数据基线
 
-当前 schema marker 是 `phase-3-application-sequence-v15`。首次用本版本打开 `phase-2-quality-attempt-v14` 或其他旧 live 数据库时，服务先完整备份 SQLite 主文件及现存 WAL/SHM，再创建空的 application-sequence-v15 数据库。旧历史只存在于备份中；不做 row migration、dual read/write 或 fallback，也没有旧新数据库并行入口。用户已授权旧数据以新跑为准。
+当前 schema marker 是 `phase-3-application-audit-v16`。首次用本版本打开 `phase-2-quality-attempt-v14` 或其他旧 live 数据库时，服务先完整备份 SQLite 主文件及现存 WAL/SHM，再创建空的 `phase-3-application-audit-v16` 数据库。旧历史只存在于备份中；不做 row migration、dual read/write 或 fallback，也没有旧新数据库并行入口。用户已授权旧数据以新跑为准。
 
 详细操作见：
 

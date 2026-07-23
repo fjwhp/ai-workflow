@@ -157,7 +157,9 @@ export function createPhase2Schema(db: DatabaseSync) {
     CREATE TABLE IF NOT EXISTS approvals (
       id TEXT PRIMARY KEY, requirement_id TEXT NOT NULL, stage TEXT NOT NULL,
       decision TEXT NOT NULL, comment TEXT NOT NULL, condition_text TEXT,
-      target_stage TEXT, actor_type TEXT NOT NULL DEFAULT 'human', artifact_id TEXT,
+      target_stage TEXT, actor_type TEXT NOT NULL DEFAULT 'human',
+      actor TEXT NOT NULL CHECK(instr(actor, char(0)) = 0 AND length(trim(actor)) BETWEEN 1 AND 256),
+      artifact_id TEXT,
       reasons_json TEXT NOT NULL DEFAULT '[]', return_count INTEGER,
       created_at TEXT NOT NULL,
       FOREIGN KEY(requirement_id) REFERENCES requirements(id)
@@ -612,7 +614,8 @@ export function createPhase2Schema(db: DatabaseSync) {
       delivery_unit_id TEXT NOT NULL,
       evidence_version INTEGER NOT NULL,
       job_id TEXT NOT NULL,
-      target TEXT NOT NULL CHECK(target IN ('implementation', 'code_review', 'automated_testing')),
+      target TEXT NOT NULL CHECK(target IN ('implementation', 'code_review', 'automated_testing', 'application')),
+      attempt INTEGER NOT NULL CHECK(typeof(attempt) = 'integer' AND attempt BETWEEN 0 AND 100),
       actor TEXT NOT NULL CHECK(instr(actor, char(0)) = 0 AND length(trim(actor)) BETWEEN 1 AND 256),
       reason TEXT NOT NULL CHECK(instr(reason, char(0)) = 0 AND length(trim(reason)) BETWEEN 1 AND 4096),
       created_at TEXT NOT NULL,
@@ -1326,6 +1329,13 @@ export function createPhase2Schema(db: DatabaseSync) {
           AND NOT EXISTS (SELECT 1 FROM stage_runs run
             WHERE run.owner_type = 'delivery_unit' AND run.owner_id = unit.id
               AND run.evidence_version = unit.evidence_version AND run.status = 'running')
+          AND NOT EXISTS (SELECT 1
+            FROM automation_jobs application, json_each(application.payload_json, '$.units') entry
+            WHERE application.owner_type = 'delivery_unit' AND application.action = 'apply'
+              AND json_extract(application.payload_json, '$.type') = 'delivery_application_plan'
+              AND json_extract(application.payload_json, '$.requirementId') = unit.requirement_id
+              AND json_extract(entry.value, '$.unitId') = unit.id
+              AND json_extract(entry.value, '$.evidenceVersion') = unit.evidence_version)
       );
     END;
     CREATE TRIGGER IF NOT EXISTS validate_delivery_unit_retry_audit_insert
@@ -1338,12 +1348,17 @@ export function createPhase2Schema(db: DatabaseSync) {
           AND job.owner_type = 'delivery_unit'
           AND job.owner_id = unit.id
           AND job.evidence_version = unit.evidence_version
-          AND job.status = 'failed'
-          AND job.action = CASE NEW.target
-            WHEN 'implementation' THEN 'implement'
-            WHEN 'code_review' THEN 'review'
-            WHEN 'automated_testing' THEN 'test'
-          END
+          AND (
+            (NEW.target = 'application' AND NEW.attempt BETWEEN 1 AND 100
+              AND job.status = 'pending' AND job.action = 'apply'
+              AND json_extract(job.payload_json, '$.retryAttempt') = NEW.attempt)
+            OR (NEW.target <> 'application' AND NEW.attempt = 0 AND job.status = 'failed'
+              AND job.action = CASE NEW.target
+                WHEN 'implementation' THEN 'implement'
+                WHEN 'code_review' THEN 'review'
+                WHEN 'automated_testing' THEN 'test'
+              END)
+          )
         WHERE unit.id = NEW.delivery_unit_id
           AND unit.requirement_id = NEW.requirement_id
           AND unit.evidence_version = NEW.evidence_version

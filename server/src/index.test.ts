@@ -290,7 +290,7 @@ describe("server entry point", () => {
     const seeded = seedRootPlan(seedStore, directory);
     expect(seedStore.automationJobs.leaseNext("crashed-worker", startedAt, 100)).toMatchObject({ attempt: 1 });
     seedStore.close();
-    writeFileSync(join(directory, "workflow.db.schema-version"), "phase-3-application-sequence-v15");
+    writeFileSync(join(directory, "workflow.db.schema-version"), "phase-3-application-audit-v16");
     const recoveredAt = new Date(startedAt.getTime() + 101);
     const coding = vi.fn(async (input: CodingAgentInput) => controlledCodingResult(input));
 
@@ -491,7 +491,7 @@ async function seedExpiredJob(directory: string) {
   });
   store.automationJobs.leaseNext("old-worker", new Date(), 1);
   store.close();
-  writeFileSync(`${databasePath}.schema-version`, "phase-3-application-sequence-v15");
+  writeFileSync(`${databasePath}.schema-version`, "phase-3-application-audit-v16");
   await new Promise((resolve) => setTimeout(resolve, 5));
   return { jobId: queued.id };
 }
@@ -517,7 +517,7 @@ function seedLeasedImplementation(directory: string, now: Date, leaseMs: number)
   store.automationJobs.leaseNext("old-worker", now, leaseMs);
   const claim = store.deliveryExecutions.claimImplementation(unit.id, "old-model");
   store.close();
-  writeFileSync(`${databasePath}.schema-version`, "phase-3-application-sequence-v15");
+  writeFileSync(`${databasePath}.schema-version`, "phase-3-application-audit-v16");
   return { jobId: job.id, unitId: unit.id, runId: claim.runId, executionId: claim.executionId };
 }
 
