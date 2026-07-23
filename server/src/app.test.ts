@@ -972,6 +972,22 @@ describe("live delivery unit detail", () => {
     expect(terminal.deliveryUnits.map((unit: any) => unit.allowedActions)).toEqual([[], []]);
     await app.close();
   });
+
+  it("returns the server-owned aggregate acceptance action in requirement detail", async () => {
+    const { store, requirement, primary, secondary } = createDeliveryFixture();
+    completeImplementation(store, primary.id);
+    passQuality(store, primary.id, 1);
+    completeImplementation(store, secondary.id);
+    passQuality(store, secondary.id, 1);
+    store.updateRequirementState(requirement.id, "implementation", "ai_ready");
+    const app = await buildApp(store);
+
+    const detail = await app.inject({ method: "GET", url: `/api/requirements/${requirement.id}` });
+
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().allowedActions).toEqual([{ type: "accept_delivery", commentRequired: true }]);
+    await app.close();
+  });
 });
 
 describe("stage run API", () => {

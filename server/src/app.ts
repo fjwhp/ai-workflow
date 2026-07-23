@@ -15,6 +15,7 @@ import { buildRequirementProjectContext, ProjectContextError, resolveProjectCont
 import { registerProjectVersionRoutes } from "./project-version-routes.js";
 import { registerRequirementRoutes } from "./requirement-routes.js";
 import { registerDeliveryUnitRoutes } from "./delivery-unit-routes.js";
+import { registerDeliveryAcceptanceRoutes } from "./delivery-acceptance-routes.js";
 
 const requirementRevisionSchema = requirementInputSchema.extend({
   clarifications: requirementInputSchema.shape.businessProblem,
@@ -27,6 +28,7 @@ export async function buildApp(store: WorkflowStore) {
   await app.register(cors, { origin: /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/ });
   await registerProjectVersionRoutes(app, { store });
   await registerDeliveryUnitRoutes(app, { store });
+  await registerDeliveryAcceptanceRoutes(app, { store });
   await registerRequirementRoutes(app, {
     store,
     onApproved: (requirementId) => { refreshRequirementKnowledge(store, requirementId); }
@@ -60,7 +62,8 @@ export async function buildApp(store: WorkflowStore) {
     const delivery = store.deliveryUnitDetails.getForRequirement(item.id);
     const detail = { ...item, artifacts, approvals, revisions: store.listRequirementRevisions(item.id),
       runs: store.listStageRuns(item.id), reworkContext, knowledgeChanges:store.getKnowledgeChangeSet(item.id),
-      deliveryUnits:delivery.units,deliveryDependencies:delivery.dependencies,automation:delivery.automation };
+      deliveryUnits:delivery.units,deliveryDependencies:delivery.dependencies,automation:delivery.automation,
+      allowedActions:delivery.allowedActions };
     return deliveryStage ? detail : { ...detail, executions: store.listExecutions(item.id), codingEvidence };
   });
   app.patch("/api/requirements/:id", async (req: any, reply) => {

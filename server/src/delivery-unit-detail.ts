@@ -14,7 +14,13 @@ export type DeliveryUnitActionType =
   | "retry_automated_testing"
   | "reuse_evidence"
   | "rerun"
-  | "skip_optional";
+  | "skip_optional"
+  | "retry_application";
+
+export interface AllowedDeliveryAcceptanceAction {
+  type: "accept_delivery";
+  commentRequired: true;
+}
 
 export interface AllowedDeliveryUnitAction {
   type: DeliveryUnitActionType;
@@ -29,6 +35,7 @@ export interface RequirementAutomationDetail {
 }
 
 export interface DeliveryRequirementDetail {
+  allowedActions: AllowedDeliveryAcceptanceAction[];
   automation: RequirementAutomationDetail & {
     allowedActions: Array<{ type: "pause_automation" | "resume_automation"; reasonRequired: true }>;
   };
@@ -63,6 +70,12 @@ interface DeliveryDetailSnapshot {
   activeInvalidations: Set<string>;
   dependenciesSatisfied: Map<string, boolean>;
   dependencyReleases: Map<string, Array<DeliveryDependency & { direction: "incoming" | "outgoing" }>>;
+  latestApplications: Map<string, {
+    status: string;
+    resolutionStatus: string;
+    projectVersionId: string;
+  }>;
+  activeApplicationProjectVersions: Set<string>;
 }
 
 export class DeliveryUnitDetailRepository {
@@ -77,6 +90,7 @@ export class DeliveryUnitDetailRepository {
     const automation = this.automationState(requirementId);
     const snapshot = this.loadSnapshot(requirementId, units, dependencies);
     return {
+      allowedActions: this.acceptanceActions(requirementId, units, automation, snapshot),
       automation: {
         ...automation,
         allowedActions: [{
@@ -196,6 +210,38 @@ export class DeliveryUnitDetailRepository {
       GROUP BY invalidation.target_unit_id`).all(requirementId) as Array<{ target_unit_id: string }>;
     for (const row of invalidationRows) activeInvalidations.add(row.target_unit_id);
 
+    const latestApplications = new Map<string, {
+      status: string; resolutionStatus: string; projectVersionId: string;
+    }>();
+    const activeApplicationProjectVersions = new Set<string>();
+    const applicationRows = this.db.prepare(`SELECT application.delivery_unit_id,
+        application.project_version_id, application.status, application.resolution_status
+      FROM delivery_application_runs application
+      WHERE application.delivery_unit_id IN (
+          SELECT id FROM delivery_units WHERE requirement_id = ?
+        ) OR application.project_version_id IN (
+          SELECT project_version_id FROM delivery_units WHERE requirement_id = ?
+        )
+      ORDER BY application.updated_at DESC, application.rowid DESC`).all(
+        requirementId, requirementId
+      ) as Array<{
+        delivery_unit_id: string; project_version_id: string;
+        status: string; resolution_status: string;
+      }>;
+    const ownUnitIds = new Set(units.map((unit) => unit.id));
+    for (const row of applicationRows) {
+      if (row.resolution_status === "pending") {
+        activeApplicationProjectVersions.add(row.project_version_id);
+      }
+      if (ownUnitIds.has(row.delivery_unit_id) && !latestApplications.has(row.delivery_unit_id)) {
+        latestApplications.set(row.delivery_unit_id, {
+          status: row.status,
+          resolutionStatus: row.resolution_status,
+          projectVersionId: row.project_version_id
+        });
+      }
+    }
+
     const dependencyReleases = new Map<
       string,
       Array<DeliveryDependency & { direction: "incoming" | "outgoing" }>
@@ -211,8 +257,26 @@ export class DeliveryUnitDetailRepository {
     }
     return {
       implementationEvidence, qualityEvidence, jobs, activeRuns, activeInvalidations,
-      dependenciesSatisfied, dependencyReleases
+      dependenciesSatisfied, dependencyReleases, latestApplications, activeApplicationProjectVersions
     };
+  }
+
+  private acceptanceActions(
+    requirementId: string,
+    units: DeliveryUnit[],
+    automation: RequirementAutomationDetail,
+    snapshot: DeliveryDetailSnapshot
+  ): AllowedDeliveryAcceptanceAction[] {
+    if (automation.status === "paused" || units.length === 0 || snapshot.activeInvalidations.size > 0) return [];
+    const requirement = this.db.prepare("SELECT stage, status FROM requirements WHERE id = ?")
+      .get(requirementId) as { stage: string; status: string } | undefined;
+    if (requirement?.stage !== "implementation" || requirement.status !== "ai_ready") return [];
+    if (units.some((unit) => unit.status === "potentially_stale"
+      || (unit.required ? unit.status !== "ready_for_acceptance"
+        : unit.status !== "ready_for_acceptance" && unit.status !== "skipped")
+      || !(snapshot.dependenciesSatisfied.get(unit.id) ?? true)
+      || snapshot.activeApplicationProjectVersions.has(unit.projectVersionId))) return [];
+    return [{ type: "accept_delivery", commentRequired: true }];
   }
 
   private allowedActions(
@@ -221,8 +285,7 @@ export class DeliveryUnitDetailRepository {
     snapshot: DeliveryDetailSnapshot,
     evidence: { implementation: unknown | null; codeReview: unknown | null; automatedTesting: unknown | null }
   ): AllowedDeliveryUnitAction[] {
-    if (automation.status === "paused" || ["waiting_dependency", "running", "applying", "applied", "skipped"]
-      .includes(unit.status)) return [];
+    if (automation.status === "paused") return [];
     const jobs = snapshot.jobs.get(unit.id);
     const active = isDeliveryUnitActiveWork({
       pendingJob: Boolean(jobs?.pending),
@@ -230,6 +293,17 @@ export class DeliveryUnitDetailRepository {
       runningExecution: snapshot.activeRuns.has(unit.id)
     }, { includePendingJobs: unit.status === "potentially_stale" });
     if (active) return [];
+    if (unit.phase === "acceptance_delivery") {
+      const application = snapshot.latestApplications.get(unit.id);
+      if (!application || snapshot.activeApplicationProjectVersions.has(unit.projectVersionId)) return [];
+      const retryable = (unit.status === "conflicted" && application.status === "conflicted"
+          && application.resolutionStatus === "not_required")
+        || (unit.status === "failed" && application.status === "failed"
+          && application.resolutionStatus === "not_required")
+        || (unit.status === "ready_for_acceptance" && application.resolutionStatus === "reverted");
+      return retryable ? [action("retry_application")] : [];
+    }
+    if (["waiting_dependency", "running", "applying", "applied", "skipped"].includes(unit.status)) return [];
     const dependenciesSatisfied = snapshot.dependenciesSatisfied.get(unit.id) ?? true;
     if (unit.status === "potentially_stale") {
       return snapshot.activeInvalidations.has(unit.id)

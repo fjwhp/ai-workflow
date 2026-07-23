@@ -324,6 +324,15 @@ export class DeliveryCoordinator {
       .all(requirement.id) as Array<{
         id: string; position: number; required: number; status: string; evidence_version: number;
       }>;
+    if (units.some((unit) => unit.status === "potentially_stale")) {
+      throw new Error("STALE_DELIVERY_EVIDENCE");
+    }
+    if (this.db.prepare(`SELECT 1 FROM delivery_application_runs application
+      WHERE application.resolution_status = 'pending' AND application.project_version_id IN (
+        SELECT project_version_id FROM delivery_units WHERE requirement_id = ?
+      ) LIMIT 1`).get(requirement.id)) {
+      throw new Error("PROJECT_VERSION_APPLICATION_BUSY");
+    }
     const dependencies = this.db.prepare(`SELECT upstream_unit_id, downstream_unit_id, release_condition,
         released_by_evidence_version, released_at
       FROM delivery_dependencies WHERE requirement_id = ? ORDER BY rowid`).all(requirement.id) as Array<{
