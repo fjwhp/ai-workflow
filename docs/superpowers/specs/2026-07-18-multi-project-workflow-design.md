@@ -121,7 +121,7 @@ Product and review AI receive the primary project's business memory plus relevan
 - cross-project contracts and dependency edges;
 - relevant project rules, decisions, risks, and prior requirement experience.
 
-Coding and project-level review/test AI receive only the overall approved context plus their delivery project's repository knowledge, module scope, upstream contracts, and dependency evidence. This bounds prompts and prevents one coding agent from modifying a different repository.
+Coding and project-level review/test AI receive only the overall approved context plus their delivery project's repository knowledge, module scope, upstream contracts, and dependency evidence. Project knowledge uses a configurable aggregate serialized-JSON character budget (`AI_PROJECT_CONTEXT_MAX_CHARS`, default 200,000, hard ceiling 1,000,000), allocated fairly across active projects. This character count is an audit and memory bound, not a model-token estimate. If irreducible identity metadata for excessive associated projects cannot fit, the run is rejected; operators must raise the budget or reduce associations. Coding receives only its sole delivery project's block, allowing that block to use most of the aggregate budget while preventing one coding agent from modifying a different repository.
 
 Knowledge candidates remain project-scoped. Cross-project decisions are referenced from each affected project with shared requirement evidence; they are not stored as an unowned global fact.
 

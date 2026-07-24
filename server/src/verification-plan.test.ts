@@ -40,4 +40,27 @@ describe("verification plan",()=>{
     const repoPath=await repo();
     expect(await buildVerificationPlan({repoPath,changedFiles:["README.md"],fallbackCommands:[]})).toEqual({changedModules:[],plannedCommands:[],commandSource:"unavailable"});
   });
+
+  it("uses the safe cached Git diff check for documentation changes",async()=>{
+    const repoPath=await repo(),fallbackCommands=[{command:"git",argsPrefix:["diff","--cached","--check"]}];
+    expect(await buildVerificationPlan({repoPath,changedFiles:["docs/release.md"],fallbackCommands})).toEqual({changedModules:[],plannedCommands:fallbackCommands,commandSource:"project_fallback"});
+  });
+
+  it.each([
+    ["commit",["commit","-m","unsafe"]],
+    ["extra path",["diff","--cached","--check","--","docs/release.md"]],
+    ["reordered flags",["diff","--check","--cached"]],
+    ["alias configuration",["-c","alias.check=!touch unsafe","check"]],
+    ["global no-pager",["--no-pager","diff","--cached","--check"]],
+    ["push",["push","origin","main"]],
+    ["reset",["reset","--hard"]]
+  ])("rejects the unsafe Git fallback variant %s",async(_label,argsPrefix)=>{
+    const repoPath=await repo();
+    expect(await buildVerificationPlan({repoPath,changedFiles:["docs/release.md"],fallbackCommands:[{command:"git",argsPrefix}]})).toEqual({changedModules:[],plannedCommands:[],commandSource:"unavailable"});
+  });
+
+  it("normalizes legacy fallback commands without an argument prefix",async()=>{
+    const repoPath=await repo();
+    expect(await buildVerificationPlan({repoPath,changedFiles:["docs/release.md"],fallbackCommands:[{command:"npm"} as any]})).toEqual({changedModules:[],plannedCommands:[{command:"npm",argsPrefix:[]}],commandSource:"project_fallback"});
+  });
 });

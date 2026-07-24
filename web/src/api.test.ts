@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseApiResponse } from "./api.js";
+import { ApiError, parseApiResponse } from "./api.js";
 
 describe("parseApiResponse", () => {
   it("reports an empty upstream response without throwing a JSON syntax error", async () => {
@@ -10,5 +10,20 @@ describe("parseApiResponse", () => {
   it("parses a normal JSON response", async () => {
     const response = new Response('{"ok":true}', { status: 200, headers: { "Content-Type": "application/json" } });
     await expect(parseApiResponse(response)).resolves.toEqual({ ok: true });
+  });
+
+  it("preserves structured server error fields", async () => {
+    const details = { valid: false, defaultBranch: "missing" };
+    const response = new Response(JSON.stringify({ error: "PROJECT_REPOSITORY_INVALID", message: "invalid", details }), { status: 400 });
+    const error = await parseApiResponse(response).catch(value => value);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ code: "PROJECT_REPOSITORY_INVALID", message: "invalid", details, status: 400 });
+  });
+
+  it("preserves top-level validation issues for field mapping", async () => {
+    const issues = [{ path: [1, "moduleIds"], message: "invalid" }];
+    const response = new Response(JSON.stringify({ error: "VALIDATION_ERROR", issues }), { status: 400 });
+    const error = await parseApiResponse(response).catch(value => value);
+    expect(error).toMatchObject({ details: { issues } });
   });
 });

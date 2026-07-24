@@ -1,118 +1,73 @@
-# AI 主执行研发工作流 SOP
+# 五阶段工作流 SOP
 
-## 1. 适用范围
+## 角色责任
 
-适用于由运营、产品负责人、研发负责人、人工 Reviewer、专职测试和 AI 角色共同交付的软件需求。SOP 终点为测试放行和运营验收，不包含生产发布。
+| 角色 | 唯一责任 |
+|---|---|
+| 业务负责人 | 提交问题、确认目标、执行总体业务验收 |
+| 产品负责人 | 审核 `definition` 的范围、规则和验收标准 |
+| 方案负责人 | 审核 `solution_design` 的交付单元、依赖、接口和风险 |
+| 实现 AI / 工程师 | 生成 implementation evidence，不判定质量 |
+| Review AI / Reviewer | 独立审查实现，不用测试替代 Review |
+| 测试 worker / 测试负责人 | 独立执行冻结的测试计划，不用 Review 替代测试 |
 
-## 2. 角色责任
+总体业务验收必须由人工完成。职责之间不得共享结论来跳过另一个节点。
 
-| 角色 | 执行责任 | 批准责任 |
-|---|---|---|
-| 运营需求方 | 描述业务问题、价值和期望；执行最终验收 | 原始需求与最终验收 |
-| 产品 AI | 澄清需求、生成 PRD 和验收标准 | 无 |
-| 产品负责人 | 审核 AI 的范围、规则和证据 | PRD 与需求变更 |
-| 研发 AI | 需求评审、技术设计、编码、单测和自测 | 无 |
-| 研发负责人 | 审核可行性、设计、风险和实现摘要 | 需求评审与技术方案 |
-| Review AI | 独立审查代码、测试与需求一致性 | 无 |
-| 人工 Reviewer | 审核 Review AI 的范围、证据和结论 | 代码合并 |
-| 测试 AI | 设计用例、执行自动化测试、分析失败 | 无 |
-| 测试负责人 | 审核覆盖、证据、缺陷等级和残余风险 | 测试放行 |
+## 标准流程
 
-每个需求必须指定产品负责人、研发负责人、人工 Reviewer 和测试负责人。人工审批人可以拒绝 AI 建议，但必须记录理由。
+1. 在 `definition` 澄清业务目标、目标用户、范围、非目标、约束和验收标准，由人工批准。
+2. 在 `solution_design` 冻结项目与版本关联，定义每个交付单元、依赖、接口契约、回滚和验证策略，由人工批准。
+3. 系统创建 delivery plan。无上游依赖的 root unit 为 `ready`，其余为 `waiting_dependency`，并以 dedupe key 创建 root implementation job。
+4. worker 使用持久化 lease 和每 lease fencing token 执行实现；成功后保存不可变 implementation evidence，并分别创建 Review 与测试任务。
+5. Review 与自动化测试各自领取 claim generation，分别保存不可变证据。只有当前 evidence version 的 Review 与自动化测试均通过，系统才释放下游依赖。
+6. 上游实现或契约变化时，系统聚合 fan-in 失效并暂停受影响后代。人工选择 reuse 或 rerun 后，系统重新计算 gate 和任务。
+7. 所有必需交付单元达到 `ready_for_acceptance` 后进入 `acceptance_delivery`。人工完成总体业务验收；后续按依赖顺序执行 no-commit local application。
 
-## 3. 主流程
+## Worker 运行与恢复
 
-```mermaid
-flowchart TD
-    A[运营提交需求] --> B[产品 AI 生成 PRD]
-    B --> C{产品负责人审批}
-    C -->|打回| B
-    C -->|批准| D[研发 AI 需求评审]
-    D --> E{研发负责人审批评审结论}
-    E -->|需求问题| B
-    E -->|批准| F[研发 AI 技术设计]
-    F --> G{研发负责人审批技术方案}
-    G -->|打回| F
-    G -->|批准| H[研发 AI 编码与自测]
-    H --> I[独立 Review AI 审查]
-    I --> J{人工 Reviewer 审批}
-    J -->|实现问题| H
-    J -->|设计问题| F
-    J -->|批准| K[测试 AI 自动化测试]
-    K --> L{测试负责人审批}
-    L -->|缺陷| H
-    L -->|设计问题| F
-    L -->|需求问题| B
-    L -->|放行| M{运营验收}
-    M -->|拒绝| B
-    M -->|通过| N[关闭]
+- 生产式本地运行需要显式设置 `AUTOMATION_WORKER_ENABLED=true`；默认关闭可用于只观察数据或浏览 pilot。
+- worker heartbeat 必须在 lease 到期前续租。续租失败立即 abort handler，旧 token 不能落证据。
+- 服务启动时恢复过期 automation job、遗留 implementation run 和中断的需求级 run；运行中还会周期恢复过期 lease。
+- 同一 dedupe key 或 claim generation 的重复请求必须收敛为一个任务/事实。禁止通过增加 worker 数量绕过 claim owner。
+- 关闭服务时先停止轮询、abort active handler，并在有界时间内等待 settlement；超时保持 lease 供下次恢复。
+
+## 质量与放行
+
+- Review 和测试只读冻结的 implementation evidence tree 与 toolchain identity，分别记录输入 hash、输出、命令结果、验收追踪和终态。
+- 两条质量活动独立执行、独立失败、独立 retry。任一 evidence 缺失、failed、aborted 或 stale 都不得 release。
+- final callback、release edge 和下游 enqueue 位于一个权威事务内；并发 callback 最多生成一条 release 和一个下游 job。
+- failed evidence 的 override 是人工风险接受，不是改写 evidence；服务端校验资格并保存 actor、reason、accepted risk。
+
+## 失效、暂停与人工恢复
+
+- implementation/contract 变化撤销非终态后代的旧 release，取消未开始任务，已开始后代标记 `potentially_stale`。
+- fan-in 的全部 active invalidation 必须由同一次 reuse、rerun 或 optional skip 决定覆盖，不能留下无人拥有的来源事实。
+- `pause` 取消 pending job 并阻止新 lease；leased/running 可以完成，但暂停期间不释放依赖。`resume` 重算 gate、dependency 和 current jobs。
+- optional unit 在无 active work 时可 `optional skip`；required unit 在 API 和数据库层都拒绝 skip。
+- failed job 的 `retry` 只重建服务端确认仍有效的当前 action。terminal `applied`/`skipped` 不提供恢复动作。
+- 所有 pause/resume/reuse/rerun/override/skip/retry 都需要原因；HTTP actor 固定为 `local-human`，不能接受客户端伪造。
+
+## UI 与实时更新
+
+- 详情 API 是操作资格的唯一权威，前端只能展示 server-owned `allowedActions`。
+- SSE 发送单调 `generation`，不在事件中复制业务详情。客户端收到新 generation 后重读 detail。
+- SSE 重连保留最后 generation；连续失败进入定时轮询 fallback，SSE 恢复后清除 fallback timer，避免重复请求和 open handle。
+
+## 本地 pilot
+
+pilot 数据必须写入尚不存在的专用目录，命令拒绝覆盖任何已有路径，也不会向生产 UI 注入静态数据。生成过程在同级 owned `sibling staging` 完成并 fsync 后，通过 macOS `RENAME_EXCL` 或 Linux `RENAME_NOREPLACE` 原子 no-replace 发布；并发路径冲突保留原 owner，能力缺失返回 `PILOT_ATOMIC_PUBLISH_UNAVAILABLE`，失败只清 staging。CLI 用 `FLOWGATE_PILOT_ERROR` 返回稳定错误码：
+
+```bash
+PILOT_DATA_DIR="$PWD/.local/delivery-pilot" npm run pilot:seed -w server
+DATA_DIR="$PWD/.local/delivery-pilot" AUTOMATION_WORKER_ENABLED=false npm run dev
 ```
 
-## 4. 阶段操作
+生成的 `REQ-0001` 包含 backend 与 frontend 两个 delivery unit、已释放依赖、独立 Review/测试 evidence、frontend stale、需求 paused，以及 API 计算的 resume `allowedActions`。需要重建时停止服务并删除整个专用 pilot 目录，再重新执行 seed；不要指向正常 `DATA_DIR`。
 
-### 4.1 运营提需
+## 数据重建 SOP
 
-- 输入：需求申请单。
-- 操作：运营确认业务问题、目标用户、价值、优先级和期望时间。
-- 输出：带唯一 `REQ-ID` 的需求记录。
-- 准出：必填字段齐全，运营确认内容真实。
+升级到 `phase-3-application-audit-v16` 前停止服务。旧 live DB 先备份主文件及现有 WAL/SHM，再创建空的新库。旧 history 只保存在 backup；没有 row migration、dual read/write 或 schema fallback。
 
-### 4.2 产品 AI 与需求审批
+## 安全边界
 
-- 输入：需求申请单及引用资料。
-- 操作：产品 AI 澄清歧义，生成 PRD、非目标和可验证验收标准。
-- 输出：PRD、问题清单、假设清单和需求追溯矩阵初版。
-- 准出：产品负责人批准；未确认的关键业务规则为零。
-
-### 4.3 研发 AI 需求评审
-
-- 输入：已批准 PRD。
-- 操作：分析可行性、依赖、数据、接口、兼容性、安全、工作拆分和可测试性。
-- 输出：结构化评审报告及通过/有条件通过/打回建议。
-- 准出：研发负责人批准；所有阻塞问题已关闭。
-
-### 4.4 技术设计与审批
-
-- 输入：已批准 PRD 和需求评审报告。
-- 操作：研发 AI 生成架构、数据、接口、异常、兼容、回滚、可观测性和测试策略。
-- 输出：技术设计、任务拆分、风险清单和追溯矩阵更新。
-- 准出：研发负责人批准；高风险项有明确缓解与验证措施。
-
-### 4.5 编码与自测
-
-- 输入：批准的 PRD、技术设计和任务清单。
-- 操作：研发 AI 编码，执行单元测试、静态检查、构建及功能自测。
-- 输出：代码差异、提交引用、自测报告和已知限制。
-- 准出：规定检查全部通过；验收标准均有实现和测试引用。
-
-### 4.6 独立 AI Review 与人工审批
-
-- 输入：只读代码差异、完整文件、批准材料和测试证据。
-- 操作：Review AI 在独立上下文检查正确性、安全、性能、维护性及覆盖率。
-- 输出：逐条发现、证据、严重度、建议和最终结论。
-- 准出：阻塞问题为零，人工 Reviewer 批准合并。
-
-### 4.7 测试 AI 与测试放行
-
-- 输入：可测试构建、PRD、设计、变更、自测和 Review 记录。
-- 操作：生成追溯用例，执行自动化测试，区分产品缺陷、脚本缺陷和环境问题。
-- 输出：执行报告、证据、缺陷单、覆盖矩阵和放行建议。
-- 准出：阻塞用例通过，无未处置严重缺陷，测试负责人批准。
-
-### 4.8 运营验收与关闭
-
-- 输入：测试放行结果和验收环境。
-- 操作：运营按 PRD 验收标准验证业务结果。
-- 输出：验收单。
-- 准出：运营签字；追溯材料完整后关闭需求。
-
-## 5. 异常和变更
-
-- AI 置信度低于 0.80、关键输入缺失、批准材料相互冲突或发现高风险时，状态改为“已阻塞”并请求人工处理。
-- 环境故障不得登记为产品缺陷；测试 AI 应保留日志并交测试负责人分类。
-- 研发评审通过后的范围变化必须递增 PRD 版本，填写变更单，并重新评估设计、代码、测试和排期影响。
-- 紧急需求可以缩短审批时限和文档篇幅，但不能跳过人工门禁、独立 Review、测试放行或运营验收。
-
-## 6. 追溯规则
-
-每项材料必须记录 `REQ-ID`、需求版本、`RUN-ID`、生成者、生成时间、引用输入版本和审批结果。验收标准使用 `AC-ID`，技术任务使用 `TASK-ID`，测试用例使用 `TC-ID`，缺陷使用 `BUG-ID`，并在追溯矩阵中建立关联。
+系统不得在目标项目自动 commit、merge、push、tag 或创建 PR。总体业务验收必须人工签署；本地 application 只能留下未提交改动，由人工检查后决定后续 Git 操作。

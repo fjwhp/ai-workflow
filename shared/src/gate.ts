@@ -1,18 +1,42 @@
-import type { WorkflowStage } from "./domain.js";
+import { z } from "zod";
+import { isRequirementAiStage, type RequirementAiStage, type WorkflowStage } from "./domain.js";
 
 export type GateDecision = "auto_approve" | "auto_return" | "human_review";
-export type GateConfig = { autoTransitionEnabled: boolean; confidenceThreshold: number; mandatoryHumanStages: WorkflowStage[] };
+export const configurableMandatoryHumanStages = ["definition"] as const satisfies readonly WorkflowStage[];
+export type ConfigurableMandatoryHumanStage = typeof configurableMandatoryHumanStages[number];
+export type GateConfig = { autoTransitionEnabled: boolean; confidenceThreshold: number; mandatoryHumanStages: ConfigurableMandatoryHumanStage[] };
 export type GateResult = { decision: GateDecision; reasons: string[] };
+
+export const gateConfigSchema = z.object({
+  autoTransitionEnabled: z.boolean(),
+  confidenceThreshold: z.number().finite().min(0).max(1),
+  mandatoryHumanStages: z.array(z.literal("definition")).max(1)
+}).strict();
 
 export const defaultGateConfig: GateConfig = {
   autoTransitionEnabled: true,
   confidenceThreshold: 0.85,
-  mandatoryHumanStages: ["coding", "acceptance"]
+  mandatoryHumanStages: []
 };
 
-export function evaluateGate(stage: WorkflowStage, artifact: any, config: GateConfig): GateResult {
+export const failClosedGateConfig: GateConfig = {
+  autoTransitionEnabled: false,
+  confidenceThreshold: 0.85,
+  mandatoryHumanStages: []
+};
+
+export function parseGateConfig(input: unknown): GateConfig {
+  const parsed = gateConfigSchema.safeParse(input);
+  const config = parsed.success ? parsed.data : failClosedGateConfig;
+  return { ...config, mandatoryHumanStages: [...config.mandatoryHumanStages] };
+}
+
+export function evaluateGate(stage: RequirementAiStage, artifact: any, config: GateConfig): GateResult {
+  if (!isRequirementAiStage(stage)) throw new Error("REQUIREMENT_AI_STAGE_UNSUPPORTED");
+  // Overall acceptance is a separate server workflow; acceptance_delivery is only a delivery-unit phase.
+  if (stage === "solution_design") return { decision: "human_review", reasons: ["solution_design 是不可配置的人工阶段"] };
   if (!config.autoTransitionEnabled) return { decision: "human_review", reasons: ["自动流转已关闭"] };
-  if (config.mandatoryHumanStages.includes(stage)) return { decision: "human_review", reasons: [`${stage} 是强制人工阶段`] };
+  if (stage === "definition" && config.mandatoryHumanStages.includes(stage)) return { decision: "human_review", reasons: [`${stage} 是强制人工阶段`] };
   const findings = Array.isArray(artifact?.findings) ? artifact.findings : [];
   const s0 = findings.filter((finding: any) => finding?.severity === "S0").length;
   if (artifact?.conclusion === "return") return { decision: "auto_return", reasons: ["AI 结论要求退回"] };
@@ -25,10 +49,10 @@ export function evaluateGate(stage: WorkflowStage, artifact: any, config: GateCo
   if (s1) reasons.push(`存在 ${s1} 个 S1 发现`);
   const risks = Array.isArray(artifact?.risks) ? artifact.risks.length : 0;
   if (risks) reasons.push(`存在 ${risks} 项风险`);
-  if(stage==="prd"){
-    const blockers=Array.isArray(artifact?.blockingQuestions)?artifact.blockingQuestions.length:0;
-    if(blockers)reasons.push(`存在 ${blockers} 个高风险阻塞问题`);
-  }else{
+  if (stage === "definition") {
+    const blockers = Array.isArray(artifact?.blockingQuestions) ? artifact.blockingQuestions.length : 0;
+    if (blockers) reasons.push(`存在 ${blockers} 个高风险阻塞问题`);
+  } else {
     const questions = Array.isArray(artifact?.openQuestions) ? artifact.openQuestions.length : 0;
     if (questions) reasons.push(`存在 ${questions} 个待确认问题`);
   }
